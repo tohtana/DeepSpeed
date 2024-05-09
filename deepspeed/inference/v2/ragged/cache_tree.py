@@ -23,13 +23,13 @@ class SequenceStateNode:
         self.name =  hash_token_chunk
         self.block_address: int = block_address
         self.ref_count: int = 0
-        self.last_refrenced = float("-inf")
+        self.last_referenced = float("-inf")
         self.children: Dict[SequenceStateNode] = []
         return
     
     def visit(self, refrence_time: int):
         self.ref_count += 1
-        self.last_refrenced = refrence_time
+        self.last_referenced = refrence_time
         return
    
 
@@ -45,7 +45,7 @@ class Tree:
         self._tree_universal_time += 1
         return
     
-    def lookup_nodes(self, tokens: torch.Tensor):
+    def lookup_nodes(self, tokens: torch.Tensor, speculate: bool = False):
         self._update_time()
         n_blocks = len(tokens) // self.block_size
         current_node = self.root
@@ -57,10 +57,11 @@ class Tree:
                 break
             current_node = current_node.children[current_state_node]
             cached_blocks.append(current_node.block_address)
+        if not speculate:
             current_node.visit(self._tree_universal_time)
         return cached_blocks
         
-    def add_nodes(self, tokens: torch.Tensor, new_block_ids: List[int]):
+    def add_nodes(self, tokens: torch.Tensor, new_block_ids: List[int], speculate: bool = False):
         self._update_time()
         n_blocks = len(tokens) // self.block_size
         current_node = self.root
@@ -70,7 +71,8 @@ class Tree:
             if current_state_node not in current_node.children:
                 current_node.children[current_state_node] = SequenceStateNode(address = new_block_ids[i])
             current_node = current_node.children[current_state_node]
-            current_node.visit(self._tree_universal_time)
+            if not speculate:
+                current_node.visit(self._tree_universal_time)
                 
     def remove_nodes(self, tokens: torch.Tensor) -> None:
         n_blocks = len(tokens) // self.block_size
