@@ -89,10 +89,9 @@ class Tree:
                 raise ValueError(f'Deleting the block of tokens 
                                  {tokens[i-1*self.block_size: i *self.block_size]} 
                                  which were never in cache')
-        elimination_sequence:List = []
         while elimination_stack[-1].ref_count == 0:
             leaf_node = elimination_stack.pop()
-            elimination_sequence.append(leaf_node)
+            self.eviction_pool[self._tree_universal_time].append(leaf_node)
 
 
         
