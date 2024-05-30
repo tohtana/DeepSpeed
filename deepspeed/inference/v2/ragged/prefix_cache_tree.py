@@ -18,6 +18,7 @@ def sequence_to_state(token_ids: Optional[torch.Tensor] = None):
 
 
 class SequenceStateNode:
+    
     def __init__(self, block_address: Optional[int] = None,
                  hash_token_chunk: Optional[torch.Tensor] = None):
         self.name =  hash_token_chunk
@@ -46,7 +47,7 @@ class PrefixCacheTree():
         self._tree_universal_time += 1
         return
     
-    def lookup_nodes(self, tokens: torch.Tensor, speculate: bool = False):
+    def lookup(self, tokens: torch.Tensor, speculate: bool = False):
         self._update_time()
         n_blocks = len(tokens) // self.block_size
         current_node = self.root
@@ -62,7 +63,7 @@ class PrefixCacheTree():
             current_node.visit(self._tree_universal_time)
         return cached_blocks
         
-    def add_nodes(self, tokens: torch.Tensor, new_block_ids: List[int], speculate: bool = False):
+    def extend(self, tokens: torch.Tensor, new_block_ids: List[int], speculate: bool = False):
         self._update_time()
         n_blocks = len(tokens) // self.block_size
         current_node = self.root
@@ -75,7 +76,7 @@ class PrefixCacheTree():
             if not speculate:
                 current_node.visit(self._tree_universal_time)
                 
-    def remove_nodes(self, tokens: torch.Tensor) -> None:
+    def delete(self, tokens: torch.Tensor) -> None:
         n_blocks = len(tokens) // self.block_size
         current_node = self.root
         elimination_stack: List = []
@@ -87,9 +88,8 @@ class PrefixCacheTree():
                 elimination_stack.push(current_node)
                 current_node.ref_count -= 1
             else:
-                raise ValueError(f'Deleting the block of tokens 
-                                 {tokens[i-1*self.block_size: i *self.block_size]} 
-                                 which were never in cache')
+                #import pdb; pdb.set_trace()
+                raise ValueError(f"Deleting the block of tokens {tokens[i-1*self.block_size: i *self.block_size]} which were never in cache")
         while elimination_stack[-1].ref_count == 0:
             leaf_node = elimination_stack.pop()
             self.eviction_pool[self._tree_universal_time].append(leaf_node)
