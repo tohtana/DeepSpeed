@@ -33,12 +33,13 @@ class SequenceStateNode:
         return
    
 
-class Tree:
+class PrefixCacheTree():
 
-    def __init__(self):
+    def __init__(self, block_size):
         self.root =  SequenceStateNode()
         self._tree_universal_time = 0
         self.eviction_pool: Dict[int, List] = {}
+        self.block_size: int = block_size
         return
     
     def update_time(self):

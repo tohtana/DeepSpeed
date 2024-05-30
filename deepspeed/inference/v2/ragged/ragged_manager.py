@@ -15,7 +15,7 @@ from .blocked_allocator import BlockedAllocator
 from .kv_cache import BlockedKVCache
 from .manager_configs import DSStateManagerConfig, KVCacheConfig
 from .sequence_descriptor import DSSequenceDescriptor
-from .prefix_block_map import PrefixBlockMap
+from .prefix_cache_tree import PrefixCacheTree
 
 
 class DSStateManager:
@@ -102,7 +102,7 @@ class DSStateManager:
                                         enable_prefix_cache=enable_prefix_cache)
 
         assert len(self._kv_configs) == 1, "Only one KV cache group is supported for now."
-        self._block_map = PrefixBlockMap(self._kv_configs[0].block_size)
+        self._block_map = PrefixCacheTree(self._kv_configs[0].block_size)
         self._ref_counts = defaultdict(int)
 
     def get_cache(self, cache_id: int, cache_group: int = 0) -> torch.Tensor:
