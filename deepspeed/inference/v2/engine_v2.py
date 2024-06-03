@@ -91,6 +91,9 @@ class InferenceEngineV2:
                                              enable_prefix_cache=self._config.enable_prefix_cache)
         self._model.set_state_manager(self._state_manager)
 
+        self.graphs = {}
+
+
     def _initialize_tp_group(self):
         """
         Implementation of our TP group initialization.
@@ -105,6 +108,7 @@ class InferenceEngineV2:
         ranks = list(range(self._config.tensor_parallel.tp_size))
         return dist.new_group(ranks=ranks)
 
+    @torch.inference_mode()
     def put(self,
             batch_uids: Iterable[int],
             batch_tokens: Iterable[torch.Tensor],
@@ -150,7 +154,23 @@ class InferenceEngineV2:
         self._model.prepare_batch(self._batch)
 
         # Model implementation will pick up in the forward.
-        logits = self._model.forward(self._batch)
+        batch_size = self._batch.input_ids().shape[0]
+
+        # if batch_size <= 32:
+        if False
+            _ = self._model.forward(self._batch)
+            if batch_size not in self.graphs:
+                g = torch.cuda.CUDAGraph()
+                torch.cuda.synchronize()
+                # self.graphs[batch_size] = torch.compile(self._model)
+                with torch.cuda.graph(g):
+                    _ = self._model.forward(self._batch)
+                torch.cuda.synchronize()
+
+                self.graphs[batch_size] = g
+            self.graphs[batch_size].replay()
+        else:
+            logits = self._model.forward(self._batch)
 
         # We return one set of logits per sequence in the batch (saves cost on unembedding)
         assert logits.shape[0] == self._batch.current_sequences
