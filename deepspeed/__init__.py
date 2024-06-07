@@ -50,6 +50,20 @@ from .pipe import PipelineModule
 from .git_version_info import version, git_hash, git_branch
 
 
+def write_to_file(message):
+    file_path = "/tmp/debug.log"
+
+    import torch.distributed as dist
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = "NA"
+
+    with open(file_path, "a") as f:
+        f.write(f"[r{rank}] {message}\n")
+    print(f"[r{rank}] {message}")
+
+
 def _parse_version(version_str):
     '''Parse a version string and extract the major, minor, and patch versions.'''
     ver = pkg_version.parse(version_str)
