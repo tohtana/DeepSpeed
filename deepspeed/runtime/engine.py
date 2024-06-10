@@ -119,6 +119,20 @@ except ImportError:
     APEX_INSTALLED = False
 
 
+def write_to_file(message):
+    file_path = "/tmp/debug.log"
+
+    import torch.distributed as dist
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = "NA"
+
+    with open(file_path, "a") as f:
+        f.write(f"[r{rank}] {message}\n")
+    print(f"[r{rank}] {message}")
+
+
 def split_half_float_double_sparse(tensors):
     device_type = get_accelerator().device_name()
     supported_types = get_accelerator().supported_dtypes()
@@ -1910,7 +1924,15 @@ class DeepSpeedEngine(Module):
         self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
         # ZeRO stage >= 2 communicates during non gradient accumulation boundaries as well
         if self.zero_optimization_partition_gradients():
+            write_to_file(f"allreduce_gradients: 1")
+            torch.cuda.synchronize()
+            write_to_file(f"allreduce_gradients: 2")
+            dist.barrier()
+            write_to_file(f"allreduce_gradients: 3")
             self.optimizer.overlapping_partition_gradients_reduce_epilogue()
+            write_to_file(f"allreduce_gradients: 4")
+            torch.cuda.synchronize()
+            dist.barrier()
 
         # Communicate only at gradient accumulation boundaries
         elif self.is_gradient_accumulation_boundary():
@@ -1919,7 +1941,17 @@ class DeepSpeedEngine(Module):
                 self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
             else:
                 grads = None
+                write_to_file(f"allreduce_gradients: 5")
+                torch.cuda.synchronize()
+                write_to_file(f"allreduce_gradients: 6")
+                dist.barrier()
+                write_to_file(f"allreduce_gradients: 7")
                 self.buffered_allreduce_fallback(grads=grads, elements_per_buffer=bucket_size)
+                write_to_file(f"allreduce_gradients: 8")
+                torch.cuda.synchronize()
+                write_to_file(f"allreduce_gradients: 9")
+
+                dist.barrier()
 
     @instrument_w_nvtx
     def backward(self, loss, allreduce_gradients=True, release_loss=False, retain_graph=False, scale_wrt_gas=True):

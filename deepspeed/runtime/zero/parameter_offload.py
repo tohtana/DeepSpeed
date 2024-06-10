@@ -21,6 +21,28 @@ FWD_MODULE_STACK = list()
 warned = False
 
 
+log_hook = False
+
+def enable_log_hook(enable):
+    global log_hook
+    log_hook = enable
+    
+
+def write_to_file(message):
+    if log_hook:
+        file_path = "/tmp/debug.log"
+
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = "NA"
+
+        with open(file_path, "a") as f:
+            f.write(f"[r{rank}] {message}\n")
+        print(f"[r{rank}] {message}")
+
+
 #for each tensor in outputs run the forward_function and register backward_function as hook
 def _apply_forward_and_backward_to_tensors_only(module, forward_function, backward_function, outputs):
     if type(outputs) is tuple:
@@ -154,6 +176,9 @@ class DeepSpeedZeRoOffload(object):
 
         see_memory_usage("DeepSpeedZeRoOffload initialize [end]", force=True)
 
+        self.forward_order = []
+        self.backward_order = []
+
     @instrument_w_nvtx
     def partition_all_parameters(self):
         """Partitioning Parameters that were not partitioned usually if parameters
@@ -275,10 +300,21 @@ class DeepSpeedZeRoOffload(object):
 
         @instrument_w_nvtx
         def _pre_forward_module_hook(module, *args):
+            if module.id == 1:
+                self.forward_order.clear()
+                self.backward_order.clear()
+            self.forward_order.append((module.id, module.__class__))
+            write_to_file(f"pre_forward_module_hook starting {module.__class__} {module.id}")
+            dist.barrier()
             self.pre_sub_module_forward_function(module)
+            write_to_file(f"pre_forward_module_hook finished {module.__class__} {module.id}")
+            dist.barrier()
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
+            write_to_file(f"_post_forward_module_hook starting {module.__class__} {module.id}")
+            dist.barrier()
+
             if hasattr(module, "disable_z3_fetch") and module.disable_z3_fetch:
                 return
 
@@ -322,12 +358,17 @@ class DeepSpeedZeRoOffload(object):
 
             self.post_sub_module_forward_function(module)
 
+            write_to_file(f"_post_forward_module_hook finished {module.__class__} {module.id}")
+            dist.barrier()
+
         def _bwd_hook_unexpected_inputs_msg(value):
             return f"A module has unknown inputs or outputs type ({type(value)}) and the tensors embedded in it cannot be detected. " \
                 "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and " \
                 "output tensors and therefore may not get triggered properly."
 
         def _pre_backward_module_hook(module, inputs, output):
+            write_to_file(f"_pre_backward_module_hook starting {module.__class__} {module.id}")
+            dist.barrier()
 
             if not hasattr(module, "pre_bwd_fn"):
 
@@ -362,9 +403,15 @@ class DeepSpeedZeRoOffload(object):
 
                 module.pre_bwd_fn = PreBackwardFunctionForModule
 
-            return apply_to_tensors_only(module.pre_bwd_fn.apply,
+
+            ret = apply_to_tensors_only(module.pre_bwd_fn.apply,
                                          output,
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+
+            write_to_file(f"_pre_backward_module_hook finished {module.__class__} {module.id}")
+            dist.barrier()
+
+            return ret
 
         #This is an alternate to doing _post_backward_module_hook
         #it uses tensor.register_hook instead of using torch.autograd.Function
@@ -387,6 +434,10 @@ class DeepSpeedZeRoOffload(object):
                                                                _run_after_backward_hook, inputs)
 
         def _post_backward_module_hook(module, inputs):
+            write_to_file(f"_post_backward_module_hook starting {module.__class__} {module.id}")
+            dist.barrier()
+            self.backward_order.append((module.id, module.__class__))
+
             module.ds_grads_remaining = 0
 
             if not hasattr(module, "post_bwd_fn"):
@@ -394,7 +445,17 @@ class DeepSpeedZeRoOffload(object):
                 @instrument_w_nvtx
                 def _run_after_backward_function(sub_module):
                     if sub_module.ds_grads_remaining == 0:
+                        for n, p in sub_module.named_parameters(recurse=False):
+                            if p.grad is None:
+                                write_to_file(f"_post_backward_module_hook {sub_module.__class__} {sub_module.id} {n} has None grad {p.shape}")
+
+                        # if z3_leaf_module(sub_module):
+                        #     for param in iter_params(sub_module, recurse=True):
+                        #         if param.grad is None:
+                        #             param.grad = torch.zeros_like(param)
+
                         self.post_sub_module_backward_function(sub_module)
+
 
                 class PostBackwardFunctionModule(torch.autograd.Function):
 
@@ -424,9 +485,14 @@ class DeepSpeedZeRoOffload(object):
 
                 module.post_bwd_fn = PostBackwardFunctionModule
 
-            return apply_to_tensors_only(module.post_bwd_fn.apply,
+            ret = apply_to_tensors_only(module.post_bwd_fn.apply,
                                          inputs,
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+
+            write_to_file(f"_post_backward_module_hook finished {module.__class__} {module.id}")
+            dist.barrier()
+
+            return ret
 
         # Pre forward hook
         self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))

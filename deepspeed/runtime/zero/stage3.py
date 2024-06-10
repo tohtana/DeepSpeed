@@ -40,6 +40,29 @@ OPTIMIZER_SWAP_OUT_STATE_TIMER = 'optimizer_swap_out_state'
 OPTIMIZER_STEP_TIMER = 'optimizer_step'
 
 
+log_hook = False
+
+
+def enable_log_hook(enable):
+    global log_hook
+    log_hook = enable
+
+
+def write_to_file(message):
+    if log_hook:
+        file_path = "/tmp/debug.log"
+
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+        else:
+            rank = "NA"
+
+        with open(file_path, "a") as f:
+            f.write(f"[r{rank}] {message}\n")
+        print(f"[r{rank}] {message}")
+
+
 def print_rank_0(message, debug=False, force=False):
     rank = dist.get_rank()
     if rank == 0 and (debug or force):
@@ -2206,11 +2229,29 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         see_memory_usage(f"Before backward", force=False)
 
+        torch.cuda.synchronize()
+        dist.barrier()
+        write_to_file(f"z3 backward starting")
+
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss
             scaled_loss.backward()
         else:
             self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+
+        write_to_file(f"z3 backward finished")
+
+        write_to_file(f"forward len={len(self.parameter_offload.forward_order)} {[o[0] for o in self.parameter_offload.forward_order]}")
+        write_to_file(f"backward len={len(self.parameter_offload.backward_order)} {[o[0] for o in self.parameter_offload.backward_order]}")
+
+        for n, m in self.module.named_modules():
+            if hasattr(m, 'ds_grads_remaining'):
+                assert m.ds_grads_remaining == 0, f"module {n} ds_grads_remaining {m.ds_grads_remaining}"
+            # else:
+                # write_to_file(f"module {n} has no ds_grads_remaining")
+
+        torch.cuda.synchronize()
+        dist.barrier()
 
         self._get_param_coordinator(training=True).reset_step()
 
