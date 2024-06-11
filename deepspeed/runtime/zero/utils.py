@@ -4,7 +4,7 @@
 # DeepSpeed Team
 
 import os
-from typing import List
+from typing import List, Set
 
 import torch
 from deepspeed import comm as dist
@@ -114,7 +114,9 @@ def is_zero_param(parameter):
     return hasattr(parameter, 'ds_id')
 
 
-def apply_to_tensors_only(function, value, warning_msg_fn=None):
+warned: Set[str] = set()
+
+def apply_to_tensors_only(function, value, warning_msg_fn=None, strict_check=False):
     """
     Apply `function` to every Tensor in `value`.
 
@@ -154,7 +156,11 @@ def apply_to_tensors_only(function, value, warning_msg_fn=None):
     else:
         if not is_builtin_type(value):
             global warned
-            if warning_msg_fn and not warned and dist.get_rank() == 0:
-                logger.warning(warning_msg_fn(value))
-                warned = True
+            if warning_msg_fn and dist.get_rank() == 0:
+                msg = warning_msg_fn(value)
+                if msg not in warned:
+                    logger.warning(msg)
+                    warned.add(msg)
+        if strict_check:
+            raise ValueError(f"Found unsupported type {type(value)} in the input")
         return value

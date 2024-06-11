@@ -28,8 +28,8 @@ def enable_log_hook(enable):
     log_hook = enable
     
 
-def write_to_file(message):
-    if log_hook:
+def write_to_file(message, force=False):
+    if log_hook or force:
         file_path = "/tmp/debug.log"
 
         import torch.distributed as dist
@@ -306,6 +306,10 @@ class DeepSpeedZeRoOffload(object):
             self.forward_order.append((module.id, module.__class__))
             write_to_file(f"pre_forward_module_hook starting {module.__class__} {module.id}")
             dist.barrier()
+
+            if dist.get_rank() == 0:
+                write_to_file(f"pre_forward_module_hook SYNC starting {module.__class__} {module.id}", force=True)
+
             self.pre_sub_module_forward_function(module)
             write_to_file(f"pre_forward_module_hook finished {module.__class__} {module.id}")
             dist.barrier()
@@ -314,6 +318,10 @@ class DeepSpeedZeRoOffload(object):
         def _post_forward_module_hook(module, input, output):
             write_to_file(f"_post_forward_module_hook starting {module.__class__} {module.id}")
             dist.barrier()
+            
+            if dist.get_rank() == 0:
+                write_to_file(f"_post_forward_module_hook SYNC starting {module.__class__} {module.id}", force=True)
+
 
             if hasattr(module, "disable_z3_fetch") and module.disable_z3_fetch:
                 return
@@ -361,14 +369,13 @@ class DeepSpeedZeRoOffload(object):
             write_to_file(f"_post_forward_module_hook finished {module.__class__} {module.id}")
             dist.barrier()
 
-        def _bwd_hook_unexpected_inputs_msg(value):
+        def _bwd_hook_unexpected_inputs_msg(value) -> str:
             return f"A module has unknown inputs or outputs type ({type(value)}) and the tensors embedded in it cannot be detected. " \
                 "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and " \
                 "output tensors and therefore may not get triggered properly."
 
         def _pre_backward_module_hook(module, inputs, output):
             write_to_file(f"_pre_backward_module_hook starting {module.__class__} {module.id}")
-            dist.barrier()
 
             if not hasattr(module, "pre_bwd_fn"):
 
@@ -378,9 +385,19 @@ class DeepSpeedZeRoOffload(object):
                     # before doing backwards, so each backward will need a pre-fetch - using reference
                     # counting to support this scenario
                     #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+
+                    if dist.get_rank() == 0:
+                        write_to_file(f"_pre_backward_module_hook SYNC starting {sub_module.__class__} {sub_module.id} applied_pre_backward_ref_cnt={sub_module.applied_pre_backward_ref_cnt}", force=True)
+                    dist.barrier()
+
                     if sub_module.applied_pre_backward_ref_cnt > 0:
                         self.pre_sub_module_backward_function(sub_module)
                         sub_module.applied_pre_backward_ref_cnt -= 1
+
+                    if dist.get_rank() == 0:
+                        write_to_file(f"_pre_backward_module_hook SYNC finished {sub_module.__class__} {sub_module.id}", force=True)
+                    dist.barrier()
+
                     #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
 
                 class PreBackwardFunctionForModule(torch.autograd.Function):
@@ -390,8 +407,8 @@ class DeepSpeedZeRoOffload(object):
                         # Capture `module` and _run_before_backward_function
                         ctx.module = module
                         ctx.pre_backward_function = _run_before_backward_function
-                        if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
-                            ctx.module.applied_pre_backward_ref_cnt = 0
+                        # if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
+                        #     ctx.module.applied_pre_backward_ref_cnt = 0
                         ctx.module.applied_pre_backward_ref_cnt += 1
                         outputs = outputs.detach()
                         return outputs
@@ -438,6 +455,7 @@ class DeepSpeedZeRoOffload(object):
         def _post_backward_module_hook(module, inputs):
             write_to_file(f"_post_backward_module_hook starting {module.__class__} {module.id}")
             dist.barrier()
+
             self.backward_order.append((module.id, module.__class__))
 
             module.ds_grads_remaining = 0
@@ -446,18 +464,23 @@ class DeepSpeedZeRoOffload(object):
 
                 @instrument_w_nvtx
                 def _run_after_backward_function(sub_module):
-                    if sub_module.ds_grads_remaining == 0:
-                        for n, p in sub_module.named_parameters(recurse=False):
-                            if p.grad is None:
-                                write_to_file(f"_post_backward_module_hook {sub_module.__class__} {sub_module.id} {n} has None grad {p.shape}")
+                    for n, p in sub_module.named_parameters(recurse=False):
+                        if p.grad is None:
+                            write_to_file(f"_post_backward_module_hook {sub_module.__class__} {sub_module.id} {n} has None grad {p.shape}")
 
-                        # if z3_leaf_module(sub_module):
-                        #     for param in iter_params(sub_module, recurse=True):
-                        #         if param.grad is None:
-                        #             param.grad = torch.zeros_like(param)
+                    # if z3_leaf_module(sub_module):
+                    #     for param in iter_params(sub_module, recurse=True):
+                    #         if param.grad is None:
+                    #             param.grad = torch.zeros_like(param)
+                    if dist.get_rank() == 0:
+                        write_to_file(f"_post_backward_module_hook SYNC starting {sub_module.__class__} {sub_module.id}", force=True)
+                    dist.barrier()
 
-                        self.post_sub_module_backward_function(sub_module)
+                    self.post_sub_module_backward_function(sub_module)
 
+                    if dist.get_rank() == 0:
+                        write_to_file(f"_post_backward_module_hook SYNC finished {sub_module.__class__} {sub_module.id}", force=True)
+                    dist.barrier()
 
                 class PostBackwardFunctionModule(torch.autograd.Function):
 
@@ -471,25 +494,35 @@ class DeepSpeedZeRoOffload(object):
                             #    ctx.view=True
                             #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
                             #assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
-                            #if module.ds_grads_remaining == 0:
-                            #    print(f"Before Forward: {ctx.module.__class__.__name__}")
                             module.ds_grads_remaining += 1
                             ctx.post_backward_function = _run_after_backward_function
+
+                        if dist.get_rank() == 0:
+                            write_to_file(f"_post_backward_module_hook SYNC forward checking ds_grads_remaining {ctx.module.__class__} {ctx.module.id}. ds_grads_remaining={ctx.module.ds_grads_remaining} output.requires_grad={output.requires_grad}", force=True)
+
                         output = output.detach()
                         return output
 
                     @staticmethod
                     def backward(ctx, *args):
-                        ctx.module.ds_grads_remaining = ctx.module.ds_grads_remaining - 1
+                        ctx.module.ds_grads_remaining -= 1
+                        if dist.get_rank() == 0:
+                            write_to_file(f"_post_backward_module_hook SYNC backward checking ds_grads_remaining {ctx.module.__class__} {ctx.module.id}. ds_grads_remaining={ctx.module.ds_grads_remaining}", force=True)
+
                         if ctx.module.ds_grads_remaining == 0:
                             ctx.post_backward_function(ctx.module)
                         return args
 
                 module.post_bwd_fn = PostBackwardFunctionModule
 
-            ret = apply_to_tensors_only(module.post_bwd_fn.apply,
-                                         inputs,
-                                         warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+            try:
+                ret = apply_to_tensors_only(module.post_bwd_fn.apply,
+                                            inputs,
+                                            warning_msg_fn=_bwd_hook_unexpected_inputs_msg,
+                                            strict_check=True)
+            except Exception as e:
+                write_to_file(f"Error in _post_backward_module_hook {e}")
+                raise e
 
             write_to_file(f"_post_backward_module_hook finished {module.__class__} {module.id}")
             dist.barrier()

@@ -420,6 +420,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage(f"After initializing ZeRO optimizer", force=True)
 
+        self.bwd_counter = 0
+
     def destroy(self):
         self.parameter_offload.destroy()
         for hook in self._grad_acc_hooks:
@@ -2231,7 +2233,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         torch.cuda.synchronize()
         dist.barrier()
-        write_to_file(f"z3 backward starting")
+        
+
+        write_to_file(f"z3 backward starting bwd_counter={self.bwd_counter}")
 
         if self.custom_loss_scaler:
             scaled_loss = self.external_loss_scale * loss
@@ -2239,7 +2243,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         else:
             self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
-        write_to_file(f"z3 backward finished")
+        write_to_file(f"z3 backward finished bwd_counter={self.bwd_counter}")
+        self.bwd_counter += 1
 
         write_to_file(f"forward len={len(self.parameter_offload.forward_order)} {[o[0] for o in self.parameter_offload.forward_order]}")
         write_to_file(f"backward len={len(self.parameter_offload.backward_order)} {[o[0] for o in self.parameter_offload.backward_order]}")
