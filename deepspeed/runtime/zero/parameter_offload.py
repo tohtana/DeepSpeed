@@ -404,6 +404,8 @@ class DeepSpeedZeRoOffload(object):
                 module.pre_bwd_fn = PreBackwardFunctionForModule
 
 
+            module.applied_pre_backward_ref_cnt = 0
+
             ret = apply_to_tensors_only(module.pre_bwd_fn.apply,
                                          output,
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
