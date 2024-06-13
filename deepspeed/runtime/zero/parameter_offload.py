@@ -347,8 +347,6 @@ class DeepSpeedZeRoOffload(object):
                         # Capture `module` and _run_before_backward_function
                         ctx.module = module
                         ctx.pre_backward_function = _run_before_backward_function
-                        if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
-                            ctx.module.applied_pre_backward_ref_cnt = 0
                         ctx.module.applied_pre_backward_ref_cnt += 1
                         outputs = outputs.detach()
                         return outputs
@@ -359,6 +357,8 @@ class DeepSpeedZeRoOffload(object):
                         return args
 
                 module.pre_bwd_fn = PreBackwardFunctionForModule
+
+            module.applied_pre_backward_ref_cnt = 0
 
             return apply_to_tensors_only(module.pre_bwd_fn.apply,
                                          output,
