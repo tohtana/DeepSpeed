@@ -14,6 +14,7 @@ from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator, InflightParamRegistry, iter_params
 from deepspeed.accelerator import get_accelerator
+import deepspeed.runtime.compiler as compiler
 
 FWD_MODULE_STACK = list()
 
@@ -236,8 +237,8 @@ class DeepSpeedZeRoOffload(object):
         self.module.register_forward_hook(_end_of_forward_hook)
 
         # Add top module to stack trace
-        global FWD_MODULE_STACK
-        FWD_MODULE_STACK.append(self.module)
+        # global FWD_MODULE_STACK
+        # FWD_MODULE_STACK.append(self.module)
 
     def mark_persistent_parameters(self, param_threshold, model_threshold):
         persistent_params = []
@@ -280,8 +281,8 @@ class DeepSpeedZeRoOffload(object):
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
 
-            global FWD_MODULE_STACK
-            FWD_MODULE_STACK.pop()
+            # global FWD_MODULE_STACK
+            # FWD_MODULE_STACK.pop()
             if output is None:
                 output = []
             elif not isinstance(output, (list, tuple)):
@@ -296,27 +297,27 @@ class DeepSpeedZeRoOffload(object):
                             outputs.append(val)
                     output = outputs
 
-            for item in filter(lambda item: is_zero_param(item) or hasattr(item, 'ds_param_alias'), output):
-                key = id(item) if hasattr(item, 'ds_id') else id(item.ds_param_alias)
-                actual_external_param = item if hasattr(item, 'ds_id') else item.ds_param_alias
+            # for item in filter(lambda item: is_zero_param(item) or hasattr(item, 'ds_param_alias'), output):
+            #     key = id(item) if hasattr(item, 'ds_id') else id(item.ds_param_alias)
+            #     actual_external_param = item if hasattr(item, 'ds_id') else item.ds_param_alias
 
-                if not any(key in m._external_params for m in FWD_MODULE_STACK):
-                    actual_external_param.is_external_param = True
-                    module_to_register = FWD_MODULE_STACK[-1]
-                    register_external_parameter(module_to_register, actual_external_param)
-                    print_rank_0(
-                        f'Registering dangling parameter for module {module_to_register.__class__.__name__}, ds_id = {actual_external_param.ds_id}.',
-                        force=False)
+            #     if not any(key in m._external_params for m in FWD_MODULE_STACK):
+            #         actual_external_param.is_external_param = True
+            #         module_to_register = FWD_MODULE_STACK[-1]
+            #         register_external_parameter(module_to_register, actual_external_param)
+            #         print_rank_0(
+            #             f'Registering dangling parameter for module {module_to_register.__class__.__name__}, ds_id = {actual_external_param.ds_id}.',
+            #             force=False)
 
-                    # It's possible that the parameter was already external to the completed module. If so, remove it the
-                    # registration as it will be covered by the outer module instead.
-                    if key in module._external_params:
-                        print_rank_0(
-                            f'  Unregistering nested dangling parameter from module {module.__class__.__name__}, ds_id = {actual_external_param.ds_id}',
-                            force=False)
-                        unregister_external_parameter(module, actual_external_param)
+            #         # It's possible that the parameter was already external to the completed module. If so, remove it the
+            #         # registration as it will be covered by the outer module instead.
+            #         if key in module._external_params:
+            #             print_rank_0(
+            #                 f'  Unregistering nested dangling parameter from module {module.__class__.__name__}, ds_id = {actual_external_param.ds_id}',
+            #                 force=False)
+            #             unregister_external_parameter(module, actual_external_param)
 
-                    actual_external_param.all_gather()
+            #         actual_external_param.all_gather()
 
             self.post_sub_module_forward_function(module)
 
@@ -438,20 +439,26 @@ class DeepSpeedZeRoOffload(object):
         # post backward hook
         self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    
     def pre_sub_module_forward_function(self, sub_module):
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)
-
-        global FWD_MODULE_STACK
-        FWD_MODULE_STACK.append(sub_module)
+        # global FWD_MODULE_STACK
+        # FWD_MODULE_STACK.append(sub_module)
 
         param_coordinator = self.get_param_coordinator(training=sub_module.training)
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
+
+        self._test_pre_sub_module_forward_function(sub_module)
+        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__} after fetch", force=False)
+
+    def _test_pre_sub_module_forward_function(self, sub_module):
+        param_coordinator = self.get_param_coordinator(training=sub_module.training)
         param_coordinator.fetch_sub_module(sub_module, forward=True)
 
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__} after fetch", force=False)
+
 
     @torch.no_grad()
     def post_sub_module_forward_function(self, sub_module):

@@ -178,23 +178,22 @@ class PartitionedParameterCoordinator:
                     force=True)
                 self._invalidate_trace()
 
-    @compiler.disable
     def record_module(self, sub_module: Module) -> None:
         """adds sub module to trace"""
         if not self.is_record_trace():
             raise RuntimeError(f"attempted to record trace when status = {self.__trace_mode}")
 
         self.__submodule_order.append(sub_module)
-        self.__step_id_module_fetched_for[sub_module.id].append(self.__step_id)
+        # self.__step_id_module_fetched_for[sub_module.id].append(self.__step_id)
 
     def record_parameters(self, sub_module: Module) -> None:
         """adds sub module to trace"""
         if not self.is_record_trace():
             raise RuntimeError(f"attempted to record trace when status = {self.__trace_mode}")
 
-        step_id = self.__step_id_module_fetched_for[sub_module.id].popleft()
-        for param in sorted(set(iter_params(sub_module, recurse=z3_leaf_module(sub_module))), key=lambda p: p.ds_id):
-            self.__param_order.append(__class__.__ParamInTrace(param=param, step_id_last_used_at=step_id))
+        # step_id = self.__step_id_module_fetched_for[sub_module.id].popleft()
+        # for param in sorted(set(iter_params(sub_module, recurse=z3_leaf_module(sub_module))), key=lambda p: p.ds_id):
+        #     self.__param_order.append(__class__.__ParamInTrace(param=param, step_id_last_used_at=step_id))
 
     def construct_parameter_trace_from_module_trace(self):
         """use module trace to construct parameter trace"""
@@ -256,7 +255,6 @@ class PartitionedParameterCoordinator:
     Fetching, prefetching, and releasing parameters
     """
 
-    @compiler.disable
     @instrument_w_nvtx
     @torch.no_grad()
     def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
@@ -315,8 +313,8 @@ class PartitionedParameterCoordinator:
                         self.__ongoing_fetch_events.append(event)
 
             assert param.ds_status == ZeroParamStatus.AVAILABLE, param.ds_summary()
-        if not get_accelerator().resolves_data_dependency():
-            get_accelerator().current_stream().wait_stream(self.__allgather_stream)
+        # if not get_accelerator().resolves_data_dependency():
+        #     get_accelerator().current_stream().wait_stream(self.__allgather_stream)
         self.__profiler.stop_event(wait_event_name, wait_numel)
 
         # kick off parameter prefetches for upcoming modules

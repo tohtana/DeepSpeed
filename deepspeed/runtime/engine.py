@@ -3614,7 +3614,27 @@ class DeepSpeedEngine(Module):
         if self.is_compiled:
             return
 
-        self.module.compile(backend=backend, **compile_kwargs)
+        import torch._dynamo
+        from torch._functorch.aot_autograd import aot_module_simplified
+        def toy_backend(gm, sample_inputs): 
+            def my_compiler(gm, sample_inputs):
+                # <implement your compiler here>
+                if self.global_rank == 0:
+                    print("AOTAutograd produced a fx Graph in Aten IR:")
+                    gm.print_readable()
+                return gm.forward
+
+            # Invoke AOTAutograd
+            return aot_module_simplified(
+                gm,
+                sample_inputs,
+                fw_compiler=my_compiler
+            )
+
+        # self.get_param_coordinator
+        self.optimizer.parameter_offload.get_param_coordinator(True)
+        self.module.compile(backend=toy_backend, **compile_kwargs)
+
         self._is_compiled = True
 
     @property
