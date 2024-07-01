@@ -70,6 +70,8 @@ class ZeROOrderedDict(OrderedDict):
 
 def _inject_parameters(module, cls):
     for module in module.modules():
+        module._original_parameters = module._parameters
+
         if cls == ZeROOrderedDict:
             new_param = cls(parent_module=module)
         else:
@@ -77,6 +79,7 @@ def _inject_parameters(module, cls):
 
         for key, param in module._parameters.items():
             new_param[key] = param
+
         module._parameters = new_param
 
 
@@ -233,7 +236,7 @@ class DeepSpeedZeRoOffload(object):
 
         #likely one of them should be enough but just to be safe
         self._register_hooks_recursively(self.module)
-        self.module.register_forward_hook(_end_of_forward_hook)
+        self.forward_hooks.append(self.module.register_forward_hook(_end_of_forward_hook))
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
