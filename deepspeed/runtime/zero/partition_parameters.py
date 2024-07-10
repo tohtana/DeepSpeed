@@ -1142,7 +1142,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param_list = [cls]
             return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
 
-        def _all_gather_dtype(dtype, params, world_size, rank_in_group, ds_process_group):
+        def _all_gather_dtype(dtype, params, world_size, rank_in_group, ds_process_group, contiguous_buffer=None):
             partition_sz = sum(p.ds_tensor.ds_numel for p in params)
 
             use_secondary_tensor = params[0].ds_secondary_tensor is not None
@@ -1150,10 +1150,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             if use_secondary_tensor:
                 partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
 
-            flat_tensor = torch.empty(partition_sz * world_size,
-                                      dtype=dtype,
-                                      device=get_accelerator().current_device_name(),
-                                      requires_grad=False)
+            flat_tensor = torch.empty(
+                partition_sz * world_size,
+                dtype=dtype,
+                device=get_accelerator().current_device_name(),
+                requires_grad=False) if contiguous_buffer is None else contiguous_buffer.flatten().narrow(
+                    0, 0, partition_sz * world_size)
 
             partitions: List[Parameter] = []
             for i in range(world_size):
@@ -1180,7 +1182,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         @instrument_w_nvtx
         def all_gather_coalesced(params: Iterable[Parameter],
                                  safe_mode: bool = False,
-                                 quantize: bool = False) -> AllGatherCoalescedHandle:
+                                 quantize: bool = False,
+                                 contiguous_buffer: torch.Tensor = None) -> AllGatherCoalescedHandle:
 
             # fetches from nvme if the partition is not available and in nvme
             self._ensure_availability_of_partitioned_params(params)
@@ -1298,7 +1301,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         handles = []
                         for dtype, params in dtype_params.items():
                             handles.append(
-                                _all_gather_dtype(dtype, params, world_size, rank_in_group, ds_process_group))
+                                _all_gather_dtype(dtype,
+                                                  params,
+                                                  world_size,
+                                                  rank_in_group,
+                                                  ds_process_group,
+                                                  contiguous_buffer=contiguous_buffer))
 
                         return MultipleAllGatherHandles(handles)
 
