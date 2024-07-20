@@ -360,6 +360,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         print_rank_0(f'Largest partitioned param numel = {largest_partitioned_param_numel}', force=False)
 
         self._setup_for_real_optimizer()
+        see_memory_usage(f"After _setup_for_real_optimizer", force=True)
+
         self.grad_position = {}
         self.set_grad_positions()
 
@@ -381,6 +383,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._leaf_module_hooks = []
         self.create_reduce_and_remove_grad_hooks()
 
+        # Store contiguous buffer for low precision parameters. Created only for non-offloaded case.
+        # Needs to be an instance variable to be evicted to host memory.
+        
         #exit(0)
 
         # we may have a way of fusing dynamic scale. Do not support for now
@@ -486,10 +491,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             logger.info(f"optimizer state initialized")
 
         # IPG
+        see_memory_usage(f"Before initializing IPG", force=True)
         if self.contiguous_gradients:
             self.__ipg_bucket_flat_buffer: Tensor = torch.empty(self.reduce_bucket_size,
                                                                 dtype=self.dtype,
                                                                 device=get_accelerator().current_device_name())
+        see_memory_usage(f"Before initializing IPG", force=True)
 
         self.grad_partitions_flat_buffer = None
         self.__param_id_to_grad_partition: Dict[int, Tensor] = {}
@@ -551,7 +558,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         get_accelerator().empty_cache()
 
         # copy tensors (now flattened and contiguous) back to GPU
+        see_memory_usage(f"defragment before to. orig_device={orig_device}", force=True)
         device_buffer = cpu_buffer.to(orig_device)
+        see_memory_usage(f"defragment after to. orig_device={orig_device}", force=True)
 
         # restore device tensors
         for tensor, offset, tensor_numel in tensor_infos:
