@@ -694,14 +694,17 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             for sub_group in self.fp16_groups:
                 for param in sub_group:
                     parameter_partitions.append(param.ds_tensor)
-            device_buffer = __class__.defragment(parameter_partitions)
+
+            # Store contiguous buffer for low precision parameters.
+            # Needs to be an instance attribute to be evicted to host memory.
+            self.lp_param_buffer = __class__.defragment(parameter_partitions)
 
             # setup flat buffers per subgroup, these are each just sections of the
             # contiguous flat buffer for all parameters that we created earlier
             offset = 0
             for sub_group in self.fp16_groups:
                 sub_group_numel = sum(param.partition_numel() for param in sub_group)
-                self.fp16_partitioned_groups_flat.append(device_buffer.narrow(0, offset, sub_group_numel))
+                self.fp16_partitioned_groups_flat.append(self.lp_param_buffer.narrow(0, offset, sub_group_numel))
                 offset += sub_group_numel
         else:  # partitioned params offloaded to CPU when not in use
             # create a flat CPU memory allocation for each param group
