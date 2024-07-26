@@ -768,20 +768,32 @@ def empty_cache():
     get_accelerator().reset_peak_memory_stats()
 
 
+from pynvml import *
+nvmlInit()
+
+def round_mem(val):
+    return round(val / 1024**3, 2)
+
 def see_memory_usage(message, force=True, custom_logger=None):
     if not force:
         return
-    if dist.is_initialized() and not dist.get_rank() == 0:
-        return
+    # if dist.is_initialized() and not dist.get_rank() == 0:
+    #     return
 
     # python doesn't do real-time garbage collection so do it explicitly to get the correct RAM reports
     gc.collect()
 
-    # Print message except when distributed but not rank 0
-    msg = f"{message} MA {round(get_accelerator().memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
+    # Get env var CUDA_VISIBLE_DEVICES to know which GPU is being used
+    cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', 'X')
+
+    handle = nvmlDeviceGetHandleByIndex(int(cuda_visible_devices) if cuda_visible_devices != 'X' else 0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+
+    msg = f"[pid={os.getpid()}] {message} MA {round(get_accelerator().memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
         Max_MA {round(get_accelerator().max_memory_allocated() / (1024 * 1024 * 1024),2)} GB \
         CA {round(torch_memory_reserved() / (1024 * 1024 * 1024),2)} GB \
-        Max_CA {round(torch_max_memory_reserved() / (1024 * 1024 * 1024))} GB "
+        Max_CA {round(torch_max_memory_reserved() / (1024 * 1024 * 1024))} GB \
+        Dev_USED {round_mem(info.used)} Dev_FREE {round_mem(info.free)} Dev_TOTAL {round_mem(info.total)} dev={cuda_visible_devices}" 
     logger.info(msg)
 
     if custom_logger is not None:
