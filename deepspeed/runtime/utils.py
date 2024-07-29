@@ -774,11 +774,11 @@ nvmlInit()
 def round_mem(val):
     return round(val / 1024**3, 2)
 
-def see_memory_usage(message, force=True, custom_logger=None):
+def see_memory_usage(message, force=False, custom_logger=None):
     if not force:
         return
-    # if dist.is_initialized() and not dist.get_rank() == 0:
-    #     return
+    if dist.is_initialized() and not dist.get_rank() == 0:
+        return
 
     # python doesn't do real-time garbage collection so do it explicitly to get the correct RAM reports
     gc.collect()
