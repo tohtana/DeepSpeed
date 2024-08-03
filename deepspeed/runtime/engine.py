@@ -28,7 +28,8 @@ from .zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.runtime.zero.utils import is_zero_supported_optimizer, ZeRORuntimeException
-from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
+from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload, ZeROOrderedDict
+from deepspeed.runtime.zero.stage3_backend import make_stage3_backend
 from deepspeed.runtime.zero.config import ZERO_OPTIMIZATION
 
 from deepspeed.runtime.fp16.fused_optimizer import FP16_Optimizer
@@ -2662,7 +2663,10 @@ class DeepSpeedEngine(Module):
             mp_rank_str = f"{mp_rank:02d}"
 
         if self.zero_optimization_partition_weights():
-            filename = "zero_pp_rank_{}".format(dist.get_rank(group=self.optimizer.dp_process_group))
+            if self.load_universal_checkpoint():
+                filename = "zero_pp_rank_0"
+            else:
+                filename = "zero_pp_rank_{}".format(dist.get_rank(group=self.optimizer.dp_process_group))
             ckpt_name = os.path.join(
                 checkpoints_path,
                 str(tag),
@@ -2789,7 +2793,7 @@ class DeepSpeedEngine(Module):
         if self._optimizer_has_ckpt_event_epilogue():
             self.optimizer.checkpoint_event_epilogue()
 
-        if self.load_universal_checkpoint():
+        if self.load_universal_checkpoint() and not self.zero_optimization_partition_weights():
             self.optimizer.update_lp_params()
 
         return load_path, client_states
@@ -2956,11 +2960,13 @@ class DeepSpeedEngine(Module):
             if zero_sd_list is None:
                 return False
 
+        param_shapes = self._get_zero_param_shapes()
         self.optimizer.load_state_dict(state_dict_list=zero_sd_list,
                                        load_optimizer_states=load_optimizer_states,
                                        load_from_fp32_weights=self.zero_load_from_fp32_weights(),
                                        checkpoint_folder=checkpoint_folder,
-                                       load_serial=load_serial)
+                                       load_serial=load_serial,
+                                       param_shapes=param_shapes)
 
         if self.load_universal_checkpoint():
             logger.info(f'loaded universal zero checkpoints from {checkpoint_folder} for rank {self.global_rank}')
@@ -3608,12 +3614,63 @@ class DeepSpeedEngine(Module):
         """Compile the module using the specified backend and kwargs.
         If a compiler_fn is set, it will be used instead of torch.compile().
         """
+        # Avoid graph breaks
+        deepspeed.utils.nvtx.enable_nvtx = False
+
         if not is_compile_supported():
             raise RuntimeError("compile is not supported in your version of PyTorch.")
 
         if self.is_compiled:
             return
 
+        if self.zero_optimization_stage() == ZeroStageEnum.weights:
+
+            for m in self.module.modules():
+                m._parameters = m._original_parameters
+            self.optimizer.parameter_offload._remove_module_hooks()
+
+            for hook in self.optimizer._grad_acc_hooks:
+                hook.remove()
+            self.optimizer._grad_acc_hooks.clear()
+
+            from torch._subclasses import FakeTensorMode 
+            original_from_tensor = FakeTensorMode.from_tensor
+
+            def from_tensor_wrapper(self, tensor, *args, **kwargs):
+                if hasattr(tensor, 'ds_id'):
+                    tensor = torch.randn(tensor.ds_shape, device=tensor.device, dtype=tensor.dtype, requires_grad=tensor.requires_grad)
+                return original_from_tensor(self, tensor, *args, **kwargs)
+
+            FakeTensorMode.from_tensor = from_tensor_wrapper
+
+            from torch._subclasses.fake_tensor import FakeCopyMode
+            class Z3FakeCopyMode(FakeCopyMode):
+                def __init__(self, fake_mode):
+                    super().__init__(fake_mode)
+                    self.param_map = {}
+
+                def __torch_function__(self, func, types, args=(), kwargs=None):
+                    if func == torch._C.TensorBase.clone:
+                        v = args[0]
+                        if args[0] in self.param_map:
+                            v = self.param_map[args[0]]
+                        return func(
+                            self.fake_mode.from_tensor(v, static_shapes=True), **kwargs
+                        )
+
+                    ret = super().__torch_function__(func, types, args, kwargs)
+
+                    if len(args) == 1 and isinstance(args[0], torch.nn.Parameter):
+                        self.param_map[ret] = args[0]
+
+                    return ret
+
+            torch._subclasses.fake_tensor.FakeCopyMode = Z3FakeCopyMode
+
+            deepspeed.runtime.zero.stage3_backend.z3_optimizer = self.optimizer
+            backend = make_stage3_backend(dump_graphs=True)
+
+        print(f"Compiling")
         self.module.compile(backend=backend, **compile_kwargs)
         self._is_compiled = True
 
