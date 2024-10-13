@@ -125,7 +125,10 @@ public:
         gathered_params_.emplace(ds_id, ds_tensor);
     }
 
-    void unregisterGatheredParam(long ds_id) { gathered_params_.erase(ds_id); }
+    void unregisterGatheredParam(long ds_id) {
+        assert(hasKey(gathered_params_, ds_id));
+        gathered_params_.erase(ds_id);
+    }
 
     const std::unordered_map<long, DSParam>& getParams() const { return params_; }
 
@@ -391,9 +394,12 @@ public:
 
         if (!param.isPersistent() && release_counter_[ds_id] == 0) {
             at::Tensor gathered_param = param_registry_->getGatheredParam(ds_id);
-            const auto options = gathered_param.options();
-            at::Tensor empty_buffer = torch::empty({0}, options);
-            gathered_param.set_data(empty_buffer);
+
+            if (gathered_param.defined()) { // gathered param is undefined while profiling
+                const auto options = gathered_param.options();
+                at::Tensor empty_buffer = torch::empty({0}, options);
+                gathered_param.set_data(empty_buffer);
+            }
 
             param_registry_->unregisterGatheredParam(ds_id);
         }
