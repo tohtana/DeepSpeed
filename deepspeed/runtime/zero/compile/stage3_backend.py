@@ -157,7 +157,7 @@ def dump_graph(graph: GraphModule, name: str, skip=False):
         graph_counts[name] += 1
 
 
-def make_stage3_backend(dump_graphs=False, debug_log=False):
+def make_stage3_backend(dump_graphs=False, debug_log=True):
     from deepspeed.ops.op_builder import NativeZ3Builder
     nz3 = NativeZ3Builder().load()
     rank = dist.get_rank()
@@ -176,6 +176,10 @@ def make_stage3_backend(dump_graphs=False, debug_log=False):
             param_indices = [(i, param.ds_id, param.ds_shape) for i, (n, param) in enumerate(gm.named_parameters())]
 
         def fw(gm, sample_inputs):
+
+            if rank == 0 and dump_graph:
+                print(f"Initial graph graph_id={graph_id} {gm.graph}")
+
             param_manager[graph_id] = DSGraphParamManager(gm.graph, sample_inputs, param_indices)
             original_output_names = [n.name for n in get_output_node(gm.graph).args[0]]
 
@@ -213,10 +217,20 @@ def make_stage3_backend(dump_graphs=False, debug_log=False):
                     ops_with_mem_str.sort(key=lambda x: x[0], reverse=True)
                     print("\n".join([x[1] for x in ops_with_mem_str]))
 
-            gm.graph = list_schedule2(gm.graph, get_accelerator().available_memory(), total_activation_size)
+            if rank == 0 and dump_graph:
+                print(f"Before scheduling graph graph_id={graph_id} {gm.graph}")
+
+            gm.graph = list_schedule2(gm.graph,
+                                      get_accelerator().available_memory(),
+                                      total_activation_size,
+                                      debug_log=debug_log)
 
             _, ag_wait_nodes = register_and_add_wait_allgather(graph_id, gm.graph, False)
             nz3.register_graph_ops(graph_id, [n.name for n in ag_wait_nodes], [len(n.args) for n in ag_wait_nodes])
+
+            if rank == 0 and dump_graph:
+                print(f"After scheduling graph_id={graph_id} {gm.graph}")
+
             dump_graph(gm, f"forward_aot_scheduled", skip=not dump_graphs)
 
             gc.collect()
