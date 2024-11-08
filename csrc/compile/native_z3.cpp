@@ -167,18 +167,24 @@ public:
     ReduceBucket(int64_t size, at::ScalarType scalar_type) : size_(size), scalar_type_(scalar_type)
     {
         buffer_ = torch::empty({size}, at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+        recv_buffer_ =
+            torch::empty({size}, at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+
         offset_ = 0;
     }
 
     int64_t getSize() const { return size_; }
     int64_t getOffset() const { return offset_; }
     at::Tensor getBuffer() const { return buffer_; }
+    at::Tensor getRecvBuffer() const { return recv_buffer_; }
     at::ScalarType getScalarType() const { return scalar_type_; }
 
     void reserve(int64_t size)
     {
         if (size > size_) {
             buffer_ =
+                torch::empty({size}, at::TensorOptions().dtype(scalar_type_).device(at::kCUDA));
+            recv_buffer_ =
                 torch::empty({size}, at::TensorOptions().dtype(scalar_type_).device(at::kCUDA));
             size_ = size;
         }
@@ -204,6 +210,7 @@ private:
     int64_t offset_;
     at::Tensor buffer_;
     at::ScalarType scalar_type_;
+    at::Tensor recv_buffer_;
 };
 
 class DoubleBufferedReduceBucket {
@@ -561,8 +568,9 @@ private:
 
         at::Tensor tmp_recv_buf = at::Tensor();
         if (tmp_recv_numel > 0) {
-            tmp_recv_buf = torch::empty({tmp_recv_numel},
-                                        at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+            tmp_recv_buf = reduce_buckets_->getBuffer(scalar_type)
+                               ->getRecvBuffer()
+                               .index({torch::indexing::Slice(0, tmp_recv_numel)});
         }
 
         ncclGroupStart();
