@@ -3763,6 +3763,7 @@ class DeepSpeedEngine(Module):
                                       update=self.is_gradient_accumulation_boundary()):
                 if global_steps == WARMUP_STEPS and self.micro_steps % self.gradient_accumulation_steps() == 0:
                     torch._dynamo.reset()
+                    self.nz3.reset()
                     launch_opt_passes()
 
             self.launch_compile_passes = launch_compile_passes

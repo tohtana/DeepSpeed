@@ -269,6 +269,14 @@ public:
         return current_buffer_events_.at(scalar_type);
     }
 
+    void clear()
+    {
+        current_buffer_.clear();
+        shadow_buffer_.clear();
+        current_buffer_events_.clear();
+        shadow_buffer_events_.clear();
+    }
+
 private:
     int64_t initial_bucket_size_;
     bool enable_double_buffer_;
@@ -641,7 +649,7 @@ private:
 
 static std::shared_ptr<DSParamRegistry> param_registry;
 static std::unordered_map<long, std::shared_ptr<CustomOpExecutor>> executors;
-std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets;
+std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets = nullptr;
 c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem = nullptr;
 
 static at::cuda::CUDAStream ag_stream = at::cuda::getStreamFromPool(true);
@@ -737,8 +745,16 @@ void init(c10::intrusive_ptr<c10d::ProcessGroup> pg,
     use_symm_mem = _use_symm_mem;
 }
 
+void reset()
+{
+    executors.clear();
+    reduce_buckets->clear();
+}
+
 void cleanup()
 {
+    reset();
+
     ncclCommDestroy(nccl_comm);
     process_group = nullptr;
     symm_mem = nullptr;
@@ -860,12 +876,6 @@ void start_backward(bool update)
 void end_backward()
 {
     for (auto& it : executors) { it.second->endBackward(); }
-}
-
-void reset()
-{
-    executors.clear();
-    reduce_buckets = nullptr;
 }
 
 at::Tensor test_call(at::Tensor a)

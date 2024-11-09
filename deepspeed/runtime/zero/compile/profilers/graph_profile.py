@@ -32,7 +32,7 @@ def _all_real_if_tensor(args):
 def _to(v, device):
     if torch.is_tensor(v):
         with unset_fake_temporarily():
-            v.data = v.to(device)
+            return v.to(device)
     return v
 
 
@@ -227,7 +227,6 @@ class MemoryProfilingInterpreter(Interpreter):
 
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):
-                    args = map_aggregate(args, lambda x: _to(x, self.device))
                     return_val = super().run(*args)
         except Exception as e:
             print(f"MemoryProfiling error {e}")
@@ -241,7 +240,10 @@ class MemoryProfilingInterpreter(Interpreter):
             ret = super().run_node(n)
         else:
             args, kwargs = self.fetch_args_kwargs_from_env(n)
+            args = map_aggregate(args, lambda x: _to(x, self.device))
+            kwargs = map_aggregate(kwargs, lambda x: _to(x, self.device))
             ret = getattr(self, n.op)(n.target, args, kwargs)
+            del args, kwargs
 
         current_alloc = get_accelerator().memory_allocated()
         self.mem_record.append((n.name, current_alloc, current_alloc - self.last_alloc))

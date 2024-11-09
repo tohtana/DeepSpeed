@@ -155,6 +155,10 @@ def make_stage3_backend(opt_passes, scheduler, dump_graphs=False, debug_log=Fals
                     ops_with_mem_str.sort(key=lambda x: x[0], reverse=True)
                     print("\n".join([x[1] for x in ops_with_mem_str]))
 
+            del profiler
+            gc.collect()
+            get_accelerator().empty_cache()
+
             if rank == 0 and debug_log:
                 print(f"Fwd before scheduling graph graph_id={graph_id} {gm.graph}")
 
@@ -175,23 +179,19 @@ def make_stage3_backend(opt_passes, scheduler, dump_graphs=False, debug_log=Fals
 
             dump_graph(gm, f"forward_aot_scheduled_{graph_id}", skip=not dump_graphs)
 
-            del profiler
-            gc.collect()
-            get_accelerator().empty_cache()
-
             mem_prof = MemoryProfilingInterpreter(nz3, gm)
             mem_prof.run(*real_inputs)
 
             if debug_log and rank == 0:
                 mem_prof.dump(f"mem_prof_fwd_{graph_id}.csv")
             profiling_results[graph_id].fwd_mem = mem_prof.mem_record
+            del mem_prof
 
             _set_time_and_tensor_size(graph_id, gm.graph, False, profiling_results)
 
             gc.collect()
             get_accelerator().empty_cache()
 
-            global enable_opt_passes
             if enable_opt_passes:
                 gm = run_opt_passes(nz3, graph_id, gm, real_inputs, opt_passes, graph_order, profiling_results,
                                     param_manager, False, debug_log and rank == 0)
@@ -241,6 +241,7 @@ def make_stage3_backend(opt_passes, scheduler, dump_graphs=False, debug_log=Fals
                 ops_with_mem_str.sort(key=lambda x: x[0], reverse=True)
                 print("\n".join([x[1] for x in ops_with_mem_str]))
 
+            del real_outputs
             offload_helper.clear()
             gc.collect()
             get_accelerator().empty_cache()
@@ -266,6 +267,10 @@ def make_stage3_backend(opt_passes, scheduler, dump_graphs=False, debug_log=Fals
             if debug_log and rank == 0:
                 mem_prof.dump(f"mem_prof_bwd_{graph_id}.csv")
             profiling_results[graph_id].bwd_mem = mem_prof.mem_record
+
+            del mem_prof
+            gc.collect()
+            get_accelerator().empty_cache()
 
             _set_time_and_tensor_size(graph_id, gm.graph, True, profiling_results)
 

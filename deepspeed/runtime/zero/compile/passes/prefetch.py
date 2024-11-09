@@ -95,7 +95,6 @@ def schedule_prefetch(graph: Graph, graph_id: int, graph_order: List[int], profi
                     # )
                 elif len(prefetch_ags) > 0:
                     prefetch_ag_groups.append(prefetch_ags)
-                    ag_tensor_size_sum -= sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
                     prefetch_ags = []
                     # print_rank_0(
                     #     f"Free up memory prefetch_ags={prefetch_ag_groups} next_alloc_mem={next_alloc_mem} ag_tensor_size_sum={ag_tensor_size_sum} max_mem={max_mem}"
@@ -124,7 +123,7 @@ def schedule_prefetch(graph: Graph, graph_id: int, graph_order: List[int], profi
                 #         f"stop fusing prefetch_ags={prefetch_ag_groups} ag_tensor_size_sum={ag_tensor_size_sum}")
                 # else:
                 #     print_rank_0(
-                #         f"continue fusing ag_tensor_size_sum={ag_tensor_size_sum} ag_size={tensor_size_dict[node.name]} prefetch_ags={prefetch_ags}"
+                #         f"continue fusing ag_tensor_size_sum={ag_tensor_size_sum} ag_size={tensor_size_dict[node.name]} prefetch_ags={prefetch_ags} prefetch_ag_groups={prefetch_ag_groups}"
                 #     )
                 prefetch_ags.append(node)
                 ag_tensor_size_sum += tensor_size_dict[node.name]
@@ -140,6 +139,9 @@ def schedule_prefetch(graph: Graph, graph_id: int, graph_order: List[int], profi
             if len(prefetch_ags) > 0:
                 new_order_rev.append(prefetch_ags)
                 ag_tensor_size_sum -= sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
+            assert ag_tensor_size_sum == 0
+
+        assert ag_tensor_size_sum >= 0
 
         # print_rank_0(
         #     f"node={node} next_alloc_mem={next_alloc_mem} pending_ags={len(prefetch_ags)} ag_tensor_size_sum={ag_tensor_size_sum}"
@@ -159,5 +161,6 @@ def schedule_prefetch(graph: Graph, graph_id: int, graph_order: List[int], profi
             ds_ids = [get_ds_id(ag_node) for ag_node in node]
             new_graph.call_function(torch.ops.native_z3.prefetch_params_fused,
                                     args=(graph_id, param_nodes_copy, ds_ids))
+    new_graph.lint()
 
     return new_graph
