@@ -235,6 +235,12 @@ public:
             current_buffer_[scalar_type] = shadow_buffer_.at(scalar_type);
             shadow_buffer_[scalar_type] = tmp;
 
+            if (hasKey(current_acc_buffer_, scalar_type)) {
+                auto tmp_acc = current_acc_buffer_.at(scalar_type);
+                current_acc_buffer_[scalar_type] = shadow_acc_buffer_.at(scalar_type);
+                shadow_acc_buffer_[scalar_type] = tmp_acc;
+            }
+
             auto tmp_event = current_buffer_events_.at(scalar_type);
             current_buffer_events_[scalar_type] = shadow_buffer_events_.at(scalar_type);
             shadow_buffer_events_[scalar_type] = tmp_event;
@@ -260,6 +266,19 @@ public:
         return current_buffer_.at(scalar_type);
     }
 
+    at::Tensor getAccBuffer(at::ScalarType scalar_type, int64_t size)
+    {
+        if (!hasKey(current_acc_buffer_, scalar_type) ||
+            current_acc_buffer_.at(scalar_type).numel() < size) {
+            current_acc_buffer_[scalar_type] =
+                torch::empty({size}, at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+            shadow_acc_buffer_[scalar_type] =
+                torch::empty({size}, at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+        }
+
+        return current_acc_buffer_.at(scalar_type);
+    }
+
     std::shared_ptr<at::cuda::CUDAEvent> getEvent(at::ScalarType scalar_type)
     {
         assert(hasKey(current_buffer_events_, scalar_type));
@@ -270,6 +289,8 @@ public:
     {
         current_buffer_.clear();
         shadow_buffer_.clear();
+        current_acc_buffer_.clear();
+        shadow_acc_buffer_.clear();
         current_buffer_events_.clear();
         shadow_buffer_events_.clear();
     }
@@ -279,6 +300,8 @@ private:
     bool enable_double_buffer_;
     std::unordered_map<at::ScalarType, std::shared_ptr<ReduceBucket>> current_buffer_;
     std::unordered_map<at::ScalarType, std::shared_ptr<ReduceBucket>> shadow_buffer_;
+    std::unordered_map<at::ScalarType, at::Tensor> current_acc_buffer_;
+    std::unordered_map<at::ScalarType, at::Tensor> shadow_acc_buffer_;
     std::unordered_map<at::ScalarType, std::shared_ptr<at::cuda::CUDAEvent>> current_buffer_events_;
     std::unordered_map<at::ScalarType, std::shared_ptr<at::cuda::CUDAEvent>> shadow_buffer_events_;
 };
@@ -685,9 +708,8 @@ private:
 
         at::Tensor tmp_recv_buf = at::Tensor();
         if (tmp_recv_numel > 0) {
-            at::cuda::CUDAStreamGuard guard(rs_stream_);
-            tmp_recv_buf = torch::empty({tmp_recv_numel},
-                                        at::TensorOptions().dtype(scalar_type).device(at::kCUDA));
+            at::cuda::CUDAStreamGuard guard(rs_stream_);  // This is necessary
+            tmp_recv_buf = reduce_buckets_->getAccBuffer(scalar_type, tmp_recv_numel);
         }
 
         ncclGroupStart();
@@ -746,8 +768,6 @@ private:
             copy_done_event->block(comp_stream);
         }
         reduce_tasks_[scalar_type].clear();
-
-        if (tmp_recv_numel > 0) { tmp_recv_buf.record_stream(rs_stream_); }
     }
 
     void flushAllReduceBuckets()
@@ -861,7 +881,9 @@ void init(c10::intrusive_ptr<c10d::ProcessGroup> pg,
 void reset()
 {
     executors.clear();
-    reduce_buckets->clear();
+
+    // We keep reduce buckets for memory usage estimation
+    // reduce_buckets->clear();
 }
 
 void cleanup()
