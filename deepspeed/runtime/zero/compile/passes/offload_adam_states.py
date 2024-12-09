@@ -155,8 +155,10 @@ def make_offload_task(task):
 def make_offload_sync(task):
 
     def run_offload_sync():
-        event = offload_key_events[task[1]]
-        sync_offload_states(event)
+        if not nz3.is_profiling():
+            assert task[1] in offload_key_events, f"{task[1]} not found in offload_key_events"
+            event = offload_key_events[task[1]]
+            sync_offload_states(event)
 
     return run_offload_sync
 
