@@ -17,9 +17,6 @@ from deepspeed.accelerator import get_accelerator
 
 FWD_MODULE_STACK = list()
 
-# ensure we only warn once, otherwise every iteration will trigger a warning
-warned = False
-
 
 #for each tensor in outputs run the forward_function and register backward_function as hook
 def _apply_forward_and_backward_to_tensors_only(module, forward_function, backward_function, outputs):
@@ -41,7 +38,7 @@ def _apply_forward_and_backward_to_tensors_only(module, forward_function, backwa
 
 class ZeROOrderedDict(OrderedDict):
 
-    def __init__(self, parent_module, *args, **kwargs):
+    def __init__(self, parent_module=None, *args, **kwargs):
         """A replacement for ``collections.OrderedDict`` to detect external ZeRO params.
 
         Args:
@@ -59,7 +56,7 @@ class ZeROOrderedDict(OrderedDict):
         if param is None:
             return param
 
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+        if hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if self._parent_module._parameters._in_forward:
                 register_external_parameter(FWD_MODULE_STACK[-1], param)
                 param.all_gather()
@@ -70,6 +67,8 @@ class ZeROOrderedDict(OrderedDict):
 
 def _inject_parameters(module, cls):
     for module in module.modules():
+        module._original_parameters = module._parameters
+
         if cls == ZeROOrderedDict:
             new_param = cls(parent_module=module)
         else:
@@ -77,6 +76,7 @@ def _inject_parameters(module, cls):
 
         for key, param in module._parameters.items():
             new_param[key] = param
+
         module._parameters = new_param
 
 
@@ -233,7 +233,7 @@ class DeepSpeedZeRoOffload(object):
 
         #likely one of them should be enough but just to be safe
         self._register_hooks_recursively(self.module)
-        self.module.register_forward_hook(_end_of_forward_hook)
+        self.forward_hooks.append(self.module.register_forward_hook(_end_of_forward_hook))
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -273,7 +273,7 @@ class DeepSpeedZeRoOffload(object):
                 count[0] = count[0] + 1
                 self._register_hooks_recursively(child, count=count)
 
-        @instrument_w_nvtx
+        @torch.compiler.disable
         def _pre_forward_module_hook(module, *args):
             self.pre_sub_module_forward_function(module)
 
@@ -384,6 +384,7 @@ class DeepSpeedZeRoOffload(object):
             return _apply_forward_and_backward_to_tensors_only(module, _run_before_forward_function,
                                                                _run_after_backward_hook, inputs)
 
+        @torch.compiler.disable
         def _post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
