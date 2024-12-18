@@ -262,7 +262,7 @@ def get_new_tensor_fn_for_dtype(dtype: torch.dtype) -> Callable:
 
 
 # https://stackoverflow.com/a/63851681/9201239
-def get_all_subclasses(cls):
+def get_all_subclasses(cls, include_root=True):
     subclass_list = []
 
     def recurse(cl):
@@ -272,7 +272,10 @@ def get_all_subclasses(cls):
 
     recurse(cls)
 
-    return set(subclass_list)
+    ret = set(subclass_list)
+    if include_root:
+        ret.add(cls)
+    return ret
 
 
 @instrument_w_nvtx
@@ -465,11 +468,13 @@ class InsertPostInitMethodToModuleSubClasses(object):
                 return wrapper
 
             def _enable_class_apply(cls):
-                cls._old_apply_of_skip_init_hook = cls._apply
-                cls._apply = partition_after_empty_init(cls._apply)
+                if '_apply' in cls.__dict__:
+                    cls._old_apply_of_skip_init_hook = cls._apply
+                    cls._apply = partition_after_empty_init(cls._apply)
 
             def _disable_class_apply(cls):
-                cls._apply = cls._old_apply_of_skip_init_hook
+                if hasattr(cls, '_old_apply_of_skip_init_hook'):
+                    cls._apply = cls._old_apply_of_skip_init_hook
 
             # add hooks for to_empty: apply_(empty_like)
             for subclass in get_all_subclasses(torch.nn.modules.module.Module):
@@ -522,12 +527,14 @@ class InsertPostInitMethodToModuleSubClasses(object):
             return wrapper
 
         def _enable_class(cls):
-            cls._old_init = cls.__init__
-            cls.__init__ = partition_after(cls.__init__)
+            if '__init__' in cls.__dict__:
+                cls._old_init = cls.__init__
+                cls.__init__ = partition_after(cls.__init__)
 
         def _init_subclass(cls, **kwargs):
-            cls._old_init = cls.__init__
-            cls.__init__ = partition_after(cls.__init__)
+            if '__init__' in cls.__dict__:
+                cls._old_init = cls.__init__
+                cls.__init__ = partition_after(cls.__init__)
 
         # Replace .__init__() for all existing subclasses of torch.nn.Module recursively
         for subclass in get_all_subclasses(torch.nn.modules.module.Module):
@@ -549,8 +556,9 @@ class InsertPostInitMethodToModuleSubClasses(object):
             print_rank_0(
                 "nn.functional.linear has been overridden with a more memory efficient version. This will persist unless manually reset.",
                 force=False)
-            self.linear_bk = torch.nn.functional.linear
-            torch.nn.functional.linear = zero3_linear_wrap
+            if not hasattr(InsertPostInitMethodToModuleSubClasses, "linear_bk"):
+                InsertPostInitMethodToModuleSubClasses.linear_bk = torch.nn.functional.linear
+                torch.nn.functional.linear = zero3_linear_wrap
 
             if self.quantized_initialization:
                 print_rank_0("nn.functional.linear has been overridden with quantized linear version.", force=False)
@@ -567,7 +575,8 @@ class InsertPostInitMethodToModuleSubClasses(object):
         if self.patched:
 
             def _disable_class(cls):
-                cls.__init__ = cls._old_init
+                if hasattr(cls, '_old_init'):
+                    cls.__init__ = cls._old_init
 
             for subclass in get_all_subclasses(torch.nn.modules.module.Module):
                 _disable_class(subclass)
@@ -814,24 +823,22 @@ class Init(InsertPostInitMethodToModuleSubClasses):
     apply_param_persistence = False
     override_module_apply = get_config_default(DeepSpeedZeroConfig, "override_module_apply")
 
-    def __init__(
-        self,
-        module=None,
-        data_parallel_group=None,
-        mem_efficient_linear=True,
-        remote_device=None,
-        pin_memory=False,
-        config_dict_or_path=None,
-        config=None,
-        enabled=True,
-        dtype=None,
-        mpu=None,
-        zero_param_parallel_group=None,
-        zero_quantized_weights=False,
-        zero_quantized_nontrainable_weights=False,
-        sequence_data_parallel_group=None,
-        param_swapper=None,
-    ):
+    def __init__(self,
+                 module=None,
+                 data_parallel_group=None,
+                 mem_efficient_linear=True,
+                 remote_device=None,
+                 pin_memory=False,
+                 config_dict_or_path=None,
+                 config=None,
+                 enabled=True,
+                 dtype=None,
+                 mpu=None,
+                 zero_param_parallel_group=None,
+                 zero_quantized_weights=False,
+                 zero_quantized_nontrainable_weights=False,
+                 sequence_data_parallel_group=None,
+                 param_swapper=None):
         """A context to enable massive model construction for training with
         ZeRO-3. Models are automatically partitioned (or, sharded) across the
         system and converted to half precision.
@@ -841,6 +848,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if it was constructed in the context.
             data_parallel_group (``deepspeed.comm`` process group, optional):
                 The group of processes to partition among. Defaults to all processes.
+                Synonymous with sequence data parallel group for param partitioning
+                across both sequence and data parallel groups.
             mem_efficient_linear (bool, optional): Replace
                 torch.nn.functional.linear with an implementation that allows
                 DeepSpeed to partition parameters. Defaults to ``True``.
@@ -940,16 +949,19 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             init_distributed()
             assert dist.is_initialized(), "Parameters cannot be scattered without initializing deepspeed.comm"
 
-        if data_parallel_group is None and sequence_data_parallel_group is None:
+        if data_parallel_group is None:
             self.ds_process_group = dist.get_world_group()
-        elif sequence_data_parallel_group is not None:
-            self.ds_process_group = sequence_data_parallel_group
-        elif data_parallel_group is not None:
+        else:
             self.ds_process_group = data_parallel_group
-        else:  # both given
-            raise ValueError(
-                "Both 'data_parallel_group' and 'sequence_data_parallel_group' were specified. Please provide only one of these arguments."
-            )
+
+        if sequence_data_parallel_group is not None:
+            logger.warning(
+                f"sequence_data_parallel_group' is deprecated and will be removed. Use 'data_parallel_group' instead.")
+            if data_parallel_group is not None:
+                raise ValueError(
+                    "Both 'data_parallel_group' and 'sequence_data_parallel_group' were specified. Please provide only one of these arguments."
+                )
+            self.ds_process_group = sequence_data_parallel_group
 
         self.rank = dist.get_rank(group=self.ds_process_group)
         self.dp_world_size = dist.get_world_size(group=self.ds_process_group)
@@ -1689,7 +1701,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             one_dim_param = param.contiguous().view(-1)
 
             # ds_numel is unpadded, so the last chunk of the secondary tensor might not be secondary_partition_size
-            sec_numel = param.ds_numel - secondary_start if secondary_end > param.ds_numel else secondary_partition_size
+            sec_numel = max(0, min(param.ds_numel - secondary_start, secondary_partition_size))
 
             # copy from full tensor to secondary tensor
             param.ds_secondary_tensor.narrow(0, 0,
@@ -1871,6 +1883,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         return None
 
+    @torch.no_grad()
     def _allgather_params(self, param_list, hierarchy=0):
         if len(param_list) == 0:
             return
