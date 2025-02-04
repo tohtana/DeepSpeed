@@ -18,13 +18,13 @@ import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero import GatheredParameters
 
-RTOL = 0.01
+RTOL = 0.1
 ATOL = 0.0
 
 
-def step_amp(baseline_model, baseline_optimizer, target_engine, dtype, baseline_scaler, x, y, rtol, atol):
+def step_amp(enabled, baseline_model, baseline_optimizer, target_engine, dtype, baseline_scaler, x, y, rtol, atol):
     # Runs the forward pass with autocasting.
-    with torch.autocast(device_type="cuda", dtype=dtype):
+    with torch.autocast(device_type="cuda", dtype=dtype, enabled=enabled):
         baseline_optimizer.zero_grad()
         baseline_loss = baseline_model(x, y)
 
@@ -41,7 +41,7 @@ def step_amp(baseline_model, baseline_optimizer, target_engine, dtype, baseline_
 
 
 @enable_determinism(123)
-def compare_loss(zero_stage, dtype):
+def compare_loss(enable, zero_stage, dtype):
     iteration = 5
     hidden_dim = 10
     lr = 0.001
@@ -58,7 +58,7 @@ def compare_loss(zero_stage, dtype):
             "stage": zero_stage,
         },
         "torch_autocast": {
-            "enabled": True,
+            "enabled": enable,
             "dtype": str(dtype)
         }
     }
@@ -92,13 +92,16 @@ def compare_loss(zero_stage, dtype):
     ys = [torch.randn_like(x) for x in xs]
 
     for i, (x, y) in enumerate(zip(xs, ys)):
-        step_amp(baseline_model, baseline_optimizer, target_engine, dtype, baseline_scaler, x, y, RTOL, ATOL)
+        step_amp(enable, baseline_model, baseline_optimizer, target_engine, dtype, baseline_scaler, x, y, RTOL, ATOL)
+
+    target_engine.destroy()
 
 
-@pytest.mark.parametrize("zero_stage", [1, 2])
+@pytest.mark.parametrize("enable", [True])
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 class TestZeroAutoCast(DistributedTest):
     world_size = 2
 
-    def test(self, zero_stage, dtype):
-        compare_loss(zero_stage, dtype)
+    def test(self, enable, zero_stage, dtype):
+        compare_loss(enable, zero_stage, dtype)

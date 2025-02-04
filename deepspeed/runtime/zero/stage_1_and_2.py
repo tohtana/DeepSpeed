@@ -952,17 +952,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         unique_id = id(param)
         return self.param_id[unique_id]
 
-    def report_ipg_memory_usage(self, tag, param_elems, dtype=None):
-        dtypes = self.ipg_buckets.keys() if dtype is None else [dtype]
-
-        for dt in dtypes:
-            bucket = self.ipg_buckets[dt]
-            elem_count = bucket.elements + param_elems
-            percent_of_bucket_size = (100.0 * elem_count) // self.reduce_bucket_size
-            see_memory_usage(
-                f"{tag}: elems in_bucket {dt} {bucket.elements} param {param_elems} max_percent {percent_of_bucket_size}"
-            )
-
     # create a flat tensor aligned at the alignment boundary
     def flatten_dense_tensors_aligned(self, tensor_list, alignment, use_cpu_data=False):
         tensor_list = [param.cpu_data for param in tensor_list] if use_cpu_data else tensor_list
