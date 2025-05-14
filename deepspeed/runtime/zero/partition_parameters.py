@@ -1183,12 +1183,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             assert all(p.dtype == dtype for p in params), "all params must have the same dtype"
             use_secondary_tensor = params[0].ds_secondary_tensor is not None
 
-            MAX_CHUNK_SIZE = 1024 ** 3
+            MAX_CHUNK_SIZE = 256 * 1024 * 1024
             param_chunks = []
             current_chunk_size = 0
             current_chunk = []
             for param in params:
-                if current_chunk_size + param.ds_tensor.ds_numel > MAX_CHUNK_SIZE:
+                if current_chunk_size + param.ds_tensor.ds_numel > MAX_CHUNK_SIZE and len(current_chunk) > 0:
                     param_chunks.append(current_chunk)
                     current_chunk = [param]
                     current_chunk_size = param.ds_tensor.ds_numel
