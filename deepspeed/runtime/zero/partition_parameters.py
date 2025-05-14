@@ -743,7 +743,9 @@ class MultipleAllGatherHandles:
         self.handles = handles
 
     def wait(self, handle_dependency=True) -> None:
-        for handle in self.handles:
+        # Free buffers for each handle
+        while len(self.handles) > 0:
+            handle = self.handles.pop(0)
             handle.wait(handle_dependency)
 
 
@@ -1179,43 +1181,59 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             # make sure all params have the same dtype
             dtype = params[0].dtype  # we assume len(params) > 0
             assert all(p.dtype == dtype for p in params), "all params must have the same dtype"
-
-            partition_sz = sum(p.ds_tensor.ds_numel for p in params)
-
             use_secondary_tensor = params[0].ds_secondary_tensor is not None
 
-            if use_secondary_tensor:
-                partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in params)
+            MAX_CHUNK_SIZE = 1024 ** 3
+            param_chunks = []
+            current_chunk_size = 0
+            current_chunk = []
+            for param in params:
+                if current_chunk_size + param.ds_tensor.ds_numel > MAX_CHUNK_SIZE:
+                    param_chunks.append(current_chunk)
+                    current_chunk = [param]
+                    current_chunk_size = param.ds_tensor.ds_numel
+                else:
+                    current_chunk.append(param)
+                    current_chunk_size += param.ds_tensor.ds_numel
+            if current_chunk:
+                param_chunks.append(current_chunk)
 
-            flat_tensor = torch.empty(partition_sz * world_size,
-                                      dtype=allgather_dtype,
-                                      device=get_accelerator().current_device_name(),
-                                      requires_grad=False)
+            handles = []
+            for chunk in param_chunks:
+                partition_sz = sum(p.ds_tensor.ds_numel for p in chunk)
+                if use_secondary_tensor:
+                    partition_sz = sum(p.ds_tensor.ds_numel * p.ds_secondary_tensor_num_of_groups for p in chunk)
 
-            partitions: List[Parameter] = []
-            for i in range(world_size):
-                partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
+                flat_tensor = torch.empty(partition_sz * world_size,
+                                        dtype=allgather_dtype,
+                                        device=get_accelerator().current_device_name(),
+                                        requires_grad=False)
 
-            if use_secondary_tensor:
-                instrument_w_nvtx(torch.cat)([
-                    p.ds_secondary_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype)
-                    for p in params
-                ],
-                                             out=partitions[rank_in_group])
-            else:
-                instrument_w_nvtx(torch.cat)(
-                    [p.ds_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype) for p in params],
-                    out=partitions[rank_in_group])
-            handle = _dist_allgather_fn(partitions[rank_in_group], flat_tensor, ds_process_group)
-            #Fix get_partition_dp_group(params[0]))
+                partitions: List[Parameter] = []
+                for i in range(world_size):
+                    partitions.append(flat_tensor.narrow(0, partition_sz * i, partition_sz))
 
-            return AllGatherCoalescedHandle(
-                allgather_handle=handle,
-                params=params,
-                partitions=partitions,
-                world_size=world_size,
-                use_secondary_tensor=use_secondary_tensor,
-            )
+                if use_secondary_tensor:
+                    instrument_w_nvtx(torch.cat)([
+                        p.ds_secondary_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype)
+                        for p in chunk
+                    ],
+                                                out=partitions[rank_in_group])
+                else:
+                    instrument_w_nvtx(torch.cat)(
+                        [p.ds_tensor.to(get_accelerator().current_device_name()).to(allgather_dtype) for p in chunk],
+                        out=partitions[rank_in_group])
+                handle = AllGatherCoalescedHandle(
+                    allgather_handle=_dist_allgather_fn(partitions[rank_in_group], flat_tensor, ds_process_group),
+                    params=chunk,
+                    partitions=partitions,
+                    world_size=world_size,
+                    use_secondary_tensor=use_secondary_tensor,
+                )
+                handles.append(handle)
+
+            return MultipleAllGatherHandles(handles)
+
 
         @instrument_w_nvtx
         def all_gather_coalesced(params: Iterable[Parameter],

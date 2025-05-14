@@ -178,6 +178,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         zeropp_loco_param=None,
         log_trace_cache_warnings=False,
     ):
+        self.no_hp_and_opt_offload = True
+
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
@@ -916,8 +918,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     self.fp32_partitioned_groups_flat.append(unpinned_fp32_buffer)
                 else:
                     if self.offload_optimizer:
-                        self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
-                            self.subgroup_to_device[i]).clone().float().detach())
+                        if self.no_hp_and_opt_offload:
+                            self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
+                                self.subgroup_to_device[i]).clone().detach())
+                        else:
+                            self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
+                                self.subgroup_to_device[i]).clone().float().detach())
+
                     else:
                         self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
                             self.device).clone().float().detach())
@@ -1041,7 +1048,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         num_subgroups = len(self.fp16_groups)
 
         largest_numel = max([sum([p.ds_numel for p in psg]) for psg in self.fp16_partitioned_groups])
-        gradient_dtype = self.fp32_partitioned_groups_flat[0].dtype
+
+        if self.no_hp_and_opt_offload:
+            gradient_dtype = self.dtype
+        else:
+            gradient_dtype = self.fp32_partitioned_groups_flat[0].dtype
         gradient_buffer = torch.zeros(int(largest_numel), dtype=gradient_dtype, device=self.device)
 
         timer_names = set()
@@ -1521,7 +1532,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     else:
                         fp32_grad_tensor = self.fp32_partitioned_groups_flat[i].grad.narrow(
                             0, dest_offset, grad_buffer.numel())
-                        fp32_grad_tensor.copy_(grad_buffer.float())
+                        if self.no_hp_and_opt_offload:
+                            fp32_grad_tensor.copy_(grad_buffer)
+                        else:
+                            fp32_grad_tensor.copy_(grad_buffer.float())
 
             # free the gradient
             if not get_accelerator().is_synchronized_device():
