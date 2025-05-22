@@ -573,7 +573,8 @@ class CheckpointFunction(torch.autograd.Function):
             all_outputs += [outputs]
             return outputs
         else:
-            all_outputs += outputs
+            # all_outputs += outputs -> this unwraps outputs
+            all_outputs.append(outputs)
             outputs, _, _ = extract_tensors(all_objects=outputs)
             return tuple(outputs)
 
