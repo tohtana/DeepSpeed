@@ -19,6 +19,7 @@ from deepspeed.runtime.utils import (empty_cache, see_memory_usage, inf, is_mode
                                      align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace)
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
+from deepspeed.runtime.zero.partition_helper import PartitionPlanner
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.utils import logger
 from deepspeed.utils.torch import register_grad_hook
@@ -144,6 +145,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  expert_parallel_group=None,
                  expert_data_parallel_group=None,
                  reduce_scatter=True,
+                 native_reduce_scatter=False,
                  overlap_comm=False,
                  offload_optimizer_config=None,
                  mpu=None,
@@ -201,6 +203,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.timers = timers
 
         self.reduce_scatter = reduce_scatter
+        self.native_reduce_scatter = native_reduce_scatter
 
         self.overlap_comm = overlap_comm
 
@@ -329,6 +332,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # padding on each partition for alignment purposes
         self.groups_padding = []
         # loop to deal with groups
+
+        self.planners = []
+
         for i, param_group in enumerate(self.optimizer.param_groups):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
 
@@ -402,8 +408,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
-            data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+
+            if self.native_reduce_scatter:
+                strategy = "chunked"
+            else:
+                data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+                strategy = "contiguous"
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+
+            planner = PartitionPlanner(self.bit16_groups_flat[i],
+                                                      dist.get_world_size(group=self.real_dp_process_group[i]),
+                                                      strategy=strategy)
+
 
             # Record padding required for alignment
             left_boundary = sum([t.numel() for t in data_parallel_partitions[:partition_id]])
@@ -461,6 +477,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.params_in_partition.append(params_in_partition)
             self.params_not_in_partition.append(params_not_in_partition)
             self.first_offset.append(first_offset)
+
+            self.planners.append(planner)
 
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
@@ -1715,6 +1733,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             start = start + partition_size
         return partitions
 
+    def get_partitions_strided(self, flat_tensor, group_idx):
+        """
+        Return list[torch.Tensor] whose i-th element becomes
+        the receive buffer of rank i *after* NCCL reduce_scatter.
+        Each element contains every k-th chunk of `flat_tensor`, offset=i.
+        """
+        world = dist.get_world_size(group=self.real_dp_process_group[group_idx])
+        chunk = flat_tensor.numel() // world
+        rs_chunks = [torch.empty_like(flat_tensor.narrow(0, 0, chunk))
+                     for _ in range(world)]
+        for r in range(world):
+            rs_chunks[r].view(-1)[::world] = \
+                flat_tensor.view(-1)[r::world]
+        return rs_chunks
+    
     def get_partition_info(self, tensor_list, partition_size, partition_id):
         params_in_partition = []
         params_not_in_partition = []
