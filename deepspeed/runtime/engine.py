@@ -845,6 +845,9 @@ class DeepSpeedEngine(Module):
     def zero_reduce_scatter(self):
         return self._config.zero_config.reduce_scatter
 
+    def zero_native_reduce_scatter(self):
+        return self._config.zero_config.native_reduce_scatter
+
     def zero_overlap_comm(self):
         return self._config.zero_config.overlap_comm
 
@@ -1725,6 +1728,7 @@ class DeepSpeedEngine(Module):
                 expert_parallel_group=self.expert_parallel_group if self.has_moe_layers else None,
                 expert_data_parallel_group=self.expert_data_parallel_group if self.has_moe_layers else None,
                 reduce_scatter=self.zero_reduce_scatter(),
+                native_reduce_scatter=self.zero_native_reduce_scatter(),
                 overlap_comm=overlap_comm,
                 offload_optimizer_config=self.zero_offload_optimizer(),
                 mpu=self.mpu,

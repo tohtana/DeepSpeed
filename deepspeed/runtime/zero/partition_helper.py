@@ -189,6 +189,21 @@ class PartitionPlanner:
     # ------------------------------------------------------------------
     def layout_for_rank(self, rank: int) -> RankShardLayout:
         return self.rank_layouts[rank]
+    
+    def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
+        """Create data parallel partitions from a flat tensor using planner layouts."""
+        partitions = []
+        for rank in range(self.world_size):
+            layout = self.rank_layouts[rank]
+            if layout.total_numel() == 0:
+                # Empty partition - create a zero tensor
+                partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
+            else:
+                # Extract the partition from flat tensor using layout boundaries
+                start = layout.left_boundary
+                end = start + layout.total_numel()
+                partitions.append(flat_tensor[start:end])
+        return partitions
 
     # ------------------------------------------------------------------
     # Internal planning algorithms -------------------------------------

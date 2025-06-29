@@ -26,6 +26,7 @@ ZeRO optimization should be enabled as:
     "use_multi_rank_bucket_allreduce": [true|false],
     "allgather_bucket_size": 500000000,
     "reduce_scatter": [true|false],
+    "native_reduce_scatter": [true|false],
     "contiguous_gradients" : [true|false]
     "overlap_comm": [true|false],
     "reduce_bucket_size": 500000000,
@@ -104,6 +105,15 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     reduce_scatter: bool = True
     """
     Uses reduce or reduce scatter instead of allreduce to average gradients
+    """
+
+    native_reduce_scatter: bool = False
+    """
+    Use native NCCL reduce-scatter operations with optimized chunked partitioning
+    strategy for improved communication efficiency. When enabled, parameters are
+    partitioned using a chunked strategy optimized for reduce-scatter operations
+    instead of the traditional contiguous partitioning used with allreduce.
+    This can significantly reduce communication overhead for ZeRO stage 1.
     """
 
     reduce_bucket_size: int = Field(pp_int(5e8), ge=0)

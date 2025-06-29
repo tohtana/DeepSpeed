@@ -412,26 +412,23 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if self.native_reduce_scatter:
                 strategy = "chunked"
             else:
-                data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
                 strategy = "contiguous"
-            self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
-            planner = PartitionPlanner(self.bit16_groups_flat[i],
+            # Create planner with the actual parameter list (round_robin_tensors)
+            planner = PartitionPlanner(round_robin_tensors,
                                                       dist.get_world_size(group=self.real_dp_process_group[i]),
                                                       strategy=strategy)
 
+            # Get the layout for this rank
+            current_layout = planner.layout_for_rank(partition_id)
+            
+            # Create data parallel partitions using planner
+            data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
+            self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
-            # Record padding required for alignment
-            left_boundary = sum([t.numel() for t in data_parallel_partitions[:partition_id]])
-            curr_partition_size = data_parallel_partitions[partition_id].numel()
 
-            if orig_group_numel <= left_boundary:
-                padding = curr_partition_size
-            elif orig_group_numel < left_boundary + curr_partition_size:
-                padding = left_boundary + curr_partition_size - orig_group_numel
-            else:
-                padding = 0
-            self.groups_padding.append(padding)
+            # Record padding required for alignment using planner
+            self.groups_padding.append(current_layout.padding)
 
             # verify that data partition start locations are 4-byte aligned
             for partitioned_data in data_parallel_partitions:
@@ -469,16 +466,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 i].requires_grad = True  # keep this in case internal optimizer uses it
             param_group['params'] = [self.single_partition_of_fp32_groups[i]]
 
-            partition_size = len(self.bit16_groups_flat[i]) / dist.get_world_size(group=self.real_dp_process_group[i])
-            params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(
-                self.round_robin_bit16_groups[i], partition_size, partition_id)
-
-            self.partition_size.append(partition_size)
-            self.params_in_partition.append(params_in_partition)
-            self.params_not_in_partition.append(params_not_in_partition)
-            self.first_offset.append(first_offset)
+            # Use planner layout for all partition information
+            self.partition_size.append(current_layout.partition_size)
+            self.params_in_partition.append(current_layout.params_in_partition)
+            self.params_not_in_partition.append(current_layout.params_not_in_partition)
+            self.first_offset.append(current_layout.first_offset)
 
             self.planners.append(planner)
+
+        # Helper methods for planner integration
+        self._setup_planner_helpers()
 
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
@@ -635,6 +632,28 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for hook in self._grad_acc_hooks:
             hook.remove()
         self.print_rank_0("Removed grad acc hooks")
+
+    def _setup_planner_helpers(self):
+        """Setup helper methods and data structures for planner integration."""
+        # Store planner layouts for easy access
+        self.current_rank = [dist.get_rank(group=self.real_dp_process_group[i]) 
+                           for i in range(len(self.optimizer.param_groups))]
+        
+    def is_param_in_current_partition_planner(self, param, group_idx):
+        """Check if a parameter is in current partition using planner."""
+        if group_idx >= len(self.planners):
+            return False
+        current_rank = self.current_rank[group_idx]
+        layout = self.planners[group_idx].layout_for_rank(current_rank)
+        return layout.is_param_in_partition(param)
+    
+    def grad_position_planner(self, param, group_idx):
+        """Get gradient position for a parameter using planner."""
+        if group_idx >= len(self.planners):
+            return 0
+        current_rank = self.current_rank[group_idx]
+        layout = self.planners[group_idx].layout_for_rank(current_rank)
+        return layout.grad_position(param)
 
     def _enable_universal_checkpoint(self):
         for lp_param_group in self.bit16_groups:
