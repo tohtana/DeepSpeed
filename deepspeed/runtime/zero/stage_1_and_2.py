@@ -1099,6 +1099,74 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         return tensor
 
+    def gradient_reduction_w_reduce_scatter(self, tensor, communication_data_type: torch.dtype):
+        """
+        Native reduce-scatter gradient reduction that replaces allreduce with reduce-scatter
+        for improved communication efficiency when using chunked partitioning strategy.
+        """
+        if tensor.size().numel() == 0:
+            return tensor
+
+        dp_world_size = dist.get_world_size(group=self.dp_process_group)
+        rank = dist.get_rank(group=self.dp_process_group)
+
+        tensor_to_reduce = tensor
+        if communication_data_type != tensor.dtype:
+            tensor_to_reduce = tensor.to(communication_data_type)
+
+        # Pre-divide gradients for numerical stability if needed
+        if self.postscale_gradients:
+            if self.gradient_predivide_factor != 1.0:
+                tensor_to_reduce.mul_(1. / self.gradient_predivide_factor)
+        else:
+            tensor_to_reduce.div_(dp_world_size / float(self.sequence_parallel_size))
+
+        # Calculate chunk size for reduce-scatter
+        total_numel = tensor_to_reduce.numel()
+        chunk_size = total_numel // dp_world_size
+        remainder = total_numel % dp_world_size
+
+        # Create input tensors for reduce-scatter - each rank gets a chunk
+        input_tensors = []
+        offset = 0
+        for i in range(dp_world_size):
+            current_chunk_size = chunk_size + (1 if i < remainder else 0)
+            if current_chunk_size > 0:
+                input_tensors.append(tensor_to_reduce.narrow(0, offset, current_chunk_size))
+            else:
+                input_tensors.append(torch.empty(0, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device))
+            offset += current_chunk_size
+
+        # Create output tensor for this rank's chunk
+        my_chunk_size = chunk_size + (1 if rank < remainder else 0)
+        output_tensor = torch.empty(my_chunk_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
+
+        # Perform reduce-scatter operation
+        dist.reduce_scatter(output_tensor, input_tensors, group=self.dp_process_group)
+
+        # Post-scale gradients if needed
+        if self.postscale_gradients and self.gradient_predivide_factor != dp_world_size:
+            output_tensor.mul_(self.gradient_predivide_factor / 
+                              (dp_world_size / float(self.sequence_parallel_size)))
+
+        # In ZeRO-1, each rank only needs its own chunk for optimizer state updates
+        # Copy the reduced chunk back to the appropriate slice of the original tensor
+        my_offset = rank * chunk_size + min(rank, remainder)
+        if my_chunk_size > 0:
+            tensor_to_reduce.narrow(0, my_offset, my_chunk_size).copy_(output_tensor)
+            
+        # Zero out other ranks' portions since they're not needed for this rank's optimizer update
+        if my_offset > 0:
+            tensor_to_reduce.narrow(0, 0, my_offset).zero_()
+        if my_offset + my_chunk_size < total_numel:
+            tensor_to_reduce.narrow(0, my_offset + my_chunk_size, 
+                                   total_numel - my_offset - my_chunk_size).zero_()
+
+        if communication_data_type != tensor.dtype and tensor is not tensor_to_reduce:
+            tensor.copy_(tensor_to_reduce)
+
+        return tensor
+
     def allreduce_and_copy_with_multiple_ranks(self,
                                                small_bucket,
                                                communication_data_type: torch.dtype,
@@ -1164,6 +1232,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         with get_accelerator().stream(stream):
             if not self.reduce_scatter:
                 self.gradient_reduction_w_predivide(tensor, communication_data_type)
+                return
+            
+            # Use native reduce-scatter implementation for improved communication efficiency
+            if self.native_reduce_scatter:
+                self.gradient_reduction_w_reduce_scatter(tensor, communication_data_type)
                 return
 
             # Accumulate destination ranks and bucket offsets for each gradient slice.
