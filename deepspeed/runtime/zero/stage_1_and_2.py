@@ -205,6 +205,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.reduce_scatter = reduce_scatter
         self.native_reduce_scatter = native_reduce_scatter
 
+        # Issue a warning if native_reduce_scatter is enabled but won't be used
+        if native_reduce_scatter and not contiguous_gradients:
+            logger.warning(
+                "native_reduce_scatter is enabled but will only be used with contiguous_gradients=True. "
+                f"Current settings: ZeRO stage={'2' if partition_grads else '1'}, contiguous_gradients={contiguous_gradients}"
+            )
+
         self.overlap_comm = overlap_comm
 
         self.deepspeed_adam_offload = self.cpu_offload
@@ -409,30 +416,65 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
 
-            if self.native_reduce_scatter:
-                strategy = "chunked"
+            if self.native_reduce_scatter and self.contiguous_gradients:
+                # Create alignment-aware planner for native reduce-scatter
+                planner = PartitionPlanner(round_robin_tensors,
+                                           dist.get_world_size(group=self.real_dp_process_group[i]),
+                                           native_reduce_scatter=True,
+                                           alignment_factor=self.nccl_start_alignment_factor)
+
+                # Get the layout for this rank
+                current_layout = planner.layout_for_rank(partition_id)
+
+                # Create data parallel partitions using planner
+                data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
+                self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+
+                # Record padding required for alignment using planner
+                self.groups_padding.append(current_layout.padding)
+
+                # Use planner layout for partition information
+                self.partition_size.append(current_layout.partition_size)
+                self.params_in_partition.append(current_layout.params_in_partition)
+                self.params_not_in_partition.append(current_layout.params_not_in_partition)
+                self.first_offset.append(current_layout.first_offset)
+
+                self.planners.append(planner)
             else:
-                strategy = "contiguous"
+                # Use original partitioning logic for contiguous strategy
+                data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+                self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
-            # Create planner with the actual parameter list (round_robin_tensors)
-            planner = PartitionPlanner(round_robin_tensors,
-                                                      dist.get_world_size(group=self.real_dp_process_group[i]),
-                                                      strategy=strategy)
+                # Calculate padding for original logic (no padding needed typically)
+                self.groups_padding.append(0)
 
-            # Get the layout for this rank
-            current_layout = planner.layout_for_rank(partition_id)
-            
-            # Create data parallel partitions using planner
-            data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
-            self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+                # Use original partition size calculation
+                dp_world_size = dist.get_world_size(group=self.real_dp_process_group[i])
+                partition_size = self.bit16_groups_flat[i].numel() // dp_world_size
+                self.partition_size.append(partition_size)
 
+                # For contiguous partitioning, all params are in the current partition
+                self.params_in_partition.append(self.bit16_groups[i])
+                self.params_not_in_partition.append([])
+                self.first_offset.append(0)
 
-            # Record padding required for alignment using planner
-            self.groups_padding.append(current_layout.padding)
+                # Create a planner for traditional partitioning
+                planner = PartitionPlanner(round_robin_tensors,
+                                           dist.get_world_size(group=self.real_dp_process_group[i]),
+                                           native_reduce_scatter=False,
+                                           alignment_factor=self.nccl_start_alignment_factor)
+                self.planners.append(planner)
 
             # verify that data partition start locations are 4-byte aligned
-            for partitioned_data in data_parallel_partitions:
-                assert (partitioned_data.data_ptr() % (2 * self.nccl_start_alignment_factor) == 0)
+            for idx, partitioned_data in enumerate(data_parallel_partitions):
+                alignment_req = 2 * self.nccl_start_alignment_factor
+                data_ptr = partitioned_data.data_ptr()
+                if data_ptr % alignment_req != 0:
+                    logger.error(f"NCCL alignment check failed for partition {idx}: "
+                                 f"data_ptr={data_ptr}, alignment_req={alignment_req}, "
+                                 f"modulo={data_ptr % alignment_req}, native_reduce_scatter={self.planners[i].native_reduce_scatter}")
+                    logger.error(f"Planner native_reduce_scatter: {self.planners[i].native_reduce_scatter}")
+                assert (data_ptr % alignment_req == 0), f"Partition {idx} alignment failed"
 
             # A partition of the fp32 master weights that will be updated by this process.
             # Note that the params in single_partition_of_fp32_groups is cloned and detached
@@ -465,14 +507,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.single_partition_of_fp32_groups[
                 i].requires_grad = True  # keep this in case internal optimizer uses it
             param_group['params'] = [self.single_partition_of_fp32_groups[i]]
-
-            # Use planner layout for all partition information
-            self.partition_size.append(current_layout.partition_size)
-            self.params_in_partition.append(current_layout.params_in_partition)
-            self.params_not_in_partition.append(current_layout.params_not_in_partition)
-            self.first_offset.append(current_layout.first_offset)
-
-            self.planners.append(planner)
 
         # Helper methods for planner integration
         self._setup_planner_helpers()
@@ -636,9 +670,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     def _setup_planner_helpers(self):
         """Setup helper methods and data structures for planner integration."""
         # Store planner layouts for easy access
-        self.current_rank = [dist.get_rank(group=self.real_dp_process_group[i]) 
-                           for i in range(len(self.optimizer.param_groups))]
-        
+        self.current_rank = [
+            dist.get_rank(group=self.real_dp_process_group[i]) for i in range(len(self.optimizer.param_groups))
+        ]
+
     def is_param_in_current_partition_planner(self, param, group_idx):
         """Check if a parameter is in current partition using planner."""
         if group_idx >= len(self.planners):
@@ -646,7 +681,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         current_rank = self.current_rank[group_idx]
         layout = self.planners[group_idx].layout_for_rank(current_rank)
         return layout.is_param_in_partition(param)
-    
+
     def grad_position_planner(self, param, group_idx):
         """Get gradient position for a parameter using planner."""
         if group_idx >= len(self.planners):
@@ -1110,6 +1145,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         dp_world_size = dist.get_world_size(group=self.dp_process_group)
         rank = dist.get_rank(group=self.dp_process_group)
 
+        # Fallback to allreduce for non-contiguous tensors (NCCL requirement)
+        if not tensor.is_contiguous():
+            return self.gradient_reduction_w_predivide(tensor, communication_data_type)
+
         tensor_to_reduce = tensor
         if communication_data_type != tensor.dtype:
             tensor_to_reduce = tensor.to(communication_data_type)
@@ -1121,46 +1160,76 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         else:
             tensor_to_reduce.div_(dp_world_size / float(self.sequence_parallel_size))
 
-        # Calculate chunk size for reduce-scatter
+        # Flatten tensor for reduce-scatter if it's not already 1D
+        original_shape = tensor_to_reduce.shape
+        tensor_to_reduce = tensor_to_reduce.flatten()
+
+        # Use alignment-aware partitioning (same logic as PartitionPlanner)
         total_numel = tensor_to_reduce.numel()
-        chunk_size = total_numel // dp_world_size
-        remainder = total_numel % dp_world_size
-
-        # Create input tensors for reduce-scatter - each rank gets a chunk
+        base_partition_size = (total_numel + dp_world_size - 1) // dp_world_size
+        
+        # Apply alignment to ensure NCCL compatibility
+        aligned_partition_size = ((base_partition_size + self.nccl_start_alignment_factor - 1) // 
+                                  self.nccl_start_alignment_factor) * self.nccl_start_alignment_factor
+        
+        # Calculate total padding needed
+        total_padded_size = aligned_partition_size * dp_world_size
+        total_padding = total_padded_size - total_numel
+        
+        # Pad tensor if needed for equal partition sizes
+        if total_padding > 0:
+            padded_tensor = torch.zeros(total_padded_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
+            padded_tensor[:total_numel].copy_(tensor_to_reduce)
+            tensor_to_reduce = padded_tensor
+        
+        # Create equal-sized input tensors for reduce-scatter
         input_tensors = []
-        offset = 0
         for i in range(dp_world_size):
-            current_chunk_size = chunk_size + (1 if i < remainder else 0)
-            if current_chunk_size > 0:
-                input_tensors.append(tensor_to_reduce.narrow(0, offset, current_chunk_size))
-            else:
-                input_tensors.append(torch.empty(0, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device))
-            offset += current_chunk_size
+            start_idx = i * aligned_partition_size
+            end_idx = start_idx + aligned_partition_size
+            input_tensors.append(tensor_to_reduce[start_idx:end_idx])
+        
+        # Create output tensor - all ranks get the same partition size
+        output_tensor = torch.empty(aligned_partition_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
 
-        # Create output tensor for this rank's chunk
-        my_chunk_size = chunk_size + (1 if rank < remainder else 0)
-        output_tensor = torch.empty(my_chunk_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
-
-        # Perform reduce-scatter operation
-        dist.reduce_scatter(output_tensor, input_tensors, group=self.dp_process_group)
+        try:
+            # Perform reduce-scatter operation
+            dist.reduce_scatter(output_tensor, input_tensors, group=self.dp_process_group)
+        except Exception as e:
+            # Fallback to allreduce if reduce-scatter fails
+            logger.warning(f"Reduce-scatter failed, falling back to allreduce: {e}")
+            # Restore original tensor shape before fallback
+            tensor_reshaped = tensor.flatten().view(original_shape) if len(original_shape) > 1 else tensor
+            result = self.gradient_reduction_w_predivide(tensor_reshaped, communication_data_type)
+            return result
 
         # Post-scale gradients if needed
         if self.postscale_gradients and self.gradient_predivide_factor != dp_world_size:
-            output_tensor.mul_(self.gradient_predivide_factor / 
-                              (dp_world_size / float(self.sequence_parallel_size)))
+            output_tensor.mul_(self.gradient_predivide_factor / (dp_world_size / float(self.sequence_parallel_size)))
 
         # In ZeRO-1, each rank only needs its own chunk for optimizer state updates
-        # Copy the reduced chunk back to the appropriate slice of the original tensor
-        my_offset = rank * chunk_size + min(rank, remainder)
-        if my_chunk_size > 0:
-            tensor_to_reduce.narrow(0, my_offset, my_chunk_size).copy_(output_tensor)
-            
+        # With aligned partitioning, each rank gets an equal-sized chunk
+        my_offset = rank * aligned_partition_size
+        
+        # Copy the reduced chunk back to the appropriate slice
+        # Only copy the real data (excluding padding)
+        real_chunk_size = min(aligned_partition_size, max(0, total_numel - my_offset))
+        if real_chunk_size > 0:
+            tensor_to_reduce.narrow(0, my_offset, real_chunk_size).copy_(output_tensor[:real_chunk_size])
+        
         # Zero out other ranks' portions since they're not needed for this rank's optimizer update
         if my_offset > 0:
             tensor_to_reduce.narrow(0, 0, my_offset).zero_()
-        if my_offset + my_chunk_size < total_numel:
-            tensor_to_reduce.narrow(0, my_offset + my_chunk_size, 
-                                   total_numel - my_offset - my_chunk_size).zero_()
+        if my_offset + real_chunk_size < total_numel:
+            tensor_to_reduce.narrow(0, my_offset + real_chunk_size, total_numel - my_offset - real_chunk_size).zero_()
+        
+        # Remove padding if we added any
+        if total_padding > 0:
+            tensor_to_reduce = tensor_to_reduce[:total_numel]
+        
+        # Reshape back to original shape if needed
+        if len(original_shape) > 1:
+            tensor_to_reduce = tensor_to_reduce.view(original_shape)
 
         if communication_data_type != tensor.dtype and tensor is not tensor_to_reduce:
             tensor.copy_(tensor_to_reduce)
@@ -1233,9 +1302,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if not self.reduce_scatter:
                 self.gradient_reduction_w_predivide(tensor, communication_data_type)
                 return
-            
+
             # Use native reduce-scatter implementation for improved communication efficiency
-            if self.native_reduce_scatter:
+            # Only use it with contiguous gradients to ensure compatibility
+            if self.native_reduce_scatter and self.contiguous_gradients:
                 self.gradient_reduction_w_reduce_scatter(tensor, communication_data_type)
                 return
 
@@ -1833,13 +1903,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         world = dist.get_world_size(group=self.real_dp_process_group[group_idx])
         chunk = flat_tensor.numel() // world
-        rs_chunks = [torch.empty_like(flat_tensor.narrow(0, 0, chunk))
-                     for _ in range(world)]
+        rs_chunks = [torch.empty_like(flat_tensor.narrow(0, 0, chunk)) for _ in range(world)]
         for r in range(world):
             rs_chunks[r].view(-1)[::world] = \
                 flat_tensor.view(-1)[r::world]
         return rs_chunks
-    
+
     def get_partition_info(self, tensor_list, partition_size, partition_id):
         params_in_partition = []
         params_not_in_partition = []

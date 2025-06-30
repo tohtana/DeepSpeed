@@ -1,9 +1,24 @@
-# zero_param_partition.py (v5 – DeepSpeed‑compat helpers)
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSpeed Team
 """
 Sharding planner for ZeRO‑1/2 and native NCCL reduce‑scatter.
 
-**v5: Full DeepSpeed compatibility helpers**
--------------------------------------------
+This module provides alignment-aware parameter partitioning for efficient NCCL
+reduce-scatter operations. It supports both contiguous and chunked partitioning
+strategies, with automatic padding to ensure NCCL alignment requirements.
+
+**Key Features:**
+- Alignment-aware chunked partitioning for native reduce-scatter
+- Equal partition sizes across all ranks (required for NCCL reduce-scatter)
+- Automatic tensor padding to meet 4-byte alignment requirements
+- Backward compatibility with existing DeepSpeed ZeRO APIs
+
+**Partitioning Modes:**
+- `native_reduce_scatter=False`: Traditional equal-sized partitioning (legacy behavior)
+- `native_reduce_scatter=True`: Round-robin parameter distribution with alignment support
+
 The following legacy bookkeeping symbols from *DeepSpeed ZeRO stage_1_and_2.py*
 now have direct equivalents:
 
@@ -34,6 +49,7 @@ import torch
 # Basic dataclasses ----------------------------------------------------------
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class ShardRange:
     """Half‑open interval within one tensor (flattened view)."""
@@ -56,17 +72,18 @@ class ParamShardSpec:
 
     param: torch.nn.Parameter
     shard_range: ShardRange  # param‑local coordinates
-    global_offset: int       # absolute offset in concatenated space
+    global_offset: int  # absolute offset in concatenated space
 
     # --------------------------------------------------------------
     def view_tensor_slice(self) -> torch.Tensor:
         """Return *view* of the shard (no copy)."""
-        return self.param.view(-1)[self.shard_range.start : self.shard_range.end]
+        return self.param.view(-1)[self.shard_range.start:self.shard_range.end]
 
 
 # ---------------------------------------------------------------------------
 # Per‑rank layout ------------------------------------------------------------
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RankShardLayout:
@@ -76,9 +93,9 @@ class RankShardLayout:
     shard_specs: List[ParamShardSpec] = field(default_factory=list)
 
     # filled by planner -------------------------------------------------
-    left_boundary: int = 0       # global start index
-    partition_size: int = 0      # logical size incl. padding
-    padding: int = 0             # trailing pad elements
+    left_boundary: int = 0  # global start index
+    partition_size: int = 0  # logical size incl. padding
+    padding: int = 0  # trailing pad elements
     _all_params: Sequence[torch.nn.Parameter] | None = None  # injected
 
     # derived maps (populated in _finalise) -----------------------------
@@ -104,7 +121,7 @@ class RankShardLayout:
         offset = 0
         for spec in self.shard_specs:
             shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
-            buf[offset : offset + spec.shard_range.length].copy_(shard)
+            buf[offset:offset + spec.shard_range.length].copy_(shard)
             offset += spec.shard_range.length
         return buf
 
@@ -121,7 +138,7 @@ class RankShardLayout:
         return self._grad_positions[param]
 
     grad_partition_insertion_offset = grad_position  # alias
-    grad_start_offset = grad_position               # alias
+    grad_start_offset = grad_position  # alias
 
     @property
     def params_in_partition(self) -> List[torch.nn.Parameter]:
@@ -146,7 +163,11 @@ class RankShardLayout:
         if not self.shard_specs:
             return -1
         param0 = self.shard_specs[0].param
-        return self._all_params.index(param0) if self._all_params else -1
+        if self._all_params:
+            for i, p in enumerate(self._all_params):
+                if p is param0:
+                    return i
+        return -1
 
     # ------------------------------------------------------------------
     # Internal – called by planner ------------------------------------
@@ -163,14 +184,22 @@ class RankShardLayout:
 # Planner -------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
+
 class PartitionPlanner:
     """Create per‑rank layouts + global maps (e.g. `param_to_partition_ids`)."""
 
-    def __init__(self, params: Sequence[torch.nn.Parameter], world_size: int, *, strategy: str = "contiguous") -> None:
+    def __init__(self,
+                 params: Sequence[torch.nn.Parameter],
+                 world_size: int,
+                 *,
+                 native_reduce_scatter: bool = False,
+                 alignment_factor: int = 1) -> None:
         self.params = list(params)
         self.world_size = world_size
-        self.strategy = strategy
+        self.native_reduce_scatter = native_reduce_scatter
+        self.alignment_factor = alignment_factor  # NCCL alignment requirement in elements
         self.total_elems = sum(p.numel() for p in self.params)
+        self.total_padding = 0  # Will be set during planning
 
         # build layouts --------------------------------------------------
         self.rank_layouts: List[RankShardLayout] = self._plan()
@@ -189,30 +218,41 @@ class PartitionPlanner:
     # ------------------------------------------------------------------
     def layout_for_rank(self, rank: int) -> RankShardLayout:
         return self.rank_layouts[rank]
-    
+
     def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
         """Create data parallel partitions from a flat tensor using planner layouts."""
+        # Pad the flat tensor if needed (no-op when total_padding=0)
+        if self.total_padding > 0:
+            padded_tensor = torch.zeros(flat_tensor.numel() + self.total_padding,
+                                        dtype=flat_tensor.dtype,
+                                        device=flat_tensor.device)
+            padded_tensor[:flat_tensor.numel()].copy_(flat_tensor)
+            source_tensor = padded_tensor
+        else:
+            source_tensor = flat_tensor
+
         partitions = []
         for rank in range(self.world_size):
             layout = self.rank_layouts[rank]
-            if layout.total_numel() == 0:
-                # Empty partition - create a zero tensor
+            if layout.partition_size == 0:
+                # Empty partition
                 partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
             else:
-                # Extract the partition from flat tensor using layout boundaries
+                # Extract equal-sized partition
                 start = layout.left_boundary
-                end = start + layout.total_numel()
-                partitions.append(flat_tensor[start:end])
+                end = start + layout.partition_size
+                partition = source_tensor[start:end].clone()
+                partitions.append(partition)
+
         return partitions
 
     # ------------------------------------------------------------------
     # Internal planning algorithms -------------------------------------
     def _plan(self) -> List[RankShardLayout]:
-        if self.strategy == "contiguous":
-            return self._contiguous_plan()
-        if self.strategy in {"chunked", "strided"}:
+        if self.native_reduce_scatter:
             return self._chunked_plan()
-        raise ValueError(f"Unknown strategy: {self.strategy}")
+        else:
+            return self._contiguous_plan()
 
     # --------------------------------------------------------------
     def _contiguous_plan(self) -> List[RankShardLayout]:
@@ -230,9 +270,7 @@ class PartitionPlanner:
             while rem > 0:
                 room = shard_size - used
                 take = min(room, rem)
-                layouts[current].shard_specs.append(
-                    ParamShardSpec(p, ShardRange(local_off, take), global_off)
-                )
+                layouts[current].shard_specs.append(ParamShardSpec(p, ShardRange(local_off, take), global_off))
                 rem -= take
                 local_off += take
                 global_off += take
@@ -246,14 +284,20 @@ class PartitionPlanner:
         self._finalise(layouts[current], rank_start, shard_size)
         for r in range(current + 1, self.world_size):
             self._finalise(layouts[r], global_off, shard_size)
+
+        # Contiguous strategy doesn't need padding
+        self.total_padding = 0
         return layouts
 
     # --------------------------------------------------------------
     def _chunked_plan(self) -> List[RankShardLayout]:
         layouts = [RankShardLayout(rank=r) for r in range(self.world_size)]
         global_off = 0
+
         for p in self.params:
             n = p.numel()
+
+            # Original chunked logic - simple round-robin distribution
             base = n // self.world_size
             extra = n % self.world_size
             local_off = 0
@@ -261,15 +305,33 @@ class PartitionPlanner:
                 length = base + (1 if rank < extra else 0)
                 if length:
                     layouts[rank].shard_specs.append(
-                        ParamShardSpec(p, ShardRange(local_off, length), global_off + local_off)
-                    )
+                        ParamShardSpec(p, ShardRange(local_off, length), global_off + local_off))
                 local_off += length
+
             global_off += n
 
+        # Calculate equal partition sizes, with alignment if needed
+        base_partition_size = (self.total_elems + self.world_size - 1) // self.world_size
+
+        # Align the partition size up to meet alignment requirements (no-op when alignment_factor=1)
+        aligned_partition_size = (
+            (base_partition_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+
+        # Total padded size needed
+        total_padded_size = aligned_partition_size * self.world_size
+        total_padding = total_padded_size - self.total_elems
+
+        # Set all partitions to the same aligned size
         running = 0
-        for lay in layouts:
-            self._finalise(lay, running, lay.total_numel())
-            running += lay.total_numel()
+        for rank in range(self.world_size):
+            # Each rank gets exactly aligned_partition_size elements
+            layouts[rank].padding = 0  # Individual padding managed during tensor creation
+            self._finalise(layouts[rank], running, aligned_partition_size)
+            running += aligned_partition_size
+
+        # Store total padding needed for the flat tensor
+        self.total_padding = total_padding
+
         return layouts
 
     # --------------------------------------------------------------
@@ -277,22 +339,3 @@ class PartitionPlanner:
         layout.left_boundary = left
         layout.partition_size = size
         layout.padding = max(0, (left + size) - self.total_elems)
-
-
-# ---------------------------------------------------------------------------
-# Quick demo -----------------------------------------------------------------
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    world = 4
-    params = [torch.arange(n) for n in (10, 7, 5)]
-    planner = PartitionPlanner(params, world, strategy="contiguous")
-
-    rank = 2
-    lay = planner.layout_for_rank(rank)
-    p0 = params[0]
-
-    print("rank", rank)
-    print("is_param_in_partition(p0)", lay.is_param_in_partition(p0))
-    print("grad_position(p0)", lay.grad_position(p0))
-    print("param_to_partition_ids[p0]", planner.param_to_partition_ids[p0])
-    print("first_param_index_in_partition", lay.first_param_index_in_partition)
