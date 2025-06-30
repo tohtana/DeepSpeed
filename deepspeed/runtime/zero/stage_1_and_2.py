@@ -470,9 +470,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 alignment_req = 2 * self.nccl_start_alignment_factor
                 data_ptr = partitioned_data.data_ptr()
                 if data_ptr % alignment_req != 0:
-                    logger.error(f"NCCL alignment check failed for partition {idx}: "
-                                 f"data_ptr={data_ptr}, alignment_req={alignment_req}, "
-                                 f"modulo={data_ptr % alignment_req}, native_reduce_scatter={self.planners[i].native_reduce_scatter}")
+                    logger.error(
+                        f"NCCL alignment check failed for partition {idx}: "
+                        f"data_ptr={data_ptr}, alignment_req={alignment_req}, "
+                        f"modulo={data_ptr % alignment_req}, native_reduce_scatter={self.planners[i].native_reduce_scatter}"
+                    )
                     logger.error(f"Planner native_reduce_scatter: {self.planners[i].native_reduce_scatter}")
                 assert (data_ptr % alignment_req == 0), f"Partition {idx} alignment failed"
 
@@ -1167,30 +1169,34 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Use alignment-aware partitioning (same logic as PartitionPlanner)
         total_numel = tensor_to_reduce.numel()
         base_partition_size = (total_numel + dp_world_size - 1) // dp_world_size
-        
+
         # Apply alignment to ensure NCCL compatibility
-        aligned_partition_size = ((base_partition_size + self.nccl_start_alignment_factor - 1) // 
+        aligned_partition_size = ((base_partition_size + self.nccl_start_alignment_factor - 1) //
                                   self.nccl_start_alignment_factor) * self.nccl_start_alignment_factor
-        
+
         # Calculate total padding needed
         total_padded_size = aligned_partition_size * dp_world_size
         total_padding = total_padded_size - total_numel
-        
+
         # Pad tensor if needed for equal partition sizes
         if total_padding > 0:
-            padded_tensor = torch.zeros(total_padded_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
+            padded_tensor = torch.zeros(total_padded_size,
+                                        dtype=tensor_to_reduce.dtype,
+                                        device=tensor_to_reduce.device)
             padded_tensor[:total_numel].copy_(tensor_to_reduce)
             tensor_to_reduce = padded_tensor
-        
+
         # Create equal-sized input tensors for reduce-scatter
         input_tensors = []
         for i in range(dp_world_size):
             start_idx = i * aligned_partition_size
             end_idx = start_idx + aligned_partition_size
             input_tensors.append(tensor_to_reduce[start_idx:end_idx])
-        
+
         # Create output tensor - all ranks get the same partition size
-        output_tensor = torch.empty(aligned_partition_size, dtype=tensor_to_reduce.dtype, device=tensor_to_reduce.device)
+        output_tensor = torch.empty(aligned_partition_size,
+                                    dtype=tensor_to_reduce.dtype,
+                                    device=tensor_to_reduce.device)
 
         try:
             # Perform reduce-scatter operation
@@ -1210,29 +1216,33 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # In ZeRO-1, each rank only needs its own chunk for optimizer state updates
         # With aligned partitioning, each rank gets an equal-sized chunk
         my_offset = rank * aligned_partition_size
-        
-        # Copy the reduced chunk back to the appropriate slice
-        # Only copy the real data (excluding padding)
+
+        # Determine final destination tensor and copy directly from output_tensor
+        final_tensor = tensor.flatten() if communication_data_type == tensor.dtype else tensor_to_reduce
+
+        # Copy the reduced chunk directly to final destination (single copy optimization)
+        # Only copy the real data (excluding padding). In ZeRO-1, each rank only needs its own chunk.
         real_chunk_size = min(aligned_partition_size, max(0, total_numel - my_offset))
         if real_chunk_size > 0:
-            tensor_to_reduce.narrow(0, my_offset, real_chunk_size).copy_(output_tensor[:real_chunk_size])
-        
-        # Zero out other ranks' portions since they're not needed for this rank's optimizer update
-        if my_offset > 0:
-            tensor_to_reduce.narrow(0, 0, my_offset).zero_()
-        if my_offset + real_chunk_size < total_numel:
-            tensor_to_reduce.narrow(0, my_offset + real_chunk_size, total_numel - my_offset - real_chunk_size).zero_()
-        
+            if communication_data_type == tensor.dtype:
+                # Direct copy to original tensor (no dtype conversion needed)
+                final_tensor.narrow(0, my_offset, real_chunk_size).copy_(output_tensor[:real_chunk_size])
+            else:
+                # Copy with dtype conversion in one step
+                final_tensor.narrow(0, my_offset,
+                                    real_chunk_size).copy_(output_tensor[:real_chunk_size].to(tensor.dtype))
+
         # Remove padding if we added any
         if total_padding > 0:
-            tensor_to_reduce = tensor_to_reduce[:total_numel]
-        
+            final_tensor = final_tensor[:total_numel]
+
         # Reshape back to original shape if needed
         if len(original_shape) > 1:
-            tensor_to_reduce = tensor_to_reduce.view(original_shape)
+            final_tensor = final_tensor.view(original_shape)
 
-        if communication_data_type != tensor.dtype and tensor is not tensor_to_reduce:
-            tensor.copy_(tensor_to_reduce)
+        # If we used dtype conversion, copy the final result back to original tensor
+        if communication_data_type != tensor.dtype:
+            tensor.copy_(final_tensor)
 
         return tensor
 
