@@ -58,7 +58,7 @@ class ShardRange:
     length: int
 
     def __post_init__(self) -> None:
-        if self.start < 0 or self.length <= 0:
+        if self.start < 0 or self.length < 0:
             raise ValueError("Invalid ShardRange")
 
     @property
@@ -72,7 +72,7 @@ class ParamShardSpec:
 
     param: torch.nn.Parameter
     shard_range: ShardRange  # param‑local coordinates
-    global_offset: int  # absolute offset in concatenated space
+    global_offset: int  # absolute offset in concatenated space. -1 means not set
 
     # --------------------------------------------------------------
     def view_tensor_slice(self) -> torch.Tensor:
@@ -123,6 +123,52 @@ class RankShardLayout:
             shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
             buf[offset:offset + spec.shard_range.length].copy_(shard)
             offset += spec.shard_range.length
+        return buf
+    
+    def gather_weights_padded(self, *, dtype: torch.dtype, device: torch.device, 
+                              planner: PartitionPlanner | None = None) -> torch.Tensor:
+        """Gather weights into partition-sized buffer with padding for reduce-scatter.
+        
+        For native_reduce_scatter mode, this respects per-parameter padding.
+        """
+        buf = torch.zeros(self.partition_size, dtype=dtype, device=device)
+        
+        if planner and planner.native_reduce_scatter:
+            # For chunked mode: each rank has a shard from each parameter
+            # The buffer layout matches the order of parameters with padding
+            offset = 0
+            for param in planner.params:
+                # Find the shard spec for this parameter (if any)
+                param_spec = None
+                for spec in self.shard_specs:
+                    if spec.param is param:
+                        param_spec = spec
+                        break
+                
+                if param_spec and param_spec.shard_range.length > 0:
+                    shard = param_spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
+                    buf[offset:offset + param_spec.shard_range.length].copy_(shard)
+                
+                # Calculate padded size for this parameter to advance offset correctly
+                n = param.numel()
+                padded_n = ((n + planner.world_size - 1) // planner.world_size) * planner.world_size
+                if planner.alignment_factor > 1:
+                    shard_size = padded_n // planner.world_size
+                    aligned_shard_size = ((shard_size + planner.alignment_factor - 1) // planner.alignment_factor) * planner.alignment_factor
+                    padded_n = aligned_shard_size * planner.world_size
+                
+                # Each rank gets exactly padded_n / world_size elements for this parameter
+                offset += padded_n // planner.world_size
+        else:
+            # Simple sequential gathering for contiguous mode
+            offset = 0
+            for spec in self.shard_specs:
+                if spec.shard_range.length > 0:
+                    shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
+                    buf[offset:offset + spec.shard_range.length].copy_(shard)
+                    offset += spec.shard_range.length
+        
+        # Remaining elements stay zero (padding)
         return buf
 
     # ------------------------------------------------------------------
@@ -221,14 +267,36 @@ class PartitionPlanner:
 
     def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
         """Create data parallel partitions from a flat tensor using planner layouts."""
-        # Pad the flat tensor if needed (no-op when total_padding=0)
-        if self.total_padding > 0:
+
+        if self.native_reduce_scatter and self.total_padding > 0:
+            # For chunked plan with per-parameter padding
             padded_tensor = torch.zeros(flat_tensor.numel() + self.total_padding,
                                         dtype=flat_tensor.dtype,
                                         device=flat_tensor.device)
-            padded_tensor[:flat_tensor.numel()].copy_(flat_tensor)
+            
+            # Copy parameters with padding between them
+            read_offset = 0
+            write_offset = 0
+            
+            for p in self.params:
+                n = p.numel()
+                
+                # Copy parameter data
+                padded_tensor[write_offset:write_offset + n].copy_(flat_tensor[read_offset:read_offset + n])
+                
+                # Calculate padded size for this parameter
+                padded_n = ((n + self.world_size - 1) // self.world_size) * self.world_size
+                if self.alignment_factor > 1:
+                    shard_size = padded_n // self.world_size
+                    aligned_shard_size = ((shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+                    padded_n = aligned_shard_size * self.world_size
+                
+                read_offset += n
+                write_offset += padded_n
+            
             source_tensor = padded_tensor
         else:
+            # For contiguous plan (legacy-style, no padding)
             source_tensor = flat_tensor
 
         partitions = []
@@ -238,7 +306,7 @@ class PartitionPlanner:
                 # Empty partition
                 partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
             else:
-                # Extract equal-sized partition
+                # Extract partition (unequal sizes allowed for legacy mode)
                 start = layout.left_boundary
                 end = start + layout.partition_size
                 partition = source_tensor[start:end].clone()
@@ -256,34 +324,47 @@ class PartitionPlanner:
 
     # --------------------------------------------------------------
     def _contiguous_plan(self) -> List[RankShardLayout]:
-        shard_size = (self.total_elems + self.world_size - 1) // self.world_size
+        # Use legacy partitioning logic: base_size + remainder distribution
+        base_size = self.total_elems // self.world_size
+        remaining = self.total_elems % self.world_size
+        
         layouts = [RankShardLayout(rank=r) for r in range(self.world_size)]
-
-        current = 0
-        used = 0
         global_off = 0
-        rank_start = 0
-
-        for p in self.params:
-            rem = p.numel()
-            local_off = 0
-            while rem > 0:
-                room = shard_size - used
-                take = min(room, rem)
-                layouts[current].shard_specs.append(ParamShardSpec(p, ShardRange(local_off, take), global_off))
-                rem -= take
-                local_off += take
-                global_off += take
-                used += take
-                if used == shard_size and current < self.world_size - 1:
-                    self._finalise(layouts[current], rank_start, shard_size)
-                    current += 1
-                    rank_start = global_off
-                    used = 0
-
-        self._finalise(layouts[current], rank_start, shard_size)
-        for r in range(current + 1, self.world_size):
-            self._finalise(layouts[r], global_off, shard_size)
+        
+        for rank in range(self.world_size):
+            # Each rank gets base_size + 1 if rank < remaining (same as legacy)
+            partition_size = base_size + (1 if rank < remaining else 0)
+            rank_start = global_off
+            
+            # Fill this rank's partition with parameter data
+            current_offset = 0
+            remaining_in_partition = partition_size
+            
+            for p in self.params:
+                if remaining_in_partition <= 0:
+                    break
+                    
+                param_size = p.numel()
+                param_start_global = sum(prev_p.numel() for prev_p in self.params[:self.params.index(p)])
+                
+                # Check if this parameter overlaps with current rank's partition
+                param_end_global = param_start_global + param_size
+                partition_end_global = rank_start + partition_size
+                
+                if param_start_global < partition_end_global and param_end_global > rank_start:
+                    # Calculate the slice of this parameter that belongs to this rank
+                    local_start = max(0, rank_start - param_start_global)
+                    local_end = min(param_size, partition_end_global - param_start_global)
+                    
+                    if local_end > local_start:
+                        take = local_end - local_start
+                        layouts[rank].shard_specs.append(
+                            ParamShardSpec(p, ShardRange(local_start, take), rank_start + current_offset))
+                        current_offset += take
+                        remaining_in_partition -= take
+            
+            self._finalise(layouts[rank], rank_start, partition_size)
+            global_off += partition_size
 
         # Contiguous strategy doesn't need padding
         self.total_padding = 0
@@ -293,43 +374,48 @@ class PartitionPlanner:
     def _chunked_plan(self) -> List[RankShardLayout]:
         layouts = [RankShardLayout(rank=r) for r in range(self.world_size)]
         global_off = 0
+        total_padding = 0
 
         for p in self.params:
             n = p.numel()
-
-            # Original chunked logic - simple round-robin distribution
-            base = n // self.world_size
-            extra = n % self.world_size
-            local_off = 0
+            
+            # Pad each parameter to be divisible by world_size
+            padded_n = ((n + self.world_size - 1) // self.world_size) * self.world_size
+            
+            # Further align if needed for NCCL requirements
+            if self.alignment_factor > 1:
+                shard_size = padded_n // self.world_size
+                aligned_shard_size = ((shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+                padded_n = aligned_shard_size * self.world_size
+            
+            # Each rank gets exactly padded_n / world_size elements
+            shard_size = padded_n // self.world_size
+            param_padding = padded_n - n
+            total_padding += param_padding
+            
+            # Distribute equal shards to each rank
             for rank in range(self.world_size):
-                length = base + (1 if rank < extra else 0)
-                if length:
-                    layouts[rank].shard_specs.append(
-                        ParamShardSpec(p, ShardRange(local_off, length), global_off + local_off))
-                local_off += length
+                local_off = rank * shard_size
+                # Calculate actual data length for this shard (0 if entirely padding)
+                actual_length = max(0, min(shard_size, n - local_off))
+                # Use min(local_off, n) to handle padding-only shards
+                shard_start = min(local_off, n)
+                layouts[rank].shard_specs.append(
+                    ParamShardSpec(p, ShardRange(shard_start, actual_length), -1))
+            
+            global_off += padded_n
 
-            global_off += n
-
-        # Calculate equal partition sizes, with alignment if needed
-        base_partition_size = (self.total_elems + self.world_size - 1) // self.world_size
-
-        # Align the partition size up to meet alignment requirements (no-op when alignment_factor=1)
-        aligned_partition_size = (
-            (base_partition_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
-
-        # Total padded size needed
-        total_padded_size = aligned_partition_size * self.world_size
-        total_padding = total_padded_size - self.total_elems
-
-        # Set all partitions to the same aligned size
+        # Calculate equal partition sizes across all ranks
+        total_padded_elems = self.total_elems + total_padding
+        partition_size = total_padded_elems // self.world_size
+        
+        # Set partition boundaries
         running = 0
         for rank in range(self.world_size):
-            # Each rank gets exactly aligned_partition_size elements
-            layouts[rank].padding = 0  # Individual padding managed during tensor creation
-            self._finalise(layouts[rank], running, aligned_partition_size)
-            running += aligned_partition_size
+            self._finalise(layouts[rank], running, partition_size)
+            running += partition_size
 
-        # Store total padding needed for the flat tensor
+        # Store total padding needed
         self.total_padding = total_padding
 
         return layouts

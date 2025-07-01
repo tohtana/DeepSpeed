@@ -413,70 +413,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # set model bit16 weight to slices of flattened buffer
             self._update_model_bit16_weights(i)
 
-            # divide the flat weights into near equal partition equal to the data parallel degree
-            # each process will compute on a different part of the partition
-
-            if self.native_reduce_scatter and self.contiguous_gradients:
-                # Create alignment-aware planner for native reduce-scatter
-                planner = PartitionPlanner(round_robin_tensors,
-                                           dist.get_world_size(group=self.real_dp_process_group[i]),
-                                           native_reduce_scatter=True,
-                                           alignment_factor=self.nccl_start_alignment_factor)
-
-                # Get the layout for this rank
-                current_layout = planner.layout_for_rank(partition_id)
-
-                # Create data parallel partitions using planner
-                data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
-                self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
-
-                # Record padding required for alignment using planner
-                self.groups_padding.append(current_layout.padding)
-
-                # Use planner layout for partition information
-                self.partition_size.append(current_layout.partition_size)
-                self.params_in_partition.append(current_layout.params_in_partition)
-                self.params_not_in_partition.append(current_layout.params_not_in_partition)
-                self.first_offset.append(current_layout.first_offset)
-
-                self.planners.append(planner)
-            else:
-                # Use original partitioning logic for contiguous strategy
-                data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
-                self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
-
-                # Calculate padding for original logic (no padding needed typically)
-                self.groups_padding.append(0)
-
-                # Use original partition size calculation
-                dp_world_size = dist.get_world_size(group=self.real_dp_process_group[i])
-                partition_size = self.bit16_groups_flat[i].numel() // dp_world_size
-                self.partition_size.append(partition_size)
-
-                # For contiguous partitioning, all params are in the current partition
-                self.params_in_partition.append(self.bit16_groups[i])
-                self.params_not_in_partition.append([])
-                self.first_offset.append(0)
-
-                # Create a planner for traditional partitioning
-                planner = PartitionPlanner(round_robin_tensors,
-                                           dist.get_world_size(group=self.real_dp_process_group[i]),
-                                           native_reduce_scatter=False,
-                                           alignment_factor=self.nccl_start_alignment_factor)
-                self.planners.append(planner)
-
-            # verify that data partition start locations are 4-byte aligned
-            for idx, partitioned_data in enumerate(data_parallel_partitions):
-                alignment_req = 2 * self.nccl_start_alignment_factor
-                data_ptr = partitioned_data.data_ptr()
-                if data_ptr % alignment_req != 0:
-                    logger.error(
-                        f"NCCL alignment check failed for partition {idx}: "
-                        f"data_ptr={data_ptr}, alignment_req={alignment_req}, "
-                        f"modulo={data_ptr % alignment_req}, native_reduce_scatter={self.planners[i].native_reduce_scatter}"
-                    )
-                    logger.error(f"Planner native_reduce_scatter: {self.planners[i].native_reduce_scatter}")
-                assert (data_ptr % alignment_req == 0), f"Partition {idx} alignment failed"
+            planner = PartitionPlanner(round_robin_tensors,
+                                        dist.get_world_size(group=self.real_dp_process_group[i]),
+                                        native_reduce_scatter=native_reduce_scatter,
+                                        alignment_factor=self.nccl_start_alignment_factor)
+                        # Get the layout for this rank
+            current_layout = planner.layout_for_rank(partition_id)
+            data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
+            self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+            self.groups_padding.append(0)
+            self.partition_size.append(current_layout.partition_size)
+            self.params_in_partition.append(current_layout.params_in_partition)
+            self.params_not_in_partition.append(current_layout.params_not_in_partition)
+            self.first_offset.append(current_layout.first_offset)
+            self.planners.append(planner)
 
             # A partition of the fp32 master weights that will be updated by this process.
             # Note that the params in single_partition_of_fp32_groups is cloned and detached
