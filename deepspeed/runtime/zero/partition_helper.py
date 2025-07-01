@@ -264,6 +264,47 @@ class PartitionPlanner:
     # ------------------------------------------------------------------
     def layout_for_rank(self, rank: int) -> RankShardLayout:
         return self.rank_layouts[rank]
+    
+    def get_shard_spec(self, param: torch.nn.Parameter, rank: int) -> ParamShardSpec:
+        """Get the shard spec for a parameter on a specific rank.
+        
+        Args:
+            param: The parameter to find
+            rank: The rank to query
+            
+        Returns:
+            ParamShardSpec for the parameter on the given rank
+            
+        Raises:
+            ValueError: If parameter is not found in this planner
+        """
+        layout = self.layout_for_rank(rank)
+        for spec in layout.shard_specs:
+            if spec.param is param:
+                return spec
+        
+        # Parameter not found - check if it's in our parameter list at all
+        if param not in self.params:
+            raise ValueError(f"Parameter not found in planner. This planner contains {len(self.params)} parameters.")
+        else:
+            raise ValueError(f"Parameter found in planner but has no shard on rank {rank}. "
+                           f"This can happen if the rank has no data for this parameter.")
+    
+    def get_shard_size(self, param: torch.nn.Parameter, rank: int) -> int:
+        """Get the shard size for a parameter on a specific rank.
+        
+        Args:
+            param: The parameter to find
+            rank: The rank to query
+            
+        Returns:
+            Size of the shard (number of elements) for this parameter on the given rank
+            
+        Raises:
+            ValueError: If parameter is not found in this planner
+        """
+        spec = self.get_shard_spec(param, rank)
+        return spec.shard_range.length
 
     def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
         """Create data parallel partitions from a flat tensor using planner layouts."""
