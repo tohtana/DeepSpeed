@@ -329,6 +329,12 @@ class PartitionPlanner:
         remaining = self.total_elems % self.world_size
         
         layouts = [RankShardLayout(rank=r) for r in range(self.world_size)]
+        
+        # Pre-compute parameter start offsets to avoid repeated calculations
+        param_start_offsets = [0]
+        for p in self.params[:-1]:
+            param_start_offsets.append(param_start_offsets[-1] + p.numel())
+        
         global_off = 0
         
         for rank in range(self.world_size):
@@ -340,12 +346,12 @@ class PartitionPlanner:
             current_offset = 0
             remaining_in_partition = partition_size
             
-            for p in self.params:
+            for param_idx, p in enumerate(self.params):
                 if remaining_in_partition <= 0:
                     break
                     
                 param_size = p.numel()
-                param_start_global = sum(prev_p.numel() for prev_p in self.params[:self.params.index(p)])
+                param_start_global = param_start_offsets[param_idx]
                 
                 # Check if this parameter overlaps with current rank's partition
                 param_end_global = param_start_global + param_size
