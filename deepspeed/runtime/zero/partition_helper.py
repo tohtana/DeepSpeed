@@ -124,15 +124,18 @@ class RankShardLayout:
             buf[offset:offset + spec.shard_range.length].copy_(shard)
             offset += spec.shard_range.length
         return buf
-    
-    def gather_weights_padded(self, *, dtype: torch.dtype, device: torch.device, 
+
+    def gather_weights_padded(self,
+                              *,
+                              dtype: torch.dtype,
+                              device: torch.device,
                               planner: PartitionPlanner | None = None) -> torch.Tensor:
         """Gather weights into partition-sized buffer with padding for reduce-scatter.
-        
+
         For native_reduce_scatter mode, this respects per-parameter padding.
         """
         buf = torch.zeros(self.partition_size, dtype=dtype, device=device)
-        
+
         if planner and planner.native_reduce_scatter:
             # For chunked mode: each rank has a shard from each parameter
             # The buffer layout matches the order of parameters with padding
@@ -144,19 +147,20 @@ class RankShardLayout:
                     if spec.param is param:
                         param_spec = spec
                         break
-                
+
                 if param_spec and param_spec.shard_range.length > 0:
                     shard = param_spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
                     buf[offset:offset + param_spec.shard_range.length].copy_(shard)
-                
+
                 # Calculate padded size for this parameter to advance offset correctly
                 n = param.numel()
                 padded_n = ((n + planner.world_size - 1) // planner.world_size) * planner.world_size
                 if planner.alignment_factor > 1:
                     shard_size = padded_n // planner.world_size
-                    aligned_shard_size = ((shard_size + planner.alignment_factor - 1) // planner.alignment_factor) * planner.alignment_factor
+                    aligned_shard_size = ((shard_size + planner.alignment_factor - 1) //
+                                          planner.alignment_factor) * planner.alignment_factor
                     padded_n = aligned_shard_size * planner.world_size
-                
+
                 # Each rank gets exactly padded_n / world_size elements for this parameter
                 offset += padded_n // planner.world_size
         else:
@@ -167,7 +171,7 @@ class RankShardLayout:
                     shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
                     buf[offset:offset + spec.shard_range.length].copy_(shard)
                     offset += spec.shard_range.length
-        
+
         # Remaining elements stay zero (padding)
         return buf
 
@@ -264,17 +268,17 @@ class PartitionPlanner:
     # ------------------------------------------------------------------
     def layout_for_rank(self, rank: int) -> RankShardLayout:
         return self.rank_layouts[rank]
-    
+
     def get_shard_spec(self, param: torch.nn.Parameter, rank: int) -> ParamShardSpec:
         """Get the shard spec for a parameter on a specific rank.
-        
+
         Args:
             param: The parameter to find
             rank: The rank to query
-            
+
         Returns:
             ParamShardSpec for the parameter on the given rank
-            
+
         Raises:
             ValueError: If parameter is not found in this planner
         """
@@ -282,24 +286,24 @@ class PartitionPlanner:
         for spec in layout.shard_specs:
             if spec.param is param:
                 return spec
-        
+
         # Parameter not found - check if it's in our parameter list at all
         if param not in self.params:
             raise ValueError(f"Parameter not found in planner. This planner contains {len(self.params)} parameters.")
         else:
             raise ValueError(f"Parameter found in planner but has no shard on rank {rank}. "
-                           f"This can happen if the rank has no data for this parameter.")
-    
+                             f"This can happen if the rank has no data for this parameter.")
+
     def get_shard_size(self, param: torch.nn.Parameter, rank: int) -> int:
         """Get the shard size for a parameter on a specific rank.
-        
+
         Args:
             param: The parameter to find
             rank: The rank to query
-            
+
         Returns:
             Size of the shard (number of elements) for this parameter on the given rank
-            
+
         Raises:
             ValueError: If parameter is not found in this planner
         """
@@ -314,27 +318,28 @@ class PartitionPlanner:
             padded_tensor = torch.zeros(flat_tensor.numel() + self.total_padding,
                                         dtype=flat_tensor.dtype,
                                         device=flat_tensor.device)
-            
+
             # Copy parameters with padding between them
             read_offset = 0
             write_offset = 0
-            
+
             for p in self.params:
                 n = p.numel()
-                
+
                 # Copy parameter data
                 padded_tensor[write_offset:write_offset + n].copy_(flat_tensor[read_offset:read_offset + n])
-                
+
                 # Calculate padded size for this parameter
                 padded_n = ((n + self.world_size - 1) // self.world_size) * self.world_size
                 if self.alignment_factor > 1:
                     shard_size = padded_n // self.world_size
-                    aligned_shard_size = ((shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+                    aligned_shard_size = (
+                        (shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
                     padded_n = aligned_shard_size * self.world_size
-                
+
                 read_offset += n
                 write_offset += padded_n
-            
+
             source_tensor = padded_tensor
         else:
             # For contiguous plan (legacy-style, no padding)
@@ -368,48 +373,48 @@ class PartitionPlanner:
         # Use legacy partitioning logic: base_size + remainder distribution
         base_size = self.total_elems // self.world_size
         remaining = self.total_elems % self.world_size
-        
+
         layouts = [RankShardLayout(rank=r) for r in range(self.world_size)]
-        
+
         # Pre-compute parameter start offsets to avoid repeated calculations
         param_start_offsets = [0]
         for p in self.params[:-1]:
             param_start_offsets.append(param_start_offsets[-1] + p.numel())
-        
+
         global_off = 0
-        
+
         for rank in range(self.world_size):
             # Each rank gets base_size + 1 if rank < remaining (same as legacy)
             partition_size = base_size + (1 if rank < remaining else 0)
             rank_start = global_off
-            
+
             # Fill this rank's partition with parameter data
             current_offset = 0
             remaining_in_partition = partition_size
-            
+
             for param_idx, p in enumerate(self.params):
                 if remaining_in_partition <= 0:
                     break
-                    
+
                 param_size = p.numel()
                 param_start_global = param_start_offsets[param_idx]
-                
+
                 # Check if this parameter overlaps with current rank's partition
                 param_end_global = param_start_global + param_size
                 partition_end_global = rank_start + partition_size
-                
+
                 if param_start_global < partition_end_global and param_end_global > rank_start:
                     # Calculate the slice of this parameter that belongs to this rank
                     local_start = max(0, rank_start - param_start_global)
                     local_end = min(param_size, partition_end_global - param_start_global)
-                    
+
                     if local_end > local_start:
                         take = local_end - local_start
                         layouts[rank].shard_specs.append(
                             ParamShardSpec(p, ShardRange(local_start, take), rank_start + current_offset))
                         current_offset += take
                         remaining_in_partition -= take
-            
+
             self._finalise(layouts[rank], rank_start, partition_size)
             global_off += partition_size
 
@@ -425,21 +430,22 @@ class PartitionPlanner:
 
         for p in self.params:
             n = p.numel()
-            
+
             # Pad each parameter to be divisible by world_size
             padded_n = ((n + self.world_size - 1) // self.world_size) * self.world_size
-            
+
             # Further align if needed for NCCL requirements
             if self.alignment_factor > 1:
                 shard_size = padded_n // self.world_size
-                aligned_shard_size = ((shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+                aligned_shard_size = (
+                    (shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
                 padded_n = aligned_shard_size * self.world_size
-            
+
             # Each rank gets exactly padded_n / world_size elements
             shard_size = padded_n // self.world_size
             param_padding = padded_n - n
             total_padding += param_padding
-            
+
             # Distribute equal shards to each rank
             for rank in range(self.world_size):
                 local_off = rank * shard_size
@@ -447,15 +453,14 @@ class PartitionPlanner:
                 actual_length = max(0, min(shard_size, n - local_off))
                 # Use min(local_off, n) to handle padding-only shards
                 shard_start = min(local_off, n)
-                layouts[rank].shard_specs.append(
-                    ParamShardSpec(p, ShardRange(shard_start, actual_length), -1))
-            
+                layouts[rank].shard_specs.append(ParamShardSpec(p, ShardRange(shard_start, actual_length), -1))
+
             global_off += padded_n
 
         # Calculate equal partition sizes across all ranks
         total_padded_elems = self.total_elems + total_padding
         partition_size = total_padded_elems // self.world_size
-        
+
         # Set partition boundaries
         running = 0
         for rank in range(self.world_size):
@@ -472,3 +477,120 @@ class PartitionPlanner:
         layout.left_boundary = left
         layout.partition_size = size
         layout.padding = max(0, (left + size) - self.total_elems)
+
+
+class PartitionHelper:
+    """Helper to create partition layouts and manage parameter sharding."""
+
+    def __init__(self,
+                 native_reduce_scatter: bool = False,
+                 alignment_factor: int = 1,
+                 gradient_accumulation_dtype: torch.dtype = torch.float32,
+                 use_grad_accum_attribute: bool = False,
+                 dtype: torch.dtype = torch.float16) -> None:
+        self.native_reduce_scatter = native_reduce_scatter
+        self.alignment_factor = alignment_factor
+        self.gradient_accumulation_dtype = gradient_accumulation_dtype
+        self.use_grad_accum_attribute = use_grad_accum_attribute
+        self.dtype = dtype  # dtype for reduction operations
+        self.planners: List[PartitionPlanner] = []
+        self.ranks: List[int] = []  # Store rank for each planner
+
+    def add_planner(self, params: Sequence[torch.nn.Parameter], rank: int, world_size: int) -> None:
+        """Create a partition planner for the given parameters."""
+        planner = PartitionPlanner(params,
+                                   world_size,
+                                   native_reduce_scatter=self.native_reduce_scatter,
+                                   alignment_factor=self.alignment_factor)
+        self.planners.append(planner)
+        self.ranks.append(rank)
+
+    def _get_param_group_index(self, param: torch.nn.Parameter) -> int | None:
+        """Find which parameter group (planner) a parameter belongs to."""
+        for idx, planner in enumerate(self.planners):
+            for p in planner.params:
+                if p is param:
+                    return idx
+        return None
+
+    def fill_param_grad_accum_attribute(self, param: torch.nn.Parameter) -> None:
+        """Fill gradient accumulation attribute for a parameter.
+
+        This method handles both native_reduce_scatter and legacy modes:
+        - For native_reduce_scatter: Creates grad_acc_with_pad with appropriate shard size
+        - For legacy mode: Creates/updates grad_accum with accumulated gradients
+
+        Args:
+            param: The parameter to process
+        """
+
+        if param.grad is not None:
+            if self.native_reduce_scatter:
+                if not hasattr(param, 'grad_acc_with_pad'):
+                    param.grad_acc_with_pad = None
+                if param.grad_acc_with_pad is None:
+                    # Find which parameter group this param belongs to
+                    group_idx = self._get_param_group_index(param)
+                    if group_idx is None:
+                        raise ValueError(f"Parameter not found in any planner")
+
+                    # Use planner API to get the shard size for this parameter
+                    current_rank = self.ranks[group_idx]
+                    shard_size = self.planners[group_idx].get_shard_size(param, current_rank)
+
+                    param.grad_acc_with_pad = torch.zeros(shard_size,
+                                                          dtype=self.gradient_accumulation_dtype,
+                                                          device=param.device)
+
+                # For native_reduce_scatter, also accumulate in grad_accum for flat partition logic
+                if param.grad_accum is None:
+                    param.grad_accum = param.grad.to(self.gradient_accumulation_dtype)
+                else:
+                    param.grad_accum.add_(param.grad.to(self.gradient_accumulation_dtype).view(param.grad_accum.shape))
+                # Don't clear param.grad for native_reduce_scatter - needed for bucket operations
+            else:
+                if param.grad_accum is None:
+                    param.grad_accum = param.grad.to(self.gradient_accumulation_dtype)
+                else:
+                    param.grad_accum.add_(param.grad.to(self.gradient_accumulation_dtype).view(param.grad_accum.shape))
+                param.grad = None
+
+    def get_gradient_for_reduction(self, param: torch.nn.Parameter) -> torch.Tensor | None:
+        """Get the gradient tensor ready for reduction.
+
+        This method handles the logic for retrieving gradients based on whether
+        grad_accum_attribute is used and whether native_reduce_scatter is enabled.
+
+        Args:
+            param: The parameter to get gradient for
+
+        Returns:
+            The gradient tensor ready for reduction, or None if no gradient exists
+        """
+        if self.use_grad_accum_attribute:
+            if param.grad_accum is None:
+                return None
+            elif self.native_reduce_scatter:
+                # For native reduce-scatter, grad_acc_with_pad is already the reduced-size buffer
+                return param.grad_acc_with_pad.to(self.dtype)
+            else:
+                return param.grad_accum.to(self.dtype)
+        else:
+            return param.grad
+
+    def get_param_gradient_attribute(self, param: torch.nn.Parameter) -> torch.Tensor | None:
+        """Get the gradient attribute for a parameter.
+
+        Returns grad_accum if use_grad_accum_attribute is True, otherwise returns grad.
+        """
+        return param.grad_accum if self.use_grad_accum_attribute else param.grad
+
+    def clear_grad_attribute(self, param: torch.nn.Parameter) -> None:
+        """Clear the gradient attribute for a parameter.
+
+        Clears grad_accum if use_grad_accum_attribute is True, otherwise clears grad.
+        """
+        if self.use_grad_accum_attribute:
+            param.grad_accum = None
+        else:
+            param.grad = None
