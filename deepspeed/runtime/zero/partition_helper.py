@@ -572,7 +572,7 @@ class PartitionHelper:
                 return None
             elif self.native_reduce_scatter:
                 # For native reduce-scatter, grad_acc_with_pad is already the reduced-size buffer
-                return param.grad_acc_with_pad.to(self.dtype)
+                return param.grad_acc_with_pad
             else:
                 return param.grad_accum.to(self.dtype)
         else:
