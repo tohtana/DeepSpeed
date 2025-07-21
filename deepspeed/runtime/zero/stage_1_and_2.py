@@ -851,10 +851,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for i, _ in enumerate(self.bit16_groups):
 
                 if not i in self.averaged_gradients or self.averaged_gradients[i] is None:
-                    if dist.get_rank() == 0:
-                        print(
-                            f"independent_gradient_partition_epilogue 1 (no grad_acc): i={i} offset={self.first_offset[i]} partition_size={self.partition_size[i]} #params_in_partition={len(self.params_in_partition[i])}"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"independent_gradient_partition_epilogue 1 (no grad_acc): i={i} offset={self.first_offset[i]} partition_size={self.partition_size[i]} #params_in_partition={len(self.params_in_partition[i])}"
+                    #     )
                         # for j, param in enumerate(self.params_in_partition[i]):
                         #     print(f"  self.params_in_partition[{i}][{j}] grad_acc_with_pad={self.params_in_partition[i][j].grad_acc_with_pad.flatten()[:5]}")
 
@@ -866,7 +866,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         device=get_accelerator().current_device_name(),
                         return_tensor_list=True)
                 else:
-                    print(f"independent_gradient_partition_epilogue 2 (grad_acc): i {i} ")
+                    # print(f"independent_gradient_partition_epilogue 2 (grad_acc): i {i} ")
                     avg_new = self.get_flat_partition(self.params_in_partition[i],
                                                       self.first_offset[i],
                                                       self.partition_size[i],
@@ -1029,9 +1029,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 should_reduce = True
 
         if dist.get_rank() == 0:
-            print(
-                f"reduce_independent_p_g_buckets_and_remove_grads should_reduce: {should_reduce} bucket.total_grad_size: {bucket.total_grad_size} bucket.elements: {bucket.elements} param.numel(): {param.numel()} use_grad_accum_attribute {self.use_grad_accum_attribute}"
-            )
+            # print(
+            #     f"reduce_independent_p_g_buckets_and_remove_grads should_reduce: {should_reduce} bucket.total_grad_size: {bucket.total_grad_size} bucket.elements: {bucket.elements} param.numel(): {param.numel()} use_grad_accum_attribute {self.use_grad_accum_attribute}"
+            # )
             self.dump_tensor(f"reduce_independent_p_g_buckets_and_remove_grads", f"param_{param_id}_grad",
                              original_grad)
 
@@ -1052,18 +1052,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.native_reduce_scatter:
             # For native reduce-scatter: collect gradients in list without copying
             if param.numel() > self.reduce_bucket_size:
-                if dist.get_rank() == 0:
-                    print(
-                        f"reduce_independent_p_g_buckets_and_remove_grads adding extra large param {original_grad.flatten()[:5]}"
-                    )
+                # if dist.get_rank() == 0:
+                #     print(
+                #         f"reduce_independent_p_g_buckets_and_remove_grads adding extra large param {original_grad.flatten()[:5]}"
+                #     )
                 self.extra_large_param_to_reduce[param.dtype] = param
             else:
                 # Add to gradient list for later per-parameter reduce-scatter
                 # Use the original gradient tensor before any processing
-                if dist.get_rank() == 0:
-                    print(
-                        f"reduce_independent_p_g_buckets_and_remove_grads adding original_grad {original_grad.flatten()[:5]}"
-                    )
+                # if dist.get_rank() == 0:
+                #     print(
+                #         f"reduce_independent_p_g_buckets_and_remove_grads adding original_grad {original_grad.flatten()[:5]}"
+                #     )
                 bucket.grad_list.append((original_grad, param))
             bucket.total_grad_size += param.numel()
         else:
@@ -1071,15 +1071,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             if self.contiguous_gradients:
                 if param.numel() > self.reduce_bucket_size:
                     self.extra_large_param_to_reduce[param.dtype] = param
-                    if dist.get_rank() == 0:
-                        print(
-                            f"reduce_independent_p_g_buckets_and_remove_grads adding extra large param {original_grad.flatten()[:5]}"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"reduce_independent_p_g_buckets_and_remove_grads adding extra large param {original_grad.flatten()[:5]}"
+                    #     )
                 else:
-                    if dist.get_rank() == 0:
-                        print(
-                            f"reduce_independent_p_g_buckets_and_remove_grads adding original_grad {original_grad.flatten()[:5]}"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"reduce_independent_p_g_buckets_and_remove_grads adding original_grad {original_grad.flatten()[:5]}"
+                    #     )
                     # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
                     # In this path, grad_reduc is param.grad
                     new_grad_tensor = bucket.buffer[bucket.index].narrow(0, bucket.elements, param.numel())
@@ -1671,10 +1671,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 # New native reduce-scatter approach: reduce each gradient individually
                 if comm_dtype in self.extra_large_param_to_reduce:
-                    if dist.get_rank() == 0:
-                        print(
-                            f"reduce_ipg_grads processing extra-large param {self.extra_large_param_to_reduce[comm_dtype].flatten()[:5]}"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"reduce_ipg_grads processing extra-large param {self.extra_large_param_to_reduce[comm_dtype].flatten()[:5]}"
+                    #     )
 
                     # Handle extra-large parameter separately
                     extra_large_param = self.extra_large_param_to_reduce[comm_dtype]
@@ -1712,14 +1712,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     if extra_large_found:
                         del self.extra_large_param_to_reduce[comm_dtype]
 
-                        if dist.get_rank() == 0:
-                            print(f"reduce_ipg_grads deleted extra-large param")
+                        # if dist.get_rank() == 0:
+                        #     print(f"reduce_ipg_grads deleted extra-large param")
 
                 else:
-                    if dist.get_rank() == 0:
-                        print(
-                            f"reduce_ipg_grads reduce-scattering bucket {comm_dtype} with {len(bucket.grad_list)} gradients"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"reduce_ipg_grads reduce-scattering bucket {comm_dtype} with {len(bucket.grad_list)} gradients"
+                    #     )
 
                     # Process each gradient in the list individually
                     for grad_tensor, param in bucket.grad_list:
@@ -1736,9 +1736,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         if dist.get_rank() == 0:
                             # accumulated_grad = self.get_gradient_for_reduction(param)
                             accumulated_grad = param.grad_acc_with_pad
-                            print(
-                                f"reduce_ipg_grads reduced-scattered gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
-                            )
+                            # print(
+                            #     f"reduce_ipg_grads reduced-scattered gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
+                            # )
 
                 # Clear the gradient list after processing
                 bucket.grad_list.clear()
@@ -1754,10 +1754,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     extra_large_found = False
                     remaining_params = []
 
-                    if dist.get_rank() == 0:
-                        print(
-                            f"reduce_ipg_grads reducing extra-large param {self.extra_large_param_to_reduce[comm_dtype].flatten()[:5]}"
-                        )
+                    # if dist.get_rank() == 0:
+                    #     print(
+                    #         f"reduce_ipg_grads reducing extra-large param {self.extra_large_param_to_reduce[comm_dtype].flatten()[:5]}"
+                    #     )
 
                     for param_tuple in bucket.params:
                         _, _, param_id = param_tuple
@@ -1783,8 +1783,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     if extra_large_found:
                         del self.extra_large_param_to_reduce[comm_dtype]
                 else:
-                    if dist.get_rank() == 0:
-                        print(f"reduce_ipg_grads reducing bucket {comm_dtype} bucket.elements={bucket.elements}")
+                    # if dist.get_rank() == 0:
+                    #     print(f"reduce_ipg_grads reducing bucket {comm_dtype} bucket.elements={bucket.elements}")
                     self.average_tensor(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements), comm_dtype)
 
             else:
@@ -2326,9 +2326,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 # free gradients for all the parameters that are not updated by this process(ZeRO stage2)
                 self.free_grad_in_param_list(self.params_not_in_partition[i])
 
-                if dist.get_rank() == 0:
-                    for j, g in enumerate(self.averaged_gradients[i]):
-                        print(f"step: averaged_gradients[{i}][{j}] {g.shape} {g.flatten()[:5]}")
+                # if dist.get_rank() == 0:
+                #     for j, g in enumerate(self.averaged_gradients[i]):
+                #         print(f"step: averaged_gradients[{i}][{j}] {g.shape} {g.flatten()[:5]}")
 
                 # create a flat gradients for parameters updated by this process
                 # If we are last partition, ensure we have same size grads and partition size, if not pad with zero tensors
@@ -2347,9 +2347,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 if dist.get_rank() == 0:
                     is_all_zero = torch.all(self.single_partition_of_fp32_groups[i].grad == 0)
-                    print(
-                        f"step i={i} partition_id={partition_id} is_all_zero={is_all_zero} self.single_partition_of_fp32_groups[i]={self.single_partition_of_fp32_groups[i].shape}"
-                    )
+                    # print(
+                    #     f"step i={i} partition_id={partition_id} is_all_zero={is_all_zero} self.single_partition_of_fp32_groups[i]={self.single_partition_of_fp32_groups[i].shape}"
+                    # )
                     # print(f"step i={i} fp32grad={self.single_partition_of_fp32_groups[i].grad.flatten()[100000000:100000005]}")
 
                 # release all the gradient since we have already created a necessary copy in dp_grad_partition(ZeRO stage2)
@@ -2367,8 +2367,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 param_before_update = self.single_partition_of_fp32_groups[i].data.clone()
                 self._optimizer_step(i)
                 param_changed = not torch.equal(param_before_update, self.single_partition_of_fp32_groups[i].data)
-                if dist.get_rank() == 0:
-                    print(f"step i={i} partition_id={partition_id} param_changed={param_changed}")
+                # if dist.get_rank() == 0:
+                #     print(f"step i={i} partition_id={partition_id} param_changed={param_changed}")
 
                 # Step 4:- get rid of the fp32 gradients. Not needed anymore
                 self.single_partition_of_fp32_groups[i].grad = None
