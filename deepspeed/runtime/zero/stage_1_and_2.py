@@ -216,6 +216,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 f"Current settings: ZeRO stage={'2' if partition_grads else '1'}, contiguous_gradients={contiguous_gradients}"
             )
         self.native_reduce_scatter = native_reduce_scatter and contiguous_gradients
+        
+        # Validate that round_robin_gradients is False when native_reduce_scatter is True
+        if self.native_reduce_scatter and round_robin_gradients:
+            raise ValueError(
+                "native_reduce_scatter cannot be used with round_robin_gradients=True. "
+                "Please set round_robin_gradients=False when using native_reduce_scatter."
+            )
 
         self.overlap_comm = overlap_comm
 
@@ -1354,6 +1361,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # Use native reduce-scatter implementation for improved communication efficiency
             # Only use it with contiguous gradients to ensure compatibility
             if self.native_reduce_scatter and self.contiguous_gradients:
+                print(f"gradient_reduction_w_reduce_scatter is called")
                 self.gradient_reduction_w_reduce_scatter(tensor, communication_data_type)
                 return
 
@@ -1431,6 +1439,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             for bucket_key in buckets:
                 if self.use_multi_rank_bucket_allreduce:
+                    print(f"allreduce_and_scatter use_multi_rank_bucket_allreduce is called")
+
                     self.allreduce_and_scatter(buckets[bucket_key],
                                                communication_data_type,
                                                numel_per_bucket=self.reduce_bucket_size,
@@ -1664,10 +1674,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.grads_in_partition_offset += param.numel()
 
     def reduce_ipg_grads(self):
-        if dist.get_rank() == 0:
-            print(
-                f"reduce_ipg_grads starting"
-            )
+        # if dist.get_rank() == 0:
+        #     print(
+        #         f"reduce_ipg_grads starting"
+        #     )
 
         for comm_dtype in sort_dtypes(self.ipg_buckets.keys()):
             bucket = self.ipg_buckets[comm_dtype]
@@ -1704,10 +1714,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                             output_tensor = self.get_gradient_for_reduction(extra_large_param)
                             self.dump_tensor(f"extra_large_param_reduced", f"param_{param_id}_extra_large_grad_reduc",
                                              output_tensor.view(-1))
-                            if dist.get_rank() == 0:
-                                print(
-                                    f"[r{dist.get_rank()}] reduce_ipg_grads reduce-scattered extra_large gradient {output_tensor.shape} {output_tensor.flatten()[:5]}"
-                                )
+                            # if dist.get_rank() == 0:
+                            #     print(
+                            #         f"[r{dist.get_rank()}] reduce_ipg_grads reduce-scattered extra_large gradient {output_tensor.shape} {output_tensor.flatten()[:5]}"
+                            #     )
                             extra_large_found = True
                         else:
                             # Keep other parameters for normal processing
@@ -1736,24 +1746,24 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         #     param, 'grad_accum') and param.grad_accum is not None else grad_tensor
                         # accumulated_grad = self.get_gradient_for_reduction(param)
                         param_id = self.get_param_id(param)
-                        for i in range(dist.get_world_size()):
-                            if i == dist.get_rank():
-                                print(
-                                    f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduced-scatter pid={param_id} gradient {grad_tensor.shape} {grad_tensor.flatten()[:5]}"
-                                )
-                            dist.barrier()
+                        # for i in range(dist.get_world_size()):
+                        #     if i == dist.get_rank():
+                        #         print(
+                        #             f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduced-scatter pid={param_id} gradient {grad_tensor.shape} {grad_tensor.flatten()[:5]}"
+                        #         )
+                        #     dist.barrier()
                         self.reduce_scatter_individual_gradient(
                             grad_tensor,  # input
                             param,  # output
                             comm_dtype)
-                        for i in range(dist.get_world_size()):
-                            if i == dist.get_rank():
-                            # accumulated_grad = self.get_gradient_for_reduction(param)
-                                accumulated_grad = param.grad_acc_with_pad
-                                print(
-                                    f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduced-scatter pid={param_id} gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
-                                )
-                            dist.barrier()
+                        # for i in range(dist.get_world_size()):
+                        #     if i == dist.get_rank():
+                        #     # accumulated_grad = self.get_gradient_for_reduction(param)
+                        #         accumulated_grad = param.grad_acc_with_pad
+                        #         print(
+                        #             f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduced-scatter pid={param_id} gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
+                        #         )
+                        #     dist.barrier()
 
                 # Clear the gradient list after processing
                 bucket.grad_list.clear()
@@ -1782,21 +1792,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                             self.dump_tensor(f"extra_large_param_before_reduce",
                                              f"param_{param_id}_extra_large_grad_reduc",
                                              extra_large_grad_reduc.view(-1))
-                            for i in range(dist.get_world_size()):
-                                if i == dist.get_rank():
-                                    print(
-                                        f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
-                                    )
-                                dist.barrier()
+                            # for i in range(dist.get_world_size()):
+                            #     if i == dist.get_rank():
+                            #         print(
+                            #             f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
+                            #         )
+                            #     dist.barrier()
                             self.average_tensor(extra_large_grad_reduc.view(-1), comm_dtype)
                             self.dump_tensor(f"extra_large_param_reduced", f"param_{param_id}_extra_large_grad_reduc",
                                              extra_large_grad_reduc.view(-1))
-                            for i in range(dist.get_world_size()):
-                                if i == dist.get_rank():
-                                    print(
-                                        f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
-                                    )
-                                dist.barrier()
+                            # for i in range(dist.get_world_size()):
+                            #     if i == dist.get_rank():
+                            #         print(
+                            #             f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
+                            #         )
+                            #     dist.barrier()
 
                             extra_large_found = True
                         else:
@@ -1811,19 +1821,19 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         del self.extra_large_param_to_reduce[comm_dtype]
                 else:
                     acc_grad = bucket.buffer[bucket.index].narrow(0, 0, bucket.elements)
-                    for i in range(dist.get_world_size()):
-                        if i == dist.get_rank():
-                            print(
-                                f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
-                            )
-                        dist.barrier()
+                    # for i in range(dist.get_world_size()):
+                    #     if i == dist.get_rank():
+                    #         print(
+                    #             f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
+                    #         )
+                    #     dist.barrier()
                     self.average_tensor(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements), comm_dtype)
-                    for i in range(dist.get_world_size()):
-                        if i == dist.get_rank():
-                            print(
-                                f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
-                            )
-                        dist.barrier()
+                    # for i in range(dist.get_world_size()):
+                    #     if i == dist.get_rank():
+                    #         print(
+                    #             f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
+                    #         )
+                    #     dist.barrier()
 
             else:
                 self.buffered_reduce_fallback(None, bucket.grads, comm_dtype, elements_per_buffer=bucket.elements)
@@ -2299,6 +2309,80 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # We need to link optimizer state after the first step() call
         self._lazy_init_hp_params_optimizer_state()
 
+    def _all_gather_params_native_reduce_scatter(self, group_id, partitioned_params):
+        """Perform parameter-wise allgather for native reduce-scatter mode."""
+        dp_process_group = self.real_dp_process_group[group_id]
+        dp_world_size = dist.get_world_size(group=dp_process_group)
+        partition_id = dist.get_rank(group=dp_process_group)
+        
+        # Get the planner for this group to understand parameter layout
+        planner = self.planners[group_id]
+        
+        # Pre-compute parameter start offsets in the flat tensor
+        param_start_offsets = {}
+        offset = 0
+        for idx, param in enumerate(self.bit16_groups[group_id]):
+            param_start_offsets[param] = offset
+            offset += param.numel()
+        
+        # For each parameter, gather all shards and reconstruct
+        for param_idx, param in enumerate(self.bit16_groups[group_id]):
+            # Collect shards from all ranks for this parameter
+            shards_to_gather = []
+            
+            for rank in range(dp_world_size):
+                # Get the shard spec for this parameter from this rank
+                shard_spec = planner.get_shard_spec(param, rank)
+                
+                if shard_spec.shard_range.length > 0:
+                    # This rank has a shard of this parameter
+                    # Find where it is in the partitioned data
+                    rank_layout = planner.layout_for_rank(rank)
+                    
+                    # Find the offset of this shard within the rank's partition
+                    shard_offset_in_partition = 0
+                    for spec in rank_layout.shard_specs:
+                        if spec.param is param:
+                            break
+                        shard_offset_in_partition += spec.shard_range.length
+                    
+                    # Extract the shard from the partitioned data
+                    shard = partitioned_params[rank].narrow(0, shard_offset_in_partition, shard_spec.shard_range.length)
+                    shards_to_gather.append(shard)
+                else:
+                    # This rank doesn't have a shard of this parameter
+                    # Create empty tensor for allgather
+                    shards_to_gather.append(torch.empty(0, dtype=param.dtype, device=param.device))
+            
+            # Perform allgather for this parameter's shards
+            if shards_to_gather[partition_id].numel() > 0:
+                # We have a shard to contribute
+                dist.all_gather(shards_to_gather, shards_to_gather[partition_id], dp_process_group)
+            else:
+                # We don't have a shard, but still need to participate in allgather
+                # Use rank 0's shard as the source (it should have one)
+                source_rank = 0
+                for r in range(dp_world_size):
+                    if shards_to_gather[r].numel() > 0:
+                        source_rank = r
+                        break
+                dist.all_gather(shards_to_gather, shards_to_gather[source_rank], dp_process_group)
+            
+            # Reconstruct the parameter from gathered shards
+            reconstructed_param = []
+            for rank in range(dp_world_size):
+                shard_spec = planner.get_shard_spec(param, rank)
+                if shard_spec.shard_range.length > 0:
+                    reconstructed_param.append(shards_to_gather[rank])
+            
+            if reconstructed_param:
+                # Concatenate all shards to form the complete parameter
+                full_param = torch.cat(reconstructed_param)
+                
+                # Copy to the appropriate location in bit16_groups_flat
+                param_offset = param_start_offsets[param]
+                self.bit16_groups_flat[group_id][param_offset:param_offset + param.numel()].copy_(full_param)
+
     def step(self, closure=None):
         """
         Not supporting closure.
@@ -2423,11 +2507,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
         # Gather the updated weights from everyone.
         # Then all partitions of the model parameters are updated and ready for next round forward.
-        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
-                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        if self.native_reduce_scatter:
+            # Use parameter-wise allgather for native reduce-scatter mode
+            for group_id in range(len(self.bit16_groups)):
+                self._all_gather_params_native_reduce_scatter(group_id, self.parallel_partitioned_bit16_groups[group_id])
+        else:
+            # Use standard allgather for contiguous partitioning
+            all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                                 partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
         self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
 
         # TODO: we probably don't need this? just to be safe
@@ -2446,11 +2536,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
             bit16_partitions[partition_id].data.copy_(fp32_partition.data)
 
-        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
-                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        if self.native_reduce_scatter:
+            # Use parameter-wise allgather for native reduce-scatter mode
+            for group_id in range(len(self.bit16_groups)):
+                self._all_gather_params_native_reduce_scatter(group_id, self.parallel_partitioned_bit16_groups[group_id])
+        else:
+            # Use standard allgather for contiguous partitioning
+            all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                                 partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
 
     def _average_expert_grad_norms(self, norm_groups):
         for i, norm in enumerate(norm_groups):
