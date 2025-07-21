@@ -1664,6 +1664,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.grads_in_partition_offset += param.numel()
 
     def reduce_ipg_grads(self):
+        if dist.get_rank() == 0:
+            print(
+                f"reduce_ipg_grads starting"
+            )
+
         for comm_dtype in sort_dtypes(self.ipg_buckets.keys()):
             bucket = self.ipg_buckets[comm_dtype]
 
@@ -1699,7 +1704,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                             output_tensor = self.get_gradient_for_reduction(extra_large_param)
                             self.dump_tensor(f"extra_large_param_reduced", f"param_{param_id}_extra_large_grad_reduc",
                                              output_tensor.view(-1))
-
+                            if dist.get_rank() == 0:
+                                print(
+                                    f"[r{dist.get_rank()}] reduce_ipg_grads reduce-scattered extra_large gradient {output_tensor.shape} {output_tensor.flatten()[:5]}"
+                                )
                             extra_large_found = True
                         else:
                             # Keep other parameters for normal processing
@@ -1727,18 +1735,25 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         # accumulated_grad = param.grad_accum if hasattr(
                         #     param, 'grad_accum') and param.grad_accum is not None else grad_tensor
                         # accumulated_grad = self.get_gradient_for_reduction(param)
-                        # if dist.get_rank() == 0:
-                        #     print(f"reduce_ipg_grads reduce-scattering accumulated_grad {accumulated_grad.shape} {accumulated_grad.flatten()[:5]} grad_tensor {grad_tensor.shape} {grad_tensor.flatten()[:5]}")
+                        param_id = self.get_param_id(param)
+                        for i in range(dist.get_world_size()):
+                            if i == dist.get_rank():
+                                print(
+                                    f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduced-scatter pid={param_id} gradient {grad_tensor.shape} {grad_tensor.flatten()[:5]}"
+                                )
+                            dist.barrier()
                         self.reduce_scatter_individual_gradient(
                             grad_tensor,  # input
                             param,  # output
                             comm_dtype)
-                        if dist.get_rank() == 0:
+                        for i in range(dist.get_world_size()):
+                            if i == dist.get_rank():
                             # accumulated_grad = self.get_gradient_for_reduction(param)
-                            accumulated_grad = param.grad_acc_with_pad
-                            # print(
-                            #     f"reduce_ipg_grads reduced-scattered gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
-                            # )
+                                accumulated_grad = param.grad_acc_with_pad
+                                print(
+                                    f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduced-scatter pid={param_id} gradient {accumulated_grad.shape} {accumulated_grad.flatten()[:5]}"
+                                )
+                            dist.barrier()
 
                 # Clear the gradient list after processing
                 bucket.grad_list.clear()
@@ -1767,9 +1782,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                             self.dump_tensor(f"extra_large_param_before_reduce",
                                              f"param_{param_id}_extra_large_grad_reduc",
                                              extra_large_grad_reduc.view(-1))
+                            for i in range(dist.get_world_size()):
+                                if i == dist.get_rank():
+                                    print(
+                                        f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
+                                    )
+                                dist.barrier()
                             self.average_tensor(extra_large_grad_reduc.view(-1), comm_dtype)
                             self.dump_tensor(f"extra_large_param_reduced", f"param_{param_id}_extra_large_grad_reduc",
                                              extra_large_grad_reduc.view(-1))
+                            for i in range(dist.get_world_size()):
+                                if i == dist.get_rank():
+                                    print(
+                                        f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce extra_large gradient {extra_large_grad_reduc.shape} {extra_large_grad_reduc.flatten()[:5]}"
+                                    )
+                                dist.barrier()
 
                             extra_large_found = True
                         else:
@@ -1783,9 +1810,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     if extra_large_found:
                         del self.extra_large_param_to_reduce[comm_dtype]
                 else:
-                    # if dist.get_rank() == 0:
-                    #     print(f"reduce_ipg_grads reducing bucket {comm_dtype} bucket.elements={bucket.elements}")
+                    acc_grad = bucket.buffer[bucket.index].narrow(0, 0, bucket.elements)
+                    for i in range(dist.get_world_size()):
+                        if i == dist.get_rank():
+                            print(
+                                f"[r{dist.get_rank()}] reduce_ipg_grads BEFORE reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
+                            )
+                        dist.barrier()
                     self.average_tensor(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements), comm_dtype)
+                    for i in range(dist.get_world_size()):
+                        if i == dist.get_rank():
+                            print(
+                                f"[r{dist.get_rank()}] reduce_ipg_grads AFTER reduce gradient {acc_grad.shape} {acc_grad.flatten()[:5]}"
+                            )
+                        dist.barrier()
 
             else:
                 self.buffered_reduce_fallback(None, bucket.grads, comm_dtype, elements_per_buffer=bucket.elements)
