@@ -102,7 +102,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     memory fragmentation during backward pass.
     """
 
-    reduce_scatter: bool = True
+    reduce_scatter: bool = False
     """
     Uses reduce or reduce scatter instead of allreduce to average gradients
     """
@@ -122,7 +122,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     for the allgather for large model sizes
     """
 
-    use_multi_rank_bucket_allreduce: bool = True
+    use_multi_rank_bucket_allreduce: bool = False
     """
     Combine the reduce buckets of the different ranks and do an All-Reduce instead of multiple Reduce ops.
     This feature is useful when the model is small and we want to scale it on too many GPUs which therefore
