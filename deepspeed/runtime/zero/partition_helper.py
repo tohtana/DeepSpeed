@@ -313,50 +313,64 @@ class PartitionPlanner:
     def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
         """Create data parallel partitions from a flat tensor using planner layouts."""
 
-        if self.native_reduce_scatter and self.total_padding > 0:
-            # For chunked plan with per-parameter padding
-            padded_tensor = torch.zeros(flat_tensor.numel() + self.total_padding,
-                                        dtype=flat_tensor.dtype,
-                                        device=flat_tensor.device)
-
-            # Copy parameters with padding between them
-            read_offset = 0
-            write_offset = 0
-
-            for p in self.params:
-                n = p.numel()
-
-                # Copy parameter data
-                padded_tensor[write_offset:write_offset + n].copy_(flat_tensor[read_offset:read_offset + n])
-
-                # Calculate padded size for this parameter
-                padded_n = ((n + self.world_size - 1) // self.world_size) * self.world_size
-                if self.alignment_factor > 1:
-                    shard_size = padded_n // self.world_size
-                    aligned_shard_size = (
-                        (shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
-                    padded_n = aligned_shard_size * self.world_size
-
-                read_offset += n
-                write_offset += padded_n
-
-            source_tensor = padded_tensor
+        if self.native_reduce_scatter:
+            # For native reduce-scatter: each rank gets concatenated shards from all parameters
+            partitions = []
+            
+            # Pre-compute parameter start offsets in the flat tensor
+            param_start_offsets = [0]
+            for p in self.params[:-1]:
+                param_start_offsets.append(param_start_offsets[-1] + p.numel())
+            
+            for rank in range(self.world_size):
+                layout = self.rank_layouts[rank]
+                if layout.partition_size == 0:
+                    # Empty partition
+                    partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
+                    continue
+                
+                # Collect all shards for this rank and concatenate them
+                rank_shards = []
+                for spec in layout.shard_specs:
+                    if spec.shard_range.length > 0:
+                        # Find parameter index to get its offset in flat_tensor
+                        param_idx = next(i for i, p in enumerate(self.params) if p is spec.param)
+                        param_start_in_flat = param_start_offsets[param_idx]
+                        
+                        # Extract the shard from the flat tensor
+                        shard_start = param_start_in_flat + spec.shard_range.start
+                        shard_end = shard_start + spec.shard_range.length
+                        shard = flat_tensor[shard_start:shard_end].clone()
+                        rank_shards.append(shard)
+                
+                if rank_shards:
+                    # Concatenate all shards for this rank
+                    rank_partition = torch.cat(rank_shards)
+                    
+                    # Pad to partition_size if needed (for alignment requirements)
+                    if rank_partition.numel() < layout.partition_size:
+                        padding_size = layout.partition_size - rank_partition.numel()
+                        padding = torch.zeros(padding_size, dtype=flat_tensor.dtype, device=flat_tensor.device)
+                        rank_partition = torch.cat([rank_partition, padding])
+                    
+                    partitions.append(rank_partition)
+                else:
+                    # No shards for this rank, create empty partition
+                    partitions.append(torch.zeros(layout.partition_size, dtype=flat_tensor.dtype, device=flat_tensor.device))
         else:
-            # For contiguous plan (legacy-style, no padding)
-            source_tensor = flat_tensor
-
-        partitions = []
-        for rank in range(self.world_size):
-            layout = self.rank_layouts[rank]
-            if layout.partition_size == 0:
-                # Empty partition
-                partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
-            else:
-                # Extract partition (unequal sizes allowed for legacy mode)
-                start = layout.left_boundary
-                end = start + layout.partition_size
-                partition = source_tensor[start:end].clone()
-                partitions.append(partition)
+            # For contiguous plan (legacy-style): use contiguous slicing
+            partitions = []
+            for rank in range(self.world_size):
+                layout = self.rank_layouts[rank]
+                if layout.partition_size == 0:
+                    # Empty partition
+                    partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
+                else:
+                    # Extract contiguous partition
+                    start = layout.left_boundary
+                    end = start + layout.partition_size
+                    partition = flat_tensor[start:end].clone()
+                    partitions.append(partition)
 
         return partitions
 
