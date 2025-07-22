@@ -719,10 +719,19 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for p, q in zip(self.round_robin_bit16_groups[group_index], updated_params):
             p.data = q.data
 
-        # set model fp16 weight to slices of reordered flattened buffer
+        # The following code `param.data = self.round_robin_bit16_groups[group_index][new_index].data` seems redundant
+        # `param`` in self.bit16_groups[group_index] and self.round_robin_bit16_groups[group_index][new_index] are the same object.
+        # For safety, we keep the assertion to ensure that the reordering is correct. We can remove the commented code later.
         for param_index, param in enumerate(self.bit16_groups[group_index]):
             new_index = self.round_robin_bit16_indices[group_index][param_index]
-            param.data = self.round_robin_bit16_groups[group_index][new_index].data
+            assert param is self.round_robin_bit16_groups[group_index][new_index], \
+                f"param at index {param_index} is not identical to round_robin_bit16_groups[{group_index}][{new_index}]"
+
+        ##### The following code is commented out because it seems redundant.
+        # set model fp16 weight to slices of reordered flattened buffer
+        # for param_index, param in enumerate(self.bit16_groups[group_index]):
+        #     new_index = self.round_robin_bit16_indices[group_index][param_index]
+        #     param.data = self.round_robin_bit16_groups[group_index][new_index].data
 
     def _round_robin_reorder(self, tensor_list, num_partitions):
 
