@@ -1007,7 +1007,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         original_grad = param.grad
         grad_reduc = self.get_gradient_for_reduction(param)
         bucket = self.ipg_buckets[self.get_param_comm_dtype(param)]
-        param_id = self.get_param_id(param)
 
         # Check if we should trigger reduction - different logic for native reduce-scatter
         should_reduce = False
@@ -1028,6 +1027,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 bucket.index = 1 - bucket.index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads", param.numel(), param.dtype)
 
+        param_id = self.get_param_id(param)
         assert self.params_already_reduced[param_id] == False, \
             f"The parameter {param_id} has already been reduced. \
             Gradient computed twice for this partition. \
