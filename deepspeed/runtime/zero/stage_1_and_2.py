@@ -110,14 +110,12 @@ class IPGBucket:
     has_moe_params: bool = False
     # For native reduce-scatter: list of (grad_tensor, param) pairs
     grad_list: List = field(default_factory=list)
-    total_grad_size: int = 0
 
     def clear(self):
         self.params.clear()
         self.grads.clear()
         self.grad_list.clear()
         self.elements = 0
-        self.total_grad_size = 0
         self.index = 0
         self.has_moe_params = False
 
@@ -1009,17 +1007,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         bucket = self.ipg_buckets[self.get_param_comm_dtype(param)]
 
         # Check if we should trigger reduction - different logic for native reduce-scatter
-        should_reduce = False
-        if self.native_reduce_scatter:
-            # For native reduce-scatter, check total gradient size in list
-            if bucket.total_grad_size > 0 and bucket.total_grad_size + param.numel() > self.reduce_bucket_size:
-                should_reduce = True
-        else:
-            # Original logic
-            if bucket.elements > 0 and bucket.elements + param.numel() > self.reduce_bucket_size:
-                should_reduce = True
-
-        if should_reduce:
+        if bucket.elements > 0 and bucket.elements + param.numel() > self.reduce_bucket_size:
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads", param.numel(), param.dtype)
             self.reduce_ipg_grads()
             if self.contiguous_gradients and self.overlap_comm:
@@ -1042,7 +1030,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 # Add to gradient list for later per-parameter reduce-scatter
                 # Use the original gradient tensor before any processing
                 bucket.grad_list.append((original_grad, param))
-            bucket.total_grad_size += param.numel()
+            bucket.elements += param.numel()
         else:
             # Original gradient copying logic
             if self.contiguous_gradients:
@@ -1670,7 +1658,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 # Clear the gradient list after processing
                 bucket.grad_list.clear()
-                bucket.total_grad_size = 0
+                bucket.elements = 0
             elif self.contiguous_gradients:
                 # Original contiguous gradient logic
                 if comm_dtype in self.extra_large_param_to_reduce:
