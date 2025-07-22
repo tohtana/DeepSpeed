@@ -109,87 +109,6 @@ class RankShardLayout:
 
     total_grads_in_partition = total_numel  # DeepSpeed alias
 
-    def alloc_recv_buffer(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Allocate buffer (logical `partition_size`, incl. padding)."""
-        return torch.empty(self.partition_size, dtype=dtype, device=device)
-
-    # ------------------------------------------------------------------
-    # Weight / gradient gathering --------------------------------------
-    def gather_weights(self, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Concatenate all local shards into a flat tensor on `device`/`dtype`."""
-        buf = torch.empty(self.total_numel(), dtype=dtype, device=device)
-        offset = 0
-        for spec in self.shard_specs:
-            shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
-            buf[offset:offset + spec.shard_range.length].copy_(shard)
-            offset += spec.shard_range.length
-        return buf
-
-    def gather_weights_padded(self,
-                              *,
-                              dtype: torch.dtype,
-                              device: torch.device,
-                              planner: PartitionPlanner | None = None) -> torch.Tensor:
-        """Gather weights into partition-sized buffer with padding for reduce-scatter.
-
-        For native_reduce_scatter mode, this respects per-parameter padding.
-        """
-        buf = torch.zeros(self.partition_size, dtype=dtype, device=device)
-
-        if planner and planner.native_reduce_scatter:
-            # For chunked mode: each rank has a shard from each parameter
-            # The buffer layout matches the order of parameters with padding
-            offset = 0
-            for param in planner.params:
-                # Find the shard spec for this parameter (if any)
-                param_spec = None
-                for spec in self.shard_specs:
-                    if spec.param is param:
-                        param_spec = spec
-                        break
-
-                if param_spec and param_spec.shard_range.length > 0:
-                    shard = param_spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
-                    buf[offset:offset + param_spec.shard_range.length].copy_(shard)
-
-                # Calculate padded size for this parameter to advance offset correctly
-                n = param.numel()
-                padded_n = ((n + planner.world_size - 1) // planner.world_size) * planner.world_size
-                if planner.alignment_factor > 1:
-                    shard_size = padded_n // planner.world_size
-                    aligned_shard_size = ((shard_size + planner.alignment_factor - 1) //
-                                          planner.alignment_factor) * planner.alignment_factor
-                    padded_n = aligned_shard_size * planner.world_size
-
-                # Each rank gets exactly padded_n / world_size elements for this parameter
-                offset += padded_n // planner.world_size
-        else:
-            # Simple sequential gathering for contiguous mode
-            offset = 0
-            for spec in self.shard_specs:
-                if spec.shard_range.length > 0:
-                    shard = spec.view_tensor_slice().to(device=device, dtype=dtype, non_blocking=True)
-                    buf[offset:offset + spec.shard_range.length].copy_(shard)
-                    offset += spec.shard_range.length
-
-        # Remaining elements stay zero (padding)
-        return buf
-
-    # ------------------------------------------------------------------
-    # DeepSpeed‑style query helpers ------------------------------------
-    def is_param_in_partition(self, param: torch.nn.Parameter) -> bool:
-        return param in self._grad_positions
-
-    # alias for naming parity
-    is_param_in_current_partition = is_param_in_partition  # type: ignore
-
-    def grad_position(self, param: torch.nn.Parameter) -> int:
-        """Offset **within rank‑local flat buffer** where this param’s first element sits."""
-        return self._grad_positions[param]
-
-    grad_partition_insertion_offset = grad_position  # alias
-    grad_start_offset = grad_position  # alias
-
     @property
     def params_in_partition(self) -> List[torch.nn.Parameter]:
         return list(self._grad_positions.keys())
@@ -207,17 +126,6 @@ class RankShardLayout:
         first_spec = self.shard_specs[0] if self.shard_specs else None
         return first_spec.shard_range.start if first_spec else 0
 
-    @property
-    def first_param_index_in_partition(self) -> int:
-        """Index (into `planner.params`) of the first parameter present on this rank."""
-        if not self.shard_specs:
-            return -1
-        param0 = self.shard_specs[0].param
-        if self._all_params:
-            for i, p in enumerate(self._all_params):
-                if p is param0:
-                    return i
-        return -1
 
     # ------------------------------------------------------------------
     # Internal – called by planner ------------------------------------
