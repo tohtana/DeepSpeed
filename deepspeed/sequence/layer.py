@@ -254,6 +254,26 @@ def single_all_to_all(input, scatter_idx, gather_idx, batch_dim_idx, group, asyn
     return res
 
 
+class _DimZeroAllToAll(torch.autograd.Function):
+    """Differentiable All2All across dimension 0."""
+
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor) -> Tensor:
+        world_size = dist.get_world_size(group)
+        assert input.shape[0] == world_size, f"Dim 0 {input.shape[0]} is not world size"
+
+        ctx.group = group
+
+        output = torch.empty_like(input).contiguous()
+        # torch.distributed.nn.functional.all_to_all_single(output, input.contiguous(), group=group)
+        dist.all_to_all_single(output, input.contiguous(), group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
+        return (None, _DimZeroAllToAll.apply(ctx.group, *grad_output))
+
+
 class _SeqAllToAll(torch.autograd.Function):
 
     @staticmethod
@@ -338,11 +358,11 @@ class DistributedAttention(torch.nn.Module):
         if sp_stream is not None:
             self.overlap_handles = {}
             self.sp_overlap_comm = True
-            self.dafult_stream = get_accelerator().default_stream()
+            self.default_stream = get_accelerator().default_stream()
 
     def layer_sync(self, layer):
         if self.sp_overlap_comm and hasattr(layer, 'done_event'):
-            self.dafult_stream.wait_event(layer.done_event)
+            self.default_stream.wait_event(layer.done_event)
 
     def forward(self,
                 query: Tensor,
@@ -374,7 +394,7 @@ class DistributedAttention(torch.nn.Module):
             def pre_hook_fun(grad):
                 type = 'd' + layer_type
                 self.overlap_handles[type + '_work'].wait()
-                self.sp_stream.wait_stream(self.dafult_stream)
+                self.sp_stream.wait_stream(self.default_stream)
                 all2all_output = self.overlap_handles[type + '_grad']
                 grad = list(grad)
                 grad[0] = self.overlap_handles[type + '_post_all2all_func'](all2all_output)
@@ -389,7 +409,7 @@ class DistributedAttention(torch.nn.Module):
         key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
                                        self.overlap_handles, 'k')
         if self.sp_overlap_comm:
-            self.dafult_stream.wait_stream(self.sp_stream)
+            self.default_stream.wait_stream(self.sp_stream)
 
         value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
                                          self.overlap_handles, 'v')

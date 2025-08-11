@@ -8,6 +8,7 @@ import sys
 import shutil
 import subprocess
 import warnings
+import re
 from shlex import split
 from abc import ABC, abstractmethod
 from deepspeed.accelerator import get_accelerator
@@ -34,7 +35,10 @@ class MultiNodeRunner(ABC):
         """Return the command to execute on node"""
 
     def add_export(self, key, var):
-        self.exports[key.strip()] = f"\"{var.strip()}\""
+        var = var.strip()
+        if re.search(r'[^\w@%+=:,./-]', var):
+            var = f"\"{var}\""
+        self.exports[key.strip()] = var
 
     def parse_user_args(self):
         return self.args.user_args
@@ -96,6 +100,8 @@ class PDSHRunner(MultiNodeRunner):
             f'--world_info={self.world_info_base64}', "--node_rank=%n", f"--master_addr={self.args.master_addr}",
             f"--master_port={self.args.master_port}"
         ]
+        if self.args.venv_script is not None:
+            deepspeed_launch = [f"source {self.args.venv_script};"] + deepspeed_launch
         if self.args.no_python:
             deepspeed_launch.append("--no_python")
         if self.args.module:
