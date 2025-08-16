@@ -1020,7 +1020,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
         if sequence_data_parallel_group is not None:
             logger.warning(
-                f"sequence_data_parallel_group' is deprecated and will be removed. Use 'data_parallel_group' instead.")
+                "sequence_data_parallel_group' is deprecated and will be removed. Use 'data_parallel_group' instead.")
             if data_parallel_group is not None:
                 raise ValueError(
                     "Both 'data_parallel_group' and 'sequence_data_parallel_group' were specified. Please provide only one of these arguments."
@@ -1390,8 +1390,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         handles = []
                         for dtype in sort_dtypes(dtype_params.keys()):
                             handles.append(
-                                _all_gather_dtype(params, world_size, rank_in_group, ds_process_group,
-                                                  allgather_dtype))
+                                _all_gather_dtype(dtype_params[dtype], world_size, rank_in_group, ds_process_group,
+                                                  dtype))
 
                         return MultipleAllGatherHandles(handles)
 
