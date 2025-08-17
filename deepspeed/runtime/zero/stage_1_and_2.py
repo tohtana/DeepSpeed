@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict
 
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from deepspeed.runtime.zenflow import zenflow_utils
 
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
@@ -136,6 +137,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  init_optimizer,
                  param_names,
                  timers,
+                 optimizer_params,
                  static_loss_scale=1.0,
                  dynamic_loss_scale=False,
                  dynamic_loss_args=None,
@@ -151,6 +153,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  native_reduce_scatter=False,
                  overlap_comm=False,
                  offload_optimizer_config=None,
+                 zenflow_config=None,
                  mpu=None,
                  clip_grad=0.0,
                  gradient_accumulation_dtype=torch.float32,
@@ -172,6 +175,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         else:
             self.cpu_offload = False
             self.cpu_offload_pin_memory = False
+
+        # TODO: Remove zenflow-specific call from vanilla ZeroOptimizer, try to isolate zenflow-specific code into sub-class zenflow_zero_optimizer
+        self.zenflow = True if zenflow_config is not None else False
 
         if dist.get_rank() == 0:
             logger.info(f"Reduce bucket size {reduce_bucket_size}")
@@ -195,9 +201,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             raise SystemError("Accelerator is not detected, cannot perform low precision training (e.g., fp16, bf16).")
         self.optimizer = init_optimizer
 
-        # Use torch (un)flatten ops
-        self.flatten = _flatten_dense_tensors
-        self.unflatten = _unflatten_dense_tensors
+        # Use torch or zenflow (un)flatten ops
+        self.flatten = _flatten_dense_tensors if not self.zenflow else zenflow_utils._flatten_dense_tensors
+        self.unflatten = _unflatten_dense_tensors if not self.zenflow else zenflow_utils._unflatten_dense_tensors
 
         # ZeRO stage 1 (False) or 2 (True)
         self.partition_gradients = partition_grads
@@ -210,18 +216,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Issue a warning if native_reduce_scatter is enabled but won't be used
         if native_reduce_scatter and not contiguous_gradients:
             contiguous_gradients = True
-            logger.warning(
-                "native_reduce_scatter is enabled but will only be used with contiguous_gradients=True. "
-                "Setting contiguous_gradients to True."
-            )
+            logger.warning("native_reduce_scatter is enabled but will only be used with contiguous_gradients=True. "
+                           "Setting contiguous_gradients to True.")
         self.native_reduce_scatter = native_reduce_scatter and contiguous_gradients
-        
+
         # Validate that round_robin_gradients is False when native_reduce_scatter is True
         if self.native_reduce_scatter and round_robin_gradients:
-            raise ValueError(
-                "native_reduce_scatter cannot be used with round_robin_gradients=True. "
-                "Please set round_robin_gradients=False when using native_reduce_scatter."
-            )
+            raise ValueError("native_reduce_scatter cannot be used with round_robin_gradients=True. "
+                             "Please set round_robin_gradients=False when using native_reduce_scatter.")
 
         self.overlap_comm = overlap_comm
 
@@ -609,10 +611,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         see_memory_usage("After initializing optimizer states", force=True)
 
         if dist.get_rank() == 0:
-            logger.info(f"optimizer state initialized")
+            logger.info("optimizer state initialized")
 
         if dist.get_rank(group=self.dp_process_group) == 0:
-            see_memory_usage(f"After initializing ZeRO optimizer", force=True)
+            see_memory_usage("After initializing ZeRO optimizer", force=True)
 
         self._link_all_hp_params()
         self._hp_optimizer_states_linked = False
@@ -738,7 +740,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         for i, tensor in enumerate(tensor_list):
             j = i % num_partitions
-            if not j in partition_tensors:
+            if j not in partition_tensors:
                 partition_tensors[j] = []
             partition_tensors[j].append((i, tensor))
 
@@ -844,9 +846,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     i, param_group, partition_id)
 
     def independent_gradient_partition_epilogue(self):
-        self.report_ipg_memory_usage(f"In ipg_epilogue before reduce_ipg_grads", 0)
+        self.report_ipg_memory_usage("In ipg_epilogue before reduce_ipg_grads", 0)
         self.reduce_ipg_grads()
-        self.report_ipg_memory_usage(f"In ipg_epilogue after reduce_ipg_grads", 0)
+        self.report_ipg_memory_usage("In ipg_epilogue after reduce_ipg_grads", 0)
 
         # if dist.get_rank() == 0:
         #    logger.info("Params already reduced %s", self.params_already_reduced)
@@ -862,7 +864,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.cpu_offload is False:
             for i, _ in enumerate(self.bit16_groups):
 
-                if not i in self.averaged_gradients or self.averaged_gradients[i] is None:
+                if i not in self.averaged_gradients or self.averaged_gradients[i] is None:
                     self.averaged_gradients[i] = self.get_flat_partition(
                         self.params_in_partition[i],
                         self.first_offset[i],
@@ -887,7 +889,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # All gradients required by the step
         # are in self.averaged_gradients
         self.zero_grad(set_to_none=True)
-        see_memory_usage(f"End ipg_epilogue")
+        see_memory_usage("End ipg_epilogue")
 
     # resets all partition to no reduced
     # sets remaining grads to the total number of grads in each partition
@@ -1011,6 +1013,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.report_ipg_memory_usage("In ipg_remove_grads before reduce_ipg_grads", param.numel(), param.dtype)
             self.reduce_ipg_grads()
             if self.contiguous_gradients and self.overlap_comm:
+                if not get_accelerator().resolves_data_dependency():
+                    self.reduction_stream.wait_stream(get_accelerator().current_stream())
+                    get_accelerator().current_stream().wait_stream(self.reduction_stream)
                 # Swap index between 0 and 1
                 bucket.index = 1 - bucket.index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads", param.numel(), param.dtype)
@@ -1038,10 +1043,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     self.extra_large_param_to_reduce[param.dtype] = param
                 else:
                     # keeping the gradients contiguous to prevent memory fragmentation, and avoid flattening
-                    # In this path, grad_reduc is param.grad
                     new_grad_tensor = bucket.buffer[bucket.index].narrow(0, bucket.elements, param.numel())
-                    new_grad_tensor.copy_(grad_reduc.view(-1))
-                    grad_reduc.data = new_grad_tensor.data.view_as(grad_reduc)
+                    new_grad_tensor.copy_(
+                        grad_reduc.view(-1) if not self.zenflow else grad_reduc.permute(
+                            *reversed(range(grad_reduc.ndim))).contiguous().view(-1))
+                    grad_reduc.data = new_grad_tensor.data.view_as(grad_reduc) if (
+                        not self.zenflow or grad_reduc.dim() == 1) else new_grad_tensor.data.view_as(
+                            grad_reduc.transpose(0, 1))
 
             bucket.elements += param.numel()
 
@@ -1523,10 +1531,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         dest_tensor = self.single_partition_of_fp32_groups[i].grad.view(-1).narrow(0, dest_offset, num_elements)
 
         grad_accum = self.get_param_gradient_attribute(param)
-        if grad_accum is None:
-            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
-        else:
-            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        assert grad_accum is not None
+
+        src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
         if not self.fp16_master_weights_and_gradients:
             src_tensor = src_tensor.float()
 
@@ -1662,31 +1669,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             elif self.contiguous_gradients:
                 # Original contiguous gradient logic
                 if comm_dtype in self.extra_large_param_to_reduce:
-                    # Handle extra-large parameter separately (same logic as native reduce-scatter)
-                    extra_large_param = self.extra_large_param_to_reduce[comm_dtype]
-                    extra_large_param_id = self.get_param_id(extra_large_param)
+                    assert len(bucket.params) == 1, "more than 1 param in ipg bucket, this shouldn't happen"
+                    _, _, param_id = bucket.params[0]
+                    assert self.get_param_id(self.extra_large_param_to_reduce[comm_dtype]
+                                             ) == param_id, "param in ipg bucket does not match extra-large param"
+                    extra_large_grad_reduc = self.get_gradient_for_reduction(
+                        self.extra_large_param_to_reduce[comm_dtype])
 
-                    # Find and process the extra-large parameter from bucket.params
-                    extra_large_found = False
-                    remaining_params = []
+                    extra_large_grad_reduc_for_average = extra_large_grad_reduc.view(-1) if not self.zenflow \
+                        else extra_large_grad_reduc.permute(*reversed(range(extra_large_grad_reduc.ndim))).contiguous().view(-1)
+                    extra_large_grad_reduc.data = extra_large_grad_reduc_for_average.data.view_as(extra_large_grad_reduc) if (not self.zenflow or self.extra_large_param_to_reduce[comm_dtype].dim() == 1) \
+                        else extra_large_grad_reduc_for_average.data.view_as(extra_large_grad_reduc.transpose(0, 1))
 
-                    for param_tuple in bucket.params:
-                        _, _, param_id = param_tuple
-                        if param_id == extra_large_param_id:
-                            # Process the extra-large parameter
-                            extra_large_grad_reduc = self.get_gradient_for_reduction(extra_large_param)
-                            self.average_tensor(extra_large_grad_reduc.view(-1), comm_dtype)
-                            extra_large_found = True
-                        else:
-                            # Keep other parameters for normal processing
-                            remaining_params.append(param_tuple)
-
-                    # Update bucket.params to exclude the processed extra-large parameter
-                    bucket.params = remaining_params
-
-                    # Clean up extra-large parameter tracking
-                    if extra_large_found:
-                        del self.extra_large_param_to_reduce[comm_dtype]
+                    self.average_tensor(extra_large_grad_reduc_for_average, comm_dtype)
+                    del self.extra_large_param_to_reduce[comm_dtype]
                 else:
                     self.average_tensor(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements), comm_dtype)
 
@@ -1741,7 +1737,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.reduce_ready_partitions_and_remove_grads(param, i)
 
     def reduce_ready_partitions_and_remove_grads(self, param, i):
-        if self.partition_gradients or self.is_gradient_accumulation_boundary:
+        if self.partition_gradients or self.is_gradient_accumulation_boundary or self.zenflow:
             self.reduce_independent_p_g_buckets_and_remove_grads(param, i)
 
     def zero_reduced_gradients(self, partition_id, i):
@@ -2156,6 +2152,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.torch_autocast_gradscaler:
             self.torch_autocast_gradscaler.step(self.optimizer)
             self.torch_autocast_gradscaler.update()
+        # TODO: Remove zenflow-specific call from vanilla ZeroOptimizer
+        elif self.zenflow:
+            self.zenflow_cpu_optimizer_step(group_no)
         else:
             self.optimizer.step()
         self.optimizer.param_groups = original_param_groups
@@ -2168,7 +2167,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         dp_process_group = self.real_dp_process_group[group_id]
         dp_world_size = dist.get_world_size(group=dp_process_group)
         partition_id = dist.get_rank(group=dp_process_group)
-        
+
         # Get the planner for this group to understand parameter layout
         planner = self.partition_helper.planners[group_id]
 
@@ -2178,36 +2177,37 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for idx, param in enumerate(self.bit16_groups[group_id]):
             param_start_offsets[param] = offset
             offset += param.numel()
-        
+
         # For each parameter, gather all shards and reconstruct
         for param_idx, param in enumerate(self.bit16_groups[group_id]):
             # Collect shards from all ranks for this parameter
             shards_to_gather = []
-            
+
             for rank in range(dp_world_size):
                 # Get the shard spec for this parameter from this rank
                 shard_spec = planner.get_shard_spec(param, rank)
-                
+
                 if shard_spec.shard_range.length > 0:
                     # This rank has a shard of this parameter
                     # Find where it is in the partitioned data
                     rank_layout = planner.layout_for_rank(rank)
-                    
+
                     # Find the offset of this shard within the rank's partition
                     shard_offset_in_partition = 0
                     for spec in rank_layout.shard_specs:
                         if spec.param is param:
                             break
                         shard_offset_in_partition += spec.shard_range.length
-                    
+
                     # Extract the shard from the partitioned data
-                    shard = partitioned_params[rank].narrow(0, shard_offset_in_partition, shard_spec.shard_range.length)
+                    shard = partitioned_params[rank].narrow(0, shard_offset_in_partition,
+                                                            shard_spec.shard_range.length)
                     shards_to_gather.append(shard)
                 else:
                     # This rank doesn't have a shard of this parameter
                     # Create empty tensor for allgather
                     shards_to_gather.append(torch.empty(0, dtype=param.dtype, device=param.device))
-            
+
             # Perform allgather for this parameter's shards
             if shards_to_gather[partition_id].numel() > 0:
                 # We have a shard to contribute
@@ -2221,18 +2221,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         source_rank = r
                         break
                 dist.all_gather(shards_to_gather, shards_to_gather[source_rank], dp_process_group)
-            
+
             # Reconstruct the parameter from gathered shards
             reconstructed_param = []
             for rank in range(dp_world_size):
                 shard_spec = planner.get_shard_spec(param, rank)
                 if shard_spec.shard_range.length > 0:
                     reconstructed_param.append(shards_to_gather[rank])
-            
+
             if reconstructed_param:
                 # Concatenate all shards to form the complete parameter
                 full_param = torch.cat(reconstructed_param)
-                
+
                 # Copy to the appropriate location in bit16_groups_flat
                 param_offset = param_start_offsets[param]
                 self.bit16_groups_flat[group_id][param_offset:param_offset + param.numel()].copy_(full_param)
@@ -2243,7 +2243,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         self.micro_step_id = INITIAL_MICRO_STEP_ID
 
-        see_memory_usage(f"In step before checking overflow")
+        see_memory_usage("In step before checking overflow")
 
         # First compute norm for all group so we know if there is overflow
         if self.check_grad_overflow:
@@ -2348,7 +2348,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.native_reduce_scatter:
             # Use parameter-wise allgather for native reduce-scatter mode
             for group_id in range(len(self.bit16_groups)):
-                self._all_gather_params_native_reduce_scatter(group_id, self.parallel_partitioned_bit16_groups[group_id])
+                self._all_gather_params_native_reduce_scatter(group_id,
+                                                              self.parallel_partitioned_bit16_groups[group_id])
         else:
             # Use standard allgather for contiguous partitioning
             all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
@@ -2377,7 +2378,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.native_reduce_scatter:
             # Use parameter-wise allgather for native reduce-scatter mode
             for group_id in range(len(self.bit16_groups)):
-                self._all_gather_params_native_reduce_scatter(group_id, self.parallel_partitioned_bit16_groups[group_id])
+                self._all_gather_params_native_reduce_scatter(group_id,
+                                                              self.parallel_partitioned_bit16_groups[group_id])
         else:
             # Use standard allgather for contiguous partitioning
             all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
@@ -2747,7 +2749,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.clip_grad = sd.get(CLIP_GRAD, self.clip_grad)
 
         ckpt_version = sd.get(DS_VERSION, False)
-        assert ckpt_version, f"Empty ds_version in checkpoint, not clear how to proceed"
+        assert ckpt_version, "Empty ds_version in checkpoint, not clear how to proceed"
         ckpt_version = pkg_version.parse(ckpt_version)
 
         # zero stage 1 mode

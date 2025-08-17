@@ -81,7 +81,7 @@ class Autotuner:
         if not os.path.exists(self.results_dir):
             try:
                 os.makedirs(self.results_dir, exist_ok=True)
-                logger.info(f"Created autotuning results directory: {self.exps_dir}")
+                logger.info(f"Created autotuning results directory: {self.results_dir}")
             except:
                 logger.error(
                     f"Failed to create {self.results_dir}, please check results_dir in the autotuning config file is accessible by all the nodes in the job."
@@ -145,7 +145,7 @@ class Autotuner:
                     f"{best_exp['name']} is the optimal setup after tuning. The exp result is at {best_exp['result_dir']}."
                 )
             else:
-                logger.info(f"No optimal setup is found. Please check that experiments were run successfully.")
+                logger.info("No optimal setup is found. Please check that experiments were run successfully.")
             tuning_duration = datetime.timedelta(seconds=(time.time() - self.start_time))
 
             logger.info(f"Tuning completed in {tuning_duration}")
@@ -410,7 +410,7 @@ class Autotuner:
 
         self.start_time = time.time()
         if self.fast_enabled():
-            logger.info(f"Fast mode is enabled. Tuning micro batch size only.")
+            logger.info("Fast mode is enabled. Tuning micro batch size only.")
 
         # model info profile run with DEFAULT_MIN_MEM_CONFIG
         model_info = self.model_info_profile_run()
@@ -1110,4 +1110,4 @@ class Autotuner:
 
             logger.info(f"Done running with the optimal DeepSpeed configuration using {self.optimal_cmd}")
         else:
-            logger.info(f"No optimal DeepSpeed configuration found by autotuning.")
+            logger.info("No optimal DeepSpeed configuration found by autotuning.")
