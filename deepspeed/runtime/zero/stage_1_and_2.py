@@ -347,6 +347,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.round_robin_bit16_groups = []
         self.round_robin_bit16_indices = []
         self.round_robin_bit16_meta = []
+        self.param_padded_sizes_per_group = []  # Store padded sizes for native_reduce_scatter
 
         # Use different parallel to do all_to_all_reduce related things
         # padding on each partition for alignment purposes
@@ -409,10 +410,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.round_robin_bit16_meta.append(meta_tensors)
 
             # create flat buffer in CPU
-            flattened_buffer = self.flatten_dense_tensors_aligned(
-                self.round_robin_bit16_groups[i],
-                self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i]),
-                use_cpu_data=True)
+            # Use different flattening strategy based on native_reduce_scatter
+            if self.partition_helper.native_reduce_scatter:
+                # Use per-param padding for efficient view-based partitioning
+                flattened_buffer, param_padded_sizes = self.partition_helper.flatten_with_per_param_padding(
+                    self.round_robin_bit16_groups[i],
+                    dist.get_world_size(group=self.real_dp_process_group[i]),
+                    use_cpu_data=True)
+            else:
+                # Use legacy flattening with single padding at the end
+                flattened_buffer = self.partition_helper.flatten_without_padding(
+                    self.round_robin_bit16_groups[i],
+                    self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i]),
+                    use_cpu_data=True)
+                param_padded_sizes = None
 
             # free temp CPU params
             for param in self.bit16_groups[i]:
@@ -435,8 +446,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             planner = self.partition_helper.planners[i]
             # Get the layout for this rank
             current_layout = planner.layout_for_rank(partition_id)
-            data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i])
+            data_parallel_partitions = planner.create_data_parallel_partitions(self.bit16_groups_flat[i],
+                                                                               param_padded_sizes)
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+            self.param_padded_sizes_per_group.append(param_padded_sizes)  # Store for later use
             self.groups_padding.append(current_layout.padding)
             self.partition_size.append(current_layout.partition_size)
             self.params_in_partition.append(current_layout.params_in_partition)

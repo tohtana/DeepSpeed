@@ -126,7 +126,6 @@ class RankShardLayout:
         first_spec = self.shard_specs[0] if self.shard_specs else None
         return first_spec.shard_range.start if first_spec else 0
 
-
     # ------------------------------------------------------------------
     # Internal – called by planner ------------------------------------
     def _finalise_offsets(self) -> None:
@@ -218,53 +217,57 @@ class PartitionPlanner:
         spec = self.get_shard_spec(param, rank)
         return spec.shard_range.length
 
-    def create_data_parallel_partitions(self, flat_tensor: torch.Tensor) -> List[torch.Tensor]:
-        """Create data parallel partitions from a flat tensor using planner layouts."""
+    def create_data_parallel_partitions(self,
+                                        flat_tensor: torch.Tensor,
+                                        param_padded_sizes: List[int] | None = None) -> List[torch.Tensor]:
+        """Create data parallel partitions from a flat tensor using planner layouts.
+
+        Args:
+            flat_tensor: The flattened tensor containing all parameters
+            param_padded_sizes: Required when native_reduce_scatter=True.
+                              List of padded sizes for each parameter.
+
+        Returns:
+            List of tensors, one per rank, containing their partition of the data
+        """
 
         if self.native_reduce_scatter:
-            # For native reduce-scatter: each rank gets concatenated shards from all parameters
+            # For native reduce-scatter: use views into pre-padded flat tensor
+            if param_padded_sizes is None:
+                raise ValueError("param_padded_sizes is required when native_reduce_scatter=True")
+
             partitions = []
-            
-            # Pre-compute parameter start offsets in the flat tensor
+
+            # Calculate start offsets for each padded parameter
             param_start_offsets = [0]
-            for p in self.params[:-1]:
-                param_start_offsets.append(param_start_offsets[-1] + p.numel())
-            
+            for padded_size in param_padded_sizes[:-1]:
+                param_start_offsets.append(param_start_offsets[-1] + padded_size)
+
             for rank in range(self.world_size):
                 layout = self.rank_layouts[rank]
                 if layout.partition_size == 0:
                     # Empty partition
                     partitions.append(torch.empty(0, dtype=flat_tensor.dtype, device=flat_tensor.device))
                     continue
-                
-                # Collect all shards for this rank and concatenate them
-                rank_shards = []
-                for spec in layout.shard_specs:
-                    if spec.shard_range.length > 0:
-                        # Find parameter index to get its offset in flat_tensor
-                        param_idx = next(i for i, p in enumerate(self.params) if p is spec.param)
-                        param_start_in_flat = param_start_offsets[param_idx]
-                        
-                        # Extract the shard from the flat tensor
-                        shard_start = param_start_in_flat + spec.shard_range.start
-                        shard_end = shard_start + spec.shard_range.length
-                        shard = flat_tensor[shard_start:shard_end].clone()
-                        rank_shards.append(shard)
-                
-                if rank_shards:
-                    # Concatenate all shards for this rank
-                    rank_partition = torch.cat(rank_shards)
-                    
-                    # Pad to partition_size if needed (for alignment requirements)
-                    if rank_partition.numel() < layout.partition_size:
-                        padding_size = layout.partition_size - rank_partition.numel()
-                        padding = torch.zeros(padding_size, dtype=flat_tensor.dtype, device=flat_tensor.device)
-                        rank_partition = torch.cat([rank_partition, padding])
-                    
+
+                # Since parameters are padded to equal shards, we can directly slice
+                rank_views = []
+                for param_idx, padded_size in enumerate(param_padded_sizes):
+                    shard_size = padded_size // self.world_size
+                    param_start = param_start_offsets[param_idx]
+
+                    # Get this rank's shard from the padded parameter (view, not copy)
+                    shard_start = param_start + rank * shard_size
+                    shard_end = shard_start + shard_size
+                    rank_views.append(flat_tensor[shard_start:shard_end])
+
+                if rank_views:
+                    # Concatenate views - efficient since we're just creating a view
+                    rank_partition = torch.cat(rank_views)
                     partitions.append(rank_partition)
                 else:
-                    # No shards for this rank, create empty partition
-                    partitions.append(torch.zeros(layout.partition_size, dtype=flat_tensor.dtype, device=flat_tensor.device))
+                    partitions.append(
+                        torch.zeros(layout.partition_size, dtype=flat_tensor.dtype, device=flat_tensor.device))
         else:
             # For contiguous plan (legacy-style): use contiguous slicing
             partitions = []
@@ -516,3 +519,87 @@ class PartitionHelper:
             param.grad_accum = None
         else:
             param.grad = None
+
+    def flatten_with_per_param_padding(self,
+                                       tensor_list: List[torch.Tensor],
+                                       world_size: int,
+                                       use_cpu_data: bool = False) -> tuple[torch.Tensor, List[int]]:
+        """Flatten tensors with padding after each parameter for native reduce-scatter.
+
+        Each parameter is padded to be divisible by world_size and optionally aligned.
+        This allows create_data_parallel_partitions to use views instead of copies.
+
+        Args:
+            tensor_list: List of tensors (or params with cpu_data attribute)
+            world_size: Number of ranks for partitioning
+            use_cpu_data: If True, use param.cpu_data instead of param directly
+
+        Returns:
+            Tuple of (flattened_tensor, param_padded_sizes) where param_padded_sizes
+            contains the padded size of each parameter
+        """
+        from torch._utils import _flatten_dense_tensors
+
+        # Extract actual tensors
+        tensors = [param.cpu_data for param in tensor_list] if use_cpu_data else tensor_list
+
+        padded_tensors = []
+        param_padded_sizes = []
+
+        for tensor in tensors:
+            n = tensor.numel()
+
+            # Pad to be divisible by world_size
+            padded_n = ((n + world_size - 1) // world_size) * world_size
+
+            # Further align if needed for NCCL requirements
+            if self.alignment_factor > 1:
+                shard_size = padded_n // world_size
+                aligned_shard_size = (
+                    (shard_size + self.alignment_factor - 1) // self.alignment_factor) * self.alignment_factor
+                padded_n = aligned_shard_size * world_size
+
+            param_padded_sizes.append(padded_n)
+
+            # Add padding if needed
+            if padded_n > n:
+                padding_size = padded_n - n
+                padding = torch.zeros(padding_size, dtype=tensor.dtype, device=tensor.device)
+                padded_tensor = torch.cat([tensor.view(-1), padding])
+                padded_tensors.append(padded_tensor)
+            else:
+                padded_tensors.append(tensor.view(-1))
+
+        # Flatten all padded tensors
+        flattened = _flatten_dense_tensors(padded_tensors)
+
+        return flattened, param_padded_sizes
+
+    def flatten_without_padding(self,
+                                tensor_list: List[torch.Tensor],
+                                alignment: int,
+                                use_cpu_data: bool = False) -> torch.Tensor:
+        """Legacy flatten function with single padding at the end.
+
+        This maintains backward compatibility with the original DeepSpeed behavior
+        where padding is only added at the end of all parameters.
+
+        Args:
+            tensor_list: List of tensors (or params with cpu_data attribute)
+            alignment: Alignment requirement for the total size
+            use_cpu_data: If True, use param.cpu_data instead of param directly
+
+        Returns:
+            Flattened tensor with padding at the end if needed
+        """
+        from torch._utils import _flatten_dense_tensors
+        from deepspeed.runtime.utils import align_dense_tensors
+
+        # Extract actual tensors
+        tensors = [param.cpu_data for param in tensor_list] if use_cpu_data else tensor_list
+
+        # Align and flatten (adds padding at the end if needed)
+        aligned_tensors = align_dense_tensors(tensors, alignment)
+        flattened = _flatten_dense_tensors(aligned_tensors)
+
+        return flattened
