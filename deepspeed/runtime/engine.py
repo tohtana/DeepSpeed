@@ -123,8 +123,7 @@ from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, 
 from deepspeed.compile.init_z1 import init_z1
 from deepspeed.compile.init_z3 import init_z3
 
-from deepspeed.runtime.universal_optimizer.universal_optimizer import UniversalOptimizer, configure_universal_optimizer
-from deepspeed.runtime.universal_optimizer.config import UniversalOptimizerConfig
+from deepspeed.runtime.universal_optimizer.universal_optimizer import configure_universal_optimizer
 
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 

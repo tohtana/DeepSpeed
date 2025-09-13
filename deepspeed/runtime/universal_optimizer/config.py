@@ -1,13 +1,12 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
 
-from enum import Enum
-from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 import torch
-from pydantic import Field
 from typing import Optional
+
+from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
 
 class UniversalOptimizerConfig(DeepSpeedConfigModel):
@@ -24,7 +23,7 @@ class UniversalOptimizerConfig(DeepSpeedConfigModel):
 
     reduce_dtype: Optional[torch.dtype] = None
     """ Desired reduce_scatter data type, will convert communication to this type.
-    """ 
+    """
     grad_accum_dtype: Optional[torch.dtype] = None
     """ Desired gradient accumulation data type, will convert gradient accumulation to this type.
     """
