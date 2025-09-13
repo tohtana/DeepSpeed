@@ -123,6 +123,9 @@ from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, 
 from deepspeed.compile.init_z1 import init_z1
 from deepspeed.compile.init_z3 import init_z3
 
+from deepspeed.runtime.universal_optimizer.universal_optimizer import UniversalOptimizer, configure_universal_optimizer
+from deepspeed.runtime.universal_optimizer.config import UniversalOptimizerConfig
+
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 
 DeepSpeedOptimizerCallable = \
@@ -346,6 +349,9 @@ class DeepSpeedEngine(Module):
             self._configure_optimizer(optimizer, model_parameters)
             self._configure_lr_scheduler()
             self._report_progress(0)
+        elif self.use_universal_optimizer():
+            assert optimizer is not None, "Universal optimizer requires a base optimizer to be passed. 'optimizer' in DeepSpeed config is ignored."
+            self.optimizer = configure_universal_optimizer(optimizer, self._config.universal_optimizer_config)
         elif self.zero_optimization():
             # no optim selected but zero is enabled
             self.optimizer = self._configure_zero_optimizer(optimizer=None)
@@ -4089,6 +4095,9 @@ class DeepSpeedEngine(Module):
     @property
     def is_compiled(self) -> bool:
         return self._is_compiled
+
+    def use_universal_optimizer(self):
+        return self._config.univesal_optimizer_config.enabled
 
     def offload_states(self,
                        include: Container[OffloadStateTypeEnum] = None,

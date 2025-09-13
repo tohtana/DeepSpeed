@@ -62,6 +62,8 @@ from .tensor_parallel import get_tensor_parallel_config
 from .data_pipeline.config import get_data_efficiency_enabled, get_data_efficiency_config, get_curriculum_enabled_legacy, get_curriculum_params_legacy
 from .data_pipeline.constants import *
 
+from .universal_optimizer.config import get_universal_optimizer_config
+
 from ..utils.config import get_timers_config
 
 TENSOR_CORE_ALIGN_SIZE = 8
@@ -868,6 +870,7 @@ class DeepSpeedConfig(object):
 
         self.timers_config = get_timers_config(param_dict)
         self.tensor_parallel_config = get_tensor_parallel_config(param_dict)
+        self.univesal_optimizer_config = get_universal_optimizer_config(param_dict)
 
     def _batch_assertion(self):
 
