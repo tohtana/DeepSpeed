@@ -241,6 +241,8 @@ class UniversalOptimizer:
         self.grad_accum_dtype: torch.dtype = config.grad_accum_dtype
         self.optimizer_dtype: torch.dtype = config.optimizer_dtype
 
+        self.is_gradient_accumulation_boundary: bool = True
+
         self.reduce_op = dist.ReduceOp.AVG
 
         self.world_size = dist.get_world_size()
@@ -281,6 +283,9 @@ class UniversalOptimizer:
         self.rs_copy_done_events = defaultdict(get_accelerator().Event)
 
     def gradient_hook(self, param):
+        if not self.is_gradient_accumulation_boundary:
+            return
+
         assert param.dtype in self.comm_buffers, f"Param dtype {param.dtype} not in comm buffers {list(self.comm_buffers.keys())}"
         comm_buffer = self.comm_buffers[param.dtype]
 
@@ -332,7 +337,6 @@ class UniversalOptimizer:
 
             for t in self.reduce_tasks[dtype]:
                 grad_buf = t.param.grad.view(-1)
-
                 if grad_buf.numel() == 0:
                     continue
 

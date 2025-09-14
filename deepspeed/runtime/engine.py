@@ -2214,6 +2214,11 @@ class DeepSpeedEngine(Module):
 
         # Pass (PP) gas boundary flag to optimizer (required for zero)
         self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
+
+        # Universal Optimizer handles its own gradient reduction but needs to know if it's at a gradient accumulation boundary
+        if self.use_universal_optimizer():
+            return
+
         # ZeRO stage >= 2 communicates during non gradient accumulation boundaries as well
         if self.zero_optimization_partition_gradients():
             self.optimizer.overlapping_partition_gradients_reduce_epilogue()
@@ -2235,8 +2240,10 @@ class DeepSpeedEngine(Module):
             scale_wrt_gas = self.scale_wrt_gas
 
         # scale loss w.r.t. gradient accumulation if reduction is not disabled
-        do_gradient_reduction = self.enable_backward_allreduce and not self.inside_no_sync_ctxt and not self.is_deepcompile_enabled(
-        )
+        do_gradient_reduction = self.enable_backward_allreduce \
+            and not self.inside_no_sync_ctxt \
+            and not self.is_deepcompile_enabled() \
+            and not self.use_universal_optimizer()
         if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
             loss = self._scale_loss_by_gas(loss.float())
 
@@ -2255,6 +2262,9 @@ class DeepSpeedEngine(Module):
 
         if self.is_deepcompile_enabled():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
+
+        if self.use_universal_optimizer():
+            self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
 
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
