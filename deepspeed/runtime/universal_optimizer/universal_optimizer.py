@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import copy
 from collections import defaultdict
 from typing import List, Dict, Optional, Tuple, Set, Any
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ def param_group_dtype(param_group: Dict[str, Any]) -> torch.dtype:
 class ParamUpdateBuffers:
     param_buffer: torch.Tensor
     offset_and_sizes: List[Tuple[int, int]]
+    grad_acc_buffer: torch.Tensor
     grad_for_optimizer: torch.Tensor
     param_for_optimizer: torch.Tensor
 
@@ -178,10 +180,35 @@ class ParamUpdateGroupContainer:
         self.optimizer_dtype = optimizer_dtype
 
         # Initialize buffers for param update for each param group
+        self.param_update_buffers = []
+        self.sharded_param_groups = []
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            param_group['param_update_buffers'] = self._init_param_update_buffers(param_group)
+            sharded_contiguous_buffer = self._init_param_update_buffers(param_group)
+            self.param_update_buffers.append(sharded_contiguous_buffer)
+
+            sharded_param_group = copy.copy(param_group)
+            contiguous_param = sharded_contiguous_buffer.param_for_optimizer
+            contiguous_param.grad = sharded_contiguous_buffer.grad_for_optimizer
+            sharded_param_group['params'] = [contiguous_param]
+            self.sharded_param_groups.append(sharded_param_group)
+
+        self.param_buffer_map: Dict[torch.Tensor, ParamUpdateBuffers] = {}
+        for param_group, pg_buffers in zip(optimizer.param_groups, self.param_update_buffers):
+            for param, offset_and_size_in_contiguous_buffer in zip(param_group['params'], pg_buffers.offset_and_sizes):
+                offset = offset_and_size_in_contiguous_buffer[0]
+                size = offset_and_size_in_contiguous_buffer[1]
+                param_buffer = pg_buffers.param_buffer[offset:offset + size]
+                offset_and_size = (0, size)
+                grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + size]
+                grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + size]
+                param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + size]
+                self.param_buffer_map[param] = ParamUpdateBuffers(param_buffer=param_buffer,
+                                                                  offset_and_sizes=offset_and_size,
+                                                                  grad_acc_buffer=grad_acc_buffer,
+                                                                  grad_for_optimizer=grad_for_optimizer,
+                                                                  param_for_optimizer=param_for_optimizer)
 
     def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> None:
 
@@ -218,9 +245,11 @@ class ParamUpdateGroupContainer:
                                                per_rank_padded_elems]
         else:
             param_for_optimizer = torch.empty(per_rank_padded_elems, dtype=self.optimizer_dtype, device=self.device)
+            param_for_optimizer.copy_(param_buffer)
 
         return ParamUpdateBuffers(param_buffer=param_buffer,
                                   offset_and_sizes=param_offset_and_sizes,
+                                  grad_acc_buffer=grad_acc_buffer,
                                   grad_for_optimizer=grad_for_optimizer,
                                   param_for_optimizer=param_for_optimizer)
 
@@ -270,6 +299,8 @@ class UniversalOptimizer:
             grad_accum_dtype=self.grad_accum_dtype,
             optimizer_dtype=self.optimizer_dtype,
         )
+        self.param_buffer_map = self.param_update_group_container.param_buffer_map
+        self.sharded_param_groups = self.param_update_group_container.sharded_param_groups
 
         self._create_gradient_handling_hooks()
 
@@ -336,7 +367,7 @@ class UniversalOptimizer:
             cm.wait()
 
             for t in self.reduce_tasks[dtype]:
-                grad_buf = t.param.grad.view(-1)
+                grad_buf = self.param_buffer_map[t.param].grad_for_optimizer
                 if grad_buf.numel() == 0:
                     continue
 
@@ -359,7 +390,10 @@ class UniversalOptimizer:
         self._backward_epilogue()
 
     def step(self, *args, **kwargs):
+        original_param_groups = self.base_optimizer.param_groups
+        self.base_optimizer.param_groups = self.sharded_param_groups
         self.base_optimizer.step(*args, **kwargs)
+        self.base_optimizer.param_groups = original_param_groups
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
