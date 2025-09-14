@@ -344,13 +344,14 @@ class DeepSpeedEngine(Module):
 
         self._configure_zenflow()
 
+        if self.use_universal_optimizer():
+            assert optimizer is not None, "Universal optimizer requires a base optimizer to be passed. 'optimizer' in DeepSpeed config is ignored."
+            self.optimizer = configure_universal_optimizer(optimizer, self._config.universal_optimizer_config,
+                                                           self.zero_reduce_bucket_size())
         if has_optimizer:
             self._configure_optimizer(optimizer, model_parameters)
             self._configure_lr_scheduler()
             self._report_progress(0)
-        elif self.use_universal_optimizer():
-            assert optimizer is not None, "Universal optimizer requires a base optimizer to be passed. 'optimizer' in DeepSpeed config is ignored."
-            self.optimizer = configure_universal_optimizer(optimizer, self._config.universal_optimizer_config)
         elif self.zero_optimization():
             # no optim selected but zero is enabled
             self.optimizer = self._configure_zero_optimizer(optimizer=None)

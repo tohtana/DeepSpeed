@@ -127,6 +127,10 @@ class CommDoubleBuffer:
             get_accelerator().Event(enable_timing=False, blocking=False)
         ]
         self.current_buffer_idx = 0
+        self.size = buffer_size
+
+    def get_size(self) -> int:
+        return self.size
 
     def get_buffer(self) -> torch.Tensor:
         return self.buckets[self.current_buffer_idx]
@@ -237,6 +241,9 @@ class UniversalOptimizer:
 
         self.reduce_op = dist.ReduceOp.AVG
 
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
         # Force model dtype if necessary
         if self.force_model_dtype is not None:
             for group in self.base_optimizer.param_groups:
@@ -251,9 +258,14 @@ class UniversalOptimizer:
         # Use communication buffer per dtype
         self.comm_buffers: Dict[torch.dtype, CommDoubleBuffer] = self._create_comm_buffers(reduce_bucket_size)
 
-        self.param_update_group_container = ParamUpdateGroupContainer(optimizer=self.base_optimizer,
-                                                                      grad_accum_dtype=self.grad_accum_dtype,
-                                                                      optimizer_dtype=self.optimizer_dtype)
+        self.param_update_group_container = ParamUpdateGroupContainer(
+            optimizer=self.base_optimizer,
+            device=self.device,
+            world_size=self.world_size,
+            rank=self.rank,
+            grad_accum_dtype=self.grad_accum_dtype,
+            optimizer_dtype=self.optimizer_dtype,
+        )
 
         self._create_gradient_handling_hooks()
 
@@ -289,8 +301,8 @@ class UniversalOptimizer:
 
         self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer))
 
-        rs_comp_done_event = self.rs_comp_done_events[param].record(self.comp_stream)
-        rs_comp_done_event.wait(self.copy_stream)
+        self.rs_comp_done_events[param].record(self.comp_stream)
+        self.rs_comp_done_events[param].wait(self.copy_stream)
         with get_accelerator().stream(self.copy_stream):
             reduce_in_buffer.copy_(copy_src, non_blocking=True)
             self.rs_copy_done_events[param].record(self.copy_stream)
@@ -344,8 +356,8 @@ class UniversalOptimizer:
         self.backward_epilogue()
 
     def _create_gradient_handling_hooks(self):
-        for i, param_group in enumerate(self.base_optimizer.param_groups):
-            for param in param_group:
+        for param_group in self.base_optimizer.param_groups:
+            for param in param_group['params']:
                 if param.requires_grad:
                     return param.register_post_accumulate_grad_hook(self.gradient_hook)
 
@@ -359,9 +371,7 @@ class UniversalOptimizer:
         # Use communication buffer per dtype
         comm_buffers: Dict[torch.dtype, CommDoubleBuffer] = {}
         for dtype in dtypes:
-            self.comm_buffers[dtype] = CommDoubleBuffer(dtype=dtype,
-                                                        buffer_size=reduce_bucket_size,
-                                                        device=self.device)
+            comm_buffers[dtype] = CommDoubleBuffer(dtype=dtype, buffer_size=reduce_bucket_size, device=self.device)
         return comm_buffers
 
     def _block_copy_events(self, dtype: torch.dtype):
@@ -380,5 +390,6 @@ class UniversalOptimizer:
             t.grad.div_(self.world_size)
 
 
-def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig):
-    return UniversalOptimizer(optimizer, config)
+def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
+                                  reduce_bucket_size: int):
+    return UniversalOptimizer(optimizer, config, reduce_bucket_size)
