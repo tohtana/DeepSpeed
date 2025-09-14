@@ -870,7 +870,7 @@ class DeepSpeedConfig(object):
 
         self.timers_config = get_timers_config(param_dict)
         self.tensor_parallel_config = get_tensor_parallel_config(param_dict)
-        self.univesal_optimizer_config = get_universal_optimizer_config(param_dict)
+        self.universal_optimizer_config = get_universal_optimizer_config(param_dict)
 
     def _batch_assertion(self):
 

@@ -4096,7 +4096,7 @@ class DeepSpeedEngine(Module):
         return self._is_compiled
 
     def use_universal_optimizer(self):
-        return self._config.univesal_optimizer_config.enabled
+        return self._config.universal_optimizer_config.enabled
 
     def offload_states(self,
                        include: Container[OffloadStateTypeEnum] = None,
