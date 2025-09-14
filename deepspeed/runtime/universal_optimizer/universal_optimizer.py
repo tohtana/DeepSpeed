@@ -199,7 +199,7 @@ class ParamUpdateGroupContainer:
         param_buffer = torch.empty(total_padded_elems, dtype=param_group_dtype(param_group), device=self.device)
         # remap parameters to the param_buffer
         for p, (offset, size) in zip(param_group['params'], param_offset_and_sizes):
-            p.data = param_buffer[offset:offset + size].view_as(p.data)
+            p.data = param_buffer[offset:offset + size].view_as(p.data).copy_(p.data)
 
         grad_acc_buffer = torch.empty(
             per_rank_padded_elems,
