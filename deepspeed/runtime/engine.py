@@ -344,10 +344,6 @@ class DeepSpeedEngine(Module):
 
         self._configure_zenflow()
 
-        if self.use_universal_optimizer():
-            assert optimizer is not None, "Universal optimizer requires a base optimizer to be passed. 'optimizer' in DeepSpeed config is ignored."
-            self.optimizer = configure_universal_optimizer(optimizer, self._config.universal_optimizer_config,
-                                                           self.zero_reduce_bucket_size())
         if has_optimizer:
             self._configure_optimizer(optimizer, model_parameters)
             self._configure_lr_scheduler()
@@ -1458,7 +1454,13 @@ class DeepSpeedEngine(Module):
 
         optimizer_wrapper = self._do_optimizer_sanity_check(basic_optimizer)
 
-        if optimizer_wrapper == ZERO_OPTIMIZATION:
+        if self.use_universal_optimizer():
+            print(
+                f"configure_universal_optimizer start basic_optimizer: {basic_optimizer.__class__} client_optimizer: {client_optimizer}"
+            )
+            self.optimizer = configure_universal_optimizer(basic_optimizer, self._config.universal_optimizer_config,
+                                                           self.zero_reduce_bucket_size())
+        elif optimizer_wrapper == ZERO_OPTIMIZATION:
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
         elif optimizer_wrapper == AMP:
             amp_params = self.amp_params()
@@ -2270,7 +2272,9 @@ class DeepSpeedEngine(Module):
 
     def _do_optimizer_backward(self, loss, retain_graph):
         self._start_timers(self.engine_timers.backward_inner_timers)
-        if self.zero_optimization():
+        if self.use_universal_optimizer():
+            self.optimizer.backward(loss, retain_graph=retain_graph)
+        elif self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
             self.optimizer.backward(loss, retain_graph=retain_graph)
         elif self.amp_enabled():

@@ -148,8 +148,10 @@ class CommDoubleBuffer:
         self.swap()
         raise NotImplementedError("flush is not implemented yet.")
 
-    def swap(self) -> None:
-        raise NotImplementedError("swap is not implemented yet.")
+    def swap(self, copy_stream) -> None:
+        self.events[self.current_buffer_idx].record(copy_stream)
+        self.buckets[self.current_buffer_idx].reset()
+        self.current_buffer_idx = 1 - self.current_buffer_idx
 
 
 @dataclass
@@ -228,7 +230,7 @@ class UniversalOptimizer:
     def __init__(self, optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
                  reduce_bucket_size: int) -> None:
 
-        # for `register_post_accumulate_grad_hook`
+        # for `register_post_accumulate_grad_hook` and `_coalescing_manager`
         assert required_torch_version(min_version=2.1), "UniversalOptimizer requires PyTorch 2.1 or higher."
 
         self.base_optimizer: torch.optim.Optimizer = optimizer
@@ -283,8 +285,7 @@ class UniversalOptimizer:
         comm_buffer = self.comm_buffers[param.dtype]
 
         if comm_buffer.should_flush(param.numel()):
-            # should swap inside
-            comm_buffer.flush(param.dtype)
+            self.flush_reduce_bucket(param.dtype)
 
         if param.numel() > comm_buffer.get_size():
             # extend buckets
@@ -307,17 +308,17 @@ class UniversalOptimizer:
             reduce_in_buffer.copy_(copy_src, non_blocking=True)
             self.rs_copy_done_events[param].record(self.copy_stream)
 
-    def gradient_hook_epilogue(self):
-        for comm_buffer in self.comm_buffers.values():
-            comm_buffer.flush()
-
     def flush_reduce_bucket(self, dtype: torch.dtype):
         if dtype not in self.reduce_tasks:
             return
 
         self._block_copy_events(dtype)
 
-        with get_coalescing_manager(async_ops=True) as cm:
+        with get_coalescing_manager(
+                group=None,
+                device=self.device,
+                async_op=True,
+        ) as cm:
             for send_buf in [t.send_buf for t in self.reduce_tasks[dtype]]:
                 dist.all_reduce(
                     send_buf,
@@ -330,8 +331,7 @@ class UniversalOptimizer:
             cm.wait()
 
             for t in self.reduce_tasks[dtype]:
-                param = t.grad  # get param from grad tensor
-                grad_buf = param.grad.view(-1)
+                grad_buf = t.param.grad.view(-1)
 
                 if grad_buf.numel() == 0:
                     continue
@@ -340,20 +340,25 @@ class UniversalOptimizer:
                 recv_buf = t.send_buf.view(-1)[offset:offset + grad_buf.numel()]
                 grad_buf.copy_(recv_buf, non_blocking=True)
 
-        self.rs_copy_done_events[param].record(self.copy_stream)
-
         for t in self.reduce_tasks[dtype]:
-            self.rs_copy_done_events[t.param].record(self.comp_stream)
+            self.rs_copy_done_events[t.param].record(self.copy_stream)
         self.reduce_tasks[dtype].clear()
 
-    def backward_epilogue(self):
-        # flash all
-        for comm_buffer in self.comm_buffers.values():
-            comm_buffer.flush()
+        self.comm_buffers[dtype].swap(self.copy_stream)
+
+    def _backward_epilogue(self):
+        for dtype in self.comm_buffers.keys():
+            self.flush_reduce_bucket(dtype)
 
     def backward(self, loss, retain_graph=False) -> None:
         loss.backward(retain_graph=retain_graph)
-        self.backward_epilogue()
+        self._backward_epilogue()
+
+    def step(self, *args, **kwargs):
+        self.base_optimizer.step(*args, **kwargs)
+
+    def zero_grad(self, *args, **kwargs):
+        self.base_optimizer.zero_grad(*args, **kwargs)
 
     def _create_gradient_handling_hooks(self):
         for param_group in self.base_optimizer.param_groups:
@@ -388,6 +393,40 @@ class UniversalOptimizer:
 
         for t in self.reduce_tasks[dtype]:
             t.grad.div_(self.world_size)
+
+    #############################################################################################
+    # DeepSpeed engine accesses these properties
+    @property
+    def state(self):
+        return self.base_optimizer.state
+
+    @state.setter
+    def state(self, value):
+        self.base_optimizer.state = value
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+    @param_groups.setter
+    def param_groups(self, value):
+        self.base_optimizer.param_groups = value
+
+    @property
+    def loss_scale(self):
+        return self.base_optimizer.loss_scale
+
+    @loss_scale.setter
+    def loss_scale(self, value):
+        self.base_optimizer.loss_scale = value
+
+    @property
+    def cur_scale(self):
+        return self.base_optimizer.cur_scale
+
+    @cur_scale.setter
+    def cur_scale(self, value):
+        self.base_optimizer.cur_scale = value
 
 
 def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,

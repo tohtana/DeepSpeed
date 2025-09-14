@@ -46,7 +46,7 @@ def has_all_reduce_coalesced():
     return hasattr(torch.distributed, "all_reduce_coalesced") and required_torch_version(min_version=1.13)
 
 
-def get_coalescing_manager(group, device, reqs, async_op):
+def get_coalescing_manager(group, device, reqs=None, async_op=False):
     if required_torch_version(min_version=2.0, max_version=2.0):
         return torch.distributed.distributed_c10d._coalescing_manager(group, device=device, reqs=reqs)
     elif required_torch_version(min_version=2.1):
