@@ -20,7 +20,7 @@ from deepspeed.accelerator import get_accelerator
 from .config import UniversalOptimizerConfig
 
 # https://github.com/NVIDIA/nccl/issues/413#issuecomment-720634194
-COMM_PAD_BYTE_SIZE = 128
+COMM_PAD_BYTE_SIZE = 64
 
 
 def log_rank0(message, log_level=logging.INFO):
@@ -331,7 +331,7 @@ class UniversalOptimizer:
         self.sharded_param_groups = self.param_update_group_container.sharded_param_groups
         self.param_update_buffers = self.param_update_group_container.param_update_buffers
 
-        self._create_gradient_handling_hooks()
+        self.gradient_hook_handles = self._create_gradient_handling_hooks()
 
         self.reduce_tasks: Dict[torch.dtype, List[ReduceTask]] = defaultdict(list)
 
@@ -429,11 +429,19 @@ class UniversalOptimizer:
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
 
+    def clear_gradient_hooks(self):
+        for handle in self.gradient_hook_handles:
+            handle.remove()
+
     def _create_gradient_handling_hooks(self):
+        hook_handles = []
+
         for param_group in self.base_optimizer.param_groups:
             for param in param_group['params']:
                 if param.requires_grad:
-                    return param.register_post_accumulate_grad_hook(self.gradient_hook)
+                    hook_handles.append(param.register_post_accumulate_grad_hook(self.gradient_hook))
+
+        return hook_handles
 
     def _create_comm_buffers(self, reduce_bucket_size: int) -> Dict[torch.dtype, CommDoubleBuffer]:
         dtypes: Set[torch.dtype] = set()
