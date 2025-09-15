@@ -1455,9 +1455,6 @@ class DeepSpeedEngine(Module):
         optimizer_wrapper = self._do_optimizer_sanity_check(basic_optimizer)
 
         if self.use_universal_optimizer():
-            print(
-                f"configure_universal_optimizer start basic_optimizer: {basic_optimizer.__class__} client_optimizer: {client_optimizer}"
-            )
             self.optimizer = configure_universal_optimizer(basic_optimizer, self._config.universal_optimizer_config,
                                                            self.zero_reduce_bucket_size())
         elif optimizer_wrapper == ZERO_OPTIMIZATION:

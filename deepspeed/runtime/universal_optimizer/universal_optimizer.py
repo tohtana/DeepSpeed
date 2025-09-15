@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import copy
+import logging
 from collections import defaultdict
 from typing import List, Dict, Optional, Tuple, Set, Any
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 import torch
 
 import deepspeed.comm as dist
+from deepspeed.utils import logger
 from deepspeed.comm.torch import get_coalescing_manager
 from deepspeed.utils.torch import required_torch_version
 from deepspeed.accelerator import get_accelerator
@@ -19,6 +21,28 @@ from .config import UniversalOptimizerConfig
 
 # https://github.com/NVIDIA/nccl/issues/413#issuecomment-720634194
 COMM_PAD_BYTE_SIZE = 128
+
+
+def log_rank0(message, log_level=logging.INFO):
+    if not dist.is_initialized():
+        raise RuntimeError("Distributed is not initialized")
+    if dist.get_rank() == 0:
+        logger.log(log_level, f"[r{dist.get_rank()}] {message}")
+
+
+def log_all_ranks_sorted(message, log_level=logging.INFO):
+    if not dist.is_initialized():
+        raise RuntimeError("Distributed is not initialized")
+    for rank in range(dist.get_world_size()):
+        if rank == dist.get_rank():
+            logger.log(log_level, f"[r{rank}] {message}")
+        dist.barrier()
+
+
+def tensor_to_short_string(t, num_elements=10):
+    list_val = t.flatten().tolist()[:num_elements]
+    list_val_str = [f"{x:.4f}" for x in list_val]
+    return f"[{', '.join(list_val_str)}]"
 
 
 def ceil_to_multiple(x: int, multiple: int) -> int:
@@ -160,7 +184,9 @@ class CommDoubleBuffer:
 class ReduceTask:
     param: torch.Tensor
     grad: torch.Tensor
-    send_buf: torch.Tensor
+    send_buf: torch.Tensor  # comm buffer, different from `grad`
+    recv_buf: torch.Tensor
+    opt_grad: torch.Tensor  # optimizer grad, may be different from `recv_buf`
 
 
 class ParamUpdateGroupContainer:
@@ -222,6 +248,8 @@ class ParamUpdateGroupContainer:
         param_offset_and_sizes: List[Tuple[int, int]] = []
         offset = 0
         for p in param_group['params']:
+            # Only Z1/Z2: broadcast param to all ranks
+            dist.broadcast(p.data, src=0)
             param_offset_and_sizes.append((offset, p.numel()))
             offset += p.numel()
 
@@ -301,6 +329,7 @@ class UniversalOptimizer:
         )
         self.param_buffer_map = self.param_update_group_container.param_buffer_map
         self.sharded_param_groups = self.param_update_group_container.sharded_param_groups
+        self.param_update_buffers = self.param_update_group_container.param_update_buffers
 
         self._create_gradient_handling_hooks()
 
@@ -336,7 +365,8 @@ class UniversalOptimizer:
 
         copy_src = param.grad.contiguous().view(-1).detach()
 
-        self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer))
+        recv_buf = self.param_buffer_map[param].grad_for_optimizer
+        self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, recv_buf))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
@@ -355,9 +385,10 @@ class UniversalOptimizer:
                 device=self.device,
                 async_op=True,
         ) as cm:
-            for send_buf in [t.send_buf for t in self.reduce_tasks[dtype]]:
-                dist.all_reduce(
-                    send_buf,
+            for t in self.reduce_tasks[dtype]:
+                dist.reduce_scatter_tensor(
+                    t.recv_buf,
+                    t.send_buf,
                     op=self.reduce_op,
                     group=None,
                     async_op=True,
@@ -367,13 +398,8 @@ class UniversalOptimizer:
             cm.wait()
 
             for t in self.reduce_tasks[dtype]:
-                grad_buf = self.param_buffer_map[t.param].grad_for_optimizer
-                if grad_buf.numel() == 0:
-                    continue
-
-                offset = 0  # get offset from param if necessary
-                recv_buf = t.send_buf.view(-1)[offset:offset + grad_buf.numel()]
-                grad_buf.copy_(recv_buf, non_blocking=True)
+                if t.recv_buf is not t.opt_grad and t.opt_grad.numel() > 0:
+                    t.opt_grad.copy_(t.recv_buf, non_blocking=True)
 
         for t in self.reduce_tasks[dtype]:
             self.rs_copy_done_events[t.param].record(self.copy_stream)
@@ -390,10 +416,15 @@ class UniversalOptimizer:
         self._backward_epilogue()
 
     def step(self, *args, **kwargs):
+        self.copy_stream.synchronize()
+
         original_param_groups = self.base_optimizer.param_groups
         self.base_optimizer.param_groups = self.sharded_param_groups
         self.base_optimizer.step(*args, **kwargs)
         self.base_optimizer.param_groups = original_param_groups
+
+        for buffers in self.param_update_buffers:
+            dist.all_gather_into_tensor(buffers.param_buffer, buffers.param_for_optimizer)
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
