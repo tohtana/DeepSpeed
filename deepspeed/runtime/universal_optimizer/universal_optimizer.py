@@ -6,7 +6,7 @@
 import copy
 import logging
 from collections import defaultdict
-from typing import List, Dict, Optional, Tuple, Set, Any
+from typing import List, Dict, Optional, Set, Any
 from dataclasses import dataclass
 
 import torch
@@ -20,7 +20,7 @@ from deepspeed.accelerator import get_accelerator
 from .config import UniversalOptimizerConfig
 
 # https://github.com/NVIDIA/nccl/issues/413#issuecomment-720634194
-COMM_PAD_BYTE_SIZE = 64
+COMM_PAD_BYTE_SIZE = 32
 
 
 def log_rank0(message, log_level=logging.INFO):
@@ -45,8 +45,17 @@ def tensor_to_short_string(t, num_elements=10):
     return f"[{', '.join(list_val_str)}]"
 
 
-def ceil_to_multiple(x: int, multiple: int) -> int:
-    return ((x + multiple - 1) // multiple) * multiple
+def ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def ceil_to_multiple(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
+
+
+def aligned_per_shard_size(data_size: int, world_size: int, pad_size: int) -> int:
+    per_shard_max = ceil_div(data_size, world_size)
+    return ceil_to_multiple(per_shard_max, pad_size)
 
 
 def ensure_same_dtype_in_param_group(param_group: Dict[str, Any]) -> None:
@@ -93,12 +102,38 @@ def param_group_dtype(param_group: Dict[str, Any]) -> torch.dtype:
 
 
 @dataclass
-class ParamUpdateBuffers:
-    param_buffer: torch.Tensor
-    offset_and_sizes: List[Tuple[int, int]]
-    grad_acc_buffer: torch.Tensor
-    grad_for_optimizer: torch.Tensor
-    param_for_optimizer: torch.Tensor
+class BufferRange:
+    offset: int
+    size: int
+    padded_size: int
+
+
+@dataclass
+class ParamGroupDtypes:
+    param_dtype: torch.dtype
+    grad_accum_dtype: torch.dtype
+    optimizer_dtype: torch.dtype
+
+
+@dataclass
+class ParamUpdateFlatBuffers:
+    param_buffer: torch.Tensor  # unsharded
+    # Mapping from a parameter to its buffer range in the global unsharded flattened buffer
+    param_range_map_global: Dict[torch.Tensor, BufferRange]
+    # Mapping from a paramteer to its buffer range in the local sharded flattened buffer
+    param_range_map_local: Dict[torch.Tensor, BufferRange]
+    grad_acc_buffer: torch.Tensor  # sharded
+    grad_for_optimizer: torch.Tensor  # sharded
+    param_for_optimizer: torch.Tensor  # sharded
+
+
+@dataclass
+class ParamUpdateShardBuffers:
+    size: int
+    padded_size: int
+    grad_acc_buffer: torch.Tensor  # sharded
+    grad_for_optimizer: torch.Tensor  # sharded
+    param_for_optimizer: torch.Tensor  # sharded
 
 
 class ReduceBucket:
@@ -197,89 +232,147 @@ class ParamUpdateGroupContainer:
                  grad_accum_dtype: Optional[torch.dtype], optimizer_dtype: Optional[torch.dtype]) -> None:
 
         self.optimizer = optimizer
-
+        self.device = device
         self.world_size = world_size
         self.rank = rank
-
-        self.device = device
         self.grad_accum_dtype = grad_accum_dtype
         self.optimizer_dtype = optimizer_dtype
 
         # Initialize buffers for param update for each param group
-        self.param_update_buffers = []
-        self.sharded_param_groups = []
+        self.param_update_buffers: List[ParamUpdateFlatBuffers] = []
+        self.sharded_param_groups: List[Dict[str, Any]] = []
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
+
+            # Create contiguous buffers for the param group
             sharded_contiguous_buffer = self._init_param_update_buffers(param_group)
             self.param_update_buffers.append(sharded_contiguous_buffer)
 
+            # Create a param group containing the contiguous buffers.
+            # Used for the optimizer.
             sharded_param_group = copy.copy(param_group)
             contiguous_param = sharded_contiguous_buffer.param_for_optimizer
             contiguous_param.grad = sharded_contiguous_buffer.grad_for_optimizer
             sharded_param_group['params'] = [contiguous_param]
             self.sharded_param_groups.append(sharded_param_group)
 
-        self.param_buffer_map: Dict[torch.Tensor, ParamUpdateBuffers] = {}
-        for param_group, pg_buffers in zip(optimizer.param_groups, self.param_update_buffers):
-            for param, offset_and_size_in_contiguous_buffer in zip(param_group['params'], pg_buffers.offset_and_sizes):
-                offset = offset_and_size_in_contiguous_buffer[0]
-                size = offset_and_size_in_contiguous_buffer[1]
-                param_buffer = pg_buffers.param_buffer[offset:offset + size]
-                offset_and_size = (0, size)
+        # Create a map from param to its buffer in the contiguous buffer
+        self.param_buffer_map: Dict[torch.Tensor, ParamUpdateShardBuffers] = {}
+        for pg_buffers in self.param_update_buffers:
+            for param, local_map in pg_buffers.param_range_map_local.items():
+                offset, size, padded_size = local_map.offset, local_map.size, local_map.padded_size
                 grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + size]
                 grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + size]
                 param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + size]
-                self.param_buffer_map[param] = ParamUpdateBuffers(param_buffer=param_buffer,
-                                                                  offset_and_sizes=offset_and_size,
-                                                                  grad_acc_buffer=grad_acc_buffer,
-                                                                  grad_for_optimizer=grad_for_optimizer,
-                                                                  param_for_optimizer=param_for_optimizer)
+                self.param_buffer_map[param] = ParamUpdateShardBuffers(size=size,
+                                                                       padded_size=padded_size,
+                                                                       grad_acc_buffer=grad_acc_buffer,
+                                                                       grad_for_optimizer=grad_for_optimizer,
+                                                                       param_for_optimizer=param_for_optimizer)
 
-    def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> None:
+    def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> ParamUpdateFlatBuffers:
+        param_group_dtypes = self._param_group_dtypes(param_group)
 
-        total_numel = sum(p.numel() for p in param_group['params'])
+        # First we create a flattened buffer for all parameters in the param group
+        param_range_map_global: Dict[torch.Tensor, BufferRange] = {}
+        padded_total_numel = 0
+        # Create a range map for the flattened buffer.
+        # Try to align shards to both the comm pad size and the world size.
+        for p in param_group['params']:
+            padded_numel = aligned_per_shard_size(p.numel(), self.world_size, COMM_PAD_BYTE_SIZE)
+            param_range_map_global[p] = BufferRange(offset=padded_total_numel,
+                                                    size=p.numel(),
+                                                    padded_size=padded_numel)
+            padded_total_numel += padded_numel
+            log_all_ranks_sorted(f"padded_numel: {padded_numel} total_numel: {padded_total_numel}")
 
-        # Make sure shards are aligned to the pad size
-        per_rank_padded_elems, total_padded_elems = sharded_counts_and_totals(total_numel,
-                                                                              param_group_dtype(param_group),
-                                                                              self.world_size)
+        log_all_ranks_sorted(f"param_range_map_global: {param_range_map_global}")
 
-        param_offset_and_sizes: List[Tuple[int, int]] = []
+        flat_param_buffer = torch.empty(padded_total_numel, dtype=param_group_dtypes.param_dtype, device=self.device)
+        # remap parameters to the param_buffer
+        for p in param_group['params']:
+            offset = param_range_map_global[p].offset
+            size = param_range_map_global[p].size
+            p.data = flat_param_buffer[offset:offset + size].view_as(p.data).copy_(p.data)
+
+        # Only Z1/Z2: Broadcast the param buffer to all ranks, just in case
+        # broadcast param to all rank
+        dist.broadcast(flat_param_buffer, src=0)
+
+        # Create the grad accumulation buffer
+        assert padded_total_numel % self.world_size == 0, f"padded_total_numel {padded_total_numel} must be a multiple of world_size {self.world_size}"
+        per_rank_padded_numel = padded_total_numel // self.world_size
+        # *Per-rank* flattened grad accumulation buffer
+        grad_acc_buffer = torch.empty(per_rank_padded_numel,
+                                      dtype=param_group_dtypes.grad_accum_dtype,
+                                      device=self.device)
+
+        # Create a range map for per-rank data:
+        # Each rank has a flattened buffer that concatenates shards of *all* parameters.
+        # Note that this is different from the traditional layout of DeepSpeed ZeRO, which partitions the flattened buffer.
+        # In traditional ZeRO layout:
+        # ---------------------------------------------------
+        # |       p#0     | p#1 |   p#2   |       p#3       |
+        # |        r0               |          r1           |
+        # ---------------------------------------------------
+        # In this layout:
+        # ---------------------------------------------------
+        # |       p#0     | p#1 |   p#2   |       p#3       |
+        # |   r0   |  r1  |r0|r1| r0 | r1 |   r0   |   r1   |
+        # ---------------------------------------------------
+
+        # We need this layout to support reduce-scatter. To avoid many reduce-scatter calls, we need _coalescing_manager (i.e. group call in NCCL).
+
+        # We also need the mapping from param to range in the per-rank buffer, like this:
+        # |    p#0[r0]   |p#1[r0]| p#2[r0] |  p#3[r0]  |
+        # |    p#0[r1]   |p#1[r1]| p#2[r1] |  p#3[r1]  |
+
+        param_range_map_local: Dict[torch.Tensor, BufferRange] = {}
         offset = 0
         for p in param_group['params']:
-            # Only Z1/Z2: broadcast param to all ranks
-            dist.broadcast(p.data, src=0)
-            param_offset_and_sizes.append((offset, p.numel()))
-            offset += p.numel()
+            assert param_range_map_global[
+                p].padded_size % self.world_size == 0, f"padded_size {param_range_map_global[p].padded_size} must be a multiple of world_size {self.world_size}"
+            padded_shard_size = param_range_map_global[p].padded_size // self.world_size
+            # Record the size except the padding. `shard_size` might be zero if the rank only contains a padding region.
+            shard_size = min(max(param_range_map_global[p].size - padded_shard_size * (self.rank + 1), 0),
+                             padded_shard_size)
+            param_range_map_local[p] = BufferRange(offset=offset, size=shard_size, padded_size=padded_shard_size)
+            offset += padded_shard_size
 
-        param_buffer = torch.empty(total_padded_elems, dtype=param_group_dtype(param_group), device=self.device)
-        # remap parameters to the param_buffer
-        for p, (offset, size) in zip(param_group['params'], param_offset_and_sizes):
-            p.data = param_buffer[offset:offset + size].view_as(p.data).copy_(p.data)
-
-        grad_acc_buffer = torch.empty(
-            per_rank_padded_elems,
-            dtype=param_group_dtype(param_group) if self.grad_accum_dtype is None else self.grad_accum_dtype,
-            device=self.device)
-
-        if self.optimizer_dtype is None or self.optimizer_dtype == grad_acc_buffer.dtype:
+        if param_group_dtypes.optimizer_dtype == param_group_dtypes.param_dtype:
+            # This path allows us to directly write reduce-scatter results to shareded gradient used by the optimizer.
+            # This case typically happens for:
+            # - For Z1: bf16/fp32 training (possibly with torch's autocast)
+            # - For Z2/3: bf16/fp32 training (possibly with torch's autocast) + No gradient accumulation training
             grad_for_optimizer = grad_acc_buffer
         else:
-            grad_for_optimizer = torch.empty(per_rank_padded_elems, dtype=self.optimizer_dtype, device=self.device)
+            # This path requires an additional buffer and copy.
+            # This is necessary for:
+            # - Mixed precision training (NVIDIA Apex AMP-style, as DeepSpeed's bf16/fp16 training does)
+            # - For Z2/3: Training with gradient accumulation
+            grad_for_optimizer = torch.empty(per_rank_padded_numel,
+                                             dtype=param_group_dtypes.optimizer_dtype,
+                                             device=self.device)
 
-        if self.optimizer_dtype is None or self.optimizer_dtype == param_group_dtype(param_group):
-            param_for_optimizer = param_buffer[self.rank * per_rank_padded_elems:(self.rank + 1) *
-                                               per_rank_padded_elems]
-        else:
-            param_for_optimizer = torch.empty(per_rank_padded_elems, dtype=self.optimizer_dtype, device=self.device)
-            param_for_optimizer.copy_(param_buffer)
+        param_for_optimizer = torch.empty(per_rank_padded_numel,
+                                          dtype=param_group_dtypes.optimizer_dtype,
+                                          device=self.device)
 
-        return ParamUpdateBuffers(param_buffer=param_buffer,
-                                  offset_and_sizes=param_offset_and_sizes,
-                                  grad_acc_buffer=grad_acc_buffer,
-                                  grad_for_optimizer=grad_for_optimizer,
-                                  param_for_optimizer=param_for_optimizer)
+        return ParamUpdateFlatBuffers(param_buffer=flat_param_buffer,
+                                      param_range_map_global=param_range_map_global,
+                                      param_range_map_local=param_range_map_local,
+                                      grad_acc_buffer=grad_acc_buffer,
+                                      grad_for_optimizer=grad_for_optimizer,
+                                      param_for_optimizer=param_for_optimizer)
+
+    def _param_group_dtypes(self, param_group: Dict[str, Any]) -> ParamGroupDtypes:
+        param_dtype = param_group_dtype(param_group)
+        grad_accum_dtype = param_dtype if self.grad_accum_dtype is None else self.grad_accum_dtype
+        optimizer_dtype = param_dtype if self.optimizer_dtype is None else self.optimizer_dtype
+        return ParamGroupDtypes(param_dtype=param_dtype,
+                                grad_accum_dtype=grad_accum_dtype,
+                                optimizer_dtype=optimizer_dtype)
 
 
 class UniversalOptimizer:
@@ -352,6 +445,10 @@ class UniversalOptimizer:
         if comm_buffer.should_flush(param.numel()):
             self.flush_reduce_bucket(param.dtype)
 
+        log_all_ranks_sorted(
+            f"gradient_hook param: {id(param)} {param.dtype} {param.numel()} should_flush: {comm_buffer.should_flush(param.numel())}"
+        )
+
         if param.numel() > comm_buffer.get_size():
             # extend buckets
             get_accelerator().current_stream().synchronize()
@@ -378,6 +475,8 @@ class UniversalOptimizer:
         if dtype not in self.reduce_tasks:
             return
 
+        log_all_ranks_sorted(f"flush_reduce_bucket dtype: {dtype} #reduce_tasks: {len(self.reduce_tasks[dtype])}")
+
         self._block_copy_events(dtype)
 
         with get_coalescing_manager(
@@ -386,6 +485,8 @@ class UniversalOptimizer:
                 async_op=True,
         ) as cm:
             for t in self.reduce_tasks[dtype]:
+                log_all_ranks_sorted(
+                    f"flush_reduce_bucket t.recv_buf: {t.recv_buf.shape} {t.recv_buf.dtype} {t.recv_buf.numel()}")
                 dist.reduce_scatter_tensor(
                     t.recv_buf,
                     t.send_buf,
@@ -408,6 +509,7 @@ class UniversalOptimizer:
         self.comm_buffers[dtype].swap(self.copy_stream)
 
     def _backward_epilogue(self):
+        log_all_ranks_sorted(f"backward_epilogue")
         for dtype in self.comm_buffers.keys():
             self.flush_reduce_bucket(dtype)
 
