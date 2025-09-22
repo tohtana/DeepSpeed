@@ -304,7 +304,7 @@ class ParamUpdateGroupContainer:
         assert padded_total_numel % self.world_size == 0, f"padded_total_numel {padded_total_numel} must be a multiple of world_size {self.world_size}"
         per_rank_padded_numel = padded_total_numel // self.world_size
         # *Per-rank* flattened grad accumulation buffer
-        grad_acc_buffer = torch.empty(per_rank_padded_numel,
+        grad_acc_buffer = torch.zeros(per_rank_padded_numel,
                                       dtype=param_group_dtypes.grad_accum_dtype,
                                       device=self.device)
 
@@ -335,9 +335,11 @@ class ParamUpdateGroupContainer:
                 p].padded_size % self.world_size == 0, f"padded_size {param_range_map_global[p].padded_size} must be a multiple of world_size {self.world_size}"
             padded_shard_size = param_range_map_global[p].padded_size // self.world_size
             # Record the size except the padding. `shard_size` might be zero if the rank only contains a padding region.
-            shard_size = min(max(param_range_map_global[p].size - padded_shard_size * (self.rank + 1), 0),
-                             padded_shard_size)
+            shard_size = min(max(param_range_map_global[p].size - padded_shard_size * self.rank, 0), padded_shard_size)
             param_range_map_local[p] = BufferRange(offset=offset, size=shard_size, padded_size=padded_shard_size)
+            log_all_ranks_sorted(
+                f"padded_shard_size {padded_shard_size} shard_size {shard_size} offset {offset} param_range_map_local: {param_range_map_local[p]}"
+            )
             offset += padded_shard_size
 
         if param_group_dtypes.optimizer_dtype == param_group_dtypes.param_dtype:
@@ -351,13 +353,32 @@ class ParamUpdateGroupContainer:
             # This is necessary for:
             # - Mixed precision training (NVIDIA Apex AMP-style, as DeepSpeed's bf16/fp16 training does)
             # - For Z2/3: Training with gradient accumulation
-            grad_for_optimizer = torch.empty(per_rank_padded_numel,
+            grad_for_optimizer = torch.zeros(per_rank_padded_numel,
                                              dtype=param_group_dtypes.optimizer_dtype,
                                              device=self.device)
 
         param_for_optimizer = torch.empty(per_rank_padded_numel,
                                           dtype=param_group_dtypes.optimizer_dtype,
                                           device=self.device)
+        for p in param_group['params']:
+            offset_global = param_range_map_global[p].offset
+            padded_size_global = param_range_map_global[p].padded_size
+            padded_shard_size = padded_size_global // self.world_size
+            shard_offset = offset_global + padded_shard_size * self.rank
+            log_all_ranks_sorted(
+                f"shard_offset: {shard_offset} padded_size_global: {padded_size_global} param_range_map_global: {param_range_map_global[p]}"
+            )
+            copy_src = flat_param_buffer[shard_offset:shard_offset + padded_shard_size]
+            log_all_ranks_sorted(
+                f"copy_src: {copy_src.shape} {copy_src.dtype} {copy_src.numel()} param_range_map_global: {param_range_map_global[p]}"
+            )
+
+            offset_local = param_range_map_local[p].offset
+            padded_size_local = param_range_map_local[p].padded_size
+            log_all_ranks_sorted(
+                f"offset_local: {offset_local} padded_size_local: {padded_size_local} param_range_map_local: {param_range_map_local[p]}"
+            )
+            param_for_optimizer[offset_local:offset_local + padded_size_local].copy_(copy_src.view(-1))
 
         return ParamUpdateFlatBuffers(param_buffer=flat_param_buffer,
                                       param_range_map_global=param_range_map_global,
@@ -486,7 +507,8 @@ class UniversalOptimizer:
         ) as cm:
             for t in self.reduce_tasks[dtype]:
                 log_all_ranks_sorted(
-                    f"flush_reduce_bucket t.recv_buf: {t.recv_buf.shape} {t.recv_buf.dtype} {t.recv_buf.numel()}")
+                    f"flush_reduce_bucket t.recv_buf: {t.recv_buf.shape} {t.recv_buf.dtype} {t.recv_buf.numel()} t.send_buf: {t.send_buf.shape} {t.send_buf.dtype} {t.send_buf.numel()}"
+                )
                 dist.reduce_scatter_tensor(
                     t.recv_buf,
                     t.send_buf,
@@ -522,6 +544,13 @@ class UniversalOptimizer:
 
         original_param_groups = self.base_optimizer.param_groups
         self.base_optimizer.param_groups = self.sharded_param_groups
+
+        for param_group in self.sharded_param_groups:
+            for param in param_group['params']:
+                log_all_ranks_sorted(
+                    f"step param: {id(param)} {param.dtype} {param.numel()} param {tensor_to_short_string(param)} grad {tensor_to_short_string(param.grad)}"
+                )
+
         self.base_optimizer.step(*args, **kwargs)
         self.base_optimizer.param_groups = original_param_groups
 
