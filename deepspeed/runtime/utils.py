@@ -967,10 +967,10 @@ def all_gather_into_tensor_dp_groups(groups_flat, partitioned_param_groups, dp_p
     for group_id, (group_flat, partitioned_params) in enumerate(zip(groups_flat, partitioned_param_groups)):
         partition_id = dist.get_rank(group=dp_process_group[group_id])
         dp_world_size = dist.get_world_size(group=dp_process_group[group_id])
-        if dp_world_size == 1:
-            # no groups share optimizer states
-            # pipeline parallel with bf16 will default call this even if dp size = 1.
-            continue
+        # if dp_world_size == 1:
+        #     # no groups share optimizer states
+        #     # pipeline parallel with bf16 will default call this even if dp size = 1.
+        #     continue
         dist.all_gather_into_tensor(group_flat, partitioned_params[partition_id], dp_process_group[group_id])
 
 
@@ -984,10 +984,10 @@ def all_gather_dp_groups(groups_flat, partitioned_param_groups, dp_process_group
         partition_id = dist.get_rank(group=dp_process_group[group_id])
         dp_world_size = dist.get_world_size(group=dp_process_group[group_id])
 
-        if dp_world_size == 1:
-            # no groups share optimizer states
-            # pipeline parallel with bf16 will default call this even if dp size = 1.
-            continue
+        # if dp_world_size == 1:
+        #     # no groups share optimizer states
+        #     # pipeline parallel with bf16 will default call this even if dp size = 1.
+        #     continue
         num_shards = max(1, partitioned_params[partition_id].numel() * dp_world_size // allgather_bucket_size)
 
         shard_size = partitioned_params[partition_id].numel() // num_shards
