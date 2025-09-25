@@ -369,7 +369,7 @@ class ParamUpdateGroupContainer:
             padded_shard_size = padded_size_global // self.world_size
             shard_offset = offset_global + padded_shard_size * self.rank
             log_all_ranks_sorted(
-                f"shard_offset: {shard_offset} padded_size_global: {padded_size_global} param_range_map_global: {param_range_map_global[p]}"
+                f"shard_offset: {shard_offset} padded_shard_size: {padded_shard_size} param_range_map_global: {param_range_map_global[p]}"
             )
             copy_src = flat_param_buffer[shard_offset:shard_offset + padded_shard_size]
             log_all_ranks_sorted(
@@ -549,17 +549,22 @@ class UniversalOptimizer:
         original_param_groups = self.base_optimizer.param_groups
         self.base_optimizer.param_groups = self.sharded_param_groups
 
-        for param_group in self.sharded_param_groups:
-            for param in param_group['params']:
-                log_all_ranks_sorted(
-                    f"step param: {id(param)} {param.dtype} {param.numel()} param {tensor_to_short_string(param)} grad {tensor_to_short_string(param.grad)}"
-                )
-
         self.base_optimizer.step(*args, **kwargs)
         self.base_optimizer.param_groups = original_param_groups
 
-        for buffers in self.param_update_buffers:
-            dist.all_gather_into_tensor(buffers.param_buffer, buffers.param_for_optimizer)
+        with get_coalescing_manager(
+                group=None,
+                device=self.device,
+                async_op=True,
+        ) as cm:
+            for buffers in self.param_update_buffers:
+                for p in buffers.param_range_map_global.keys():
+                    map_global = buffers.param_range_map_global[p]
+                    map_local = buffers.param_range_map_local[p]
+                    dist.all_gather_into_tensor(
+                        buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size],
+                        buffers.param_for_optimizer[map_local.offset:map_local.offset + map_local.padded_size])
+        cm.wait()
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
