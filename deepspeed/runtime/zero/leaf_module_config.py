@@ -8,7 +8,7 @@ from pydantic import Field, model_validator
 
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
-DEFAULT_LEAF_MODULE_CLASSES: List[str] = ["torch.nn.ModuleList"]
+DEFAULT_LEAF_MODULE_CLASSES: List[str] = []
 DEFAULT_LEAF_MODULE_NAMES: List[str] = []
 
 
