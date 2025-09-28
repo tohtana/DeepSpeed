@@ -73,6 +73,63 @@ Each configuration works as follows:
 .. autofunction:: deepspeed.runtime.torch_autocast.has_autocast_dtype
 
 
+Configuring ZeRO Leaf Modules
+-----------------------------
+
+ZeRO-3 relies on module execution order to prefetch partitioned parameters. Models
+that pick submodules dynamically (for example, MoE routers) can cause incorrect
+prefetch order unless you designate those subtrees as "leaf" modules. When a
+module is marked as a leaf, ZeRO gathers all of its descendants immediately and
+stops inserting hooks beneath it.
+
+Programmatic API
+================
+
+Use :func:`deepspeed.utils.set_z3_leaf_modules` to flag modules by class, class
+name, or both. Optionally combine with
+:func:`deepspeed.utils.set_z3_leaf_modules_by_name` to target specific entries
+from ``model.named_modules()``.
+
+.. code-block:: python
+
+    from deepspeed.utils import (
+        set_z3_leaf_modules,
+        set_z3_leaf_modules_by_name,
+    )
+
+    # Match by class or subclass
+    set_z3_leaf_modules(model, [CustomMoEBlock])
+
+    # Match by fully qualified class name
+    set_z3_leaf_modules(model, ["my_package.layers.CustomMoEBlock"])
+
+    # Match by module name returned from model.named_modules()
+    set_z3_leaf_modules_by_name(model, ["transformer.layers.0.experts"])
+
+Configuration in DeepSpeed config
+=================================
+
+The same behavior can be controlled from the DeepSpeed config. Add a
+``leaf_module`` block to ``zero_optimization`` specifying either classes or
+names (or both). By default only ``torch.nn.ModuleList`` is treated as a leaf.
+
+.. code-block:: json
+
+    {
+      "train_micro_batch_size_per_gpu": 1,
+      "zero_optimization": {
+        "stage": 3,
+        "leaf_module": {
+          "classes": ["my_package.layers.CustomMoEBlock"],
+          "names": ["transformer.layers.0.experts"]
+        }
+      }
+    }
+
+You can mix and match the API and configuration approaches; all referenced
+modules are flagged before ZeRO installs its hooks.
+
+
 Model Saving
 ------------
 .. autofunction:: deepspeed.DeepSpeedEngine.save_16bit_model
