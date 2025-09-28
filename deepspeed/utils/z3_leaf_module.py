@@ -54,10 +54,11 @@ def _do_set_z3_leaf_modules(model: torch.nn.Module, leaf_module_classes: Union[L
     def _set_z3_leaf_flag(model: torch.nn.Module):
         nonlocal leaf_modules
         for module in leaf_module_classes:
-            if (isinstance(module, type) and model.__class__ == module) or \
-            (isinstance(module, str) and model.__class__.__name__ == module):
+            if (isinstance(module, type) and isinstance(model, module)) or \
+               (isinstance(module, str) and model.__class__.__name__ == module):
                 model._z3_leaf = flag
                 leaf_modules.append(model)
+                break
 
     model.apply(_set_z3_leaf_flag)
 

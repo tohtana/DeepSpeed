@@ -82,6 +82,32 @@ class FineGrainedBlock(nn.Module):
         return x
 
 
+class BaseLeafModule(nn.Module):
+
+    def __init__(self):
+        super(BaseLeafModule, self).__init__()
+
+
+class SubLeafModule(BaseLeafModule):
+
+    def __init__(self, hidden_dim):
+        super(SubLeafModule, self).__init__()
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class WrapperLeafModule(nn.Module):
+
+    def __init__(self, hidden_dim):
+        super(WrapperLeafModule, self).__init__()
+        self.child = SubLeafModule(hidden_dim)
+
+    def forward(self, x):
+        return self.child(x)
+
+
 class modelWithFineGrainedBlock(nn.Module):
 
     def __init__(self, hidden_dim, num_block):
@@ -180,6 +206,17 @@ class TestSetZ3LeafModule(DistributedTest):
         assert len(unset_z3_leaf_modules(model, [torch.nn.ModuleList])) == 1, \
             "Expected only one module to be unset as a leaf module"
         assert len(get_z3_leaf_modules(model)) == 0, "Expected there is no leaf module"
+
+    def test_set_leaf_modules_with_subclass(self):
+        hidden_dim = 32
+        model = WrapperLeafModule(hidden_dim)
+
+        leaf_modules = set_z3_leaf_modules(model, [BaseLeafModule])
+
+        assert len(leaf_modules) == 1, "Expected the subclass instance to be marked as leaf"
+        assert leaf_modules[0] is model.child, "Expected the subclass instance to be returned"
+        assert z3_leaf_module(model.child), "Expected subclass instance flagged as leaf"
+        assert not z3_leaf_module(model), "Expected wrapper module to remain non-leaf"
 
     def test_set_no_match_class(self):
         hidden_dim = 128
