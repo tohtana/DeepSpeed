@@ -287,7 +287,7 @@ class DeepSpeedEngine(Module):
 
         self.pipeline_parallelism = isinstance(model, PipelineModule)
 
-        self._deepcompile_active = None
+        self._deepcompile_active = False
         self._deepcompile_noop_warning_emitted = False
 
         # Configure distributed model
@@ -4134,11 +4134,11 @@ class DeepSpeedEngine(Module):
     def register_compile_pass(self, pass_name: str, pass_fn: Callable) -> None:
         register_compile_pass(pass_name, pass_fn)
 
-    def is_deepcompile_enabled(self):
+    def is_deepcompile_enabled(self) -> bool:
         return self._config.compile_config.deepcompile
 
-    def is_deepcompile_active(self):
-        return bool(self._deepcompile_active)
+    def is_deepcompile_active(self) -> bool:
+        return self._deepcompile_active
 
     @property
     def is_compiled(self) -> bool:
