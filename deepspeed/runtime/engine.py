@@ -74,7 +74,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
-from deepspeed.utils import logger, log_dist, instrument_w_nvtx
+from deepspeed.utils import logger, log_dist, log_dist_once, instrument_w_nvtx
 from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallClockTimer, \
     FORWARD_MICRO_TIMER, BACKWARD_MICRO_TIMER, BACKWARD_INNER_MICRO_TIMER, BACKWARD_REDUCE_MICRO_TIMER, \
     STEP_MICRO_TIMER, \
@@ -288,7 +288,6 @@ class DeepSpeedEngine(Module):
         self.pipeline_parallelism = isinstance(model, PipelineModule)
 
         self._deepcompile_active = False
-        self._deepcompile_noop_warning_emitted = False
 
         # Configure distributed model
         self._configure_distributed_model(model)
@@ -2158,12 +2157,10 @@ class DeepSpeedEngine(Module):
         if self.autotuning_profile_model_info():
             ma = get_ma_status()
 
-        if (self.is_deepcompile_enabled() and not self.is_deepcompile_active() and not self.is_compiled
-                and not self._deepcompile_noop_warning_emitted):
-            log_dist(
+        if self.is_deepcompile_enabled() and not self.is_deepcompile_active() and not self.is_compiled:
+            log_dist_once(
                 "DeepCompile is enabled but engine.compile() has not been called; executing without DeepCompile until compile() runs.",
                 ranks=[0])
-            self._deepcompile_noop_warning_emitted = True
 
         if self.is_deepcompile_active() and hasattr(self, "launch_compile_passes"):
             # We can't have this in forward prologue as the compiler compiles hooks including the forward prologue.
