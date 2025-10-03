@@ -487,8 +487,10 @@ class UniversalOptimizer:
 
         copy_src = param.grad.contiguous().view(-1).detach()
 
-        recv_buf = self.param_buffer_map[param].grad_for_optimizer
-        self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, recv_buf))
+        param_buffers = self.param_buffer_map[param]
+        recv_buf = param_buffers.grad_acc_buffer
+        opt_grad = param_buffers.grad_for_optimizer
+        self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, opt_grad))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
@@ -561,9 +563,13 @@ class UniversalOptimizer:
                 for p in buffers.param_range_map_global.keys():
                     map_global = buffers.param_range_map_global[p]
                     map_local = buffers.param_range_map_local[p]
+
+                    gather_src = buffers.param_for_optimizer[map_local.offset:map_local.offset + map_local.padded_size]
+                    if gather_src.dtype != buffers.param_buffer.dtype:
+                        gather_src = gather_src.to(dtype=buffers.param_buffer.dtype)
+
                     dist.all_gather_into_tensor(
-                        buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size],
-                        buffers.param_for_optimizer[map_local.offset:map_local.offset + map_local.padded_size])
+                        buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size], gather_src)
         cm.wait()
 
     def zero_grad(self, *args, **kwargs):
