@@ -76,11 +76,10 @@ Each configuration works as follows:
 Configuring ZeRO Leaf Modules
 -----------------------------
 
-ZeRO-3 relies on module execution order to prefetch partitioned parameters. Models
-that pick submodules dynamically (for example, MoE routers) can cause incorrect
-prefetch order unless you designate those subtrees as "leaf" modules. When a
-module is marked as a leaf, ZeRO gathers all of its descendants immediately and
-stops inserting hooks beneath it.
+ZeRO-3 relies on module execution order to gather partitioned parameters.
+When models select submodules dynamically (for example, MoE routers), different data-parallel ranks may gather different sets of parameters, which can cause the all-gather collective to deadlock.
+To avoid this problem, you can designate the parent of dynamically activated submodules (e.g., MoE experts) as a "leaf" module.
+When a module is marked as a leaf, ZeRO gathers all of its descendants immediately and stops inserting hooks beneath it.
 
 Programmatic API
 ================
