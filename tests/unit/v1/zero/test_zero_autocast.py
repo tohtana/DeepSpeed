@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from unit.common import DistributedTest, enable_determinism, reduce_boolean_flags
+from unit.common import DistributedTest, enable_determinism, allclose_on_all_ranks
 from unit.simple_model import SimpleModel
 from unit.util import bf16_required_version_check
 
@@ -60,13 +60,7 @@ def step_amp(enabled, baseline_model, baseline_optimizer, target_engine, dtype, 
 
     # reduce-scatter in `dtype` makes a difference in the loss.
     if step <= 1 and expect_match:
-        allclose_local = torch.allclose(baseline_loss.float(), target_loss.float(), rtol=rtol, atol=atol)
-        if not allclose_local:
-            print(f"Losses do not match: baseline_loss={baseline_loss}, target_loss={target_loss}")
-        # Ensure all ranks either pass or fail together.
-        # If some ranks fail while others pass, subsequent tests or iterations may hang.
-        if not reduce_boolean_flags(allclose_local, all):
-            assert False, f"Losses do not match on one or more ranks."
+        allclose_on_all_ranks(baseline_loss, target_loss)
 
     target_engine.backward(target_loss)
     target_engine.step()
