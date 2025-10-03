@@ -582,14 +582,15 @@ def allclose_on_all_ranks(actual, expected, assert_message=None, **kwargs) -> No
     """
     allclose_local = False
     allclose_global = False
+    mismatch_msg = ""
     try:
         torch_assert_close(actual, expected, **kwargs)
         allclose_local = True
         allclose_global = reduce_boolean_flags(allclose_local, all)
     except AssertionError:
         allclose_global = reduce_boolean_flags(allclose_local, all)
-        print(f"Tensors are not close: {actual=}, {expected=} {kwargs=}")
+        mismatch_msg = f"Tensors are not close: {actual=}, {expected=} {kwargs=}"
 
     if not allclose_global:
         message = "Tensors are not close on all ranks." if assert_message is None else assert_message
-        raise AssertionError(message)
+        raise AssertionError(f"{message} {mismatch_msg}")
