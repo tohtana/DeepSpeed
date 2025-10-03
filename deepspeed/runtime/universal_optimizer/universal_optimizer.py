@@ -123,6 +123,7 @@ class ParamUpdateFlatBuffers:
     # Mapping from a paramteer to its buffer range in the local sharded flattened buffer
     param_range_map_local: Dict[torch.Tensor, BufferRange]
     grad_acc_buffer: torch.Tensor  # sharded
+    grad_comm_buffer: torch.Tensor  # sharded, dtype matches parameter dtype
     grad_for_optimizer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
 
@@ -132,6 +133,7 @@ class ParamUpdateShardBuffers:
     size: int
     padded_size: int
     grad_acc_buffer: torch.Tensor  # sharded
+    grad_comm_buffer: torch.Tensor  # sharded
     grad_for_optimizer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
 
@@ -221,6 +223,7 @@ class ReduceTask:
     grad: torch.Tensor
     send_buf: torch.Tensor  # comm buffer, different from `grad`
     recv_buf: torch.Tensor
+    grad_acc_buf: torch.Tensor
     opt_grad: torch.Tensor  # optimizer grad, may be different from `recv_buf`
 
 
@@ -263,11 +266,13 @@ class ParamUpdateGroupContainer:
             for param, local_map in pg_buffers.param_range_map_local.items():
                 offset, size, padded_size = local_map.offset, local_map.size, local_map.padded_size
                 grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + padded_size]
+                grad_comm_buffer = pg_buffers.grad_comm_buffer[offset:offset + padded_size]
                 grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + padded_size]
                 param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + padded_size]
                 self.param_buffer_map[param] = ParamUpdateShardBuffers(size=size,
                                                                        padded_size=padded_size,
                                                                        grad_acc_buffer=grad_acc_buffer,
+                                                                       grad_comm_buffer=grad_comm_buffer,
                                                                        grad_for_optimizer=grad_for_optimizer,
                                                                        param_for_optimizer=param_for_optimizer)
 
@@ -345,6 +350,13 @@ class ParamUpdateGroupContainer:
                                       dtype=param_group_dtypes.grad_accum_dtype,
                                       device=self.device)
 
+        if param_group_dtypes.grad_accum_dtype == param_group_dtypes.param_dtype:
+            grad_comm_buffer = grad_acc_buffer
+        else:
+            grad_comm_buffer = torch.zeros(per_rank_padded_numel,
+                                           dtype=param_group_dtypes.param_dtype,
+                                           device=self.device)
+
         if param_group_dtypes.optimizer_dtype == param_group_dtypes.param_dtype:
             # This path allows us to directly write reduce-scatter results to shareded gradient used by the optimizer.
             # This case typically happens for:
@@ -387,6 +399,7 @@ class ParamUpdateGroupContainer:
                                       param_range_map_global=param_range_map_global,
                                       param_range_map_local=param_range_map_local,
                                       grad_acc_buffer=grad_acc_buffer,
+                                      grad_comm_buffer=grad_comm_buffer,
                                       grad_for_optimizer=grad_for_optimizer,
                                       param_for_optimizer=param_for_optimizer)
 
@@ -488,9 +501,11 @@ class UniversalOptimizer:
         copy_src = param.grad.contiguous().view(-1).detach()
 
         param_buffers = self.param_buffer_map[param]
-        recv_buf = param_buffers.grad_acc_buffer
+        recv_buf = param_buffers.grad_comm_buffer
+        grad_acc_buf = param_buffers.grad_acc_buffer
         opt_grad = param_buffers.grad_for_optimizer
-        self.reduce_tasks[param.dtype].append(ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, opt_grad))
+        self.reduce_tasks[param.dtype].append(
+            ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, grad_acc_buf, opt_grad))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
@@ -527,8 +542,18 @@ class UniversalOptimizer:
             cm.wait()
 
             for t in self.reduce_tasks[dtype]:
-                if t.recv_buf is not t.opt_grad and t.opt_grad.numel() > 0:
-                    t.opt_grad.copy_(t.recv_buf, non_blocking=True)
+                if t.grad_acc_buf is not t.recv_buf and t.grad_acc_buf.numel() > 0:
+                    t.grad_acc_buf.copy_(t.recv_buf, non_blocking=True)
+
+            for t in self.reduce_tasks[dtype]:
+                if t.opt_grad.numel() == 0 or t.opt_grad is t.grad_acc_buf or t.opt_grad is t.recv_buf:
+                    continue
+
+                src = t.grad_acc_buf
+                if t.opt_grad.dtype == t.recv_buf.dtype:
+                    src = t.recv_buf
+
+                t.opt_grad.copy_(src, non_blocking=True)
 
         for t in self.reduce_tasks[dtype]:
             self.rs_copy_done_events[t.param].record(self.copy_stream)
