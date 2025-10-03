@@ -70,6 +70,7 @@ from deepspeed.compression.constants import \
     WEIGHT_QUANTIZE_KERNEL
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, FROZEN_PARAM_FRAGMENTS
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+from deepspeed.checkpoint.ds_to_universal import dp_index_to_str
 from deepspeed.runtime.sparse_tensor import SparseTensor
 
 from deepspeed.runtime import lr_schedules
@@ -3013,7 +3014,7 @@ class DeepSpeedEngine(Module):
         bf16_mode = self.bfloat16_enabled()
         return self._get_rank_zero_ckpt_name(checkpoints_path, tag, mp_rank, pp_rank, bf16_mode)
 
-    def _get_ckpt_name(self, checkpoints_path, tag, mp_placeholder=None):
+    def _get_ckpt_name(self, checkpoints_path, tag, mp_placeholder=None, pp_placeholder=None):
         if mp_placeholder is not None:
             mp_rank_str = mp_placeholder
         else:
@@ -3021,7 +3022,12 @@ class DeepSpeedEngine(Module):
             mp_rank_str = f"{mp_rank:02d}"
 
         if self.zero_optimization_partition_weights():
-            filename = "zero_pp_rank_{}".format(dist.get_rank(group=self.optimizer.dp_process_group))
+            if pp_placeholder is not None:
+                pp_rank = pp_placeholder
+            else:
+                pp_rank = dist.get_rank(group=self.optimizer.dp_process_group)
+
+            filename = "zero_pp_rank_{}".format(pp_rank)
             ckpt_name = os.path.join(
                 checkpoints_path,
                 str(tag),
@@ -3056,15 +3062,15 @@ class DeepSpeedEngine(Module):
 
     def _get_all_ckpt_names(self, checkpoints_path, tag):
         # It is required that (checkpoints_path, tag) are consistent among all ranks.
-        ckpt_file_pattern = self._get_ckpt_name(checkpoints_path, tag, mp_placeholder="*")
+        ckpt_file_pattern = self._get_ckpt_name(checkpoints_path,
+                                                tag,
+                                                mp_placeholder="*",
+                                                pp_placeholder="0" if self.load_universal_checkpoint() else None)
         import glob
 
         ckpt_files = glob.glob(ckpt_file_pattern)
         ckpt_files.sort()
-        if self.load_universal_checkpoint():
-            return [ckpt_files[0]]
-        else:
-            return ckpt_files
+        return ckpt_files
 
     def load_checkpoint(self,
                         load_dir,
@@ -3127,7 +3133,7 @@ class DeepSpeedEngine(Module):
                                                          custom_load_fn=custom_load_fn)
 
         load_zero_checkpoint = load_path is not None and self.zero_optimization()
-        if load_zero_checkpoint:
+        if load_zero_checkpoint and not self.zero_nvme_offload_optimizer():
             if (load_optimizer_states and not load_module_only) or self.load_universal_checkpoint():
                 success = self._load_zero_checkpoint(load_dir, tag, load_optimizer_states=load_optimizer_states)
             else:
@@ -3137,8 +3143,10 @@ class DeepSpeedEngine(Module):
 
         if self.zero_nvme_offload_optimizer():
             from shutil import copytree, disk_usage
+            rank = self.local_rank if self.use_node_local_storage() else self.global_rank
+            rank_dir = "rank" + dp_index_to_str(rank)
             offload_dir = self.optimizer.optimizer_swapper.swap_folder
-            offload_ckpt_dir = os.path.join(load_dir, tag, "offloaded_tensors")
+            offload_ckpt_dir = os.path.join(load_dir, tag, "offloaded_tensors", rank_dir)
             _, _, free = disk_usage(offload_dir)
             logger.info(
                 f"Copying NVMe offload checkpoint from {offload_ckpt_dir} to {offload_dir}, {free / 1e9:,.2f} GB free on target filesystem..."
@@ -3479,8 +3487,9 @@ class DeepSpeedEngine(Module):
 
         if self.zero_nvme_offload_optimizer():
             from shutil import copytree, disk_usage
+            rank_dir = "rank" + dp_index_to_str(rank)
             offload_dir = self.optimizer.optimizer_swapper.swap_folder
-            offload_ckpt_dir = os.path.join(save_dir, tag, "offloaded_tensors")
+            offload_ckpt_dir = os.path.join(save_dir, tag, "offloaded_tensors", rank_dir)
             _, _, free = disk_usage(save_dir)
             logger.info(
                 f"Copying NVMe offload files from {offload_dir} to {offload_ckpt_dir}, {free / 1e9:,.2f} GB free on target filesystem..."
