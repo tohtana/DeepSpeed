@@ -554,6 +554,32 @@ class UniversalOptimizer:
         self.base_optimizer.step(*args, **kwargs)
         self.base_optimizer.param_groups = original_param_groups
 
+        # Copy updated parameters to the param_buffer if necessary
+        issued_cast_copies = False
+        with get_accelerator().stream(self.copy_stream):
+            for buffers in self.param_update_buffers:
+                if buffers.param_for_optimizer.dtype == buffers.param_buffer.dtype:
+                    continue
+
+                for p in buffers.param_range_map_global.keys():
+                    map_global = buffers.param_range_map_global[p]
+                    map_local = buffers.param_range_map_local[p]
+
+                    padded_shard_size = map_local.padded_size
+                    if padded_shard_size == 0:
+                        continue
+
+                    local_shard_offset = map_global.offset + padded_shard_size * self.rank
+                    dst = buffers.param_buffer[local_shard_offset:local_shard_offset + padded_shard_size]
+                    src = buffers.param_for_optimizer[map_local.offset:map_local.offset + padded_shard_size]
+                    dst.copy_(src, non_blocking=True)
+                    issued_cast_copies = True
+
+        if issued_cast_copies:
+            pre_gather_event = get_accelerator().Event(enable_timing=False, blocking=False)
+            pre_gather_event.record(self.copy_stream)
+            pre_gather_event.wait(self.comp_stream)
+
         with get_coalescing_manager(
                 group=None,
                 device=self.device,
@@ -564,9 +590,16 @@ class UniversalOptimizer:
                     map_global = buffers.param_range_map_global[p]
                     map_local = buffers.param_range_map_local[p]
 
-                    gather_src = buffers.param_for_optimizer[map_local.offset:map_local.offset + map_local.padded_size]
-                    if gather_src.dtype != buffers.param_buffer.dtype:
-                        gather_src = gather_src.to(dtype=buffers.param_buffer.dtype)
+                    padded_shard_size = map_local.padded_size
+                    if padded_shard_size == 0:
+                        continue
+
+                    local_shard_offset = map_global.offset + padded_shard_size * self.rank
+
+                    if buffers.param_for_optimizer.dtype == buffers.param_buffer.dtype:
+                        gather_src = buffers.param_for_optimizer[map_local.offset:map_local.offset + padded_shard_size]
+                    else:
+                        gather_src = buffers.param_buffer[local_shard_offset:local_shard_offset + padded_shard_size]
 
                     dist.all_gather_into_tensor(
                         buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size], gather_src)
