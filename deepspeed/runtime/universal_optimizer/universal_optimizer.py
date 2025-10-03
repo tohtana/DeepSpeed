@@ -510,7 +510,10 @@ class UniversalOptimizer(ABC):
         self.rs_comp_done_events[param].wait(self.copy_stream)
         with get_accelerator().stream(self.copy_stream):
             reduce_in_buffer.view(-1).narrow(0, 0, param.numel()).copy_(param.grad.view(-1), non_blocking=True)
+            param.grad.record_stream(self.copy_stream)
             self.rs_copy_done_events[param].record(self.copy_stream)
+
+        param.grad = None  # free the original grad to reduce memory usage
 
     def flush_reduce_bucket(self, dtype: torch.dtype):
         if dtype not in self.reduce_tasks:
