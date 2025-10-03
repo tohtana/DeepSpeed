@@ -5,6 +5,7 @@
 
 import copy
 import logging
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from typing import List, Dict, Optional, Set, Any
 from dataclasses import dataclass
@@ -232,7 +233,8 @@ class ParamUpdateGroupContainer:
     """
 
     def __init__(self, optimizer: torch.optim.Optimizer, device: torch.device, world_size: int, rank: int,
-                 grad_accum_dtype: Optional[torch.dtype], optimizer_dtype: Optional[torch.dtype]) -> None:
+                 grad_accum_dtype: Optional[torch.dtype], optimizer_dtype: Optional[torch.dtype],
+                 share_grad_and_comm_buffer: bool) -> None:
 
         self.optimizer = optimizer
         self.device = device
@@ -240,6 +242,7 @@ class ParamUpdateGroupContainer:
         self.rank = rank
         self.grad_accum_dtype = grad_accum_dtype
         self.optimizer_dtype = optimizer_dtype
+        self.share_grad_and_comm_buffer = share_grad_and_comm_buffer
 
         # Initialize buffers for param update for each param group
         self.param_update_buffers: List[ParamUpdateFlatBuffers] = []
@@ -412,7 +415,7 @@ class ParamUpdateGroupContainer:
                                 optimizer_dtype=optimizer_dtype)
 
 
-class UniversalOptimizer:
+class UniversalOptimizer(ABC):
 
     def __init__(self, optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
                  reduce_bucket_size: int) -> None:
@@ -456,7 +459,7 @@ class UniversalOptimizer:
             rank=self.rank,
             grad_accum_dtype=self.grad_accum_dtype,
             optimizer_dtype=self.optimizer_dtype,
-        )
+            share_grad_and_comm_buffer=self._share_grad_and_comm_buffer())
         self.param_buffer_map = self.param_update_group_container.param_buffer_map
         self.sharded_param_groups = self.param_update_group_container.sharded_param_groups
         self.param_update_buffers = self.param_update_group_container.param_update_buffers
@@ -472,8 +475,31 @@ class UniversalOptimizer:
         self.rs_comp_done_events = defaultdict(get_accelerator().Event)
         self.rs_copy_done_events = defaultdict(get_accelerator().Event)
 
+    @abstractmethod
+    def _share_grad_and_comm_buffer(self) -> bool:
+        """Indicate whether gradient accumulation and communication buffers can be shared."""
+
+    @abstractmethod
+    def _should_process_gradient(self, param: torch.Tensor) -> bool:
+        """Return True if we should queue gradient communication for `param`."""
+
+    @abstractmethod
+    def _accumulate_into_grad_acc_buf(self, task: 'ReduceTask') -> None:
+        """Combine the reduce-scatter result into the accumulation buffer."""
+
+    def _reset_grad_accum_buffers(self) -> None:
+        """Hook for subclasses to reset accumulation buffers during zero_grad."""
+        pass
+
+    def _select_optimizer_grad_src(self, task: 'ReduceTask') -> torch.Tensor:
+        if task.opt_grad.dtype == task.grad_acc_buf.dtype:
+            return task.grad_acc_buf
+        if task.opt_grad.dtype == task.recv_buf.dtype:
+            return task.recv_buf
+        return task.grad_acc_buf
+
     def gradient_hook(self, param):
-        if not self.is_gradient_accumulation_boundary:
+        if not self._should_process_gradient(param):
             return
 
         assert param.dtype in self.comm_buffers, f"Param dtype {param.dtype} not in comm buffers {list(self.comm_buffers.keys())}"
@@ -542,17 +568,13 @@ class UniversalOptimizer:
             cm.wait()
 
             for t in self.reduce_tasks[dtype]:
-                if t.grad_acc_buf is not t.recv_buf and t.grad_acc_buf.numel() > 0:
-                    t.grad_acc_buf.copy_(t.recv_buf, non_blocking=True)
+                self._accumulate_into_grad_acc_buf(t)
 
             for t in self.reduce_tasks[dtype]:
                 if t.opt_grad.numel() == 0 or t.opt_grad is t.grad_acc_buf or t.opt_grad is t.recv_buf:
                     continue
 
-                src = t.grad_acc_buf
-                if t.opt_grad.dtype == t.recv_buf.dtype:
-                    src = t.recv_buf
-
+                src = self._select_optimizer_grad_src(t)
                 t.opt_grad.copy_(src, non_blocking=True)
 
         for t in self.reduce_tasks[dtype]:
@@ -632,6 +654,7 @@ class UniversalOptimizer:
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
+        self._reset_grad_accum_buffers()
 
     def clear_gradient_hooks(self):
         for handle in self.gradient_hook_handles:
@@ -710,6 +733,49 @@ class UniversalOptimizer:
         self.base_optimizer.cur_scale = value
 
 
+class UniversalOptimizerZ1(UniversalOptimizer):
+
+    def _share_grad_and_comm_buffer(self) -> bool:
+        return True
+
+    def _should_process_gradient(self, param: torch.Tensor) -> bool:
+        return self.is_gradient_accumulation_boundary
+
+    def _accumulate_into_grad_acc_buf(self, task: ReduceTask) -> None:
+        if task.grad_acc_buf is task.recv_buf or task.grad_acc_buf.numel() == 0:
+            return
+        task.grad_acc_buf.copy_(task.recv_buf, non_blocking=True)
+
+
+class UniversalOptimizerZ2(UniversalOptimizer):
+
+    def _share_grad_and_comm_buffer(self) -> bool:
+        return False
+
+    def _should_process_gradient(self, param: torch.Tensor) -> bool:
+        return True
+
+    def _accumulate_into_grad_acc_buf(self, task: ReduceTask) -> None:
+        if task.grad_acc_buf is task.recv_buf or task.grad_acc_buf.numel() == 0:
+            return
+
+        if task.grad_acc_buf.dtype == task.recv_buf.dtype:
+            task.grad_acc_buf.add_(task.recv_buf)
+        else:
+            task.grad_acc_buf.add_(task.recv_buf.to(dtype=task.grad_acc_buf.dtype))
+
+    def _reset_grad_accum_buffers(self) -> None:
+        for buffers in self.param_update_buffers:
+            buffers.grad_acc_buffer.zero_()
+
+
 def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
-                                  reduce_bucket_size: int):
-    return UniversalOptimizer(optimizer, config, reduce_bucket_size)
+                                  reduce_bucket_size: int, zero_stage: int):
+    if zero_stage == 1:
+        optimizer_cls = UniversalOptimizerZ1
+    elif zero_stage == 2:
+        optimizer_cls = UniversalOptimizerZ2
+    else:
+        raise ValueError(f"Universal optimizer does not yet support ZeRO stage {zero_stage}.")
+
+    return optimizer_cls(optimizer, config, reduce_bucket_size)
