@@ -21,7 +21,7 @@ from deepspeed.accelerator import get_accelerator
 from .config import UniversalOptimizerConfig
 
 # https://github.com/NVIDIA/nccl/issues/413#issuecomment-720634194
-COMM_PAD_BYTE_SIZE = 32
+COMM_PAD_BYTE_SIZE = 16
 
 
 def log_rank0(message, log_level=logging.INFO):
@@ -208,10 +208,6 @@ class CommDoubleBuffer:
     def allocate(self, size: int) -> torch.Tensor:
         return self.buckets[self.current_buffer_idx].allocate(size)
 
-    def flush(self) -> None:
-        self.swap()
-        raise NotImplementedError("flush is not implemented yet.")
-
     def swap(self, copy_stream) -> None:
         self.events[self.current_buffer_idx].record(copy_stream)
         self.buckets[self.current_buffer_idx].reset()
@@ -221,7 +217,6 @@ class CommDoubleBuffer:
 @dataclass
 class ReduceTask:
     param: torch.Tensor
-    grad: torch.Tensor
     send_buf: torch.Tensor  # comm buffer, different from `grad`
     recv_buf: torch.Tensor
     grad_acc_buf: torch.Tensor
@@ -288,11 +283,12 @@ class ParamUpdateGroupContainer:
         # Create a range map for the flattened buffer.
         # Try to align shards to both the comm pad size and the world size.
         for p in param_group['params']:
-            padded_numel = aligned_per_shard_size(p.numel(), self.world_size, COMM_PAD_BYTE_SIZE)
+            per_rank_padded_numel = aligned_per_shard_size(p.numel(), self.world_size, COMM_PAD_BYTE_SIZE)
+            total_padded_numel = per_rank_padded_numel * self.world_size
             param_range_map_global[p] = BufferRange(offset=padded_total_numel,
                                                     size=p.numel(),
-                                                    padded_size=padded_numel)
-            padded_total_numel += padded_numel
+                                                    padded_size=total_padded_numel)
+            padded_total_numel += total_padded_numel
 
         flat_param_buffer = torch.empty(padded_total_numel, dtype=param_group_dtypes.param_dtype, device=self.device)
         # remap parameters to the param_buffer
@@ -498,26 +494,22 @@ class UniversalOptimizer(ABC):
             get_accelerator().current_stream().synchronize()
             comm_buffer.buckets[comm_buffer.current_buffer_idx].reserve(param.numel())
 
-        # reduce_in_buffer = comm_buffer.allocate(param.numel())
         reduce_in_buffer = comm_buffer.allocate(ceil_to_multiple(param.numel(), COMM_PAD_BYTE_SIZE))
 
         # This ensures the order of reduce_scatter -> copy
         # Without this block, copy may start while reduce_scatter is still running
         comm_buffer.get_event().wait(self.comp_stream)
 
-        copy_src = param.grad.contiguous().view(-1).detach()
-
         param_buffers = self.param_buffer_map[param]
         recv_buf = param_buffers.grad_comm_buffer
         grad_acc_buf = param_buffers.grad_acc_buffer
         opt_grad = param_buffers.grad_for_optimizer
-        self.reduce_tasks[param.dtype].append(
-            ReduceTask(param, copy_src, reduce_in_buffer, recv_buf, grad_acc_buf, opt_grad))
+        self.reduce_tasks[param.dtype].append(ReduceTask(param, reduce_in_buffer, recv_buf, grad_acc_buf, opt_grad))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
         with get_accelerator().stream(self.copy_stream):
-            reduce_in_buffer.view(-1).narrow(0, 0, copy_src.numel()).copy_(copy_src, non_blocking=True)
+            reduce_in_buffer.view(-1).narrow(0, 0, param.numel()).copy_(param.grad.view(-1), non_blocking=True)
             self.rs_copy_done_events[param].record(self.copy_stream)
 
     def flush_reduce_bucket(self, dtype: torch.dtype):
@@ -555,8 +547,8 @@ class UniversalOptimizer(ABC):
 
         for t in self.reduce_tasks[dtype]:
             self.rs_copy_done_events[t.param].record(self.copy_stream)
-        self.reduce_tasks[dtype].clear()
 
+        self.reduce_tasks[dtype].clear()
         self.comm_buffers[dtype].swap(self.copy_stream)
 
     def _backward_epilogue(self):
@@ -663,15 +655,8 @@ class UniversalOptimizer(ABC):
             return
 
         for t in self.reduce_tasks[dtype]:
-            copy_done_event = self.rs_copy_done_events[t.grad]
+            copy_done_event = self.rs_copy_done_events[t.param]
             copy_done_event.wait(self.comp_stream)
-
-    def _apply_pre_division(self, dtype: torch.dtype):
-        if dtype not in self.reduce_tasks:
-            return
-
-        for t in self.reduce_tasks[dtype]:
-            t.grad.div_(self.world_size)
 
     #############################################################################################
     # DeepSpeed engine accesses these properties
