@@ -293,9 +293,6 @@ class ParamUpdateGroupContainer:
                                                     size=p.numel(),
                                                     padded_size=padded_numel)
             padded_total_numel += padded_numel
-            log_all_ranks_sorted(f"padded_numel: {padded_numel} total_numel: {padded_total_numel}")
-
-        log_all_ranks_sorted(f"param_range_map_global: {param_range_map_global}")
 
         flat_param_buffer = torch.empty(padded_total_numel, dtype=param_group_dtypes.param_dtype, device=self.device)
         # remap parameters to the param_buffer
@@ -342,9 +339,6 @@ class ParamUpdateGroupContainer:
             # Record the size except the padding. `shard_size` might be zero if the rank only contains a padding region.
             shard_size = min(max(param_range_map_global[p].size - padded_shard_size * self.rank, 0), padded_shard_size)
             param_range_map_local[p] = BufferRange(offset=offset, size=shard_size, padded_size=padded_shard_size)
-            log_all_ranks_sorted(
-                f"padded_shard_size {padded_shard_size} shard_size {shard_size} offset {offset} param_range_map_local: {param_range_map_local[p]}"
-            )
             offset += padded_shard_size
 
         # *Per-rank* flattened grad accumulation buffer
@@ -383,19 +377,10 @@ class ParamUpdateGroupContainer:
             padded_size_global = param_range_map_global[p].padded_size
             padded_shard_size = padded_size_global // self.world_size
             shard_offset = offset_global + padded_shard_size * self.rank
-            log_all_ranks_sorted(
-                f"shard_offset: {shard_offset} padded_shard_size: {padded_shard_size} param_range_map_global: {param_range_map_global[p]}"
-            )
             copy_src = flat_param_buffer[shard_offset:shard_offset + padded_shard_size]
-            log_all_ranks_sorted(
-                f"copy_src: {copy_src.shape} {copy_src.dtype} {copy_src.numel()} param_range_map_global: {param_range_map_global[p]}"
-            )
 
             offset_local = param_range_map_local[p].offset
             padded_size_local = param_range_map_local[p].padded_size
-            log_all_ranks_sorted(
-                f"offset_local: {offset_local} padded_size_local: {padded_size_local} param_range_map_local: {param_range_map_local[p]}"
-            )
             param_for_optimizer[offset_local:offset_local + padded_size_local].copy_(copy_src.view(-1))
 
         return ParamUpdateFlatBuffers(param_buffer=flat_param_buffer,
@@ -508,10 +493,6 @@ class UniversalOptimizer(ABC):
         if comm_buffer.should_flush(param.numel()):
             self.flush_reduce_bucket(param.dtype)
 
-        log_all_ranks_sorted(
-            f"gradient_hook param: {id(param)} {param.dtype} {param.numel()} should_flush: {comm_buffer.should_flush(param.numel())}"
-        )
-
         if param.numel() > comm_buffer.get_size():
             # extend buckets
             get_accelerator().current_stream().synchronize()
@@ -543,8 +524,6 @@ class UniversalOptimizer(ABC):
         if dtype not in self.reduce_tasks:
             return
 
-        log_all_ranks_sorted(f"flush_reduce_bucket dtype: {dtype} #reduce_tasks: {len(self.reduce_tasks[dtype])}")
-
         self._block_copy_events(dtype)
 
         with get_coalescing_manager(
@@ -553,9 +532,6 @@ class UniversalOptimizer(ABC):
                 async_op=True,
         ) as cm:
             for t in self.reduce_tasks[dtype]:
-                log_all_ranks_sorted(
-                    f"flush_reduce_bucket t.recv_buf: {t.recv_buf.shape} {t.recv_buf.dtype} {t.recv_buf.numel()} t.send_buf: {t.send_buf.shape} {t.send_buf.dtype} {t.send_buf.numel()}"
-                )
                 dist.reduce_scatter_tensor(
                     t.recv_buf,
                     t.send_buf,
@@ -584,7 +560,6 @@ class UniversalOptimizer(ABC):
         self.comm_buffers[dtype].swap(self.copy_stream)
 
     def _backward_epilogue(self):
-        log_all_ranks_sorted(f"backward_epilogue")
         for dtype in self.comm_buffers.keys():
             self.flush_reduce_bucket(dtype)
 
