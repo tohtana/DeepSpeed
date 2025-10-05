@@ -7,7 +7,7 @@ import copy
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import List, Dict, Optional, Set, Any
+from typing import List, Dict, Optional, Set, Any, Tuple
 from dataclasses import dataclass
 
 import torch
@@ -233,6 +233,34 @@ class GradientChunk:
     param_group: Dict[str, Any]
 
 
+class GradConversionDoubleBuffer:
+
+    def __init__(self, dtype: torch.dtype, device: torch.device) -> None:
+        self.dtype = dtype
+        self.device = device
+        self.buffers: List[torch.Tensor] = [
+            torch.empty(0, dtype=dtype, device=device),
+            torch.empty(0, dtype=dtype, device=device)
+        ]
+        self.current = 0
+
+    def ensure_capacity(self, numel: int) -> None:
+        if self.buffers[self.current].numel() < numel:
+            self.buffers[self.current] = torch.empty(numel, dtype=self.dtype, device=self.device)
+
+    def acquire(self) -> torch.Tensor:
+        buffer = self.buffers[self.current]
+        self.current = 1 - self.current
+        return buffer
+
+    def release(self) -> None:
+        self.buffers = [
+            torch.empty(0, dtype=self.dtype, device=self.device),
+            torch.empty(0, dtype=self.dtype, device=self.device)
+        ]
+        self.current = 0
+
+
 class ParamUpdateGroupContainer:
     """ A container of ParamUpdateGroup, each group is identified by (dtype, param_group).
     """
@@ -375,14 +403,12 @@ class ParamUpdateGroupContainer:
             padded_size_local = param_range_map_local[p].padded_size
             param_for_optimizer[offset_local:offset_local + padded_size_local].copy_(copy_src.view(-1))
 
-        return ParamUpdateFlatBuffers(
-            param_buffer=flat_param_buffer,
-            param_range_map_global=param_range_map_global,
-            param_range_map_local=param_range_map_local,
-            grad_acc_buffer=grad_acc_buffer,
-            grad_comm_buffer=grad_comm_buffer,
-            #   grad_for_optimizer=grad_for_optimizer,
-            param_for_optimizer=param_for_optimizer)
+        return ParamUpdateFlatBuffers(param_buffer=flat_param_buffer,
+                                      param_range_map_global=param_range_map_global,
+                                      param_range_map_local=param_range_map_local,
+                                      grad_acc_buffer=grad_acc_buffer,
+                                      grad_comm_buffer=grad_comm_buffer,
+                                      param_for_optimizer=param_for_optimizer)
 
     def _param_group_dtypes(self, param_group: Dict[str, Any]) -> ParamGroupDtypes:
         param_dtype = param_group_dtype(param_group)
@@ -452,6 +478,7 @@ class UniversalOptimizer(ABC):
 
         self.reduce_tasks: Dict[torch.dtype, List[ReduceTask]] = defaultdict(list)
         self.reduce_results: Dict[torch.dtype, List[ReduceResult]] = defaultdict(list)
+        self.grad_conversion_buffers: Dict[torch.dtype, 'GradConversionDoubleBuffer'] = {}
 
         self.comp_stream = get_accelerator().current_stream()
         self.rs_stream = get_accelerator().Stream(priority=-1)
@@ -535,6 +562,11 @@ class UniversalOptimizer(ABC):
         chunk_param_group['params'] = params
         chunk_dtype = params[0].dtype if params else results[0].reduced_grad.dtype
         return GradientChunk(dtype=chunk_dtype, results=results, param_group=chunk_param_group)
+
+    def _get_conversion_buffer(self, dtype: torch.dtype) -> GradConversionDoubleBuffer:
+        if dtype not in self.grad_conversion_buffers:
+            self.grad_conversion_buffers[dtype] = GradConversionDoubleBuffer(dtype=dtype, device=self.device)
+        return self.grad_conversion_buffers[dtype]
 
     def gradient_hook(self, param):
         if not self._should_process_gradient(param):
@@ -624,22 +656,35 @@ class UniversalOptimizer(ABC):
         gradient_chunks = self._chunk_reduce_results()
         original_param_groups = self.base_optimizer.param_groups
 
+        # Overlap copy and optimizer's step with double buffering
         for chunk in gradient_chunks:
             chunk_param_group = chunk.param_group
             chunk_params = chunk_param_group['params']
 
-            temporary_grad_buffers: List[torch.Tensor] = []
+            conversion_needs: Dict[torch.dtype, int] = defaultdict(int)
+            for result, param_tensor in zip(chunk.results, chunk_params):
+                if result.reduced_grad.dtype != param_tensor.dtype:
+                    conversion_needs[param_tensor.dtype] += param_tensor.numel()
+
+            buffer_state: Dict[torch.dtype, Tuple[torch.Tensor, int]] = {}
+            for dtype, required_numel in conversion_needs.items():
+                buffer_mgr = self._get_conversion_buffer(dtype)
+                buffer_mgr.ensure_capacity(required_numel)
+                buffer_state[dtype] = (buffer_mgr.acquire(), 0)
 
             with get_accelerator().stream(self.copy_stream):
                 for result, param_tensor in zip(chunk.results, chunk_params):
                     grad_tensor = result.reduced_grad
 
                     if grad_tensor.dtype != param_tensor.dtype:
-                        converted_grad = grad_tensor.to(dtype=param_tensor.dtype, non_blocking=True)
-                        temporary_grad_buffers.append(converted_grad)
-                        grad_src = converted_grad
+                        buffer_tensor, offset = buffer_state[param_tensor.dtype]
+                        numel = param_tensor.numel()
+                        slice_view = buffer_tensor.narrow(0, offset, numel)
+                        slice_view.copy_(grad_tensor.view(-1), non_blocking=True)
+                        buffer_state[param_tensor.dtype] = (buffer_tensor, offset + numel)
+                        grad_src = slice_view
                     else:
-                        grad_src = grad_tensor
+                        grad_src = grad_tensor.view(-1)
 
                     param_tensor.grad = grad_src.view_as(param_tensor)
 
@@ -653,9 +698,10 @@ class UniversalOptimizer(ABC):
             for param_tensor in chunk_params:
                 param_tensor.grad = None
 
-            temporary_grad_buffers.clear()
-
         self.base_optimizer.param_groups = original_param_groups
+
+        for buffer_mgr in self.grad_conversion_buffers.values():
+            buffer_mgr.release()
 
         # Copy updated parameters to the param_buffer if necessary
         issued_cast_copies = False
