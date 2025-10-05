@@ -528,10 +528,10 @@ class UniversalOptimizer(ABC):
 
                 param_buffers = self.param_buffer_map[result.param]
                 param_tensor = param_buffers.param_for_optimizer
-                param_numel = result.param.numel()
+                shard_numel = param_tensor.numel()
 
                 is_new_group = chunk_group_index is not None and chunk_group_index != param_group_index
-                exceed_chunk = chunk_numel + param_numel > self.gradient_chunk_size
+                exceed_chunk = chunk_numel + shard_numel > self.gradient_chunk_size
 
                 if chunk_results and (is_new_group or exceed_chunk):
                     gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
@@ -540,7 +540,7 @@ class UniversalOptimizer(ABC):
                     chunk_numel = 0
                     chunk_group_index = None
 
-                if param_numel >= self.gradient_chunk_size:
+                if shard_numel >= self.gradient_chunk_size:
                     gradient_chunks.append(self._build_gradient_chunk(param_group_index, [result], [param_tensor]))
                     continue
 
@@ -549,7 +549,7 @@ class UniversalOptimizer(ABC):
 
                 chunk_results.append(result)
                 chunk_params.append(param_tensor)
-                chunk_numel += param_numel
+                chunk_numel += shard_numel
 
             if chunk_results and chunk_group_index is not None:
                 gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
