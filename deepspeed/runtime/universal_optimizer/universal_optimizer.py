@@ -472,6 +472,10 @@ class UniversalOptimizer(ABC):
         """Hook for subclasses to reset accumulation buffers during zero_grad."""
         pass
 
+    @abstractmethod
+    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
+        """Return True if `param.grad` should be cleared after the hook."""
+
     def _select_optimizer_grad_src(self, task: 'ReduceTask') -> torch.Tensor:
         if task.opt_grad.dtype == task.grad_acc_buf.dtype:
             return task.grad_acc_buf
@@ -513,7 +517,8 @@ class UniversalOptimizer(ABC):
             param.grad.record_stream(self.copy_stream)
             self.rs_copy_done_events[param].record(self.copy_stream)
 
-        param.grad = None  # free the original grad to reduce memory usage
+        if self._should_clear_param_grad(param):
+            param.grad = None  # free the original grad to reduce memory usage
 
     def flush_reduce_bucket(self, dtype: torch.dtype):
         if dtype not in self.reduce_tasks:
@@ -709,6 +714,9 @@ class UniversalOptimizerZ1(UniversalOptimizer):
             return
         task.grad_acc_buf.copy_(task.recv_buf, non_blocking=True)
 
+    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
+        return False
+
 
 class UniversalOptimizerZ2(UniversalOptimizer):
 
@@ -730,6 +738,9 @@ class UniversalOptimizerZ2(UniversalOptimizer):
     def _reset_grad_accum_buffers(self) -> None:
         for buffers in self.param_update_buffers:
             buffers.grad_acc_buffer.zero_()
+
+    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
+        return True
 
 
 def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
