@@ -125,7 +125,6 @@ class ParamUpdateFlatBuffers:
     param_range_map_local: Dict[torch.Tensor, BufferRange]
     grad_acc_buffer: torch.Tensor  # sharded
     grad_comm_buffer: torch.Tensor  # sharded, dtype matches parameter dtype
-    grad_for_optimizer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
 
 
@@ -135,7 +134,6 @@ class ParamUpdateShardBuffers:
     padded_size: int
     grad_acc_buffer: torch.Tensor  # sharded
     grad_comm_buffer: torch.Tensor  # sharded
-    grad_for_optimizer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
 
 
@@ -220,7 +218,19 @@ class ReduceTask:
     send_buf: torch.Tensor  # comm buffer, different from `grad`
     recv_buf: torch.Tensor
     grad_acc_buf: torch.Tensor
-    opt_grad: torch.Tensor  # optimizer grad, may be different from `recv_buf`
+
+
+@dataclass
+class ReduceResult:
+    param: torch.Tensor
+    reduced_grad: torch.Tensor
+
+
+@dataclass
+class GradientChunk:
+    dtype: torch.dtype
+    results: List[ReduceResult]
+    param_group: Dict[str, Any]
 
 
 class ParamUpdateGroupContainer:
@@ -254,7 +264,7 @@ class ParamUpdateGroupContainer:
             # Used for the optimizer.
             sharded_param_group = copy.copy(param_group)
             contiguous_param = sharded_contiguous_buffer.param_for_optimizer
-            contiguous_param.grad = sharded_contiguous_buffer.grad_for_optimizer
+            # contiguous_param.grad = sharded_contiguous_buffer.grad_for_optimizer
             sharded_param_group['params'] = [contiguous_param]
             self.sharded_param_groups.append(sharded_param_group)
 
@@ -265,14 +275,15 @@ class ParamUpdateGroupContainer:
                 offset, size, padded_size = local_map.offset, local_map.size, local_map.padded_size
                 grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + padded_size]
                 grad_comm_buffer = pg_buffers.grad_comm_buffer[offset:offset + padded_size]
-                grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + padded_size]
+                # grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + padded_size]
                 param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + padded_size]
-                self.param_buffer_map[param] = ParamUpdateShardBuffers(size=size,
-                                                                       padded_size=padded_size,
-                                                                       grad_acc_buffer=grad_acc_buffer,
-                                                                       grad_comm_buffer=grad_comm_buffer,
-                                                                       grad_for_optimizer=grad_for_optimizer,
-                                                                       param_for_optimizer=param_for_optimizer)
+                self.param_buffer_map[param] = ParamUpdateShardBuffers(
+                    size=size,
+                    padded_size=padded_size,
+                    grad_acc_buffer=grad_acc_buffer,
+                    grad_comm_buffer=grad_comm_buffer,
+                    #    grad_for_optimizer=grad_for_optimizer,
+                    param_for_optimizer=param_for_optimizer)
 
     def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> ParamUpdateFlatBuffers:
         param_group_dtypes = self._param_group_dtypes(param_group)
@@ -350,21 +361,6 @@ class ParamUpdateGroupContainer:
                                            dtype=param_group_dtypes.param_dtype,
                                            device=self.device)
 
-        if param_group_dtypes.optimizer_dtype == param_group_dtypes.param_dtype:
-            # This path allows us to directly write reduce-scatter results to shareded gradient used by the optimizer.
-            # This case typically happens for:
-            # - For Z1: bf16/fp32 training (possibly with torch's autocast)
-            # - For Z2/3: bf16/fp32 training (possibly with torch's autocast) + No gradient accumulation training
-            grad_for_optimizer = grad_acc_buffer
-        else:
-            # This path requires an additional buffer and copy.
-            # This is necessary for:
-            # - Mixed precision training (NVIDIA Apex AMP-style, as DeepSpeed's bf16/fp16 training does)
-            # - For Z2/3: Training with gradient accumulation
-            grad_for_optimizer = torch.zeros(per_rank_padded_numel,
-                                             dtype=param_group_dtypes.optimizer_dtype,
-                                             device=self.device)
-
         param_for_optimizer = torch.empty(per_rank_padded_numel,
                                           dtype=param_group_dtypes.optimizer_dtype,
                                           device=self.device)
@@ -379,13 +375,14 @@ class ParamUpdateGroupContainer:
             padded_size_local = param_range_map_local[p].padded_size
             param_for_optimizer[offset_local:offset_local + padded_size_local].copy_(copy_src.view(-1))
 
-        return ParamUpdateFlatBuffers(param_buffer=flat_param_buffer,
-                                      param_range_map_global=param_range_map_global,
-                                      param_range_map_local=param_range_map_local,
-                                      grad_acc_buffer=grad_acc_buffer,
-                                      grad_comm_buffer=grad_comm_buffer,
-                                      grad_for_optimizer=grad_for_optimizer,
-                                      param_for_optimizer=param_for_optimizer)
+        return ParamUpdateFlatBuffers(
+            param_buffer=flat_param_buffer,
+            param_range_map_global=param_range_map_global,
+            param_range_map_local=param_range_map_local,
+            grad_acc_buffer=grad_acc_buffer,
+            grad_comm_buffer=grad_comm_buffer,
+            #   grad_for_optimizer=grad_for_optimizer,
+            param_for_optimizer=param_for_optimizer)
 
     def _param_group_dtypes(self, param_group: Dict[str, Any]) -> ParamGroupDtypes:
         param_dtype = param_group_dtype(param_group)
@@ -415,6 +412,7 @@ class UniversalOptimizer(ABC):
         self.is_gradient_accumulation_boundary: bool = True
 
         self.reduce_op = dist.ReduceOp.AVG
+        self.gradient_chunk_size = 5_000_000
 
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
@@ -445,9 +443,15 @@ class UniversalOptimizer(ABC):
         self.sharded_param_groups = self.param_update_group_container.sharded_param_groups
         self.param_update_buffers = self.param_update_group_container.param_update_buffers
 
+        self.param_to_param_group_index: Dict[torch.Tensor, int] = {}
+        for group_idx, param_group in enumerate(self.base_optimizer.param_groups):
+            for p in param_group['params']:
+                self.param_to_param_group_index[p] = group_idx
+
         self.gradient_hook_handles = self._create_gradient_handling_hooks()
 
         self.reduce_tasks: Dict[torch.dtype, List[ReduceTask]] = defaultdict(list)
+        self.reduce_results: Dict[torch.dtype, List[ReduceResult]] = defaultdict(list)
 
         self.comp_stream = get_accelerator().current_stream()
         self.rs_stream = get_accelerator().Stream(priority=-1)
@@ -476,12 +480,61 @@ class UniversalOptimizer(ABC):
     def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
         """Return True if `param.grad` should be cleared after the hook."""
 
-    def _select_optimizer_grad_src(self, task: 'ReduceTask') -> torch.Tensor:
-        if task.opt_grad.dtype == task.grad_acc_buf.dtype:
-            return task.grad_acc_buf
-        if task.opt_grad.dtype == task.recv_buf.dtype:
-            return task.recv_buf
-        return task.grad_acc_buf
+    def _chunk_reduce_results(self) -> List[GradientChunk]:
+        gradient_chunks: List[GradientChunk] = []
+
+        for _, results in self.reduce_results.items():
+            if not results:
+                continue
+
+            chunk_results: List[ReduceResult] = []
+            chunk_params: List[torch.Tensor] = []
+            chunk_numel = 0
+            chunk_group_index: Optional[int] = None
+
+            for result in results:
+                param_group_index = self.param_to_param_group_index.get(result.param)
+                if param_group_index is None:
+                    raise RuntimeError("Parameter missing from param group mapping during chunking")
+
+                param_buffers = self.param_buffer_map[result.param]
+                param_tensor = param_buffers.param_for_optimizer
+                param_numel = result.param.numel()
+
+                is_new_group = chunk_group_index is not None and chunk_group_index != param_group_index
+                exceed_chunk = chunk_numel + param_numel > self.gradient_chunk_size
+
+                if chunk_results and (is_new_group or exceed_chunk):
+                    gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
+                    chunk_results = []
+                    chunk_params = []
+                    chunk_numel = 0
+                    chunk_group_index = None
+
+                if param_numel >= self.gradient_chunk_size:
+                    gradient_chunks.append(self._build_gradient_chunk(param_group_index, [result], [param_tensor]))
+                    continue
+
+                if not chunk_results:
+                    chunk_group_index = param_group_index
+
+                chunk_results.append(result)
+                chunk_params.append(param_tensor)
+                chunk_numel += param_numel
+
+            if chunk_results and chunk_group_index is not None:
+                gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
+
+        self.reduce_results.clear()
+        return gradient_chunks
+
+    def _build_gradient_chunk(self, param_group_index: int, results: List[ReduceResult],
+                              params: List[torch.Tensor]) -> GradientChunk:
+        base_group = self.base_optimizer.param_groups[param_group_index]
+        chunk_param_group = dict(base_group)
+        chunk_param_group['params'] = params
+        chunk_dtype = params[0].dtype if params else results[0].reduced_grad.dtype
+        return GradientChunk(dtype=chunk_dtype, results=results, param_group=chunk_param_group)
 
     def gradient_hook(self, param):
         if not self._should_process_gradient(param):
@@ -507,8 +560,7 @@ class UniversalOptimizer(ABC):
         param_buffers = self.param_buffer_map[param]
         recv_buf = param_buffers.grad_comm_buffer
         grad_acc_buf = param_buffers.grad_acc_buffer
-        opt_grad = param_buffers.grad_for_optimizer
-        self.reduce_tasks[param.dtype].append(ReduceTask(param, reduce_in_buffer, recv_buf, grad_acc_buf, opt_grad))
+        self.reduce_tasks[param.dtype].append(ReduceTask(param, reduce_in_buffer, recv_buf, grad_acc_buf))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
@@ -547,11 +599,7 @@ class UniversalOptimizer(ABC):
                 self._accumulate_into_grad_acc_buf(t)
 
             for t in self.reduce_tasks[dtype]:
-                if t.opt_grad.numel() == 0 or t.opt_grad is t.grad_acc_buf or t.opt_grad is t.recv_buf:
-                    continue
-
-                src = self._select_optimizer_grad_src(t)
-                t.opt_grad.copy_(src, non_blocking=True)
+                self.reduce_results[dtype].append(ReduceResult(t.param, t.grad_acc_buf))
 
         for t in self.reduce_tasks[dtype]:
             self.rs_copy_done_events[t.param].record(self.copy_stream)
@@ -570,10 +618,43 @@ class UniversalOptimizer(ABC):
     def step(self, *args, **kwargs):
         self.copy_stream.synchronize()
 
-        original_param_groups = self.base_optimizer.param_groups
-        self.base_optimizer.param_groups = self.sharded_param_groups
+        if not self.reduce_results:
+            return
 
-        self.base_optimizer.step(*args, **kwargs)
+        gradient_chunks = self._chunk_reduce_results()
+        original_param_groups = self.base_optimizer.param_groups
+
+        for chunk in gradient_chunks:
+            chunk_param_group = chunk.param_group
+            chunk_params = chunk_param_group['params']
+
+            temporary_grad_buffers: List[torch.Tensor] = []
+
+            with get_accelerator().stream(self.copy_stream):
+                for result, param_tensor in zip(chunk.results, chunk_params):
+                    grad_tensor = result.reduced_grad
+
+                    if grad_tensor.dtype != param_tensor.dtype:
+                        converted_grad = grad_tensor.to(dtype=param_tensor.dtype, non_blocking=True)
+                        temporary_grad_buffers.append(converted_grad)
+                        grad_src = converted_grad
+                    else:
+                        grad_src = grad_tensor
+
+                    param_tensor.grad = grad_src.view_as(param_tensor)
+
+            copy_event = get_accelerator().Event(enable_timing=False, blocking=False)
+            copy_event.record(self.copy_stream)
+            copy_event.wait(get_accelerator().current_stream())
+
+            self.base_optimizer.param_groups = [chunk_param_group]
+            self.base_optimizer.step(*args, **kwargs)
+
+            for param_tensor in chunk_params:
+                param_tensor.grad = None
+
+            temporary_grad_buffers.clear()
+
         self.base_optimizer.param_groups = original_param_groups
 
         # Copy updated parameters to the param_buffer if necessary
