@@ -135,6 +135,7 @@ class ParamUpdateShardBuffers:
     grad_acc_buffer: torch.Tensor  # sharded
     grad_comm_buffer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
+    param_buffer: torch.Tensor  # sharded view in param_buffer dtype
 
 
 class ReduceBucket:
@@ -303,15 +304,16 @@ class ParamUpdateGroupContainer:
                 offset, size, padded_size = local_map.offset, local_map.size, local_map.padded_size
                 grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + padded_size]
                 grad_comm_buffer = pg_buffers.grad_comm_buffer[offset:offset + padded_size]
-                # grad_for_optimizer = pg_buffers.grad_for_optimizer[offset:offset + padded_size]
                 param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + padded_size]
-                self.param_buffer_map[param] = ParamUpdateShardBuffers(
-                    size=size,
-                    padded_size=padded_size,
-                    grad_acc_buffer=grad_acc_buffer,
-                    grad_comm_buffer=grad_comm_buffer,
-                    #    grad_for_optimizer=grad_for_optimizer,
-                    param_for_optimizer=param_for_optimizer)
+                map_global = pg_buffers.param_range_map_global[param]
+                local_shard_offset = map_global.offset + padded_size * self.rank
+                param_buffer_view = pg_buffers.param_buffer[local_shard_offset:local_shard_offset + padded_size]
+                self.param_buffer_map[param] = ParamUpdateShardBuffers(size=size,
+                                                                       padded_size=padded_size,
+                                                                       grad_acc_buffer=grad_acc_buffer,
+                                                                       grad_comm_buffer=grad_comm_buffer,
+                                                                       param_for_optimizer=param_for_optimizer,
+                                                                       param_buffer=param_buffer_view)
 
     def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> ParamUpdateFlatBuffers:
         param_group_dtypes = self._param_group_dtypes(param_group)
@@ -456,6 +458,7 @@ class UniversalOptimizer(ABC):
 
         # Use communication buffer per dtype
         self.comm_buffers: Dict[torch.dtype, CommDoubleBuffer] = self._create_comm_buffers(reduce_bucket_size)
+        self.grad_conversion_buffers: Dict[torch.dtype, GradConversionDoubleBuffer] = {}
 
         self.param_update_group_container = ParamUpdateGroupContainer(
             optimizer=self.base_optimizer,
@@ -478,7 +481,6 @@ class UniversalOptimizer(ABC):
 
         self.reduce_tasks: Dict[torch.dtype, List[ReduceTask]] = defaultdict(list)
         self.reduce_results: Dict[torch.dtype, List[ReduceResult]] = defaultdict(list)
-        self.grad_conversion_buffers: Dict[torch.dtype, 'GradConversionDoubleBuffer'] = {}
 
         self.comp_stream = get_accelerator().current_stream()
         self.rs_stream = get_accelerator().Stream(priority=-1)
@@ -655,8 +657,8 @@ class UniversalOptimizer(ABC):
 
         gradient_chunks = self._chunk_reduce_results()
         original_param_groups = self.base_optimizer.param_groups
+        issued_cast_copies = False
 
-        # Overlap copy and optimizer's step with double buffering
         for chunk in gradient_chunks:
             chunk_param_group = chunk.param_group
             chunk_params = chunk_param_group['params']
@@ -698,31 +700,26 @@ class UniversalOptimizer(ABC):
             for param_tensor in chunk_params:
                 param_tensor.grad = None
 
-        self.base_optimizer.param_groups = original_param_groups
+            step_event = get_accelerator().Event(enable_timing=False, blocking=False)
+            step_event.record(get_accelerator().current_stream())
+            chunk_copy_issued = False
+            with get_accelerator().stream(self.copy_stream):
+                step_event.wait(self.copy_stream)
+                for result in chunk.results:
+                    param_buffers = self.param_buffer_map[result.param]
+                    if param_buffers.param_buffer.numel() == 0:
+                        continue
+                    if param_buffers.param_for_optimizer.dtype == param_buffers.param_buffer.dtype:
+                        continue
+                    param_buffers.param_buffer.copy_(param_buffers.param_for_optimizer, non_blocking=True)
+                    chunk_copy_issued = True
 
+            if chunk_copy_issued:
+                issued_cast_copies = True
+
+        self.base_optimizer.param_groups = original_param_groups
         for buffer_mgr in self.grad_conversion_buffers.values():
             buffer_mgr.release()
-
-        # Copy updated parameters to the param_buffer if necessary
-        issued_cast_copies = False
-        with get_accelerator().stream(self.copy_stream):
-            for buffers in self.param_update_buffers:
-                if buffers.param_for_optimizer.dtype == buffers.param_buffer.dtype:
-                    continue
-
-                for p in buffers.param_range_map_global.keys():
-                    map_global = buffers.param_range_map_global[p]
-                    map_local = buffers.param_range_map_local[p]
-
-                    padded_shard_size = map_local.padded_size
-                    if padded_shard_size == 0:
-                        continue
-
-                    local_shard_offset = map_global.offset + padded_shard_size * self.rank
-                    dst = buffers.param_buffer[local_shard_offset:local_shard_offset + padded_shard_size]
-                    src = buffers.param_for_optimizer[map_local.offset:map_local.offset + padded_shard_size]
-                    dst.copy_(src, non_blocking=True)
-                    issued_cast_copies = True
 
         if issued_cast_copies:
             pre_gather_event = get_accelerator().Event(enable_timing=False, blocking=False)
