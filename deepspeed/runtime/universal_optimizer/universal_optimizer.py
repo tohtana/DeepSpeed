@@ -440,7 +440,7 @@ class UniversalOptimizer(ABC):
         self.is_gradient_accumulation_boundary: bool = True
 
         self.reduce_op = dist.ReduceOp.AVG
-        self.gradient_chunk_size = 5_000_000
+        self.gradient_chunk_size = config.gradient_chunk_size
 
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()

@@ -35,6 +35,10 @@ class UniversalOptimizerConfig(DeepSpeedConfigModel):
     """ Desired optimizer data type, will convert optimizer state to this type.
     """
 
+    gradient_chunk_size: int = 500_000_000
+    """ Maximum number of elements allowed in a gradient chunk before issuing an optimizer step.
+    """
+
     _dtype_fields = ("force_model_dtype", "zero3_allgather_dtype", "reduce_dtype", "grad_accum_dtype",
                      "optimizer_dtype")
 
@@ -72,6 +76,13 @@ class UniversalOptimizerConfig(DeepSpeedConfigModel):
         if value is None:
             return None
         return str(value)
+
+    @field_validator("gradient_chunk_size")
+    @classmethod
+    def validate_gradient_chunk_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("gradient_chunk_size must be a positive integer")
+        return value
 
 
 def get_universal_optimizer_config(config_dict):
