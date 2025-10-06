@@ -423,12 +423,27 @@ class ParamUpdateGroupContainer:
                                                     padded_size=total_padded_numel)
             padded_total_numel += total_padded_numel
 
+        # Stage the parameter data on CPU so we can release the original GPU storage before
+        # allocating the flattened buffer. This mirrors the ZeRO stage-1 flow and avoids the
+        # temporary 2x model footprint during initialization.
+        cpu_param_copies: Dict[torch.Tensor, torch.Tensor] = {}
+        for p in param_group['params']:
+            cpu_param_copies[p] = p.data.detach().cpu()
+            # Replace with an empty tensor on device to release the original storage.
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
         flat_param_buffer = torch.empty(padded_total_numel, dtype=param_group_dtypes.param_dtype, device=self.device)
-        # remap parameters to the param_buffer
+
+        # Remap parameters to the flat buffer and restore their values from the CPU staging area.
         for p in param_group['params']:
             offset = param_range_map_global[p].offset
             size = param_range_map_global[p].size
-            p.data = flat_param_buffer[offset:offset + size].view_as(p.data).copy_(p.data)
+            cpu_copy = cpu_param_copies[p]
+            param_view = flat_param_buffer[offset:offset + size].view_as(cpu_copy)
+            param_view.copy_(cpu_copy)
+            p.data = param_view
+
+        cpu_param_copies.clear()
 
         # Only Z1/Z2: Broadcast the param buffer to all ranks, just in case
         # broadcast param to all rank
@@ -600,7 +615,7 @@ class UniversalOptimizer(ABC):
         pass
 
     @abstractmethod
-    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
+    def _should_clear_param_grad(self) -> bool:
         """Return True if `param.grad` should be cleared after the hook."""
 
     @abstractmethod
@@ -707,8 +722,9 @@ class UniversalOptimizer(ABC):
             param.grad.record_stream(self.copy_stream)
             self.rs_copy_done_events[param].record(self.copy_stream)
 
-        if self._should_clear_param_grad(param):
-            param.grad = None  # free the original grad to reduce memory usage
+        if self._should_clear_param_grad():
+            param.grad.data = torch.empty(0, dtype=param.dtype,
+                                          device=self.device)  # free the original grad to reduce memory usage
 
     def flush_reduce_bucket(self, dtype: torch.dtype):
         if dtype not in self.reduce_tasks:
@@ -961,6 +977,10 @@ class UniversalOptimizer(ABC):
 
 class UniversalOptimizerZ1(UniversalOptimizer):
 
+    def __call__(self, optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig, reduce_bucket_size: int,
+                 clip_grad: float):
+        super().__call__(optimizer, config, reduce_bucket_size, clip_grad)
+
     def _share_grad_and_comm_buffer(self) -> bool:
         return True
 
@@ -972,8 +992,8 @@ class UniversalOptimizerZ1(UniversalOptimizer):
             return
         task.grad_acc_buf.copy_(task.recv_buf, non_blocking=True)
 
-    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
-        return False
+    def _should_clear_param_grad(self) -> bool:
+        return self.is_gradient_accumulation_boundary
 
     def _reduce_and_sqrt_grad_norm(self, norm_accum: torch.Tensor) -> torch.Tensor:
         return norm_accum.sqrt()
@@ -1000,7 +1020,7 @@ class UniversalOptimizerZ2(UniversalOptimizer):
         for buffers in self.param_update_buffers:
             buffers.grad_acc_buffer.zero_()
 
-    def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
+    def _should_clear_param_grad(self) -> bool:
         return True
 
     def _reduce_and_sqrt_grad_norm(self, norm_accum: torch.Tensor) -> torch.Tensor:
