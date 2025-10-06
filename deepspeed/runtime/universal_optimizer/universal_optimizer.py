@@ -121,11 +121,45 @@ class ParamUpdateFlatBuffers:
     param_buffer: torch.Tensor  # unsharded
     # Mapping from a parameter to its buffer range in the global unsharded flattened buffer
     param_range_map_global: Dict[torch.Tensor, BufferRange]
-    # Mapping from a paramteer to its buffer range in the local sharded flattened buffer
+    # Mapping from a parameter to its buffer range in the local sharded flattened buffer
     param_range_map_local: Dict[torch.Tensor, BufferRange]
     grad_acc_buffer: torch.Tensor  # sharded
-    grad_comm_buffer: torch.Tensor  # sharded, dtype matches parameter dtype
+    grad_comm_buffer: torch.Tensor  # sharded, dtype matches parameter dtype when not shared
     param_for_optimizer: torch.Tensor  # sharded
+    per_rank_padded_numel: int
+    grad_accum_dtype: torch.dtype
+    param_dtype: torch.dtype
+    shard_views: List['ParamUpdateShardBuffers']
+
+    def _can_share(self, share_grad_and_comm_buffer: bool) -> bool:
+        return share_grad_and_comm_buffer and self.grad_accum_dtype == self.param_dtype
+
+    def allocate_grad_buffers(self, share_grad_and_comm_buffer: bool) -> None:
+        can_share = self._can_share(share_grad_and_comm_buffer)
+        device = self.param_buffer.device
+        if self.per_rank_padded_numel == 0:
+            empty_acc = torch.empty(0, dtype=self.grad_accum_dtype, device=device)
+            self.grad_acc_buffer = empty_acc
+            self.grad_comm_buffer = empty_acc if can_share else torch.empty(0, dtype=self.param_dtype, device=device)
+        else:
+            self.grad_acc_buffer = torch.zeros(self.per_rank_padded_numel, dtype=self.grad_accum_dtype, device=device)
+            if can_share:
+                self.grad_comm_buffer = self.grad_acc_buffer
+            else:
+                self.grad_comm_buffer = torch.zeros(self.per_rank_padded_numel, dtype=self.param_dtype, device=device)
+
+        for shard in self.shard_views:
+            shard.refresh_views(self, share_grad_and_comm_buffer)
+
+    def release_grad_buffers(self, share_grad_and_comm_buffer: bool) -> None:
+        can_share = self._can_share(share_grad_and_comm_buffer)
+        device = self.param_buffer.device
+        empty_acc = torch.empty(0, dtype=self.grad_accum_dtype, device=device)
+        self.grad_acc_buffer = empty_acc
+        self.grad_comm_buffer = self.grad_acc_buffer if can_share else torch.empty(
+            0, dtype=self.param_dtype, device=device)
+        for shard in self.shard_views:
+            shard.refresh_views(self, share_grad_and_comm_buffer)
 
 
 @dataclass
@@ -136,6 +170,28 @@ class ParamUpdateShardBuffers:
     grad_comm_buffer: torch.Tensor  # sharded
     param_for_optimizer: torch.Tensor  # sharded
     param_buffer: torch.Tensor  # sharded view in param_buffer dtype
+    grad_offset: int
+    param_buffer_offset: int
+
+    def refresh_views(self, flat_buffers: ParamUpdateFlatBuffers, share_grad_and_comm_buffer: bool) -> None:
+        can_share = flat_buffers._can_share(share_grad_and_comm_buffer)
+
+        if self.padded_size == 0 or flat_buffers.grad_acc_buffer.numel() == 0:
+            self.grad_acc_buffer = flat_buffers.grad_acc_buffer.narrow(0, 0, 0)
+        else:
+            self.grad_acc_buffer = flat_buffers.grad_acc_buffer.narrow(0, self.grad_offset, self.padded_size)
+
+        if self.padded_size == 0:
+            self.grad_comm_buffer = flat_buffers.grad_comm_buffer.narrow(0, 0, 0)
+        else:
+            if can_share:
+                self.grad_comm_buffer = self.grad_acc_buffer
+            elif flat_buffers.grad_comm_buffer.numel() == 0:
+                self.grad_comm_buffer = flat_buffers.grad_comm_buffer.narrow(0, 0, 0)
+            else:
+                self.grad_comm_buffer = flat_buffers.grad_comm_buffer.narrow(0, self.grad_offset, self.padded_size)
+
+        # param_for_optimizer and param_buffer are static buffers, no need to refresh unless resized
 
 
 class ReduceBucket:
@@ -301,21 +357,55 @@ class ParamUpdateGroupContainer:
 
         # Create a map from param to its buffer in the contiguous buffer
         self.param_buffer_map: Dict[torch.Tensor, ParamUpdateShardBuffers] = {}
+        self.param_to_group_buffer: Dict[torch.Tensor, ParamUpdateFlatBuffers] = {}
         for pg_buffers in self.param_update_buffers:
             for param, local_map in pg_buffers.param_range_map_local.items():
                 offset, size, padded_size = local_map.offset, local_map.size, local_map.padded_size
-                grad_acc_buffer = pg_buffers.grad_acc_buffer[offset:offset + padded_size]
-                grad_comm_buffer = pg_buffers.grad_comm_buffer[offset:offset + padded_size]
-                param_for_optimizer = pg_buffers.param_for_optimizer[offset:offset + padded_size]
                 map_global = pg_buffers.param_range_map_global[param]
                 local_shard_offset = map_global.offset + padded_size * self.rank
-                param_buffer_view = pg_buffers.param_buffer[local_shard_offset:local_shard_offset + padded_size]
-                self.param_buffer_map[param] = ParamUpdateShardBuffers(size=size,
-                                                                       padded_size=padded_size,
-                                                                       grad_acc_buffer=grad_acc_buffer,
-                                                                       grad_comm_buffer=grad_comm_buffer,
-                                                                       param_for_optimizer=param_for_optimizer,
-                                                                       param_buffer=param_buffer_view)
+                if pg_buffers.grad_acc_buffer.numel() == 0 or padded_size == 0:
+                    grad_acc_view = pg_buffers.grad_acc_buffer.narrow(0, 0, 0)
+                else:
+                    grad_acc_view = pg_buffers.grad_acc_buffer.narrow(0, offset, padded_size)
+
+                if pg_buffers.grad_comm_buffer is pg_buffers.grad_acc_buffer:
+                    grad_comm_view = grad_acc_view
+                elif pg_buffers.grad_comm_buffer.numel() == 0 or padded_size == 0:
+                    grad_comm_view = pg_buffers.grad_comm_buffer.narrow(0, 0, 0)
+                else:
+                    grad_comm_view = pg_buffers.grad_comm_buffer.narrow(0, offset, padded_size)
+
+                param_for_optimizer_view = pg_buffers.param_for_optimizer.narrow(0, offset, padded_size)
+                param_buffer_view = pg_buffers.param_buffer.narrow(0, local_shard_offset, padded_size)
+
+                shard_buffers = ParamUpdateShardBuffers(size=size,
+                                                        padded_size=padded_size,
+                                                        grad_acc_buffer=grad_acc_view,
+                                                        grad_comm_buffer=grad_comm_view,
+                                                        param_for_optimizer=param_for_optimizer_view,
+                                                        param_buffer=param_buffer_view,
+                                                        grad_offset=offset,
+                                                        param_buffer_offset=local_shard_offset)
+
+                pg_buffers.shard_views.append(shard_buffers)
+                self.param_buffer_map[param] = shard_buffers
+                self.param_to_group_buffer[param] = pg_buffers
+
+        self.grad_buffers_allocated: bool = False
+
+    def allocate_grad_buffers(self) -> None:
+        if self.grad_buffers_allocated:
+            return
+        for buffers in self.param_update_buffers:
+            buffers.allocate_grad_buffers(self.share_grad_and_comm_buffer)
+        self.grad_buffers_allocated = True
+
+    def release_grad_buffers(self) -> None:
+        if not self.grad_buffers_allocated:
+            return
+        for buffers in self.param_update_buffers:
+            buffers.release_grad_buffers(self.share_grad_and_comm_buffer)
+        self.grad_buffers_allocated = False
 
     def _init_param_update_buffers(self, param_group: Dict[str, Any]) -> ParamUpdateFlatBuffers:
         param_group_dtypes = self._param_group_dtypes(param_group)
@@ -382,16 +472,12 @@ class ParamUpdateGroupContainer:
 
         # *Per-rank* flattened grad accumulation buffer
         per_rank_padded_numel = offset
-        grad_acc_buffer = torch.zeros(per_rank_padded_numel,
-                                      dtype=param_group_dtypes.grad_accum_dtype,
-                                      device=self.device)
+        grad_acc_buffer = torch.empty(0, dtype=param_group_dtypes.grad_accum_dtype, device=self.device)
 
         if param_group_dtypes.grad_accum_dtype == param_group_dtypes.param_dtype:
             grad_comm_buffer = grad_acc_buffer
         else:
-            grad_comm_buffer = torch.zeros(per_rank_padded_numel,
-                                           dtype=param_group_dtypes.param_dtype,
-                                           device=self.device)
+            grad_comm_buffer = torch.empty(0, dtype=param_group_dtypes.param_dtype, device=self.device)
 
         param_for_optimizer = torch.empty(per_rank_padded_numel,
                                           dtype=param_group_dtypes.optimizer_dtype,
@@ -412,7 +498,11 @@ class ParamUpdateGroupContainer:
                                       param_range_map_local=param_range_map_local,
                                       grad_acc_buffer=grad_acc_buffer,
                                       grad_comm_buffer=grad_comm_buffer,
-                                      param_for_optimizer=param_for_optimizer)
+                                      param_for_optimizer=param_for_optimizer,
+                                      per_rank_padded_numel=per_rank_padded_numel,
+                                      grad_accum_dtype=param_group_dtypes.grad_accum_dtype,
+                                      param_dtype=param_group_dtypes.param_dtype,
+                                      shard_views=[])
 
     def _param_group_dtypes(self, param_group: Dict[str, Any]) -> ParamGroupDtypes:
         param_dtype = param_group_dtype(param_group)
@@ -663,6 +753,7 @@ class UniversalOptimizer(ABC):
             self.flush_reduce_bucket(dtype)
 
     def backward(self, loss, retain_graph=False) -> None:
+        self.param_update_group_container.allocate_grad_buffers()
         loss.backward(retain_graph=retain_graph)
         self._backward_epilogue()
 
@@ -791,9 +882,12 @@ class UniversalOptimizer(ABC):
                         buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size], gather_src)
         cm.wait()
 
+        self.param_update_group_container.release_grad_buffers()
+
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
         self._reset_grad_accum_buffers()
+        self.param_update_group_container.release_grad_buffers()
 
     def clear_gradient_hooks(self):
         for handle in self.gradient_hook_handles:
