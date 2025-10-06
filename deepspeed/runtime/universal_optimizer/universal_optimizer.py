@@ -645,6 +645,9 @@ class UniversalOptimizer(ABC):
 
             for t in self.reduce_tasks[dtype]:
                 self._accumulate_into_grad_acc_buf(t)
+                padded_numel = t.grad_acc_buf.numel()
+                if t.data_size < padded_numel:
+                    t.grad_acc_buf.narrow(0, t.data_size, padded_numel - t.data_size).zero_()
 
             for t in self.reduce_tasks[dtype]:
                 self.reduce_results[dtype].append(ReduceResult(t.param, t.grad_acc_buf, t.data_size))
@@ -669,18 +672,20 @@ class UniversalOptimizer(ABC):
         if not self.reduce_results:
             return
 
+        gradient_chunks = self._chunk_reduce_results()
+        original_param_groups = self.base_optimizer.param_groups
+        issued_cast_copies = False
+
         grad_clip_coef: Optional[float] = None
         norm_accum = torch.zeros(1, dtype=torch.float32, device=self.device)
-        for results in self.reduce_results.values():
-            for result in results:
-                valid_numel = result.data_size
-                if valid_numel == 0:
-                    continue
-                grad_flat = result.reduced_grad.view(-1)
-                grad_view = grad_flat.narrow(0, 0, valid_numel)
-                if grad_view.numel() == 0:
-                    continue
-                norm_accum += torch.dot(grad_view.float(), grad_view.float())
+
+        for buffers in self.param_update_buffers:
+            grad_buffer = buffers.grad_acc_buffer
+            if grad_buffer.numel() == 0:
+                continue
+            grad_flat = grad_buffer.view(-1)
+            grad_view = grad_flat if grad_flat.dtype == torch.float32 else grad_flat.float()
+            norm_accum += torch.dot(grad_view, grad_view)
 
         global_grad_norm = self._reduce_and_sqrt_grad_norm(norm_accum)
         self._global_grad_norm = global_grad_norm.item()
@@ -689,10 +694,6 @@ class UniversalOptimizer(ABC):
             clip_coef = self.clip_grad / (self._global_grad_norm + 1e-6)
             if clip_coef < 1.0:
                 grad_clip_coef = float(clip_coef)
-
-        gradient_chunks = self._chunk_reduce_results()
-        original_param_groups = self.base_optimizer.param_groups
-        issued_cast_copies = False
 
         for chunk in gradient_chunks:
             chunk_param_group = chunk.param_group
@@ -713,14 +714,9 @@ class UniversalOptimizer(ABC):
                 for result, param_tensor in zip(chunk.results, chunk_params):
                     grad_tensor = result.reduced_grad
                     grad_flat = grad_tensor.view(-1)
-                    valid_numel = result.data_size
-                    total_numel = grad_flat.numel()
 
-                    if grad_clip_coef is not None and valid_numel > 0:
-                        grad_flat.narrow(0, 0, valid_numel).mul_(grad_clip_coef)
-
-                    if valid_numel < total_numel:
-                        grad_flat.narrow(0, valid_numel, total_numel - valid_numel).zero_()
+                    if grad_clip_coef is not None:
+                        grad_flat.mul_(grad_clip_coef)
 
                     if grad_tensor.dtype != param_tensor.dtype:
                         buffer_tensor, offset = buffer_state[param_tensor.dtype]
