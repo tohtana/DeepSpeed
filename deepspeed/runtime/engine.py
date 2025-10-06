@@ -1457,7 +1457,7 @@ class DeepSpeedEngine(Module):
         if self.use_universal_optimizer():
             self.optimizer = configure_universal_optimizer(basic_optimizer, self._config.universal_optimizer_config,
                                                            self.zero_reduce_bucket_size(),
-                                                           self.zero_optimization_stage())
+                                                           self.zero_optimization_stage(), self.gradient_clipping())
         elif optimizer_wrapper == ZERO_OPTIMIZATION:
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
         elif optimizer_wrapper == AMP:

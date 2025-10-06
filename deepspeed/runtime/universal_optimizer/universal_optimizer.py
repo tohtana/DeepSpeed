@@ -219,12 +219,14 @@ class ReduceTask:
     send_buf: torch.Tensor  # comm buffer, different from `grad`
     recv_buf: torch.Tensor
     grad_acc_buf: torch.Tensor
+    data_size: int
 
 
 @dataclass
 class ReduceResult:
     param: torch.Tensor
     reduced_grad: torch.Tensor
+    data_size: int
 
 
 @dataclass
@@ -423,8 +425,8 @@ class ParamUpdateGroupContainer:
 
 class UniversalOptimizer(ABC):
 
-    def __init__(self, optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
-                 reduce_bucket_size: int) -> None:
+    def __init__(self, optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig, reduce_bucket_size: int,
+                 clip_grad: float) -> None:
 
         # for `register_post_accumulate_grad_hook` and `_coalescing_manager`
         assert required_torch_version(min_version=2.1), "UniversalOptimizer requires PyTorch 2.1 or higher."
@@ -436,6 +438,8 @@ class UniversalOptimizer(ABC):
         self.reduce_dtype: torch.dtype = config.reduce_dtype
         self.grad_accum_dtype: torch.dtype = config.grad_accum_dtype
         self.optimizer_dtype: torch.dtype = config.optimizer_dtype
+        self.clip_grad: float = clip_grad
+        self._global_grad_norm: float = 0.0
 
         self.is_gradient_accumulation_boundary: bool = True
 
@@ -509,60 +513,69 @@ class UniversalOptimizer(ABC):
     def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
         """Return True if `param.grad` should be cleared after the hook."""
 
+    @abstractmethod
+    def _reduce_and_sqrt_grad_norm(self, norm_accum: torch.Tensor) -> torch.Tensor:
+        """Return the L2 norm for gradient clipping, including any collective ops."""
+
     def _chunk_reduce_results(self) -> List[GradientChunk]:
         gradient_chunks: List[GradientChunk] = []
 
-        for _, results in self.reduce_results.items():
+        for dtype, results in self.reduce_results.items():
             if not results:
                 continue
 
-            chunk_results: List[ReduceResult] = []
-            chunk_params: List[torch.Tensor] = []
-            chunk_numel = 0
-            chunk_group_index: Optional[int] = None
+            grouped_results: Dict[int, List[ReduceResult]] = defaultdict(list)
+            group_order: List[int] = []
 
             for result in results:
                 param_group_index = self.param_to_param_group_index.get(result.param)
                 if param_group_index is None:
                     raise RuntimeError("Parameter missing from param group mapping during chunking")
+                if param_group_index not in grouped_results:
+                    group_order.append(param_group_index)
+                grouped_results[param_group_index].append(result)
 
-                param_buffers = self.param_buffer_map[result.param]
-                param_tensor = param_buffers.param_for_optimizer
-                shard_numel = param_tensor.numel()
-
-                is_new_group = chunk_group_index is not None and chunk_group_index != param_group_index
-                exceed_chunk = chunk_numel + shard_numel > self.gradient_chunk_size
-
-                if chunk_results and (is_new_group or exceed_chunk):
-                    gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
-                    chunk_results = []
-                    chunk_params = []
-                    chunk_numel = 0
-                    chunk_group_index = None
-
-                if shard_numel >= self.gradient_chunk_size:
-                    gradient_chunks.append(self._build_gradient_chunk(param_group_index, [result], [param_tensor]))
+            for param_group_index in group_order:
+                group_results = grouped_results[param_group_index]
+                if not group_results:
                     continue
 
-                if not chunk_results:
-                    chunk_group_index = param_group_index
+                chunk_results: List[ReduceResult] = []
+                chunk_params: List[torch.Tensor] = []
+                chunk_numel = 0
 
-                chunk_results.append(result)
-                chunk_params.append(param_tensor)
-                chunk_numel += shard_numel
+                for result in group_results:
+                    param_buffers = self.param_buffer_map[result.param]
+                    param_tensor = param_buffers.param_for_optimizer
+                    shard_numel = result.data_size
 
-            if chunk_results and chunk_group_index is not None:
-                gradient_chunks.append(self._build_gradient_chunk(chunk_group_index, chunk_results, chunk_params))
+                    if shard_numel == 0:
+                        continue
+
+                    if chunk_results and chunk_numel + shard_numel > self.gradient_chunk_size:
+                        gradient_chunks.append(
+                            self._build_gradient_chunk(dtype, param_group_index, chunk_results, chunk_params))
+                        chunk_results = []
+                        chunk_params = []
+                        chunk_numel = 0
+
+                    chunk_results.append(result)
+                    chunk_params.append(param_tensor)
+                    chunk_numel += shard_numel
+
+                if chunk_results:
+                    gradient_chunks.append(
+                        self._build_gradient_chunk(dtype, param_group_index, chunk_results, chunk_params))
 
         self.reduce_results.clear()
         return gradient_chunks
 
-    def _build_gradient_chunk(self, param_group_index: int, results: List[ReduceResult],
+    def _build_gradient_chunk(self, dtype: torch.dtype, param_group_index: int, results: List[ReduceResult],
                               params: List[torch.Tensor]) -> GradientChunk:
         base_group = self.base_optimizer.param_groups[param_group_index]
         chunk_param_group = dict(base_group)
         chunk_param_group['params'] = params
-        chunk_dtype = params[0].dtype if params else results[0].reduced_grad.dtype
+        chunk_dtype = dtype if params else results[0].reduced_grad.dtype
         return GradientChunk(dtype=chunk_dtype, results=results, param_group=chunk_param_group)
 
     def _get_conversion_buffer(self, dtype: torch.dtype) -> GradConversionDoubleBuffer:
@@ -594,7 +607,8 @@ class UniversalOptimizer(ABC):
         param_buffers = self.param_buffer_map[param]
         recv_buf = param_buffers.grad_comm_buffer
         grad_acc_buf = param_buffers.grad_acc_buffer
-        self.reduce_tasks[param.dtype].append(ReduceTask(param, reduce_in_buffer, recv_buf, grad_acc_buf))
+        shard_size = param_buffers.size
+        self.reduce_tasks[param.dtype].append(ReduceTask(param, reduce_in_buffer, recv_buf, grad_acc_buf, shard_size))
 
         self.rs_comp_done_events[param].record(self.comp_stream)
         self.rs_comp_done_events[param].wait(self.copy_stream)
@@ -633,7 +647,7 @@ class UniversalOptimizer(ABC):
                 self._accumulate_into_grad_acc_buf(t)
 
             for t in self.reduce_tasks[dtype]:
-                self.reduce_results[dtype].append(ReduceResult(t.param, t.grad_acc_buf))
+                self.reduce_results[dtype].append(ReduceResult(t.param, t.grad_acc_buf, t.data_size))
 
         for t in self.reduce_tasks[dtype]:
             self.rs_copy_done_events[t.param].record(self.copy_stream)
@@ -654,6 +668,27 @@ class UniversalOptimizer(ABC):
 
         if not self.reduce_results:
             return
+
+        grad_clip_coef: Optional[float] = None
+        norm_accum = torch.zeros(1, dtype=torch.float32, device=self.device)
+        for results in self.reduce_results.values():
+            for result in results:
+                valid_numel = result.data_size
+                if valid_numel == 0:
+                    continue
+                grad_flat = result.reduced_grad.view(-1)
+                grad_view = grad_flat.narrow(0, 0, valid_numel)
+                if grad_view.numel() == 0:
+                    continue
+                norm_accum += torch.dot(grad_view.float(), grad_view.float())
+
+        global_grad_norm = self._reduce_and_sqrt_grad_norm(norm_accum)
+        self._global_grad_norm = global_grad_norm.item()
+
+        if self.clip_grad > 0.0:
+            clip_coef = self.clip_grad / (self._global_grad_norm + 1e-6)
+            if clip_coef < 1.0:
+                grad_clip_coef = float(clip_coef)
 
         gradient_chunks = self._chunk_reduce_results()
         original_param_groups = self.base_optimizer.param_groups
@@ -677,16 +712,25 @@ class UniversalOptimizer(ABC):
             with get_accelerator().stream(self.copy_stream):
                 for result, param_tensor in zip(chunk.results, chunk_params):
                     grad_tensor = result.reduced_grad
+                    grad_flat = grad_tensor.view(-1)
+                    valid_numel = result.data_size
+                    total_numel = grad_flat.numel()
+
+                    if grad_clip_coef is not None and valid_numel > 0:
+                        grad_flat.narrow(0, 0, valid_numel).mul_(grad_clip_coef)
+
+                    if valid_numel < total_numel:
+                        grad_flat.narrow(0, valid_numel, total_numel - valid_numel).zero_()
 
                     if grad_tensor.dtype != param_tensor.dtype:
                         buffer_tensor, offset = buffer_state[param_tensor.dtype]
                         numel = param_tensor.numel()
                         slice_view = buffer_tensor.narrow(0, offset, numel)
-                        slice_view.copy_(grad_tensor.view(-1), non_blocking=True)
+                        slice_view.copy_(grad_flat, non_blocking=True)
                         buffer_state[param_tensor.dtype] = (buffer_tensor, offset + numel)
                         grad_src = slice_view
                     else:
-                        grad_src = grad_tensor.view(-1)
+                        grad_src = grad_flat
 
                     param_tensor.grad = grad_src.view_as(param_tensor)
 
@@ -841,6 +885,9 @@ class UniversalOptimizerZ1(UniversalOptimizer):
     def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
         return False
 
+    def _reduce_and_sqrt_grad_norm(self, norm_accum: torch.Tensor) -> torch.Tensor:
+        return norm_accum.sqrt()
+
 
 class UniversalOptimizerZ2(UniversalOptimizer):
 
@@ -866,9 +913,13 @@ class UniversalOptimizerZ2(UniversalOptimizer):
     def _should_clear_param_grad(self, param: torch.Tensor) -> bool:
         return True
 
+    def _reduce_and_sqrt_grad_norm(self, norm_accum: torch.Tensor) -> torch.Tensor:
+        dist.all_reduce(norm_accum, op=dist.ReduceOp.SUM)
+        return norm_accum.sqrt()
+
 
 def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: UniversalOptimizerConfig,
-                                  reduce_bucket_size: int, zero_stage: int):
+                                  reduce_bucket_size: int, zero_stage: int, clip_grad: float):
     if zero_stage == 1:
         optimizer_cls = UniversalOptimizerZ1
     elif zero_stage == 2:
@@ -876,4 +927,4 @@ def configure_universal_optimizer(optimizer: torch.optim.Optimizer, config: Univ
     else:
         raise ValueError(f"Universal optimizer does not yet support ZeRO stage {zero_stage}.")
 
-    return optimizer_cls(optimizer, config, reduce_bucket_size)
+    return optimizer_cls(optimizer, config, reduce_bucket_size, clip_grad)
