@@ -836,12 +836,16 @@ class UniversalOptimizer(ABC):
             buffer_mgr.ensure_capacity(required_numel)
             global_buffer_state[dtype] = (buffer_mgr.acquire(), 0)
 
-        # OPTIMIZATION: Overlap gradient copy with optimizer step by processing chunks in pipeline
+        # OPTIMIZATION: Overlap gradient copy, optimizer step, and all-gather by processing chunks in pipeline
         # For each chunk:
         #   1. Copy gradients for chunk N on copy_stream (overlaps with previous chunk's compute)
         #   2. Wait for copy to complete
         #   3. Run optimizer.step() for chunk N on default stream
-        # This hides gradient copy latency behind compute
+        #   4. Launch coalesced all-gather for chunk N (overlaps with next chunk's gradient copy and step)
+        # This hides gradient copy and all-gather latency behind compute
+
+        # Collect async all-gather coalescing managers for later synchronization
+        allgather_cms = []
 
         for chunk in gradient_chunks:
             chunk_params = chunk.param_group['params']
@@ -882,6 +886,38 @@ class UniversalOptimizer(ABC):
             for param_tensor in chunk_params:
                 param_tensor.grad = None
 
+            # Launch coalesced all-gather for this chunk's parameters immediately after optimizer step
+            # This overlaps with the next chunk's gradient copy and optimizer step
+            # Use coalescing_manager to batch all-gathers within this chunk for efficiency
+            with get_coalescing_manager(group=None, device=self.device, async_op=True) as cm:
+                for result in chunk.results:
+                    param = result.param
+                    # Find the buffer containing this parameter and launch all-gather
+                    for buffers in self.param_update_buffers:
+                        if param in buffers.param_range_map_global:
+                            map_global = buffers.param_range_map_global[param]
+                            map_local = buffers.param_range_map_local[param]
+
+                            padded_shard_size = map_local.padded_size
+                            if padded_shard_size == 0:
+                                break
+
+                            local_shard_offset = map_global.offset + padded_shard_size * self.rank
+
+                            if buffers.param_for_optimizer.dtype == buffers.param_buffer.dtype:
+                                gather_src = buffers.param_for_optimizer[map_local.offset:map_local.offset +
+                                                                          padded_shard_size]
+                            else:
+                                gather_src = buffers.param_buffer[local_shard_offset:local_shard_offset +
+                                                                   padded_shard_size]
+
+                            dist.all_gather_into_tensor(
+                                buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size],
+                                gather_src)
+                            break
+            # Store the coalescing manager for later synchronization
+            allgather_cms.append(cm)
+
         # Copy back updated parameters
         step_event = get_accelerator().Event(enable_timing=False, blocking=False)
         step_event.record(get_accelerator().current_stream())
@@ -907,30 +943,11 @@ class UniversalOptimizer(ABC):
             pre_gather_event.record(self.copy_stream)
             pre_gather_event.wait(self.comp_stream)
 
-        with get_coalescing_manager(
-                group=None,
-                device=self.device,
-                async_op=True,
-        ) as cm:
-            for buffers in self.param_update_buffers:
-                for p in buffers.param_range_map_global.keys():
-                    map_global = buffers.param_range_map_global[p]
-                    map_local = buffers.param_range_map_local[p]
-
-                    padded_shard_size = map_local.padded_size
-                    if padded_shard_size == 0:
-                        continue
-
-                    local_shard_offset = map_global.offset + padded_shard_size * self.rank
-
-                    if buffers.param_for_optimizer.dtype == buffers.param_buffer.dtype:
-                        gather_src = buffers.param_for_optimizer[map_local.offset:map_local.offset + padded_shard_size]
-                    else:
-                        gather_src = buffers.param_buffer[local_shard_offset:local_shard_offset + padded_shard_size]
-
-                    dist.all_gather_into_tensor(
-                        buffers.param_buffer[map_global.offset:map_global.offset + map_global.padded_size], gather_src)
-        cm.wait()
+        # Wait for all coalesced all-gather operations to complete
+        # Each chunk's all-gathers were coalesced and launched asynchronously
+        # They have been overlapping with subsequent chunks' computation
+        for cm in allgather_cms:
+            cm.wait()
 
         self.param_update_group_container.release_grad_buffers()
 
