@@ -197,10 +197,16 @@ class ParamUpdateShardBuffers:
 class ReduceBucket:
 
     def __init__(self, dtype: torch.dtype, buffer_size: int, device: torch.device) -> None:
-        self.buffer = torch.empty(buffer_size, dtype=dtype, device=device)
+        self.buffer = None  # Lazy allocation
         self.size = buffer_size
         self.offset = 0
         self.dtype = dtype
+        self.device = device
+
+    def _ensure_allocated(self) -> None:
+        """Lazily allocate buffer on first use"""
+        if self.buffer is None:
+            self.buffer = torch.empty(self.size, dtype=self.dtype, device=self.device)
 
     def get_size(self) -> int:
         return self.size
@@ -209,6 +215,7 @@ class ReduceBucket:
         return self.offset
 
     def get_buffer(self) -> torch.Tensor:
+        self._ensure_allocated()
         return self.buffer
 
     def get_dtype(self) -> torch.dtype:
@@ -216,10 +223,11 @@ class ReduceBucket:
 
     def reserve(self, size: int) -> None:
         if size > self.size:
-            self.buffer = torch.empty(size, dtype=self.dtype, device=self.buffer.device)
+            self.buffer = torch.empty(size, dtype=self.dtype, device=self.device)
             self.size = size
 
     def allocate(self, numel: int) -> torch.Tensor:
+        self._ensure_allocated()
         if self.offset + numel > self.size:
             raise RuntimeError("Buffer size exceeds the reduce bucket size")
 
@@ -231,6 +239,11 @@ class ReduceBucket:
         return self.offset > 0 and self.offset + numel > self.size
 
     def reset(self) -> None:
+        self.offset = 0
+
+    def release(self) -> None:
+        """Release buffer memory"""
+        self.buffer = None
         self.offset = 0
 
 
@@ -267,6 +280,12 @@ class CommDoubleBuffer:
         self.events[self.current_buffer_idx].record(copy_stream)
         self.buckets[self.current_buffer_idx].reset()
         self.current_buffer_idx = 1 - self.current_buffer_idx
+
+    def release(self) -> None:
+        """Release all buffer memory"""
+        for bucket in self.buckets:
+            bucket.release()
+        self.current_buffer_idx = 0
 
 
 @dataclass
@@ -899,6 +918,10 @@ class UniversalOptimizer(ABC):
         cm.wait()
 
         self.param_update_group_container.release_grad_buffers()
+
+        # Release communication buffers after step to save memory
+        for comm_buffer in self.comm_buffers.values():
+            comm_buffer.release()
 
     def zero_grad(self, *args, **kwargs):
         self.base_optimizer.zero_grad(*args, **kwargs)
