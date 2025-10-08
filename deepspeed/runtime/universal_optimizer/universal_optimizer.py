@@ -821,21 +821,33 @@ class UniversalOptimizer(ABC):
             if clip_coef < 1.0:
                 grad_clip_coef = float(clip_coef)
 
+        # Calculate total conversion needs across all chunks
+        total_conversion_needs: Dict[torch.dtype, int] = defaultdict(int)
         for chunk in gradient_chunks:
-            chunk_param_group = chunk.param_group
-            chunk_params = chunk_param_group['params']
-
-            conversion_needs: Dict[torch.dtype, int] = defaultdict(int)
+            chunk_params = chunk.param_group['params']
             for result, param_tensor in zip(chunk.results, chunk_params):
                 if result.reduced_grad.dtype != param_tensor.dtype:
-                    conversion_needs[param_tensor.dtype] += param_tensor.numel()
+                    total_conversion_needs[param_tensor.dtype] += param_tensor.numel()
 
-            buffer_state: Dict[torch.dtype, Tuple[torch.Tensor, int]] = {}
-            for dtype, required_numel in conversion_needs.items():
-                buffer_mgr = self._get_conversion_buffer(dtype)
-                buffer_mgr.ensure_capacity(required_numel)
-                buffer_state[dtype] = (buffer_mgr.acquire(), 0)
+        # Allocate all conversion buffers at once
+        global_buffer_state: Dict[torch.dtype, Tuple[torch.Tensor, int]] = {}
+        for dtype, required_numel in total_conversion_needs.items():
+            buffer_mgr = self._get_conversion_buffer(dtype)
+            buffer_mgr.ensure_capacity(required_numel)
+            global_buffer_state[dtype] = (buffer_mgr.acquire(), 0)
 
+        # OPTIMIZATION: Overlap gradient copy with optimizer step by processing chunks in pipeline
+        # For each chunk:
+        #   1. Copy gradients for chunk N on copy_stream (overlaps with previous chunk's compute)
+        #   2. Wait for copy to complete
+        #   3. Run optimizer.step() for chunk N on default stream
+        # This hides gradient copy latency behind compute
+
+        for chunk in gradient_chunks:
+            chunk_params = chunk.param_group['params']
+
+            # Start copying gradients for this chunk on copy_stream
+            # This overlaps with the previous chunk's optimizer.step() if any
             with get_accelerator().stream(self.copy_stream):
                 for result, param_tensor in zip(chunk.results, chunk_params):
                     grad_tensor = result.reduced_grad
@@ -845,32 +857,38 @@ class UniversalOptimizer(ABC):
                         grad_flat.mul_(grad_clip_coef)
 
                     if grad_tensor.dtype != param_tensor.dtype:
-                        buffer_tensor, offset = buffer_state[param_tensor.dtype]
+                        buffer_tensor, offset = global_buffer_state[param_tensor.dtype]
                         numel = param_tensor.numel()
                         slice_view = buffer_tensor.narrow(0, offset, numel)
                         slice_view.copy_(grad_flat, non_blocking=True)
-                        buffer_state[param_tensor.dtype] = (buffer_tensor, offset + numel)
+                        global_buffer_state[param_tensor.dtype] = (buffer_tensor, offset + numel)
                         grad_src = slice_view
                     else:
                         grad_src = grad_flat
 
                     param_tensor.grad = grad_src.view_as(param_tensor)
 
+            # Wait for this chunk's gradient copy to complete before running optimizer
             copy_event = get_accelerator().Event(enable_timing=False, blocking=False)
             copy_event.record(self.copy_stream)
             copy_event.wait(get_accelerator().current_stream())
 
+            # Run optimizer step for this chunk on default stream
+            # While this runs, the next chunk's gradients can be copied in parallel!
+            chunk_param_group = chunk.param_group
             self.base_optimizer.param_groups = [chunk_param_group]
             self.base_optimizer.step(*args, **kwargs)
 
             for param_tensor in chunk_params:
                 param_tensor.grad = None
 
-            step_event = get_accelerator().Event(enable_timing=False, blocking=False)
-            step_event.record(get_accelerator().current_stream())
-            chunk_copy_issued = False
-            with get_accelerator().stream(self.copy_stream):
-                step_event.wait(self.copy_stream)
+        # Copy back updated parameters
+        step_event = get_accelerator().Event(enable_timing=False, blocking=False)
+        step_event.record(get_accelerator().current_stream())
+
+        with get_accelerator().stream(self.copy_stream):
+            step_event.wait(self.copy_stream)
+            for chunk in gradient_chunks:
                 for result in chunk.results:
                     param_buffers = self.param_buffer_map[result.param]
                     if param_buffers.param_buffer.numel() == 0:
@@ -878,10 +896,7 @@ class UniversalOptimizer(ABC):
                     if param_buffers.param_for_optimizer.dtype == param_buffers.param_buffer.dtype:
                         continue
                     param_buffers.param_buffer.copy_(param_buffers.param_for_optimizer, non_blocking=True)
-                    chunk_copy_issued = True
-
-            if chunk_copy_issued:
-                issued_cast_copies = True
+                    issued_cast_copies = True
 
         self.base_optimizer.param_groups = original_param_groups
         for buffer_mgr in self.grad_conversion_buffers.values():
