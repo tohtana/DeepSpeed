@@ -1517,7 +1517,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #####################################################################
 
     def process_gradients(self, param, i):
-        self.backward_prologue()
+        self.backward_param_prologue()
         if self.use_grad_accum_attribute:
             self._fill_param_grad_accum_attribute(param)
         if self.partition_gradients or self.overlap_comm:
@@ -2196,7 +2196,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         inf_or_nan = nan.logical_or(inf)
         return inf_or_nan.float().max()
 
-    def backward_prologue(self):
+    def backward_param_prologue(self):
         if not self.ready_for_gradients:
             self.micro_step_id += 1
 
