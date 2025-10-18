@@ -85,7 +85,7 @@ from deepspeed.utils.timer import NoopTimer, ThroughputTimer, SynchronizedWallCl
 from deepspeed.utils.debug import debug_extract_module_and_param_names, debug_clear_module_and_param_names
 from deepspeed.monitor.monitor import MonitorMaster
 from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
-from deepspeed.runtime.utils import clip_grad_norm_, compare_tensors_in_structures
+from deepspeed.runtime.utils import clip_grad_norm_, compare_tensors_in_structures, maybe_loss_for_backward
 from deepspeed.runtime.eigenvalue import Eigenvalue
 from deepspeed.runtime.data_pipeline.constants import DATA_SAMPLING, \
     DATA_ROUTING, DATA_SAMPLING_ENABLED, CURRICULUM_LEARNING, \
@@ -419,6 +419,11 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(prefetch.NAME, prefetch.schedule_prefetch)
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
+
+        # Register backward hooks for non-scalar backward support
+        self._running_engine_backward = False  # Track if we're currently in engine's backward
+        self._backward_pre_hook_handle = self.register_full_backward_pre_hook(self._backward_pre_hook)
+        self._backward_post_hook_handle = self.register_full_backward_hook(self._backward_post_hook)
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2248,7 +2253,9 @@ class DeepSpeedEngine(Module):
         elif self.zenflow:
             self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
 
-    def _backward_prologue(self, loss, scale_wrt_gas=True):
+    def _backward_prologue(self, grad_output, scale_wrt_gas=True):
+        self._start_timers(self.engine_timers.backward_timers)
+
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
         if self.scale_wrt_gas is not None:
             scale_wrt_gas = self.scale_wrt_gas
@@ -2256,21 +2263,24 @@ class DeepSpeedEngine(Module):
         # scale loss w.r.t. gradient accumulation if reduction is not disabled
         do_gradient_reduction = self.enable_backward_allreduce and not self.inside_no_sync_ctxt and not self.is_deepcompile_active(
         )
-        if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
-            loss = self._scale_loss_by_gas(loss.float())
 
-        # Log training loss
-        mean_loss = loss.mean().detach()
-        self.losses = mean_loss if self.losses is None else self.losses + mean_loss
-        if self.monitor.enabled:
-            if self.is_gradient_accumulation_boundary():
-                if self.global_rank == 0:
-                    self.summary_events = [(
-                        "Train/Samples/train_loss",
-                        self.losses.item(),
-                        self.global_samples,
-                    )]
-                    self.monitor.write_events(self.summary_events)
+        if maybe_loss_for_backward(grad_output):
+            if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
+                grad_output = self._scale_loss_by_gas(grad_output.float())
+
+            # Log training loss
+            loss = grad_output
+            mean_loss = loss.mean().detach()
+            self.losses = mean_loss if self.losses is None else self.losses + mean_loss
+            if self.monitor.enabled:
+                if self.is_gradient_accumulation_boundary():
+                    if self.global_rank == 0:
+                        self.summary_events = [(
+                            "Train/Samples/train_loss",
+                            self.losses.item(),
+                            self.global_samples,
+                        )]
+                        self.monitor.write_events(self.summary_events)
 
         if self.is_deepcompile_active():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
@@ -2278,7 +2288,16 @@ class DeepSpeedEngine(Module):
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
 
-        return loss
+        if self.zero_optimization():
+            self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
+
+        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+            grad_output = self.optimizer.backward_prologue(grad_output)
+
+        if self.torch_autocast_z0_gradscaler:
+            grad_output = self.torch_autocast_z0_gradscaler.scale(grad_output)
+
+        return grad_output
 
     def _backward_epilogue(self):
         self._start_timers(self.engine_timers.backward_reduce_timers)
@@ -2286,38 +2305,45 @@ class DeepSpeedEngine(Module):
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
 
-        self._stop_timers(self.engine_timers.backward_reduce_timers)
+        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+            self.optimizer.backward_epilogue()
+
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
+        self._stop_timers(self.engine_timers.backward_reduce_timers)
+        self._stop_timers(self.engine_timers.backward_timers)
 
     def _do_optimizer_backward(self, loss, retain_graph):
         self._start_timers(self.engine_timers.backward_inner_timers)
-        if self.zero_optimization():
-            self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
-            self.optimizer.backward(loss, retain_graph=retain_graph)
+        backward_kwargs = {"retain_graph": retain_graph}
+        if self.eigenvalue_enabled():
+            backward_kwargs["create_graph"] = True
+            backward_kwargs["retain_graph"] = True
+
+        if self.zero_optimization() or not self.amp_enabled():
+            loss.backward(**backward_kwargs)
         elif self.amp_enabled():
             # AMP requires delaying unscale when inside gradient accumulation boundaries
             # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
             delay_unscale = not self.is_gradient_accumulation_boundary()
             with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(retain_graph=retain_graph)
-        elif self.fp16_enabled():
-            if self.eigenvalue_enabled():
-                self.optimizer.backward(loss, create_graph=True, retain_graph=True)
-            else:
-                self.optimizer.backward(loss, retain_graph=retain_graph)
-        elif self.bfloat16_enabled():
-            self.optimizer.backward(loss, retain_graph=retain_graph)
-        else:
-            if self.torch_autocast_z0_gradscaler:
-                if self.eigenvalue_enabled():
-                    self.torch_autocast_z0_gradscaler.scale(loss).backward(create_graph=True, retain_graph=True)
-                else:
-                    self.torch_autocast_z0_gradscaler.scale(loss).backward(retain_graph=retain_graph)
-            elif self.eigenvalue_enabled():
-                loss.backward(create_graph=True, retain_graph=True)
-            else:
-                loss.backward(retain_graph=retain_graph)
+                scaled_loss.backward(**backward_kwargs)
+
         self._stop_timers(self.engine_timers.backward_inner_timers)
+
+    def _backward_pre_hook(self, module, grad_output):
+        if self._running_engine_backward:
+            return grad_output  # Prevent reentry
+
+        assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
+        assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
+
+        return self._backward_prologue(grad_output)
+
+    def _backward_post_hook(self, module, grad_input, grad_output):
+        if self._running_engine_backward:
+            return  # Prevent reentry
+
+        self._backward_epilogue()
 
     @contextmanager
     def no_sync(self):
@@ -2349,12 +2375,16 @@ class DeepSpeedEngine(Module):
         """
         assert self.optimizer is not None and not isinstance(self.optimizer, DummyOptim), \
             "must provide optimizer during init in order to use backward"
+        assert maybe_loss_for_backward(
+            loss), "loss must be a scalar tensor. If you need to pass output gradients, backward() of output tensors"
 
+        self._running_engine_backward = True
         self._start_timers(self.engine_timers.backward_timers)
         loss = self._backward_prologue(loss, scale_wrt_gas)
         self._do_optimizer_backward(loss, retain_graph)
         self._backward_epilogue()
         self._stop_timers(self.engine_timers.backward_timers)
+        self._running_engine_backward = False
 
         return loss
 
