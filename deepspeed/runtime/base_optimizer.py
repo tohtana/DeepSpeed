@@ -99,9 +99,16 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
         return value
 
-    def backward(self, loss, retain_graph=False):
+    def backward_prologue(self, loss):
+        return loss
+
+    def backward_epilogue(self, **kwargs):
+        pass
+
+    def backward(self, loss, **kwargs):
         assert maybe_loss_for_backward(loss), "Optimizer's backward() only accepts a scalar tensor"
 
         scaled_loss = self.backward_prologue(loss)
+        retain_graph = kwargs.pop('retain_graph', False)
         scaled_loss.backward(retain_graph=retain_graph)
         self.backward_epilogue()

@@ -2226,7 +2226,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         return self.scale_if_loss(maybe_loss_value)
 
-    def backward_epilogue(self):
+    def backward_epilogue(self, *args, **kwargs):
         # Only for Stage 1, Mode 2
         if self.use_grad_accum_attribute:
             self.fill_grad_accum_attribute()
