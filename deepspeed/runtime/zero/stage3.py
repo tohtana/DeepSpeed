@@ -7,7 +7,7 @@ import sys
 import gc
 import collections
 import itertools
-from typing import Deque, Dict, Set, List, Tuple, Container, Optional
+from typing import Deque, Dict, Set, List, Tuple, Container, Optional, Any
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -2260,28 +2260,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 return True
             return False
 
-    @instrument_w_nvtx
-    def backward(self, loss, retain_graph=False):
-        """
-        :attr:`backward` performs the following steps:
-
-        1. fp32_loss = loss.float()
-        2. scaled_loss = fp32_loss*loss_scale
-        3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
+    def backward_prologue(self, maybe_loss_value: Any):
+        """Currently only scales the loss value. Defined for consistency of naming.
         """
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
 
-        see_memory_usage("Before backward", force=False)
+        return self.scale_if_loss(maybe_loss_value)
 
-        if self.custom_loss_scaler:
-            scaled_loss = self.external_loss_scale * loss
-            scaled_loss.backward()
-        elif self.torch_autocast_gradscaler:
-            self.torch_autocast_gradscaler.scale(loss).backward(retain_graph=retain_graph)
-        else:
-            self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
-
+    def backward_epilogue(self):
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 

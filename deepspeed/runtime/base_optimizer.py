@@ -5,11 +5,13 @@
 
 import os
 import torch
+from typing import Any
 
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank, see_memory_usage
 from deepspeed.runtime.torch_autocast import get_comm_dtype, is_autocast_initialized
+from deepspeed.runtime.utils import maybe_loss_for_backward
 
 
 class DeepSpeedOptimizer(object):
@@ -79,3 +81,27 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             return get_comm_dtype(param)
         else:
             return self.communication_data_type
+
+    def scale_if_loss(self, value: Any) -> Any:
+        """
+        :attr:`backward` performs the following steps:
+
+        1. fp32_loss = loss.float()
+        2. scaled_loss = fp32_loss*loss_scale
+        3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
+        """
+        if maybe_loss_for_backward(value):
+            if self.custom_loss_scaler:
+                return self.external_loss_scale * value
+            if self.torch_autocast_gradscaler:
+                return self.torch_autocast_gradscaler.scale(value)
+            return self.loss_scaler.scale_loss(value.float())
+
+        return value
+
+    def backward(self, loss, retain_graph=False):
+        assert maybe_loss_for_backward(loss), "Optimizer's backward() only accepts a scalar tensor"
+
+        scaled_loss = self.backward_prologue(loss)
+        scaled_loss.backward(retain_graph=retain_graph)
+        self.backward_epilogue()

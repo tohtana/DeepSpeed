@@ -20,8 +20,7 @@ from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
 from deepspeed.runtime.utils import (empty_cache, see_memory_usage, inf, is_model_parallel_parameter,
-                                     align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace,
-                                     maybe_loss_for_backward)
+                                     align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace)
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -2222,23 +2221,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
             self.ready_for_gradients = True
 
-    def scale_if_loss(self, value: Any) -> Any:
-        """
-        :attr:`backward` performs the following steps:
-
-        1. fp32_loss = loss.float()
-        2. scaled_loss = fp32_loss*loss_scale
-        3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
-        """
-        if maybe_loss_for_backward(value):
-            if self.custom_loss_scaler:
-                return self.external_loss_scale * value
-            if self.torch_autocast_gradscaler:
-                return self.torch_autocast_gradscaler.scale(value)
-            return self.loss_scaler.scale_loss(value.float())
-
-        return value
-
     def backward_prologue(self, maybe_loss_value: Any):
         """Currently only scales the loss value. Defined for consistency of naming.
         """
@@ -2248,13 +2230,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Only for Stage 1, Mode 2
         if self.use_grad_accum_attribute:
             self.fill_grad_accum_attribute()
-
-    def backward(self, loss, retain_graph=False):
-        assert maybe_loss_for_backward(loss), "Optimizer's backward() only accepts a scalar tensor"
-
-        scaled_loss = self.backward_prologue(loss)
-        scaled_loss.backward(retain_graph=retain_graph)
-        self.backward_epilogue()
 
     def check_overflow(self, partition_gradients=True):
         self._check_overflow(partition_gradients)
