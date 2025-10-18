@@ -1188,3 +1188,16 @@ def compare_tensors_in_structures(inputs1: Union[List, Dict], inputs2: Union[Lis
         return True
 
     return False
+
+
+def maybe_loss_for_backward(value) -> bool:
+    """Check if the value is a loss tensor.
+    Conditions:
+    - The value must be a tensor.
+    - The tensor must have exactly one element.
+    - The tensor must have grad_fn defined.
+
+    Args:
+        value: The value to check.
+    """
+    return isinstance(value, torch.Tensor) and value.numel() == 1 and value.grad_fn is not None
