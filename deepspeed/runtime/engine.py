@@ -421,6 +421,7 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
+        self._running_engine_backward = False
         if isinstance(self.optimizer, ZeROOptimizer):
             if self._config.zero_config.allow_user_backward:
                 # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
@@ -440,7 +441,6 @@ class DeepSpeedEngine(Module):
                 # When `engine.backward()` is called, we want to skip these pre- and post-backward hooks
                 # since they are already handled in engine.backward(). We set this flag to True
                 # to avoid duplicated preprocessing and postprocessing.
-                self._running_engine_backward = False
             else:
 
                 def warn_user_backward_disabled(*args, **kwargs):
