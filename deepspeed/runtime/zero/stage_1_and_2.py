@@ -167,6 +167,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  elastic_checkpoint=False,
                  check_grad_overflow=True):
 
+        super().__init__()
+
         if offload_optimizer_config is not None and offload_optimizer_config.device != OffloadDeviceEnum.none:
             self.cpu_offload = True
             self.cpu_offload_pin_memory = offload_optimizer_config.pin_memory
@@ -983,10 +985,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                         def grad_handling_hook(*notneeded):
                             self.process_gradients(param, i)
+                            self.remaining_grad_acc_hooks -= 1
+                            if self.remaining_grad_acc_hooks == 0:
+                                self.run_grad_acc_post_hooks()
+                                self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
 
                     wrapper(param, i)
+
+        self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
 
     def get_param_id(self, param):
         unique_id = id(param)
@@ -1517,7 +1525,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #####################################################################
 
     def process_gradients(self, param, i):
-        self.backward_param_prologue()
+        self.setup_buckets()
         if self.use_grad_accum_attribute:
             self._fill_param_grad_accum_attribute(param)
         if self.partition_gradients or self.overlap_comm:
@@ -2196,7 +2204,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         inf_or_nan = nan.logical_or(inf)
         return inf_or_nan.float().max()
 
-    def backward_param_prologue(self):
+    def setup_buckets(self):
         if not self.ready_for_gradients:
             self.micro_step_id += 1
 

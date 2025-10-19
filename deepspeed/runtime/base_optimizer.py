@@ -20,6 +20,10 @@ class DeepSpeedOptimizer(object):
 
 class ZeROOptimizer(DeepSpeedOptimizer):
 
+    def __init__(self):
+        self.remaining_grad_acc_hooks = 0
+        self.grad_acc_post_hooks = []
+
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
         optim_state_path = os.path.join(checkpoint_dir, "optimizer_state.pt")
@@ -112,3 +116,13 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         retain_graph = kwargs.pop('retain_graph', False)
         scaled_loss.backward(retain_graph=retain_graph)
         self.backward_epilogue()
+
+    def register_grad_acc_post_hook(self, hook):
+        self.grad_acc_post_hooks.append(hook)
+
+    def unregister_grad_acc_post_hooks(self):
+        self.grad_acc_post_hooks = []
+
+    def run_grad_acc_post_hooks(self):
+        for hook in self.grad_acc_post_hooks:
+            hook()

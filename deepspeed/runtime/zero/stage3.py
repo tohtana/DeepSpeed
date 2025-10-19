@@ -184,6 +184,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         see_memory_usage("Stage 3 initialize beginning", force=True)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
+        super().__init__()
 
         if dist.get_rank() == 0:
             logger.info(f"Reduce bucket size {reduce_bucket_size}")
@@ -1204,6 +1205,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
                             self.reduce_ready_partitions_and_remove_grads(param)
+                            self.remaining_grad_acc_hooks -= 1
+                            if self.remaining_grad_acc_hooks == 0:
+                                self.run_grad_acc_post_hooks()
+                                self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, reduce_partition_and_remove_grads))
 
@@ -1215,6 +1220,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                     # Partition the parameter after creating the hook
                     param.partition()
+
+        self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
 
         # We delay reduce for all gradients in the leaf modules until the backward pass of the leaf module is done
         for leaf_module, leaf_parameters in self.leaf_parameters.items():

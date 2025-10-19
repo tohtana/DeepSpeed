@@ -420,10 +420,24 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
-        # Register backward hooks for non-scalar backward support
-        self._running_engine_backward = False  # Track if we're currently in engine's backward
+        # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
+        # not for `engine.backward(loss)`. In this case, we need to ensure that the preprocessing
+        # and postprocessing around the backward call are handled correctly.
+        # To achieve this, we register a pre-backward hook using `register_full_backward_pre_hook`.
         self._backward_pre_hook_handle = self.register_full_backward_pre_hook(self._backward_pre_hook)
-        self._backward_post_hook_handle = self.register_full_backward_hook(self._backward_post_hook)
+        # However, we cannot use `register_full_backward_hook` for post-backward hooks.
+        # If none of the module inputs require gradients, `register_full_backward_hook` fires
+        # when the gradients of the module outputs are computed. Our gradient
+        # accumulation hooks are called later. But we want `_backward_post_hook` to be called
+        # only after all gradients have been computed.
+        # To handle this, the optimizer maintains a counter to track the number of gradients
+        # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
+        # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
+        self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
+        # When `engine.backward()` is called, we want to skip these pre- and post-backward hooks
+        # since they are already handled in engine.backward(). We set this flag to True
+        # to avoid duplicated preprocessing and postprocessing.
+        self._running_engine_backward = False
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2339,7 +2353,7 @@ class DeepSpeedEngine(Module):
 
         return self._backward_prologue(grad_output)
 
-    def _backward_post_hook(self, module, grad_input, grad_output):
+    def _backward_post_hook(self):
         if self._running_engine_backward:
             return  # Prevent reentry
 
