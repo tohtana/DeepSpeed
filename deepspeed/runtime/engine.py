@@ -2307,7 +2307,7 @@ class DeepSpeedEngine(Module):
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
 
-        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+        if isinstance(self.optimizer, ZeROOptimizer):
             grad_output = self.optimizer.backward_prologue(grad_output)
 
         if self.torch_autocast_z0_gradscaler:
