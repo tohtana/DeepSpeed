@@ -56,6 +56,13 @@ class DeepSpeedBF16Config(DeepSpeedConfigModel):
     Check for gradient overflows and underflows
     """
 
+    bf16_master_weights_and_grads: bool = False
+    """
+    Maintain master weights and gradients in optimizer state as bf16 instead of fp32.
+    This option allows pure BF16 training without FP32 master parameters.
+    Note: This may affect numerical stability and convergence for some models.
+    """
+
 
 #########################################
 # FP16 support

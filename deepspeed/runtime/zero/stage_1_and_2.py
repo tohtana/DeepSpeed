@@ -164,6 +164,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  round_robin_gradients=False,
                  has_moe_layers=False,
                  fp16_master_weights_and_gradients=False,
+                 bf16_master_weights_and_gradients=False,
                  elastic_checkpoint=False,
                  check_grad_overflow=True):
 
@@ -266,6 +267,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         self.extra_large_param_to_reduce: Dict[int, torch.Tensor] = {}
         self.fp16_master_weights_and_gradients = fp16_master_weights_and_gradients
+        self.bf16_master_weights_and_gradients = bf16_master_weights_and_gradients
+
+        if self.fp16_master_weights_and_gradients and self.bf16_master_weights_and_gradients:
+            raise ValueError(
+                "Cannot enable both fp16_master_weights_and_gradients and bf16_master_weights_and_gradients. "
+                "Please enable only one of them."
+            )
 
         if self.fp16_master_weights_and_gradients:
             assert self.cpu_offload and type(self.optimizer) in [DeepSpeedCPUAdam], \
@@ -435,12 +443,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # A partition of the fp32 master weights that will be updated by this process.
             # Note that the params in single_partition_of_fp32_groups is cloned and detached
             # from the origin params of the model.
-            if not fp16_master_weights_and_gradients:
+            if not (fp16_master_weights_and_gradients or bf16_master_weights_and_gradients):
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().float().detach()
-            else:
+            elif fp16_master_weights_and_gradients:
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().half().detach()
+            elif bf16_master_weights_and_gradients:
+                weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
+                    self.device).clone().bfloat16().detach()
 
             if self.cpu_offload:
                 weights_partition = get_accelerator().pin_memory(weights_partition)
@@ -1299,7 +1310,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         #buffer for storing gradients for this parameter in CPU
         def buffer_to_accumulate_to_in_cpu():
-            if not self.fp16_master_weights_and_gradients:
+            if not (self.fp16_master_weights_and_gradients or self.bf16_master_weights_and_gradients):
                 buffer = torch.zeros(param.numel(), dtype=param.dtype, device=self.device)
                 return get_accelerator().pin_memory(buffer) if self.cpu_offload_pin_memory else buffer
             else:
@@ -1308,7 +1319,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #accumulate gradients into param.grad_accum or parts of it that belongs to this partition
         def accumulate_gradients():
             grad_accum = self.get_param_gradient_attribute(param)
-            if not self.fp16_master_weights_and_gradients:
+            if not (self.fp16_master_weights_and_gradients or self.bf16_master_weights_and_gradients):
                 dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
                 grad_accum.data.view(-1).add_(dest_buffer)
             else:
@@ -1321,7 +1332,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #move accumulated gradients back to CPU
         def copy_gradients_to_cpu():
             grad_accum = self.get_param_gradient_attribute(param)
-            if not self.fp16_master_weights_and_gradients:
+            if not (self.fp16_master_weights_and_gradients or self.bf16_master_weights_and_gradients):
                 self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1), non_blocking=True)
             else:
                 self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1).narrow(
@@ -1375,7 +1386,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         assert grad_accum is not None
 
         src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
-        if not self.fp16_master_weights_and_gradients:
+        if not (self.fp16_master_weights_and_gradients or self.bf16_master_weights_and_gradients):
             src_tensor = src_tensor.float()
 
         dest_tensor.copy_(src_tensor, non_blocking=True)
