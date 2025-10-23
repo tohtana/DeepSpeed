@@ -1611,7 +1611,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         tensor_to_allreduce = tensor
 
-        if pg_correctness_test or self.sequence_parallel_size > 1:
+        if pg_correctness_test or (self.sequence_parallel_size > 1 and communication_data_type is None):
             communication_data_type = torch.float32
 
         if communication_data_type != tensor.dtype:
