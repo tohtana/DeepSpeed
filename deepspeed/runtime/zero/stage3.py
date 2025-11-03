@@ -26,6 +26,7 @@ from deepspeed.runtime.zero.partition_parameters import *
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
+import deepspeed.runtime.zenflow.engine_stage3 as zf_engine_stage3
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
 from deepspeed.runtime.zero.offload_states import offload_adam_states, reload_adam_states
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -160,6 +161,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         overlap_comm=False,
         offload_optimizer_config=None,
         offload_param_config=None,
+        zenflow_config=None,
         sub_group_size=1000000000000,
         offload_ratio=0.0,
         mpu=None,
@@ -227,6 +229,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.partial_offload = offload_ratio
         self.enable_sanity_checks = enable_sanity_checks
 
+        self.create_zenflow_hooks()
+        self._initialize_zenflow_stage3_prologue(module, zenflow_config)
+
         #num of ranks in a ZeRO param partitioning group
         self.zero_hpz_partition_size = zero_hpz_partition_size
 
@@ -242,6 +247,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             module=module,
             timers=timers,
             ds_config=ds_config,
+            zenflow=self.zenflow,
             overlap_comm=overlap_comm,
             prefetch_bucket_size=prefetch_bucket_size,
             max_reuse_distance=max_reuse_distance,
@@ -276,6 +282,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if len(self.optimizer.param_groups) > 1:
                 for i in range(1, len(self.optimizer.param_groups)):
                     self.backup_optimizer.add_param_group(self.optimizer.param_groups[i])
+
+        self._initialize_zenflow_stage3_epilogue(zenflow_config, overlap_comm)
 
         self.module = module
         self.elastic_checkpoint = elastic_checkpoint
@@ -477,11 +485,32 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         print_rank_0("Removed grad acc hooks", force=False)
         self.ipg_buckets.clear()
 
+    def create_zenflow_hooks(self):
+        from functools import partial
+        hook_names = [
+            "_initialize_zenflow_stage3_prologue",
+            "_initialize_zenflow_stage3_epilogue",
+            "zenflow_cpu_optimizer_step",
+            "_sync_selective_optimizer_lr",
+            "selective_optimizer_step",
+            "is_zenflow_select_boundary",
+            "update_selected_channels",
+            "_process_selected_fp32_groups_grad",
+            "zenflow_backward_prologue",
+            "zenflow_backward_epilogue",
+            "log_selective_optimizer_timers",
+        ]
+
+        for name in hook_names:
+            fn = getattr(zf_engine_stage3, name)
+            setattr(self, name, partial(fn, self))
+
     def initialize_ds_offload(
         self,
         module,
         timers,
         ds_config,
+        zenflow,
         overlap_comm,
         prefetch_bucket_size,
         max_reuse_distance,
@@ -500,6 +529,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         return DeepSpeedZeRoOffload(module=module,
                                     timers=timers,
                                     ds_config=ds_config,
+                                    zenflow=zenflow,
                                     overlap_comm=overlap_comm,
                                     prefetch_bucket_size=prefetch_bucket_size,
                                     max_reuse_distance=max_reuse_distance,
@@ -739,6 +769,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 self.fp16_groups.append(sub_group)
                 self.fp16_partitioned_groups.append([param.ds_tensor for param in sub_group])
 
+                if self.zenflow:
+                    for param in sub_group:
+                        param.group_id = param_group_idx
+
                 # record sub group -> group mapping
                 self.sub_group_to_group_id[sub_group_idx] = param_group_idx
 
@@ -921,13 +955,17 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     unpinned_fp32_buffer = torch.empty(num_elements, device=self.device, dtype=torch.float)
                     self._swap_in_sub_group_to_flat_buffer(unpinned_fp32_buffer, i)
                     self.fp32_partitioned_groups_flat.append(unpinned_fp32_buffer)
+                elif self.offload_optimizer:
+                    self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
+                        self.subgroup_to_device[i]).clone().float().detach())
+                elif self.fp16_partitioned_groups_flat[i].dtype == torch.float32:
+                    # When torch autocast is enabled, weights in the provided model (and thus groups in the so-called
+                    # "fp16" partitioned groups) are already in and updated using fp32. In such cases we don't need
+                    # another copy of the weights.
+                    self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i])
                 else:
-                    if self.offload_optimizer:
-                        self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
-                            self.subgroup_to_device[i]).clone().float().detach())
-                    else:
-                        self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
-                            self.device).clone().float().detach())
+                    self.fp32_partitioned_groups_flat.append(self.fp16_partitioned_groups_flat[i].to(
+                        self.device).clone().float().detach())
                 self.fp32_partitioned_groups_flat[i].ds_id = ds_id
 
             self.fp32_partitioned_groups_flat[i].requires_grad = True  # keep this in case internal optimizer uses it
@@ -998,7 +1036,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 self.torch_autocast_gradscaler.step(optimizer)
                 self.torch_autocast_gradscaler.update()
             else:
-                optimizer.step()
+                if not self.zenflow:
+                    optimizer.step()
+                else:
+                    self.zenflow_cpu_optimizer_step()
 
         if self.offload_optimizer:
             cur_device = self.subgroup_to_device[sub_group_id]
@@ -1274,8 +1315,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # move the gradient to a contiguous buffer
             with get_accelerator().stream(self.reduce_and_partition_stream):
                 # move the parameter's gradient to the contiguous flat buffer
-                new_grad_tensor = bucket.buffer.narrow(0, bucket.elements, param.grad.numel()).view_as(param.grad)
-                new_grad_tensor.copy_(param.grad, non_blocking=True)
+                if self.zenflow and len(param.ds_shape) != 1:
+                    transposed_shape = param.grad.t().shape
+                    new_grad_tensor = bucket.buffer.narrow(0, bucket.elements,
+                                                           param.grad.numel()).view(transposed_shape)
+                    new_grad_tensor.copy_(param.grad.t().contiguous(), non_blocking=True)
+                else:
+                    new_grad_tensor = bucket.buffer.narrow(0, bucket.elements, param.grad.numel()).view_as(param.grad)
+                    new_grad_tensor.copy_(param.grad, non_blocking=True)
                 if not get_accelerator().is_synchronized_device():
                     param.grad.record_stream(get_accelerator().current_stream())
                 param.grad.data = new_grad_tensor
@@ -1314,6 +1361,12 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             else:
                 params_in_bucket.sort(key=lambda p: p.ds_id)
                 grad_partitions = self.__avg_scatter_grads(params_in_bucket, communication_data_type)
+
+            if self.is_zenflow_select_boundary():
+                self.update_selected_channels(params_in_bucket, grad_partitions)
+
+            if self.zenflow and self.micro_step >= self.full_warm_up_rounds:
+                self._process_selected_fp32_groups_grad(params_in_bucket, grad_partitions)
 
             self.partition_grads(params_in_bucket, grad_partitions)
 
@@ -2072,6 +2125,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
+            # When torch autocast is enabled, groups in fp16_partitioned_groups are in fp32 already and those in
+            # fp32_partitioned_groups are aliases. Calling tensor.data.copy_ will not trigger any copy in that case.
             self.fp16_partitioned_groups_flat[sub_group_id].data.copy_(
                 self.fp32_partitioned_groups_flat[sub_group_id].data)
 
@@ -2273,9 +2328,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
 
+        if self.zenflow:
+            self.zenflow_backward_prologue()
+
+        see_memory_usage("Before backward", force=False)
         return self.scale_if_loss(maybe_loss_value)
 
     def backward_epilogue(self):
+        if self.zenflow:
+            self.zenflow_backward_epilogue()
+
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 
