@@ -2420,7 +2420,7 @@ class DeepSpeedEngine(Module):
         self._stop_timers(self.engine_timers.backward_timers)
         self._running_engine_backward = False
 
-        return loss
+        return loss * scale
 
     def is_gradient_accumulation_boundary(self):
         """
