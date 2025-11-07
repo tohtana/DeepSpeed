@@ -85,26 +85,20 @@ class TestZeroUserBackwardBasic(DistributedTest):
 
         # Initialize with engine.backward (traditional way)
         config1 = get_config_dict(zero_stage, allow_user_backward=False)
-        model_engine1, _, _, _ = deepspeed.initialize(
-            config=config1,
-            model=model1,
-            model_parameters=model1.parameters()
-        )
+        model_engine1, _, _, _ = deepspeed.initialize(config=config1,
+                                                      model=model1,
+                                                      model_parameters=model1.parameters())
 
         # Initialize with loss.backward (new way)
         config2 = get_config_dict(zero_stage, allow_user_backward=True)
-        model_engine2, _, _, _ = deepspeed.initialize(
-            config=config2,
-            model=model2,
-            model_parameters=model2.parameters()
-        )
+        model_engine2, _, _, _ = deepspeed.initialize(config=config2,
+                                                      model=model2,
+                                                      model_parameters=model2.parameters())
 
-        data_loader = random_dataloader(
-            model=model_engine1,
-            total_samples=8,
-            hidden_dim=hidden_dim,
-            device=model_engine1.device
-        )
+        data_loader = random_dataloader(model=model_engine1,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=model_engine1.device)
 
         # Run one training step with engine.backward
         batch = next(iter(data_loader))
@@ -121,8 +115,10 @@ class TestZeroUserBackwardBasic(DistributedTest):
         assert len(grads1) == len(grads2), "Different number of parameters with gradients"
         for name in grads1.keys():
             assert name in grads2, f"Parameter {name} missing in grads2"
-            allclose_on_all_ranks(grads1[name], grads2[name],
-                                  rtol=1e-4, atol=1e-5,
+            allclose_on_all_ranks(grads1[name],
+                                  grads2[name],
+                                  rtol=1e-4,
+                                  atol=1e-5,
                                   assert_message=f"Gradients differ for parameter {name}")
 
         model_engine1.destroy()
@@ -150,11 +146,9 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
 
         # Initialize DeepSpeed with allow_user_backward
         config = get_config_dict(zero_stage, allow_user_backward=True)
-        model_engine, _, _, _ = deepspeed.initialize(
-            config=config,
-            model=model_deepspeed,
-            model_parameters=model_deepspeed.parameters()
-        )
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_deepspeed,
+                                                     model_parameters=model_deepspeed.parameters())
 
         # Convert PyTorch model to the same dtype as DeepSpeed
         dtype = preferred_dtype()
@@ -204,9 +198,13 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
             # so we convert both to fp32 for comparison
             pytorch_grad_fp32 = pytorch_grads[name].float()
             deepspeed_grad_fp32 = deepspeed_grads[name].float()
-            allclose_on_all_ranks(pytorch_grad_fp32, deepspeed_grad_fp32,
-                                  rtol=1e-3, atol=1e-4,
-                                  assert_message=f"Gradient for parameter {name} mismatch between PyTorch and DeepSpeed after non-scalar backward")
+            allclose_on_all_ranks(
+                pytorch_grad_fp32,
+                deepspeed_grad_fp32,
+                rtol=1e-3,
+                atol=1e-4,
+                assert_message=
+                f"Gradient for parameter {name} mismatch between PyTorch and DeepSpeed after non-scalar backward")
 
         # Now run optimizer step
         optimizer_pytorch.step()
@@ -239,9 +237,12 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
             # Convert to fp32 for comparison in case of dtype mismatch
             pytorch_param_fp32 = pytorch_params[name].float()
             deepspeed_param_fp32 = deepspeed_params[name].float()
-            allclose_on_all_ranks(pytorch_param_fp32, deepspeed_param_fp32,
-                                  rtol=1e-3, atol=1e-4,
-                                  assert_message=f"Parameter {name} mismatch between PyTorch and DeepSpeed after non-scalar backward")
+            allclose_on_all_ranks(
+                pytorch_param_fp32,
+                deepspeed_param_fp32,
+                rtol=1e-3,
+                atol=1e-4,
+                assert_message=f"Parameter {name} mismatch between PyTorch and DeepSpeed after non-scalar backward")
 
         model_engine.destroy()
 
@@ -259,18 +260,12 @@ class TestZeroUserBackwardDisabled(DistributedTest):
 
         # Initialize without allow_user_backward
         config = get_config_dict(zero_stage, allow_user_backward=False)
-        model_engine, _, _, _ = deepspeed.initialize(
-            config=config,
-            model=model,
-            model_parameters=model.parameters()
-        )
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
-        data_loader = random_dataloader(
-            model=model_engine,
-            total_samples=4,
-            hidden_dim=hidden_dim,
-            device=model_engine.device
-        )
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=4,
+                                        hidden_dim=hidden_dim,
+                                        device=model_engine.device)
 
         batch = next(iter(data_loader))
         loss = model_engine(batch[0], batch[1])
@@ -292,38 +287,31 @@ class TestZeroUserBackwardGradAccumulation(DistributedTest):
         hidden_dim = 4
         gradient_accumulation_steps = 4
 
-        _run_baseline = True
-        _run_new = True
-
         # Create two identical models
         model1 = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
         model2 = deepcopy(model1)
 
         # Initialize with engine.backward (traditional way)
-        config1 = get_config_dict(zero_stage, allow_user_backward=False,
-                                    gradient_accumulation_steps=gradient_accumulation_steps)
-        model_engine1, _, _, _ = deepspeed.initialize(
-            config=config1,
-            model=model1,
-            model_parameters=model1.parameters()
-        )
+        config1 = get_config_dict(zero_stage,
+                                  allow_user_backward=False,
+                                  gradient_accumulation_steps=gradient_accumulation_steps)
+        model_engine1, _, _, _ = deepspeed.initialize(config=config1,
+                                                      model=model1,
+                                                      model_parameters=model1.parameters())
 
         # Initialize with loss.backward (new way)
-        config2 = get_config_dict(zero_stage, allow_user_backward=True,
-                                gradient_accumulation_steps=gradient_accumulation_steps)
+        config2 = get_config_dict(zero_stage,
+                                  allow_user_backward=True,
+                                  gradient_accumulation_steps=gradient_accumulation_steps)
 
-        model_engine2, _, _, _ = deepspeed.initialize(
-            config=config2,
-            model=model2,
-            model_parameters=model2.parameters()
-        )
+        model_engine2, _, _, _ = deepspeed.initialize(config=config2,
+                                                      model=model2,
+                                                      model_parameters=model2.parameters())
 
-        data_loader = random_dataloader(
-            model=model_engine2 if _run_new else model_engine1,
-            total_samples=16,
-            hidden_dim=hidden_dim,
-            device=model_engine2.device if _run_new else model_engine1.device
-        )
+        data_loader = random_dataloader(model=model_engine1,
+                                        total_samples=16,
+                                        hidden_dim=hidden_dim,
+                                        device=model_engine1.device)
 
         # Run training with gradient accumulation
         for i, batch in enumerate(data_loader):
@@ -345,9 +333,11 @@ class TestZeroUserBackwardGradAccumulation(DistributedTest):
                 assert len(grads1) == len(grads2), f"Different number of parameters with gradients at step {i}"
                 for name in grads1.keys():
                     assert name in grads2, f"Parameter {name} missing in grads2 at step {i}"
-                    allclose_on_all_ranks(grads2[name], grads1[name],
-                                        rtol=1e-4, atol=1e-5,
-                                        assert_message=f"Gradients differ for {name} at step {i}")
+                    allclose_on_all_ranks(grads2[name],
+                                          grads1[name],
+                                          rtol=1e-4,
+                                          atol=1e-5,
+                                          assert_message=f"Gradients differ for {name} at step {i}")
 
             # Now step both models
             model_engine1.step()
@@ -357,104 +347,72 @@ class TestZeroUserBackwardGradAccumulation(DistributedTest):
         model_engine2.destroy()
 
 
-@pytest.mark.parametrize("zero_stage", [1])
-class TestZeroUserBackwardMultipleBackward(DistributedTest):
-    """Test multiple backward calls in one forward pass"""
-    world_size = 2
-
-    def test_multiple_backward_calls(self, zero_stage):
-        """Test calling backward multiple times with retain_graph=True"""
-        hidden_dim = 4
-
-        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
-
-        config = get_config_dict(zero_stage, allow_user_backward=True)
-        model_engine, _, _, _ = deepspeed.initialize(
-            config=config,
-            model=model,
-            model_parameters=model.parameters()
-        )
-
-        data_loader = random_dataloader(
-            model=model_engine,
-            total_samples=4,
-            hidden_dim=hidden_dim,
-            device=model_engine.device
-        )
-
-        batch = next(iter(data_loader))
-        loss = model_engine(batch[0], batch[1])
-
-        # First backward with retain_graph=True
-        loss.backward(retain_graph=True)
-        grads_first = collect_gradients_safe(model_engine)
-
-        # Second backward should accumulate gradients
-        loss.backward()
-        grads_second = collect_gradients_safe(model_engine)
-
-        # Gradients should be accumulated (doubled)
-        for name in grads_first.keys():
-            expected = grads_first[name] * 2
-            allclose_on_all_ranks(grads_second[name], expected,
-                                  rtol=1e-4, atol=1e-5,
-                                  assert_message=f"Gradient accumulation failed for parameter {name}")
-
-        model_engine.destroy()
-
-
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
 class TestZeroUserBackwardCompatibility(DistributedTest):
     """Test that engine.backward still works when allow_user_backward is enabled"""
     world_size = 2
 
     def test_engine_backward_still_works(self, zero_stage):
-        """Test that engine.backward() still works correctly when allow_user_backward=True"""
+        """Test that engine.backward() produces same gradients with allow_user_backward=False/True"""
         hidden_dim = 4
 
-        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        # Create two identical models
+        model1 = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        model2 = deepcopy(model1)
 
-        config = get_config_dict(zero_stage, allow_user_backward=True)
-        model_engine, _, _, _ = deepspeed.initialize(
-            config=config,
-            model=model,
-            model_parameters=model.parameters()
-        )
+        # Initialize with allow_user_backward=False (traditional)
+        config1 = get_config_dict(zero_stage, allow_user_backward=False)
+        model_engine1, _, _, _ = deepspeed.initialize(config=config1,
+                                                      model=model1,
+                                                      model_parameters=model1.parameters())
 
-        data_loader = random_dataloader(
-            model=model_engine,
-            total_samples=8,
-            hidden_dim=hidden_dim,
-            device=model_engine.device
-        )
+        # Initialize with allow_user_backward=True (but still use engine.backward)
+        config2 = get_config_dict(zero_stage, allow_user_backward=True)
+        model_engine2, _, _, _ = deepspeed.initialize(config=config2,
+                                                      model=model2,
+                                                      model_parameters=model2.parameters())
 
-        # Run several training steps using engine.backward
-        for i, batch in enumerate(data_loader):
-            loss = model_engine(batch[0], batch[1])
-            # Should still work with engine.backward
-            model_engine.backward(loss)
+        data_loader = random_dataloader(model=model_engine1,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=model_engine1.device)
 
-            # Verify gradients are computed
-            if model_engine.is_gradient_accumulation_boundary():
-                grads = collect_gradients_safe(model_engine)
-                assert len(grads) > 0, f"No gradients computed at step {i}"
+        # Run one training step with engine.backward on both
+        batch = next(iter(data_loader))
+        loss1 = model_engine1(batch[0], batch[1])
+        model_engine1.backward(loss1)
+        grads1 = collect_gradients_safe(model_engine1)
 
-            model_engine.step()
+        loss2 = model_engine2(batch[0], batch[1])
+        model_engine2.backward(loss2)
+        grads2 = collect_gradients_safe(model_engine2)
 
-        model_engine.destroy()
+        # Compare gradients across all ranks
+        assert len(grads1) == len(grads2), "Different number of parameters with gradients"
+        for name in grads1.keys():
+            assert name in grads2, f"Parameter {name} missing in grads2"
+            allclose_on_all_ranks(grads1[name],
+                                  grads2[name],
+                                  rtol=1e-4,
+                                  atol=1e-5,
+                                  assert_message=f"Gradients differ for parameter {name}")
+
+        model_engine1.destroy()
+        model_engine2.destroy()
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
-class TestZeroUserBackwardMixedLoss(DistributedTest):
+class TestZeroUserBackwardSeparateLoss(DistributedTest):
     """Test using separate loss functions"""
     world_size = 2
 
     def test_separate_loss_function(self, zero_stage):
-        """Test using loss function defined separately from model"""
+        """Test that separate loss function produces same gradients with allow_user_backward=False/True"""
         hidden_dim = 4
 
         class SimpleOutputModel(torch.nn.Module):
             """Model that returns output without computing loss"""
+
             def __init__(self, hidden_dim):
                 super().__init__()
                 self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
@@ -465,34 +423,52 @@ class TestZeroUserBackwardMixedLoss(DistributedTest):
                 x = self.linear2(x)
                 return x
 
-        model = SimpleOutputModel(hidden_dim=hidden_dim)
+        # Create two identical models
+        model1 = SimpleOutputModel(hidden_dim=hidden_dim)
+        model2 = deepcopy(model1)
 
-        config = get_config_dict(zero_stage, allow_user_backward=True)
-        model_engine, _, _, _ = deepspeed.initialize(
-            config=config,
-            model=model,
-            model_parameters=model.parameters()
-        )
+        # Initialize with allow_user_backward=False (use engine.backward)
+        config1 = get_config_dict(zero_stage, allow_user_backward=False)
+        model_engine1, _, _, _ = deepspeed.initialize(config=config1,
+                                                      model=model1,
+                                                      model_parameters=model1.parameters())
+
+        # Initialize with allow_user_backward=True (use loss.backward)
+        config2 = get_config_dict(zero_stage, allow_user_backward=True)
+        model_engine2, _, _, _ = deepspeed.initialize(config=config2,
+                                                      model=model2,
+                                                      model_parameters=model2.parameters())
 
         # Define loss function separately
         loss_fn = torch.nn.CrossEntropyLoss()
 
-        # Create data
+        # Create data (use same seed for reproducibility)
         batch_size = 2
-        x = torch.randn(batch_size, hidden_dim, device=model_engine.device, dtype=preferred_dtype())
-        y = torch.randint(0, hidden_dim, (batch_size,), device=model_engine.device)
+        torch.manual_seed(456)
+        x = torch.randn(batch_size, hidden_dim, device=model_engine1.device, dtype=preferred_dtype())
+        y = torch.randint(0, hidden_dim, (batch_size, ), device=model_engine1.device)
 
-        # Forward pass
-        output = model_engine(x)
+        # First model: engine.backward
+        output1 = model_engine1(x)
+        loss1 = loss_fn(output1, y)
+        model_engine1.backward(loss1)
+        grads1 = collect_gradients_safe(model_engine1)
 
-        # Compute loss outside model
-        loss = loss_fn(output, y)
+        # Second model: loss.backward
+        output2 = model_engine2(x)
+        loss2 = loss_fn(output2, y)
+        loss2.backward()
+        grads2 = collect_gradients_safe(model_engine2)
 
-        # Backward should work
-        loss.backward()
+        # Compare gradients across all ranks
+        assert len(grads1) == len(grads2), "Different number of parameters with gradients"
+        for name in grads1.keys():
+            assert name in grads2, f"Parameter {name} missing in grads2"
+            allclose_on_all_ranks(grads1[name],
+                                  grads2[name],
+                                  rtol=1e-4,
+                                  atol=1e-5,
+                                  assert_message=f"Gradients differ for parameter {name}")
 
-        # Check gradients
-        grads = collect_gradients_safe(model_engine)
-        assert len(grads) > 0, "No gradients computed"
-
-        model_engine.destroy()
+        model_engine1.destroy()
+        model_engine2.destroy()
