@@ -2293,10 +2293,13 @@ class DeepSpeedEngine(Module):
         do_gradient_reduction = self.enable_backward_allreduce and not self.inside_no_sync_ctxt and not self.is_deepcompile_active(
         )
 
-        if maybe_loss_for_backward(grad_output):
-            if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
-                grad_output = self._scale_loss_by_gas(grad_output.float())
+        if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
+            if maybe_loss_for_backward(grad_output):
+                # Respect original policy of scaling only scalar loss
+                grad_output = grad_output.float()
+            grad_output = self._scale_loss_by_gas(grad_output)
 
+        if maybe_loss_for_backward(grad_output):
             # Log training loss
             loss = grad_output
             mean_loss = loss.mean().detach()
@@ -2341,7 +2344,7 @@ class DeepSpeedEngine(Module):
         self._stop_timers(self.engine_timers.backward_reduce_timers)
         self._stop_timers(self.engine_timers.backward_timers)
 
-    def _do_optimizer_backward(self, loss, retain_graph):
+    def _do_optimizer_backward(self, loss, scale, retain_graph):
         self._start_timers(self.engine_timers.backward_inner_timers)
         backward_kwargs = {"retain_graph": retain_graph}
         if self.eigenvalue_enabled():
@@ -2349,13 +2352,13 @@ class DeepSpeedEngine(Module):
             backward_kwargs["retain_graph"] = True
 
         if self.zero_optimization() or not self.amp_enabled():
-            loss.backward(**backward_kwargs)
+            loss.backward(scale, **backward_kwargs)
         elif self.amp_enabled():
             # AMP requires delaying unscale when inside gradient accumulation boundaries
             # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
             delay_unscale = not self.is_gradient_accumulation_boundary()
             with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(**backward_kwargs)
+                scaled_loss.backward(scale, **backward_kwargs)
 
         self._stop_timers(self.engine_timers.backward_inner_timers)
 
@@ -2409,8 +2412,10 @@ class DeepSpeedEngine(Module):
 
         self._running_engine_backward = True
         self._start_timers(self.engine_timers.backward_timers)
-        loss = self._backward_prologue(loss, scale_wrt_gas)
-        self._do_optimizer_backward(loss, retain_graph)
+
+        scale = torch.ones_like(loss)
+        scale = self._backward_prologue(scale, scale_wrt_gas)
+        self._do_optimizer_backward(loss, scale, retain_graph)
         self._backward_epilogue()
         self._stop_timers(self.engine_timers.backward_timers)
         self._running_engine_backward = False
