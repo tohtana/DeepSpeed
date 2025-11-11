@@ -24,7 +24,7 @@ from typing import Callable, Dict, Union, Iterable, Container, List
 import deepspeed
 
 from deepspeed import comm as dist
-from deepspeed.runtime.utils import see_memory_usage, DummyOptim
+from deepspeed.runtime.utils import see_memory_usage, DummyOptim, register_output_backward_hooks
 from .zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
@@ -423,34 +423,18 @@ class DeepSpeedEngine(Module):
 
         self._running_engine_backward = False
         if isinstance(self.optimizer, ZeROOptimizer):
-            if self._config.zero_config.allow_user_backward:
-                # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
-                # not for `engine.backward(loss)`. In this case, we need to ensure that the preprocessing
-                # and postprocessing around the backward call are handled correctly.
-                # To achieve this, we register a pre-backward hook using `register_full_backward_pre_hook`.
-                self._backward_pre_hook_handle = self.register_full_backward_pre_hook(self._backward_pre_hook)
-                # However, we cannot use `register_full_backward_hook` for post-backward hooks.
-                # If none of the module inputs require gradients, `register_full_backward_hook` fires
-                # when the gradients of the module outputs are computed. Our gradient
-                # accumulation hooks are called later. But we want `_backward_post_hook` to be called
-                # only after all gradients have been computed.
-                # To handle this, the optimizer maintains a counter to track the number of gradients
-                # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
-                # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
-                self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
-                # When `engine.backward()` is called, we want to skip these pre- and post-backward hooks
-                # since they are already handled in engine.backward(). We set this flag to True
-                # to avoid duplicated preprocessing and postprocessing.
-            else:
-
-                def warn_user_backward_disabled(*args, **kwargs):
-                    if not self._running_engine_backward:
-                        raise RuntimeError(
-                            "DeepSpeed requires backward to be invoked via `engine.backward(loss)`. "
-                            "If you wish to use PyTorch-native style backward such as `loss.backward()` or `tensor.backward(grad)`, "
-                            "please set `allow_user_backward` to True in the ZeRO configuration.")
-
-                self.optimizer.register_grad_acc_post_hook(warn_user_backward_disabled)
+            # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
+            # not for `engine.backward(loss)`. In this case, we need to ensure that the preprocessing
+            # and postprocessing around the backward call are handled correctly.
+            # However, we cannot use `register_full_backward_hook` for post-backward hooks.
+            # If none of the module inputs require gradients, `register_full_backward_hook` fires
+            # when the gradients of the module outputs are computed. Our gradient
+            # accumulation hooks are called later. But we want `_backward_post_hook` to be called
+            # only after all gradients have been computed.
+            # To handle this, the optimizer maintains a counter to track the number of gradients
+            # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
+            # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
+            self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
             # TODO: Add warning for optimizers that are not ZeROOptimizer
 
     def _optimized_linear_offload_setup(self):
@@ -2211,6 +2195,17 @@ class DeepSpeedEngine(Module):
         with autocast_if_enabled(self):
             loss = self.module(*inputs, **kwargs)
 
+        if maybe_loss_for_backward(loss):
+            if isinstance(self.optimizer, ZeROOptimizer):
+                loss = self.optimizer.backward_prologue(loss)
+            elif self.torch_autocast_z0_gradscaler:
+                loss = self.torch_autocast_z0_gradscaler.scale(loss)
+
+        # Register output backward hooks
+        register_output_backward_hooks(loss,
+                                       preprocess_once_fn=self._backward_prologue,
+                                       preprocess_per_tensor_fn=self._backward_prologue_per_tensor)
+
         if self.autotuning_profile_model_info():
             activation_mem = get_ma_status() - ma
             self.autotuning_model_info["activation_mem_per_gpu"] = activation_mem
@@ -2282,37 +2277,16 @@ class DeepSpeedEngine(Module):
         elif self.zenflow:
             self.optimizer.reduce_gradients(pipeline_parallel=self.pipeline_parallelism)
 
-    def _backward_prologue(self, grad_output, scale_wrt_gas=True):
+    def _backward_prologue(self):
         self._start_timers(self.engine_timers.backward_timers)
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
-        if self.scale_wrt_gas is not None:
-            scale_wrt_gas = self.scale_wrt_gas
 
-        # scale loss w.r.t. gradient accumulation if reduction is not disabled
-        do_gradient_reduction = self.enable_backward_allreduce and not self.inside_no_sync_ctxt and not self.is_deepcompile_active(
-        )
+        if self._running_engine_backward:
+            return  # Prevent reentry
 
-        if do_gradient_reduction and self.gradient_accumulation_steps() > 1 and scale_wrt_gas:
-            if maybe_loss_for_backward(grad_output):
-                # Respect original policy of scaling only scalar loss
-                grad_output = grad_output.float()
-            grad_output = self._scale_loss_by_gas(grad_output)
-
-        if maybe_loss_for_backward(grad_output):
-            # Log training loss
-            loss = grad_output
-            mean_loss = loss.mean().detach()
-            self.losses = mean_loss if self.losses is None else self.losses + mean_loss
-            if self.monitor.enabled:
-                if self.is_gradient_accumulation_boundary():
-                    if self.global_rank == 0:
-                        self.summary_events = [(
-                            "Train/Samples/train_loss",
-                            self.losses.item(),
-                            self.global_samples,
-                        )]
-                        self.monitor.write_events(self.summary_events)
+        assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
+        assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
 
         if self.is_deepcompile_active():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
@@ -2322,14 +2296,6 @@ class DeepSpeedEngine(Module):
 
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
-
-        if isinstance(self.optimizer, ZeROOptimizer):
-            grad_output = self.optimizer.backward_prologue(grad_output)
-
-        if self.torch_autocast_z0_gradscaler:
-            grad_output = self.torch_autocast_z0_gradscaler.scale(grad_output)
-
-        return grad_output
 
     def _backward_epilogue(self):
         self._start_timers(self.engine_timers.backward_reduce_timers)
@@ -2371,6 +2337,9 @@ class DeepSpeedEngine(Module):
 
         return self._backward_prologue(grad_output)
 
+    def _backward_prologue_per_tensor(self, grad):
+        return grad / self.gradient_accumulation_steps()
+
     def _backward_post_hook(self):
         if self._running_engine_backward:
             return  # Prevent reentry
@@ -2410,17 +2379,8 @@ class DeepSpeedEngine(Module):
         assert maybe_loss_for_backward(
             loss), "loss must be a scalar tensor. If you need to pass output gradients, backward() of output tensors"
 
-        self._running_engine_backward = True
-        self._start_timers(self.engine_timers.backward_timers)
-
-        scale = torch.ones_like(loss)
-        scale = self._backward_prologue(scale, scale_wrt_gas)
-        self._do_optimizer_backward(loss, scale, retain_graph)
-        self._backward_epilogue()
-        self._stop_timers(self.engine_timers.backward_timers)
-        self._running_engine_backward = False
-
-        return loss * scale
+        loss.float().backward()
+        return loss
 
     def is_gradient_accumulation_boundary(self):
         """

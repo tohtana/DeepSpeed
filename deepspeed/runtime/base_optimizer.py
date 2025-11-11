@@ -99,7 +99,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
                 return self.external_loss_scale * value
             if self.torch_autocast_gradscaler:
                 return self.torch_autocast_gradscaler.scale(value)
-            return self.loss_scaler.scale_loss(value.float())
+            return self.loss_scaler.scale_loss(value)
 
         return value
 

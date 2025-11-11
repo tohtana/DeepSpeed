@@ -49,7 +49,6 @@ ZeRO optimization should be enabled as:
     "zeropp_loco_param": {...},
     "log_trace_cache_warnings" : [true|false],
     "enable_sanity_checks": [true|false],
-    "allow_user_backward": [true|false]
     }
 }
 """
@@ -361,13 +360,6 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     leaf_module: DeepSpeedZeroLeafModuleConfig = Field(default_factory=DeepSpeedZeroLeafModuleConfig)
     """
     Configuration for modules that should be treated as ZeRO3 leaf modules.
-    """
-
-    allow_user_backward: bool = False
-    """
-    Allow PyTorch-native style backward entrypoints.
-    When False, DeepSpeed expects backward to be invoked exclusively via ``engine.backward(loss)``.
-    When True, ``loss.backward()`` or ``tensor.backward(grad)`` are supported.
     """
 
     # Validators
