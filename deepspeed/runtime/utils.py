@@ -1201,3 +1201,169 @@ def maybe_loss_for_backward(value) -> bool:
         value: The value to check.
     """
     return isinstance(value, torch.Tensor) and value.numel() == 1 and value.grad_fn is not None
+
+
+class OutputBackwardHookManager:
+    """
+    Manages backward hooks on output tensors to trigger preprocessing only once.
+
+    This is an alternative to register_full_backward_pre_hook that avoids warnings
+    and provides more fine-grained control over when preprocessing occurs.
+
+    The hook manager automatically manages its lifetime by attaching itself to the
+    output tensors. When the outputs are freed, the hook manager is also freed.
+
+    This manager handles two types of preprocessing:
+    1. Global preprocessing (run once per backward pass): timers, flags, setup
+    2. Per-tensor preprocessing (run for each output tensor): gradient scaling, loss logging
+
+    Usage:
+        # Only global preprocessing (run once)
+        hook_manager = OutputBackwardHookManager(
+            preprocess_once_fn=lambda: start_timers()
+        )
+
+        # Both global and per-tensor preprocessing
+        hook_manager = OutputBackwardHookManager(
+            preprocess_once_fn=lambda: start_timers(),
+            preprocess_per_tensor_fn=lambda tensor: scale_gradient(tensor)
+        )
+
+        outputs = model(*inputs)
+        hook_manager.register_hooks_on_outputs(outputs)
+        # No need to manually clean up - it's freed when outputs are freed
+    """
+
+    def __init__(self, preprocess_once_fn, preprocess_per_tensor_fn=None):
+        """
+        Args:
+            preprocess_once_fn: A callable that takes no arguments and performs
+                               one-time preprocessing before backward (e.g., start timers).
+                               Will only be called once per backward pass.
+            preprocess_per_tensor_fn: Optional callable that takes a tensor and returns
+                                     a potentially modified tensor. Called for each output
+                                     tensor during backward (e.g., gradient scaling).
+                                     If None, no per-tensor processing is done.
+        """
+        self.preprocess_once_fn = preprocess_once_fn
+        self.preprocess_per_tensor_fn = preprocess_per_tensor_fn
+        self.preprocess_done = False
+        self.hook_handles = []
+
+    def _make_backward_hook(self, tensor):
+        """
+        Creates a backward hook for a specific tensor.
+
+        Args:
+            tensor: The output tensor this hook is attached to
+        """
+
+        def backward_hook(grad):
+            # First, ensure global preprocessing happens once
+            if not self.preprocess_done:
+                self.preprocess_done = True
+                self.preprocess_once_fn()
+
+            # Then apply per-tensor preprocessing if provided
+            if self.preprocess_per_tensor_fn is not None:
+                # Per-tensor preprocessing receives the tensor
+                # It can perform operations like gradient scaling
+                grad = self.preprocess_per_tensor_fn(grad)
+
+            return grad
+
+        return backward_hook
+
+    def _traverse_and_register_hooks(self, outputs, first_tensor_holder):
+        """
+        Recursively traverse outputs to find tensors with grad_fn and register hooks.
+
+        Args:
+            outputs: Can be a tensor, tuple, list, dict, or nested structure of these.
+            first_tensor_holder: List to hold the first tensor found (for attaching self)
+        """
+        if isinstance(outputs, torch.Tensor):
+            if outputs.grad_fn is not None:
+                # Store reference to first tensor to attach hook manager lifetime
+                if not first_tensor_holder:
+                    first_tensor_holder.append(outputs)
+                # Pass the tensor to _make_backward_hook so per-tensor processing can access it
+                hook_handle = outputs.register_hook(self._make_backward_hook(outputs))
+                self.hook_handles.append(hook_handle)
+        elif isinstance(outputs, (tuple, list)):
+            for item in outputs:
+                self._traverse_and_register_hooks(item, first_tensor_holder)
+        elif isinstance(outputs, dict):
+            for value in outputs.values():
+                self._traverse_and_register_hooks(value, first_tensor_holder)
+
+    def register_hooks_on_outputs(self, outputs):
+        """
+        Register backward hooks on all output tensors that have grad_fn.
+
+        Args:
+            outputs: The outputs from the forward pass. Can be a tensor or nested structure.
+        """
+        # Reset state for new forward pass
+        self.preprocess_done = False
+        self.remove_hooks()
+
+        # Register hooks on all tensors with grad_fn
+        first_tensor_holder = []
+        self._traverse_and_register_hooks(outputs, first_tensor_holder)
+
+        # Attach this hook manager instance to the first output tensor
+        # This ensures the hook manager is kept alive as long as the outputs are alive
+        # and automatically freed when outputs are freed
+        if first_tensor_holder:
+            first_tensor = first_tensor_holder[0]
+            if not hasattr(first_tensor, '_backward_hook_managers'):
+                first_tensor._backward_hook_managers = []
+            first_tensor._backward_hook_managers.append(self)
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+
+    def reset(self):
+        """Reset the preprocessing flag without removing hooks."""
+        self.preprocess_done = False
+
+
+def register_output_backward_hooks(outputs, preprocess_once_fn, preprocess_per_tensor_fn=None):
+    """
+    Convenience function to register backward hooks on outputs.
+
+    This function creates a hook manager that is automatically tied to the lifetime
+    of the output tensors. When outputs are freed, the hook manager is also freed.
+
+    Args:
+        outputs: The outputs from forward pass (tensor, tuple, list, dict, or nested)
+        preprocess_once_fn: A callable that takes no arguments and performs one-time
+                           preprocessing before backward. Will only be called once per backward pass.
+        preprocess_per_tensor_fn: Optional callable that takes a tensor and performs
+                                 per-tensor preprocessing (e.g., gradient scaling).
+                                 Called for each output tensor during backward.
+
+    Returns:
+        The hook manager instance (usually not needed, as lifetime is automatic)
+
+    Example:
+        # Only global preprocessing
+        outputs = model(x)
+        register_output_backward_hooks(outputs, lambda: print("Backward starting!"))
+
+        # Both global and per-tensor preprocessing
+        outputs = model(x)
+        register_output_backward_hooks(
+            outputs,
+            preprocess_once_fn=lambda: start_timers(),
+            preprocess_per_tensor_fn=lambda tensor: scale_tensor(tensor)
+        )
+        # Hook manager is automatically freed when outputs are freed
+    """
+    hook_manager = OutputBackwardHookManager(preprocess_once_fn, preprocess_per_tensor_fn)
+    hook_manager.register_hooks_on_outputs(outputs)
+    return hook_manager
