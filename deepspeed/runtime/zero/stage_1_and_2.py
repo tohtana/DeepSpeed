@@ -854,7 +854,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         if self.cpu_offload is False:
             for i, _ in enumerate(self.bit16_groups):
-                if not i in self.averaged_gradients or self.averaged_gradients[i] is None:
+                if i not in self.all_grad_tensors or self.all_grad_tensors[i] is None:
                     self.all_grad_tensors[i] = self.get_all_grad_tensors(self.params_in_partition[i],
                                                                          dtype=self.gradient_accumulation_dtype)
                 else:
