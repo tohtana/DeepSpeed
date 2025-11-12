@@ -4,7 +4,9 @@
 # DeepSpeed Team
 
 import torch
+import weakref
 from deepspeed import comm as dist
+from torch.autograd import graph as autograd_graph
 from packaging import version as pkg_version
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
@@ -583,10 +585,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # 2. gradient partitioning
         # 3. overlapping backward and reduction
         self._grad_acc_hooks = []
+        self._multi_grad_hook_handle = None
 
         if (self.partition_gradients or self.overlap_comm or self.use_grad_accum_attribute
                 or self.contiguous_gradients):
             self.create_gradient_handling_hooks()
+            self._register_multi_grad_hook()
 
         self.ready_for_gradients = False
         self.custom_loss_scaler = False
@@ -632,6 +636,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for hook in self._grad_acc_hooks:
             hook.remove()
         self.print_rank_0("Removed grad acc hooks")
+        if self._multi_grad_hook_handle is not None:
+            self._multi_grad_hook_handle.remove()
+            self._multi_grad_hook_handle = None
 
     def _enable_universal_checkpoint(self):
         for lp_param_group in self.bit16_groups:
@@ -996,6 +1003,35 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     wrapper(param, i)
 
         self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
+
+    def _register_multi_grad_hook(self):
+        if not hasattr(autograd_graph, "register_multi_grad_hook"):
+            return
+
+        tensors = [param for group in self.bit16_groups for param in group if param.requires_grad]
+        if not tensors:
+            return
+
+        self_ref = weakref.ref(self)
+
+        def _multi_grad_callback(grads):
+            opt = self_ref()
+            if opt is None:
+                return
+            if grads is None:
+                return
+
+            missing = sum(1 for grad in grads if grad is None)
+            if missing == 0:
+                return
+
+            opt.remaining_grad_acc_hooks = max(0, opt.remaining_grad_acc_hooks - missing)
+            if opt.remaining_grad_acc_hooks == 0:
+                opt.run_grad_acc_post_hooks()
+                opt.remaining_grad_acc_hooks = len(opt._grad_acc_hooks)
+
+        self._multi_grad_hook_handle = autograd_graph.register_multi_grad_hook(
+            tensors, _multi_grad_callback, mode="all")
 
     def get_param_id(self, param):
         unique_id = id(param)

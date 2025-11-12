@@ -23,6 +23,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
     def __init__(self):
         self.remaining_grad_acc_hooks = 0
         self.grad_acc_post_hooks = []
+        self._grad_acc_post_hooks_ran = False
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
@@ -122,7 +123,18 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
     def unregister_grad_acc_post_hooks(self):
         self.grad_acc_post_hooks = []
+        self._grad_acc_post_hooks_ran = False
 
     def run_grad_acc_post_hooks(self):
+        if self._grad_acc_post_hooks_ran:
+            return
         for hook in self.grad_acc_post_hooks:
             hook()
+        self._grad_acc_post_hooks_ran = True
+
+    def reset_grad_acc_post_hooks_state(self):
+        self._grad_acc_post_hooks_ran = False
+
+    def ensure_grad_acc_post_hooks_ran(self):
+        if not self._grad_acc_post_hooks_ran:
+            self.run_grad_acc_post_hooks()

@@ -2289,6 +2289,9 @@ class DeepSpeedEngine(Module):
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
 
+        if hasattr(self.optimizer, "reset_grad_acc_post_hooks_state"):
+            self.optimizer.reset_grad_acc_post_hooks_state()
+
     def _backward_epilogue(self):
         self._start_timers(self.engine_timers.backward_reduce_timers)
         if self.enable_backward_allreduce and not self.inside_no_sync_ctxt:
