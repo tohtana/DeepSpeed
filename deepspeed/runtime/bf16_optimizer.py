@@ -316,9 +316,8 @@ class BF16_Optimizer(ZeROOptimizer):
 
         self.clear_hp_grads()
 
-    def backward_prologue(self, loss):
+    def backward_prologue(self):
         self.clear_lp_grads()
-        return loss
 
     def backward_epilogue(self, update_hp_grads=True, clear_lp_grads=False, **bwd_kwargs):
         if update_hp_grads:

@@ -103,8 +103,8 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
         return value
 
-    def backward_prologue(self, loss):
-        return loss
+    def backward_prologue(self):
+        pass
 
     def backward_epilogue(self, **kwargs):
         pass

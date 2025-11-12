@@ -7,7 +7,7 @@ import sys
 import gc
 import collections
 import itertools
-from typing import Deque, Dict, Set, List, Tuple, Container, Optional, Any
+from typing import Deque, Dict, Set, List, Tuple, Container, Optional
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -2323,7 +2323,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 return True
             return False
 
-    def backward_prologue(self, maybe_loss_value: Any):
+    def backward_prologue(self):
         """Currently only scales the loss value. Defined for consistency of naming.
         """
         if self.swap_optimizer:
@@ -2333,7 +2333,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.zenflow_backward_prologue()
 
         see_memory_usage("Before backward", force=False)
-        return self.scale_if_loss(maybe_loss_value)
 
     def backward_epilogue(self):
         if self.zenflow:

@@ -421,7 +421,6 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
-        self._running_engine_backward = False
         if isinstance(self.optimizer, ZeROOptimizer):
             # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
             # not for `engine.backward(loss)`. In this case, we need to ensure that the preprocessing
@@ -2195,12 +2194,6 @@ class DeepSpeedEngine(Module):
         with autocast_if_enabled(self):
             loss = self.module(*inputs, **kwargs)
 
-        if maybe_loss_for_backward(loss):
-            if isinstance(self.optimizer, ZeROOptimizer):
-                loss = self.optimizer.backward_prologue(loss)
-            elif self.torch_autocast_z0_gradscaler:
-                loss = self.torch_autocast_z0_gradscaler.scale(loss)
-
         # Register output backward hooks
         register_output_backward_hooks(loss,
                                        preprocess_once_fn=self._backward_prologue,
@@ -2282,14 +2275,13 @@ class DeepSpeedEngine(Module):
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
-        if self._running_engine_backward:
-            return  # Prevent reentry
-
         assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
         assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
 
         if self.is_deepcompile_active():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
+
+        self.optimizer.backward_prologue()
 
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
@@ -2310,40 +2302,10 @@ class DeepSpeedEngine(Module):
         self._stop_timers(self.engine_timers.backward_reduce_timers)
         self._stop_timers(self.engine_timers.backward_timers)
 
-    def _do_optimizer_backward(self, loss, scale, retain_graph):
-        self._start_timers(self.engine_timers.backward_inner_timers)
-        backward_kwargs = {"retain_graph": retain_graph}
-        if self.eigenvalue_enabled():
-            backward_kwargs["create_graph"] = True
-            backward_kwargs["retain_graph"] = True
-
-        if self.zero_optimization() or not self.amp_enabled():
-            loss.backward(scale, **backward_kwargs)
-        elif self.amp_enabled():
-            # AMP requires delaying unscale when inside gradient accumulation boundaries
-            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-            delay_unscale = not self.is_gradient_accumulation_boundary()
-            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(scale, **backward_kwargs)
-
-        self._stop_timers(self.engine_timers.backward_inner_timers)
-
-    def _backward_pre_hook(self, module, grad_output):
-        if self._running_engine_backward:
-            return grad_output  # Prevent reentry
-
-        assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
-        assert not self.amp_enabled(), "Apex AMP is not supported with non-scalar backward"
-
-        return self._backward_prologue(grad_output)
-
     def _backward_prologue_per_tensor(self, grad):
         return grad / self.gradient_accumulation_steps()
 
     def _backward_post_hook(self):
-        if self._running_engine_backward:
-            return  # Prevent reentry
-
         self._backward_epilogue()
 
     @contextmanager
@@ -2379,7 +2341,30 @@ class DeepSpeedEngine(Module):
         assert maybe_loss_for_backward(
             loss), "loss must be a scalar tensor. If you need to pass output gradients, backward() of output tensors"
 
-        loss.float().backward()
+        # Set flag to prevent hooks from firing (we'll manually call prologue/epilogue)
+        self._start_timers(self.engine_timers.backward_timers)
+        backward_kwargs = {"retain_graph": retain_graph}
+        if self.eigenvalue_enabled():
+            backward_kwargs["create_graph"] = True
+            backward_kwargs["retain_graph"] = True
+
+        # TODO: handle these scaling with direct calls to loss.backward()
+        if isinstance(self.optimizer, ZeROOptimizer):
+            loss = self.optimizer.scale_if_loss(loss)
+        elif self.torch_autocast_z0_gradscaler:
+            loss = self.torch_autocast_z0_gradscaler.scale(loss)
+
+        if self.zero_optimization() or not self.amp_enabled():
+            loss.backward(**backward_kwargs)
+        elif self.amp_enabled():
+            # AMP requires delaying unscale when inside gradient accumulation boundaries
+            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+            delay_unscale = not self.is_gradient_accumulation_boundary()
+            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                scaled_loss.backward(**backward_kwargs)
+
+        self._stop_timers(self.engine_timers.backward_timers)
+
         return loss
 
     def is_gradient_accumulation_boundary(self):

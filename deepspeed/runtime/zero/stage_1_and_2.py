@@ -8,7 +8,7 @@ from deepspeed import comm as dist
 from packaging import version as pkg_version
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Any
+from typing import List, Dict, Set
 
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from deepspeed.runtime.zenflow import zenflow_utils
@@ -2230,11 +2230,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         bucket.buffer.append(buf_1)
 
             self.ready_for_gradients = True
-
-    def backward_prologue(self, maybe_loss_value: Any):
-        """Currently only scales the loss value. Defined for consistency of naming.
-        """
-        return self.scale_if_loss(maybe_loss_value)
 
     def backward_epilogue(self, *args, **kwargs):
         # Only for Stage 1, Mode 2
