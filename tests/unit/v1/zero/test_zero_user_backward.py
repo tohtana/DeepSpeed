@@ -138,8 +138,6 @@ class TestZeroUserBackwardBasic(DistributedTest):
             grads_ds_fp32 = grads_ds[name].float()
             allclose_on_all_ranks(grads_ddp_fp32,
                                   grads_ds_fp32,
-                                  rtol=1e-4,
-                                  atol=1e-5,
                                   assert_message=f"Gradients differ for parameter {name} between DDP and DeepSpeed")
 
         model_engine.destroy()
@@ -226,8 +224,6 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
             allclose_on_all_ranks(
                 ddp_grad_fp32,
                 deepspeed_grad_fp32,
-                rtol=1e-3,
-                atol=1e-4,
                 assert_message=
                 f"Gradient for parameter {name} mismatch between DDP and DeepSpeed after non-scalar backward")
 
@@ -267,8 +263,6 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
             allclose_on_all_ranks(
                 ddp_param_fp32,
                 deepspeed_param_fp32,
-                rtol=1e-3,
-                atol=1e-4,
                 assert_message=f"Parameter {name} mismatch between DDP and DeepSpeed after non-scalar backward")
 
         model_engine.destroy()
@@ -346,8 +340,6 @@ class TestZeroUserBackwardGradAccumulation(DistributedTest):
                     grads_ds_fp32 = grads_ds[name].float()
                     allclose_on_all_ranks(grads_ddp_fp32,
                                           grads_ds_fp32,
-                                          rtol=1e-3,
-                                          atol=1e-4,
                                           assert_message=f"Gradients differ for {name} at step {i}")
 
                 # Step both optimizers
@@ -444,8 +436,6 @@ class TestZeroUserBackwardSeparateLoss(DistributedTest):
             grads_ds_fp32 = grads_ds[name].float()
             allclose_on_all_ranks(grads_ddp_fp32,
                                   grads_ds_fp32,
-                                  rtol=1e-3,
-                                  atol=1e-4,
                                   assert_message=f"Gradients differ for parameter {name} between DDP and DeepSpeed")
 
         model_engine.destroy()
