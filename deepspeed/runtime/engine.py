@@ -2289,7 +2289,8 @@ class DeepSpeedEngine(Module):
         if self.is_deepcompile_active():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
 
-        self.optimizer.backward_prologue()
+        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+            self.optimizer.backward_prologue()
 
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
