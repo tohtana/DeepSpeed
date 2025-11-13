@@ -701,6 +701,8 @@ class SequenceTiledCompute(torch.autograd.Function):
         ctx.shards = shards
         ctx.grad_requiring_tensor_key = grad_requiring_tensor_key
         ctx.compute_params = [p for p in compute_params if p.requires_grad]
+        for param in ctx.compute_params:
+            param.ds_has_custom_backward = True
         ctx.output_unshard_dimension = output_unshard_dimension
         ctx.output_reduction = output_reduction
 
@@ -893,6 +895,8 @@ class TiledMLP(torch.autograd.Function):
         ctx.self = self
         ctx.shards = shards
         ctx.compute_params = [p for p in compute_params if p.requires_grad]
+        for param in ctx.compute_params:
+            param.ds_has_custom_backward = True
         ctx.save_for_backward(x)
 
         # x.shape could be [bs, seqlen, hidden_size] or [seqlen, hidden_size] (moe experts)
@@ -1031,6 +1035,8 @@ class TiledFusedLogitsLoss(torch.autograd.Function):
                 raise ValueError(f"mask shape must match x and y batch/seq")
 
         compute_params = [p for p in compute_params if p.requires_grad]
+        for param in compute_params:
+            param.ds_has_custom_backward = True
 
         x_requires_grad = x.requires_grad
         x = x.detach().requires_grad_(x_requires_grad)

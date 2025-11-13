@@ -1249,15 +1249,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            if self.remaining_grad_acc_hooks == 0:
-                                self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
-                                    non_leaf_params_requiring_grad) + leaf_module_count
+                            if not self._ensure_grad_acc_hook_counter(
+                                    lambda: count_used_parameters_in_backward(non_leaf_params_requiring_grad) +
+                                    leaf_module_count):
+                                return
 
                             self.reduce_ready_partitions_and_remove_grads(param)
 
-                            self.remaining_grad_acc_hooks -= 1
-                            if self.remaining_grad_acc_hooks == 0:
-                                self.run_grad_acc_post_hooks()
+                            should_trigger_post = getattr(param, "ds_grad_is_ready", True)
+                            self._decrement_grad_acc_hook_counter(should_trigger_post=should_trigger_post)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, reduce_partition_and_remove_grads))
 
@@ -1275,9 +1275,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             def make_hook(params):
 
                 def reduce_leaf_module_grads(module, grad_input, grad_output):
-                    if self.remaining_grad_acc_hooks == 0:
-                        self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
-                            non_leaf_params_requiring_grad) + leaf_module_count
+                    if not self._ensure_grad_acc_hook_counter(
+                            lambda: count_used_parameters_in_backward(non_leaf_params_requiring_grad) +
+                            leaf_module_count):
+                        return
 
                     for param in params:
                         # this takes care of grads for MoE experts that didn't participate in the current iteration/layer
@@ -1285,9 +1286,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                             param.grad = torch.zeros_like(param)
                         self.reduce_ready_partitions_and_remove_grads(param)
 
-                    self.remaining_grad_acc_hooks -= 1
-                    if self.remaining_grad_acc_hooks == 0:
-                        self.run_grad_acc_post_hooks()
+                    should_trigger_post = any(getattr(param, "ds_grad_is_ready", True) for param in params)
+                    self._decrement_grad_acc_hook_counter(should_trigger_post=should_trigger_post)
 
                 return reduce_leaf_module_grads
 

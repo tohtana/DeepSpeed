@@ -23,6 +23,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
     def __init__(self):
         self.remaining_grad_acc_hooks = 0
         self.grad_acc_post_hooks = []
+        self._grad_acc_hook_stack = []
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
@@ -126,3 +127,37 @@ class ZeROOptimizer(DeepSpeedOptimizer):
     def run_grad_acc_post_hooks(self):
         for hook in self.grad_acc_post_hooks:
             hook()
+
+    def _ensure_grad_acc_hook_counter(self, counter_fn):
+        """Track backward hook execution counts per autograd graph task."""
+        graph_id = torch._C._current_graph_task_id()
+        if self._grad_acc_hook_stack and self._grad_acc_hook_stack[-1][0] == graph_id:
+            return True
+
+        remaining = counter_fn()
+        if remaining <= 0:
+            return False
+
+        self._grad_acc_hook_stack.append([graph_id, remaining, False])
+        return True
+
+    def _decrement_grad_acc_hook_counter(self, steps: int = 1, should_trigger_post: bool = True):
+        if not self._grad_acc_hook_stack:
+            return
+
+        self._grad_acc_hook_stack[-1][1] -= steps
+        if should_trigger_post:
+            self._grad_acc_hook_stack[-1][2] = True
+
+        while self._grad_acc_hook_stack:
+            graph_id, remaining, ready_to_post = self._grad_acc_hook_stack[-1]
+            if remaining > 0:
+                break
+
+            self._grad_acc_hook_stack.pop()
+            if remaining < 0:
+                logger.warning(
+                    f"Grad hook counter for graph task {graph_id} became negative. "
+                    "Treating as completed but this indicates mismatched hook accounting.")
+            if ready_to_post and not self._grad_acc_hook_stack:
+                self.run_grad_acc_post_hooks()

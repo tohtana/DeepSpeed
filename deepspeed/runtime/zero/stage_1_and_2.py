@@ -584,6 +584,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # 2. gradient partitioning
         # 3. overlapping backward and reduction
         self._grad_acc_hooks = []
+        self._custom_params_pending = set()
 
         if (self.partition_gradients or self.overlap_comm or self.use_grad_accum_attribute
                 or self.contiguous_gradients):
@@ -981,6 +982,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     def create_gradient_handling_hooks(self):
         all_params_requiring_grad = []
 
+        self._all_params_requiring_grad = all_params_requiring_grad
         for i, param_group in enumerate(self.bit16_groups):
             for param in param_group:
                 if param.requires_grad:
@@ -997,10 +999,24 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                 self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
                                     all_params_requiring_grad)
 
+                            param_id = id(param)
+                            is_custom_param = getattr(param, "ds_has_custom_backward", False)
+                            if is_custom_param and param_id not in self._custom_params_pending:
+                                self._custom_params_pending.add(param_id)
+
                             self.process_gradients(param, i)
 
+                            if is_custom_param:
+                                should_trigger_post = getattr(param, "ds_grad_is_ready", True)
+                                if should_trigger_post:
+                                    self._custom_params_pending.discard(param_id)
+                                allow_post = should_trigger_post and not self._custom_params_pending
+                            else:
+                                should_trigger_post = True
+                                allow_post = True
+
                             self.remaining_grad_acc_hooks -= 1
-                            if self.remaining_grad_acc_hooks == 0:
+                            if self.remaining_grad_acc_hooks == 0 and allow_post:
                                 self.run_grad_acc_post_hooks()
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
@@ -2241,6 +2257,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                             device=get_accelerator().current_device_name())
                         bucket.buffer.append(buf_1)
 
+            custom_params = set()
+            for param in getattr(self, "_all_params_requiring_grad", []):
+                if getattr(param, "ds_has_custom_backward", False):
+                    custom_params.add(id(param))
+            self._custom_params_pending = custom_params
             self.ready_for_gradients = True
 
     def backward_epilogue(self, *args, **kwargs):
