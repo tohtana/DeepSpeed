@@ -20,7 +20,8 @@ from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
 from deepspeed.runtime.utils import (empty_cache, see_memory_usage, inf, is_model_parallel_parameter,
-                                     align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace)
+                                     align_dense_tensors, all_gather_dp_groups, mask_nan_or_inf_with_val_inplace,
+                                     count_used_parameters_in_backward)
 from deepspeed.runtime.zero.config import ZeroStageEnum
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -978,6 +979,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param.grad = None
 
     def create_gradient_handling_hooks(self):
+        all_params_requiring_grad = []
+
+        for i, param_group in enumerate(self.bit16_groups):
+            for param in param_group:
+                if param.requires_grad:
+                    all_params_requiring_grad.append(param)
+
         for i, param_group in enumerate(self.bit16_groups):
             for param in param_group:
                 if param.requires_grad:
@@ -985,17 +993,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     def wrapper(param, i):
 
                         def grad_handling_hook(*notneeded):
+                            if self.remaining_grad_acc_hooks == 0:
+                                self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
+                                    all_params_requiring_grad)
+
                             self.process_gradients(param, i)
+
                             self.remaining_grad_acc_hooks -= 1
                             if self.remaining_grad_acc_hooks == 0:
                                 self.run_grad_acc_post_hooks()
-                                self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
 
                     wrapper(param, i)
 
-        self.remaining_grad_acc_hooks = len(self._grad_acc_hooks)
+        self.remaining_grad_acc_hooks = 0
 
     def get_param_id(self, param):
         unique_id = id(param)

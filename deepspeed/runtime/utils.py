@@ -22,7 +22,7 @@ try:
     from torch._six import inf
 except ModuleNotFoundError:
     from torch import inf
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Sequence
 from deepspeed import comm as dist
 from deepspeed.moe.utils import is_moe_param
 from deepspeed.utils import groups, logger
@@ -1367,3 +1367,65 @@ def register_output_backward_hooks(outputs, preprocess_once_fn, preprocess_per_t
     hook_manager = OutputBackwardHookManager(preprocess_once_fn, preprocess_per_tensor_fn)
     hook_manager.register_hooks_on_outputs(outputs)
     return hook_manager
+
+
+def check_internal_apis_for_count_used_parameters() -> bool:
+    """
+    Ensure the Torch internal APIs needed by `count_used_parameters_in_backward` exist.
+    """
+    if not hasattr(torch.autograd.graph, '_get_grad_fn_or_grad_acc'):
+        return False
+
+    missing = [attr for attr in ("_current_graph_task_id", "_will_engine_execute_node") if not hasattr(torch._C, attr)]
+
+    if missing:
+        return False
+
+    return True
+
+
+def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) -> int:
+    """
+    Count the number of parameters that participate in the currently running backward graph.
+
+    This helper is designed to be invoked from within a backward hook where a graph task
+    is active. Parameters that do not require gradients, are detached, or are not touched
+    by the current backward pass are ignored.
+
+    Args:
+        parameters: Iterable of model parameters to inspect.
+
+    Returns:
+        The number of parameters whose gradient nodes will be executed by the autograd engine
+        for the active backward call.
+    """
+    assert check_internal_apis_for_count_used_parameters(), (
+        "count_used_parameters_in_backward requires internal PyTorch APIs that are not available "
+        "in this PyTorch build.")
+
+    from torch.autograd.graph import _get_grad_fn_or_grad_acc
+    if torch._C._current_graph_task_id() == -1:
+        raise RuntimeError("count_used_parameters_in_backward must be called during backward execution")
+
+    grad_nodes = []
+    seen_nodes = set()
+    for param in parameters:
+        if not isinstance(param, torch.Tensor) or not param.requires_grad:
+            continue
+
+        grad_fn = _get_grad_fn_or_grad_acc(param)
+        if grad_fn is None:
+            continue
+
+        grad_fn_id = id(grad_fn)
+        if grad_fn_id in seen_nodes:
+            continue
+
+        seen_nodes.add(grad_fn_id)
+        grad_nodes.append(grad_fn)
+
+    if not grad_nodes:
+        return 0
+
+    participating = sum(map(torch._C._will_engine_execute_node, grad_nodes))
+    return int(participating)

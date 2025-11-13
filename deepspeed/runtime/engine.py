@@ -24,7 +24,7 @@ from typing import Callable, Dict, Union, Iterable, Container, List
 import deepspeed
 
 from deepspeed import comm as dist
-from deepspeed.runtime.utils import see_memory_usage, DummyOptim, register_output_backward_hooks
+from deepspeed.runtime.utils import see_memory_usage, DummyOptim, register_output_backward_hooks, check_internal_apis_for_count_used_parameters
 from .zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
@@ -421,7 +421,9 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
-        if isinstance(self.optimizer, ZeROOptimizer):
+        self._running_engine_backward = False
+        if isinstance(self.optimizer, ZeROOptimizer) and check_internal_apis_for_count_used_parameters():
+            self._support_torch_style_backward = True
             # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
             # not for `engine.backward(loss)`. In this case, we need to ensure that the preprocessing
             # and postprocessing around the backward call are handled correctly.
@@ -2273,6 +2275,11 @@ class DeepSpeedEngine(Module):
     def _backward_prologue(self):
         self._start_timers(self.engine_timers.backward_timers)
 
+        if not self._support_torch_style_backward and not self._running_engine_backward:
+            raise RuntimeError(
+                "Direct calls to tensor.backward() are not supported with this PyTorch version. Please use engine.backward(loss) instead."
+            )
+
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
         assert not self.eigenvalue_enabled(), "Eigenvalue is not supported with non-scalar backward"
@@ -2341,6 +2348,8 @@ class DeepSpeedEngine(Module):
         assert maybe_loss_for_backward(
             loss), "loss must be a scalar tensor. If you need to pass output gradients, backward() of output tensors"
 
+        self._running_engine_backward = True
+
         # Set flag to prevent hooks from firing (we'll manually call prologue/epilogue)
         self._start_timers(self.engine_timers.backward_timers)
         backward_kwargs = {"retain_graph": retain_graph}
@@ -2363,7 +2372,13 @@ class DeepSpeedEngine(Module):
             with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
                 scaled_loss.backward(**backward_kwargs)
 
+        # backward_epilogue is not called as in a hook when self._support_torch_style_backward is False
+        if not self._support_torch_style_backward:
+            self._backward_epilogue()
+
         self._stop_timers(self.engine_timers.backward_timers)
+
+        self._running_engine_backward = False
 
         return loss
 
