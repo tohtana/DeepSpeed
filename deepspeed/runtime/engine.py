@@ -422,6 +422,7 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
         self._running_engine_backward = False
+        self._support_torch_style_backward = False
         if isinstance(self.optimizer, ZeROOptimizer) and check_internal_apis_for_count_used_parameters():
             self._support_torch_style_backward = True
             # These hooks are used for non-scalar backward support, such as `out.backward(out_grad)`,
