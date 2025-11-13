@@ -2289,7 +2289,7 @@ class DeepSpeedEngine(Module):
         if self.is_deepcompile_active():
             deepcompile_backward_prologue(self.is_gradient_accumulation_boundary())
 
-        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+        if isinstance(self.optimizer, ZeROOptimizer):
             self.optimizer.backward_prologue()
             self.optimizer.enter_backward()
 
@@ -2305,7 +2305,7 @@ class DeepSpeedEngine(Module):
             # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
 
-        if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
+        if isinstance(self.optimizer, ZeROOptimizer):
             self.optimizer.backward_epilogue()
             self.optimizer.exit_backward()
 

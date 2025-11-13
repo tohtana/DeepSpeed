@@ -133,8 +133,8 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         # trigger ZeRO's grad hooks, but we must not run the engine's
         # post-backward logic (which reduces/clears grads) until the outer/user
         # backward is active. The depth guard filters out only those pre-user
-        # invocations while still allowing nested backward calls that happen
-        # during the real user backward.
+        # invocations while still allowing backward calls that happen during
+        # the real user backward.
         if self._backward_active_depth == 0:
             return
         for hook in self.grad_acc_post_hooks:
