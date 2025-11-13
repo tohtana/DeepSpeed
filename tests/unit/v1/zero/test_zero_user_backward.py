@@ -353,6 +353,175 @@ class TestZeroUserBackwardGradAccumulation(DistributedTest):
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
+class TestZeroUserBackwardMultipleEngines(DistributedTest):
+    """Test multiple DeepSpeed engines with combined loss without manual _backward_epilogue()"""
+    world_size = 2
+
+    def test_multiple_engines_combined_loss(self, zero_stage):
+        """Test that multiple engines work with combined loss.backward() without manual _backward_epilogue()
+
+        This test compares the behavior with PyTorch DDP baseline to ensure correctness.
+        """
+        hidden_dim = 4
+        batch_size = 2
+        num_models = 3
+        lr = 1e-3
+
+        # Initialize distributed
+        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
+        device = get_accelerator().current_device_name()
+        rank = get_accelerator().current_device()
+        dtype = preferred_dtype()
+
+        # Create DDP baseline models
+        ddp_models = []
+        ddp_optimizers = []
+        for i in range(num_models):
+            torch.manual_seed(42 + i)
+            model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+            model = model.to(device=device, dtype=dtype)
+            model = DDP(model, device_ids=[rank], output_device=rank)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            ddp_models.append(model)
+            ddp_optimizers.append(optimizer)
+
+        # Create multiple DeepSpeed engines with identical initialization
+        model_engines = []
+        for i in range(num_models):
+            torch.manual_seed(42 + i)  # Same seed as DDP models
+            model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+            config = get_config_dict(zero_stage)
+            engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+            model_engines.append(engine)
+
+        # Create same input for all models
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+        y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
+
+        # DDP baseline: compute losses and combined backward
+        for optimizer in ddp_optimizers:
+            optimizer.zero_grad()
+
+        ddp_losses = []
+        for model in ddp_models:
+            loss = model(x, y)
+            ddp_losses.append(loss)
+
+        ddp_combined_loss = sum(l / (i + 1) for i, l in enumerate(ddp_losses))
+        ddp_combined_loss.backward()
+
+        # Collect DDP gradients for each model
+        ddp_grads_per_model = []
+        for model in ddp_models:
+            grads = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    clean_name = name.replace('module.', '')
+                    grads[clean_name] = param.grad.detach().clone().cpu()
+            ddp_grads_per_model.append(grads)
+
+        # DeepSpeed: compute losses and combined backward WITHOUT manual _backward_epilogue()
+        ds_losses = []
+        for engine in model_engines:
+            loss = engine(x, y)
+            ds_losses.append(loss)
+
+        # Combine losses with weighted sum (as in the documentation example)
+        ds_combined_loss = sum(l / (i + 1) for i, l in enumerate(ds_losses))
+
+        # Call backward on combined loss WITHOUT manual _backward_epilogue()
+        # This should now work automatically
+        ds_combined_loss.backward()
+
+        # Collect DeepSpeed gradients for each engine and compare with DDP
+        for engine_idx, engine in enumerate(model_engines):
+            ds_grads = collect_gradients_safe(engine)
+            ddp_grads = ddp_grads_per_model[engine_idx]
+
+            assert len(ds_grads) > 0, f"Engine {engine_idx} has no gradients after combined_loss.backward()"
+            assert len(ddp_grads) == len(ds_grads), \
+                f"Engine {engine_idx}: DDP has {len(ddp_grads)} gradients, DeepSpeed has {len(ds_grads)}"
+
+            # Compare gradients between DDP and DeepSpeed for this model
+            for name in ddp_grads.keys():
+                assert name in ds_grads, f"Engine {engine_idx}: Parameter {name} missing in DeepSpeed gradients"
+
+                # Convert both to fp32 for comparison in case of dtype mismatch
+                ddp_grad_fp32 = ddp_grads[name].float()
+                ds_grad_fp32 = ds_grads[name].float()
+                allclose_on_all_ranks(
+                    ddp_grad_fp32,
+                    ds_grad_fp32,
+                    assert_message=
+                    f"Engine {engine_idx}: Gradients differ for parameter {name} between DDP and DeepSpeed")
+
+        # Step all DDP models
+        for optimizer in ddp_optimizers:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        # Step all DeepSpeed engines
+        for engine in model_engines:
+            engine.step()
+            engine.optimizer.zero_grad()
+
+        # Run another iteration to ensure everything still works
+        torch.manual_seed(456)
+        x2 = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+        y2 = torch.randint(0, hidden_dim, (batch_size, ), device=device)
+
+        # DDP second iteration
+        ddp_losses2 = [model(x2, y2) for model in ddp_models]
+        ddp_combined_loss2 = sum(l / (i + 1) for i, l in enumerate(ddp_losses2))
+        ddp_combined_loss2.backward()
+
+        ddp_grads_per_model2 = []
+        for model in ddp_models:
+            grads = {}
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    clean_name = name.replace('module.', '')
+                    grads[clean_name] = param.grad.detach().clone().cpu()
+            ddp_grads_per_model2.append(grads)
+
+        # DeepSpeed second iteration
+        ds_losses2 = [engine(x2, y2) for engine in model_engines]
+        ds_combined_loss2 = sum(l / (i + 1) for i, l in enumerate(ds_losses2))
+        ds_combined_loss2.backward()
+
+        # Verify gradients again and compare with DDP
+        for engine_idx, engine in enumerate(model_engines):
+            ds_grads = collect_gradients_safe(engine)
+            ddp_grads = ddp_grads_per_model2[engine_idx]
+
+            assert len(ds_grads) > 0, f"Engine {engine_idx} has no gradients in second iteration"
+            assert len(ddp_grads) == len(ds_grads), \
+                f"Engine {engine_idx} (iter 2): DDP has {len(ddp_grads)} gradients, DeepSpeed has {len(ds_grads)}"
+
+            for name in ddp_grads.keys():
+                assert name in ds_grads, f"Engine {engine_idx} (iter 2): Parameter {name} missing in DeepSpeed gradients"
+
+                ddp_grad_fp32 = ddp_grads[name].float()
+                ds_grad_fp32 = ds_grads[name].float()
+                allclose_on_all_ranks(
+                    ddp_grad_fp32,
+                    ds_grad_fp32,
+                    assert_message=f"Engine {engine_idx} (iter 2): Gradients differ for parameter {name}")
+
+        # Step both
+        for optimizer in ddp_optimizers:
+            optimizer.step()
+
+        for engine in model_engines:
+            engine.step()
+
+        # Cleanup
+        for engine in model_engines:
+            engine.destroy()
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
 class TestZeroUserBackwardSeparateLoss(DistributedTest):
     """Test using separate loss functions"""
     world_size = 2
