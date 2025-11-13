@@ -1392,6 +1392,10 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
     is active. Parameters that do not require gradients, are detached, or are not touched
     by the current backward pass are ignored.
 
+    torch.autograd.graph.register_multi_grad_hook is used for the purpose, but
+    its verification on tensor shapes throws an error with ZeRO3 (it expects original tensor shape).
+    So this function simplifies register_multi_grad_hook just to count used parameters.
+
     Args:
         parameters: Iterable of model parameters to inspect.
 

@@ -421,6 +421,11 @@ class DeepSpeedEngine(Module):
             self.register_compile_pass(selective_gather.NAME, selective_gather.selective_gather)
             self.register_compile_pass(offload_adam_states.NAME, offload_adam_states.move_opt_states)
 
+        # We now support PyTorch style backward, but it relies on the counter in ZeRO optimizers.
+        # However, we need some internal APIs to count the number of only used parameters.
+        # So we only enable this feature when those internal APIs are available.
+        # Otherwise, we fallback to DeepSpeed style backward only.
+        # See `count_used_parameters_in_backward` for more details.
         self._running_engine_backward = False
         self._support_torch_style_backward = False
         if isinstance(self.optimizer, ZeROOptimizer) and check_internal_apis_for_count_used_parameters():
@@ -437,7 +442,6 @@ class DeepSpeedEngine(Module):
             # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
             # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
             self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
-            # TODO: Add warning for optimizers that are not ZeROOptimizer
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2204,6 +2208,8 @@ class DeepSpeedEngine(Module):
             loss = self.module(*inputs, **kwargs)
 
         # Register output backward hooks
+        # preprocess_once_fn is called for preprocessing
+        # preprocess_per_tensor_fn scales a tensor for gradient accumulation
         register_output_backward_hooks(loss,
                                        preprocess_once_fn=self._backward_prologue,
                                        preprocess_per_tensor_fn=self._backward_prologue_per_tensor)
@@ -2282,6 +2288,8 @@ class DeepSpeedEngine(Module):
     def _backward_prologue(self):
         self._start_timers(self.engine_timers.backward_timers)
 
+        # When necessary internal APIs are not available, we disable direct calls to tensor.backward()
+        # and limit to engine.backward(loss) only.
         if not self._support_torch_style_backward and not self._running_engine_backward:
             raise RuntimeError(
                 "Direct calls to tensor.backward() are not supported with this PyTorch version. Please use engine.backward(loss) instead."
@@ -2362,12 +2370,12 @@ class DeepSpeedEngine(Module):
         self._running_engine_backward = True
 
         # Set flag to prevent hooks from firing (we'll manually call prologue/epilogue)
-        self._start_timers(self.engine_timers.backward_timers)
         backward_kwargs = {"retain_graph": retain_graph}
         if self.eigenvalue_enabled():
             backward_kwargs["create_graph"] = True
             backward_kwargs["retain_graph"] = True
 
+        # Used only for return value
         gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
 
         # TODO: handle these scaling with direct calls to loss.backward()
@@ -2387,8 +2395,6 @@ class DeepSpeedEngine(Module):
 
         # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
         self._backward_epilogue()
-
-        self._stop_timers(self.engine_timers.backward_timers)
 
         self._running_engine_backward = False
 

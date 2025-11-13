@@ -21,8 +21,8 @@ class DeepSpeedOptimizer(object):
 class ZeROOptimizer(DeepSpeedOptimizer):
 
     def __init__(self):
-        self.remaining_grad_acc_hooks = 0
-        self.grad_acc_post_hooks = []
+        self._remaining_grad_acc_hooks = 0
+        self._grad_acc_post_hooks = []
         self._backward_active_depth = 0
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
@@ -89,11 +89,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
     def scale_if_loss(self, value: Any) -> Any:
         """
-        :attr:`backward` performs the following steps:
-
-        1. fp32_loss = loss.float()
-        2. scaled_loss = fp32_loss*loss_scale
-        3. scaled_loss.backward(), which accumulates scaled gradients into the ``.grad`` attributes of the model's fp16 leaves
+        Applies loss scaling to the input value if it is a loss tensor.
         """
         if maybe_loss_for_backward(value):
             if self.custom_loss_scaler:
@@ -121,10 +117,10 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         self.exit_backward()
 
     def register_grad_acc_post_hook(self, hook):
-        self.grad_acc_post_hooks.append(hook)
+        self._grad_acc_post_hooks.append(hook)
 
     def unregister_grad_acc_post_hooks(self):
-        self.grad_acc_post_hooks = []
+        self._grad_acc_post_hooks = []
 
     def run_grad_acc_post_hooks(self):
         # Custom autograd Functions (e.g., TiledFusedLogitsLoss) can invoke
@@ -137,7 +133,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         # the real user backward.
         if self._backward_active_depth == 0:
             return
-        for hook in self.grad_acc_post_hooks:
+        for hook in self._grad_acc_post_hooks:
             hook()
 
     def enter_backward(self):

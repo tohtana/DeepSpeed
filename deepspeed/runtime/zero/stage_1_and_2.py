@@ -994,21 +994,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     def wrapper(param, i):
 
                         def grad_handling_hook(*notneeded):
-                            if self.remaining_grad_acc_hooks == 0:
-                                self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
+                            if self._remaining_grad_acc_hooks == 0:
+                                self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
                                     all_params_requiring_grad)
 
                             self.process_gradients(param, i)
 
-                            self.remaining_grad_acc_hooks -= 1
-                            if self.remaining_grad_acc_hooks == 0:
+                            self._remaining_grad_acc_hooks -= 1
+                            if self._remaining_grad_acc_hooks == 0:
                                 self.run_grad_acc_post_hooks()
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
 
                     wrapper(param, i)
 
-        self.remaining_grad_acc_hooks = 0
+        self._remaining_grad_acc_hooks = 0
 
     def get_param_id(self, param):
         unique_id = id(param)

@@ -1249,14 +1249,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            if self.remaining_grad_acc_hooks == 0:
-                                self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
+                            if self._remaining_grad_acc_hooks == 0:
+                                self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
                                     non_leaf_params_requiring_grad) + leaf_module_count
 
                             self.reduce_ready_partitions_and_remove_grads(param)
 
-                            self.remaining_grad_acc_hooks -= 1
-                            if self.remaining_grad_acc_hooks == 0:
+                            self._remaining_grad_acc_hooks -= 1
+                            if self._remaining_grad_acc_hooks == 0:
                                 self.run_grad_acc_post_hooks()
 
                         self._grad_acc_hooks.append(register_grad_hook(param, reduce_partition_and_remove_grads))
@@ -1275,8 +1275,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             def make_hook(params):
 
                 def reduce_leaf_module_grads(module, grad_input, grad_output):
-                    if self.remaining_grad_acc_hooks == 0:
-                        self.remaining_grad_acc_hooks = count_used_parameters_in_backward(
+                    if self._remaining_grad_acc_hooks == 0:
+                        self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
                             non_leaf_params_requiring_grad) + leaf_module_count
 
                     for param in params:
@@ -1285,8 +1285,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                             param.grad = torch.zeros_like(param)
                         self.reduce_ready_partitions_and_remove_grads(param)
 
-                    self.remaining_grad_acc_hooks -= 1
-                    if self.remaining_grad_acc_hooks == 0:
+                    self._remaining_grad_acc_hooks -= 1
+                    if self._remaining_grad_acc_hooks == 0:
                         self.run_grad_acc_post_hooks()
 
                 return reduce_leaf_module_grads
@@ -1294,7 +1294,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             assert required_torch_version(min_version=1.8), "Leaf module requires PyTorch >= 1.8"
             self._leaf_module_hooks.append(leaf_module.register_full_backward_hook(make_hook(leaf_parameters)))
 
-        self.remaining_grad_acc_hooks = 0
+        self._remaining_grad_acc_hooks = 0
 
         print_rank_0('[End] Create gradient reduction hooks')
 
