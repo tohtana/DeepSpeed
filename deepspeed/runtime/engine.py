@@ -2315,7 +2315,8 @@ class DeepSpeedEngine(Module):
         return grad / self.gradient_accumulation_steps()
 
     def _backward_post_hook(self):
-        self._backward_epilogue()
+        if not self._running_engine_backward:
+            self._backward_epilogue()
 
     @contextmanager
     def no_sync(self):
@@ -2359,6 +2360,8 @@ class DeepSpeedEngine(Module):
             backward_kwargs["create_graph"] = True
             backward_kwargs["retain_graph"] = True
 
+        gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
+
         # TODO: handle these scaling with direct calls to loss.backward()
         if isinstance(self.optimizer, ZeROOptimizer):
             loss = self.optimizer.scale_if_loss(loss)
@@ -2374,15 +2377,14 @@ class DeepSpeedEngine(Module):
             with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
                 scaled_loss.backward(**backward_kwargs)
 
-        # backward_epilogue is not called as in a hook when self._support_torch_style_backward is False
-        if not self._support_torch_style_backward:
-            self._backward_epilogue()
+        # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
+        self._backward_epilogue()
 
         self._stop_timers(self.engine_timers.backward_timers)
 
         self._running_engine_backward = False
 
-        return loss
+        return gas_scaled_loss
 
     def is_gradient_accumulation_boundary(self):
         """
