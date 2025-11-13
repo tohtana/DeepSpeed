@@ -23,6 +23,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
     def __init__(self):
         self.remaining_grad_acc_hooks = 0
         self.grad_acc_post_hooks = []
+        self._backward_active_depth = 0
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
@@ -114,8 +115,10 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
         scaled_loss = self.backward_prologue(loss)
         retain_graph = kwargs.pop('retain_graph', False)
+        self.enter_backward()
         scaled_loss.backward(retain_graph=retain_graph)
         self.backward_epilogue()
+        self.exit_backward()
 
     def register_grad_acc_post_hook(self, hook):
         self.grad_acc_post_hooks.append(hook)
@@ -124,5 +127,22 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         self.grad_acc_post_hooks = []
 
     def run_grad_acc_post_hooks(self):
+        # Custom autograd Functions (e.g., TiledFusedLogitsLoss) can invoke
+        # `torch.autograd.backward()` from their *forward* pass before the user
+        # ever calls `engine.backward(loss)`. Those early backward calls still
+        # trigger ZeRO's grad hooks, but we must not run the engine's
+        # post-backward logic (which reduces/clears grads) until the outer/user
+        # backward is active. The depth guard filters out only those pre-user
+        # invocations while still allowing nested backward calls that happen
+        # during the real user backward.
+        if self._backward_active_depth == 0:
+            return
         for hook in self.grad_acc_post_hooks:
             hook()
+
+    def enter_backward(self):
+        self._backward_active_depth += 1
+
+    def exit_backward(self):
+        if self._backward_active_depth > 0:
+            self._backward_active_depth -= 1

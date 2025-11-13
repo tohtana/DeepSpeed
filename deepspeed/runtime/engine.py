@@ -2291,6 +2291,7 @@ class DeepSpeedEngine(Module):
 
         if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
             self.optimizer.backward_prologue()
+            self.optimizer.enter_backward()
 
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
@@ -2306,6 +2307,7 @@ class DeepSpeedEngine(Module):
 
         if isinstance(self.optimizer, DeepSpeedZeroOptimizer):
             self.optimizer.backward_epilogue()
+            self.optimizer.exit_backward()
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
         self._stop_timers(self.engine_timers.backward_reduce_timers)
