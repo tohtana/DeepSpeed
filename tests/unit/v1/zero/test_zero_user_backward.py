@@ -29,6 +29,20 @@ class SimpleNonScalarModel(torch.nn.Module):
         return x
 
 
+class SimpleOutputModel(torch.nn.Module):
+    """Model that returns output without computing loss"""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.linear2(x)
+        return x
+
+
 def get_config_dict(zero_stage, gradient_accumulation_steps=1):
     """Helper to create config dict with common settings"""
     config_dict = {
@@ -71,6 +85,111 @@ def collect_gradients_safe(model):
     return grads
 
 
+def setup_models_and_engines(model_class, zero_stage, seed=42, lr=1e-3, gradient_accumulation_steps=1, **model_kwargs):
+    """
+    Helper to create DDP model and DeepSpeed engine with identical initialization.
+
+    Args:
+        model_class: The model class to instantiate
+        zero_stage: ZeRO stage (1, 2, or 3)
+        seed: Random seed for model initialization
+        lr: Learning rate for optimizer
+        gradient_accumulation_steps: Number of gradient accumulation steps
+        **model_kwargs: Additional keyword arguments to pass to model_class constructor
+
+    Returns:
+        Tuple of (model_ddp, optimizer_ddp, model_engine, device, dtype)
+    """
+    # Initialize distributed environment
+    deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
+    device = get_accelerator().current_device_name()
+    rank = get_accelerator().current_device()
+    dtype = preferred_dtype()
+
+    # Create DDP model
+    torch.manual_seed(seed)
+    model_ddp = model_class(**model_kwargs)
+    model_ddp = model_ddp.to(device=device, dtype=dtype)
+    model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+    optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
+
+    # Create DeepSpeed model with identical initialization
+    torch.manual_seed(seed)
+    model_deepspeed = model_class(**model_kwargs)
+
+    # Initialize DeepSpeed engine
+    config = get_config_dict(zero_stage, gradient_accumulation_steps=gradient_accumulation_steps)
+    model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                 model=model_deepspeed,
+                                                 model_parameters=model_deepspeed.parameters())
+
+    return model_ddp, optimizer_ddp, model_engine, device, dtype
+
+
+def collect_ddp_gradients(model_ddp):
+    """Collect gradients from DDP model"""
+    grads = {}
+    for name, param in model_ddp.named_parameters():
+        if param.grad is not None:
+            clean_name = name.replace('module.', '')
+            grads[clean_name] = param.grad.detach().clone().cpu()
+    return grads
+
+
+def compare_gradients(grads_ddp, grads_ds, step_info=""):
+    """Compare gradients between DDP and DeepSpeed"""
+    step_suffix = f" at {step_info}" if step_info else ""
+    assert len(grads_ddp) == len(grads_ds), \
+        f"Different number of parameters with gradients{step_suffix}: DDP={len(grads_ddp)}, DeepSpeed={len(grads_ds)}"
+
+    for name in grads_ddp.keys():
+        assert name in grads_ds, f"Parameter {name} missing in DeepSpeed gradients{step_suffix}"
+        # Convert both to fp32 for comparison in case of dtype mismatch
+        grads_ddp_fp32 = grads_ddp[name].float()
+        grads_ds_fp32 = grads_ds[name].float()
+        allclose_on_all_ranks(grads_ddp_fp32,
+                              grads_ds_fp32,
+                              assert_message=f"Gradients differ for parameter {name}{step_suffix}")
+
+
+def collect_ddp_parameters(model_ddp):
+    """Collect parameters from DDP model"""
+    params = {}
+    for name, param in model_ddp.named_parameters():
+        clean_name = name.replace('module.', '')
+        params[clean_name] = param.detach().clone().cpu()
+    return params
+
+
+def collect_deepspeed_parameters(model_engine, zero_stage):
+    """Collect parameters from DeepSpeed engine (handles ZeRO-3 gathering)"""
+    params = {}
+    for name, param in model_engine.named_parameters():
+        clean_name = name.replace('module.', '')
+        if zero_stage == 3:
+            with deepspeed.zero.GatheredParameters([param], modifier_rank=None):
+                params[clean_name] = param.detach().clone().cpu()
+        else:
+            params[clean_name] = param.detach().clone().cpu()
+    return params
+
+
+def compare_parameters(params_ddp, params_ds, step_info=""):
+    """Compare parameters between DDP and DeepSpeed"""
+    step_suffix = f" at {step_info}" if step_info else ""
+    assert len(params_ddp) == len(params_ds), \
+        f"Parameter count mismatch{step_suffix}: DDP={len(params_ddp)}, DeepSpeed={len(params_ds)}"
+
+    for name in params_ddp.keys():
+        assert name in params_ds, f"Parameter {name} missing in DeepSpeed model{step_suffix}"
+        # Convert to fp32 for comparison in case of dtype mismatch
+        params_ddp_fp32 = params_ddp[name].float()
+        params_ds_fp32 = params_ds[name].float()
+        allclose_on_all_ranks(params_ddp_fp32,
+                              params_ds_fp32,
+                              assert_message=f"Parameter {name} mismatch{step_suffix}")
+
+
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
 class TestZeroUserBackwardBasic(DistributedTest):
     """Test basic functionality of user backward (loss.backward()) by comparing with PyTorch DDP"""
@@ -79,66 +198,32 @@ class TestZeroUserBackwardBasic(DistributedTest):
     def test_loss_backward_matches_ddp(self, zero_stage):
         """Test that DeepSpeed loss.backward() produces same gradients as PyTorch DDP"""
         hidden_dim = 4
-        lr = 1e-3
 
-        # Create two identical models
-        torch.manual_seed(42)
-        model_ddp = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        # Create DDP and DeepSpeed models
+        model_ddp, optimizer_ddp, model_engine, device, dtype = setup_models_and_engines(model_class=SimpleModel,
+                                                                                         zero_stage=zero_stage,
+                                                                                         hidden_dim=hidden_dim,
+                                                                                         nlayers=2)
 
-        torch.manual_seed(42)
-        model_deepspeed = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        # Create data
+        data_loader = random_dataloader(model=model_engine, total_samples=8, hidden_dim=hidden_dim, device=device)
 
-        # Initialize DDP baseline
-        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
-        device = get_accelerator().current_device_name()
-        rank = get_accelerator().current_device()
-        dtype = preferred_dtype()
-
-        model_ddp = model_ddp.to(device=device, dtype=dtype)
-        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
-        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
-
-        # Initialize DeepSpeed
-        config = get_config_dict(zero_stage)
-        model_engine, _, _, _ = deepspeed.initialize(config=config,
-                                                     model=model_deepspeed,
-                                                     model_parameters=model_deepspeed.parameters())
-
-        data_loader = random_dataloader(model=model_engine,
-                                        total_samples=8,
-                                        hidden_dim=hidden_dim,
-                                        device=model_engine.device)
-
-        # Run one training step with DDP
+        # Run one training step with both models
         batch = next(iter(data_loader))
+
+        # DDP: forward and backward
         optimizer_ddp.zero_grad()
         loss_ddp = model_ddp(batch[0], batch[1])
         loss_ddp.backward()
+        grads_ddp = collect_ddp_gradients(model_ddp)
 
-        # Collect DDP gradients
-        grads_ddp = {}
-        for name, param in model_ddp.named_parameters():
-            if param.grad is not None:
-                # Remove 'module.' prefix from DDP
-                clean_name = name.replace('module.', '')
-                grads_ddp[clean_name] = param.grad.detach().clone().cpu()
-
-        # Run one training step with DeepSpeed using loss.backward()
+        # DeepSpeed: forward and backward
         loss_ds = model_engine(batch[0], batch[1])
         loss_ds.backward()
         grads_ds = collect_gradients_safe(model_engine)
 
-        # Compare gradients across all ranks
-        assert len(grads_ddp) == len(grads_ds), \
-            f"Different number of parameters with gradients: DDP={len(grads_ddp)}, DeepSpeed={len(grads_ds)}"
-        for name in grads_ddp.keys():
-            assert name in grads_ds, f"Parameter {name} missing in DeepSpeed gradients"
-            # Convert both to fp32 for comparison in case of dtype mismatch
-            grads_ddp_fp32 = grads_ddp[name].float()
-            grads_ds_fp32 = grads_ds[name].float()
-            allclose_on_all_ranks(grads_ddp_fp32,
-                                  grads_ds_fp32,
-                                  assert_message=f"Gradients differ for parameter {name} between DDP and DeepSpeed")
+        # Compare gradients
+        compare_gradients(grads_ddp, grads_ds)
 
         model_engine.destroy()
 
@@ -152,118 +237,39 @@ class TestZeroUserBackwardNonScalar(DistributedTest):
         """Test that tensor.backward(grad) works correctly by comparing with PyTorch DDP"""
         hidden_dim = 4
         batch_size = 2
-        lr = 1e-3
 
-        # Create two identical models - one for PyTorch DDP, one for DeepSpeed
-        torch.manual_seed(42)
-        model_ddp = SimpleNonScalarModel(hidden_dim=hidden_dim)
+        # Create DDP and DeepSpeed models
+        model_ddp, optimizer_ddp, model_engine, device, dtype = setup_models_and_engines(
+            model_class=SimpleNonScalarModel, zero_stage=zero_stage, hidden_dim=hidden_dim)
 
-        torch.manual_seed(42)
-        model_deepspeed = SimpleNonScalarModel(hidden_dim=hidden_dim)
-
-        # Initialize DDP baseline
-        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
-        device = get_accelerator().current_device_name()
-        rank = get_accelerator().current_device()
-        dtype = preferred_dtype()
-
-        model_ddp = model_ddp.to(device=device, dtype=dtype)
-        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
-        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
-
-        # Initialize DeepSpeed
-        config = get_config_dict(zero_stage)
-        model_engine, _, _, _ = deepspeed.initialize(config=config,
-                                                     model=model_deepspeed,
-                                                     model_parameters=model_deepspeed.parameters())
-
-        # Create same input for both models
+        # Create input data
         torch.manual_seed(123)
         x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
 
-        # DDP baseline: forward, backward with gradient
+        # DDP: forward and non-scalar backward
         optimizer_ddp.zero_grad()
         output_ddp = model_ddp(x)
         grad_output = torch.ones_like(output_ddp)
         output_ddp.backward(grad_output)
+        ddp_grads = collect_ddp_gradients(model_ddp)
 
-        # Collect DDP gradients after backward, before step
-        ddp_grads = {}
-        for name, param in model_ddp.named_parameters():
-            if param.grad is not None:
-                # Remove 'module.' prefix from DDP
-                clean_name = name.replace('module.', '')
-                ddp_grads[clean_name] = param.grad.detach().clone().cpu()
-
-        # DeepSpeed: forward, backward with gradient
+        # DeepSpeed: forward and non-scalar backward
         output_deepspeed = model_engine(x)
         grad_output_ds = torch.ones_like(output_deepspeed)
         output_deepspeed.backward(grad_output_ds)
+        deepspeed_grads = collect_gradients_safe(model_engine)
 
-        # Collect DeepSpeed gradients after backward, before step using safe API
-        deepspeed_grads = {}
-        for name, param in model_engine.named_parameters():
-            # Remove 'module.' prefix if present (DeepSpeed wraps the model)
-            clean_name = name.replace('module.', '')
-            grad = safe_get_full_grad(param)
-            if grad is not None:
-                deepspeed_grads[clean_name] = grad.detach().clone().cpu()
+        # Compare gradients
+        compare_gradients(ddp_grads, deepspeed_grads, "after non-scalar backward")
 
-        # Compare gradients across all ranks
-        assert len(ddp_grads) == len(deepspeed_grads), \
-            f"Gradient count mismatch: DDP has {len(ddp_grads)}, DeepSpeed has {len(deepspeed_grads)}"
-
-        for name in ddp_grads.keys():
-            assert name in deepspeed_grads, f"Gradient for parameter {name} missing in DeepSpeed model"
-
-            # Gradients should match between DDP and DeepSpeed
-            # Note: DeepSpeed may accumulate gradients in fp32 even when model is bf16,
-            # so we convert both to fp32 for comparison
-            ddp_grad_fp32 = ddp_grads[name].float()
-            deepspeed_grad_fp32 = deepspeed_grads[name].float()
-            allclose_on_all_ranks(
-                ddp_grad_fp32,
-                deepspeed_grad_fp32,
-                assert_message=
-                f"Gradient for parameter {name} mismatch between DDP and DeepSpeed after non-scalar backward")
-
-        # Now run optimizer step
+        # Run optimizer step
         optimizer_ddp.step()
         model_engine.step()
 
-        # Collect DDP parameters after step
-        ddp_params = {}
-        for name, param in model_ddp.named_parameters():
-            # Remove 'module.' prefix from DDP
-            clean_name = name.replace('module.', '')
-            ddp_params[clean_name] = param.detach().clone().cpu()
-
-        # Collect DeepSpeed parameters after step
-        deepspeed_params = {}
-        for name, param in model_engine.named_parameters():
-            # Remove 'module.' prefix if present (DeepSpeed wraps the model)
-            clean_name = name.replace('module.', '')
-            if zero_stage == 3:
-                with deepspeed.zero.GatheredParameters([param], modifier_rank=None):
-                    deepspeed_params[clean_name] = param.detach().clone().cpu()
-            else:
-                deepspeed_params[clean_name] = param.detach().clone().cpu()
-
-        # Compare parameters across all ranks
-        assert len(ddp_params) == len(deepspeed_params), \
-            f"Parameter count mismatch: DDP has {len(ddp_params)}, DeepSpeed has {len(deepspeed_params)}"
-
-        for name in ddp_params.keys():
-            assert name in deepspeed_params, f"Parameter {name} missing in DeepSpeed model"
-
-            # Parameters should match between DDP and DeepSpeed
-            # Convert to fp32 for comparison in case of dtype mismatch
-            ddp_param_fp32 = ddp_params[name].float()
-            deepspeed_param_fp32 = deepspeed_params[name].float()
-            allclose_on_all_ranks(
-                ddp_param_fp32,
-                deepspeed_param_fp32,
-                assert_message=f"Parameter {name} mismatch between DDP and DeepSpeed after non-scalar backward")
+        # Collect and compare parameters after step
+        ddp_params = collect_ddp_parameters(model_ddp)
+        deepspeed_params = collect_deepspeed_parameters(model_engine, zero_stage)
+        compare_parameters(ddp_params, deepspeed_params, "after non-scalar backward")
 
         model_engine.destroy()
 
@@ -529,49 +535,17 @@ class TestZeroUserBackwardSeparateLoss(DistributedTest):
     def test_separate_loss_function(self, zero_stage):
         """Test that separate loss function works correctly by comparing with PyTorch DDP"""
         hidden_dim = 4
-        lr = 1e-3
+        batch_size = 2
 
-        class SimpleOutputModel(torch.nn.Module):
-            """Model that returns output without computing loss"""
-
-            def __init__(self, hidden_dim):
-                super().__init__()
-                self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
-                self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
-
-            def forward(self, x):
-                x = self.linear1(x)
-                x = self.linear2(x)
-                return x
-
-        # Create two identical models
-        torch.manual_seed(42)
-        model_ddp = SimpleOutputModel(hidden_dim=hidden_dim)
-
-        torch.manual_seed(42)
-        model_deepspeed = SimpleOutputModel(hidden_dim=hidden_dim)
-
-        # Initialize DDP baseline
-        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
-        device = get_accelerator().current_device_name()
-        rank = get_accelerator().current_device()
-        dtype = preferred_dtype()
-
-        model_ddp = model_ddp.to(device=device, dtype=dtype)
-        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
-        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
-
-        # Initialize DeepSpeed
-        config = get_config_dict(zero_stage)
-        model_engine, _, _, _ = deepspeed.initialize(config=config,
-                                                     model=model_deepspeed,
-                                                     model_parameters=model_deepspeed.parameters())
+        # Create DDP and DeepSpeed models
+        model_ddp, optimizer_ddp, model_engine, device, dtype = setup_models_and_engines(model_class=SimpleOutputModel,
+                                                                                         zero_stage=zero_stage,
+                                                                                         hidden_dim=hidden_dim)
 
         # Define loss function separately
         loss_fn = torch.nn.CrossEntropyLoss()
 
-        # Create data (use same seed for reproducibility)
-        batch_size = 2
+        # Create input data
         torch.manual_seed(456)
         x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
         y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
@@ -581,13 +555,7 @@ class TestZeroUserBackwardSeparateLoss(DistributedTest):
         output_ddp = model_ddp(x)
         loss_ddp = loss_fn(output_ddp, y)
         loss_ddp.backward()
-
-        # Collect DDP gradients
-        grads_ddp = {}
-        for name, param in model_ddp.named_parameters():
-            if param.grad is not None:
-                clean_name = name.replace('module.', '')
-                grads_ddp[clean_name] = param.grad.detach().clone().cpu()
+        grads_ddp = collect_ddp_gradients(model_ddp)
 
         # DeepSpeed: forward, loss, backward
         output_ds = model_engine(x)
@@ -595,17 +563,8 @@ class TestZeroUserBackwardSeparateLoss(DistributedTest):
         loss_ds.backward()
         grads_ds = collect_gradients_safe(model_engine)
 
-        # Compare gradients across all ranks
-        assert len(grads_ddp) == len(grads_ds), \
-            f"Different number of parameters with gradients: DDP={len(grads_ddp)}, DeepSpeed={len(grads_ds)}"
-        for name in grads_ddp.keys():
-            assert name in grads_ds, f"Parameter {name} missing in DeepSpeed gradients"
-            # Convert both to fp32 for comparison in case of dtype mismatch
-            grads_ddp_fp32 = grads_ddp[name].float()
-            grads_ds_fp32 = grads_ds[name].float()
-            allclose_on_all_ranks(grads_ddp_fp32,
-                                  grads_ds_fp32,
-                                  assert_message=f"Gradients differ for parameter {name} between DDP and DeepSpeed")
+        # Compare gradients
+        compare_gradients(grads_ddp, grads_ds)
 
         model_engine.destroy()
 
@@ -630,6 +589,21 @@ class LeafModuleModel(torch.nn.Module):
         return loss
 
 
+class LeafNonScalarModel(torch.nn.Module):
+    """Leaf module model that returns non-scalar output"""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.branches = torch.nn.ModuleList([
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+        ])
+
+    def forward(self, x):
+        # Use all branches - returns non-scalar output
+        return self.branches[0](x) + self.branches[1](x)
+
+
 @pytest.mark.parametrize("zero_stage", [3])
 class TestZeroUserBackwardLeafModule(DistributedTest):
     """Test leaf module behavior during backward passes in ZeRO Stage 3"""
@@ -647,24 +621,22 @@ class TestZeroUserBackwardLeafModule(DistributedTest):
         batch_size = 2
         lr = 1e-3
 
-        # Create two identical models
-        torch.manual_seed(42)
-        model_ddp = LeafModuleModel(hidden_dim=hidden_dim)
-
-        torch.manual_seed(42)
-        model_deepspeed = LeafModuleModel(hidden_dim=hidden_dim)
-
-        # Initialize DDP baseline
+        # Initialize distributed environment
         deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
         device = get_accelerator().current_device_name()
         rank = get_accelerator().current_device()
         dtype = preferred_dtype()
 
+        # Create DDP model
+        torch.manual_seed(42)
+        model_ddp = LeafModuleModel(hidden_dim=hidden_dim)
         model_ddp = model_ddp.to(device=device, dtype=dtype)
         model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
         optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
 
-        # Mark the ModuleList (branches) as a leaf module BEFORE initialization
+        # Create DeepSpeed model and mark leaf modules BEFORE initialization
+        torch.manual_seed(42)
+        model_deepspeed = LeafModuleModel(hidden_dim=hidden_dim)
         leaf_modules = set_z3_leaf_modules(model_deepspeed, [torch.nn.ModuleList])
         assert len(leaf_modules) == 1, "Expected exactly one ModuleList to be marked as leaf"
         assert z3_leaf_module(model_deepspeed.branches), "ModuleList should be marked as leaf module"
@@ -679,44 +651,24 @@ class TestZeroUserBackwardLeafModule(DistributedTest):
         assert len(model_engine.optimizer.leaf_parameters) == 1, \
             "Expected 1 leaf module in optimizer.leaf_parameters"
 
-        # Create same input for both models
+        # Create input data
         torch.manual_seed(123)
         x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
         y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
 
-        # DDP baseline: forward and backward
+        # DDP: forward and backward
         optimizer_ddp.zero_grad()
         loss_ddp = model_ddp(x, y)
         loss_ddp.backward()
-
-        # Collect DDP gradients
-        ddp_grads = {}
-        for name, param in model_ddp.named_parameters():
-            if param.grad is not None:
-                clean_name = name.replace('module.', '')
-                ddp_grads[clean_name] = param.grad.detach().clone().cpu()
+        ddp_grads = collect_ddp_gradients(model_ddp)
 
         # DeepSpeed: forward and backward with leaf module
         loss_deepspeed = model_engine(x, y)
         loss_deepspeed.backward()
-
-        # Collect DeepSpeed gradients
         deepspeed_grads = collect_gradients_safe(model_engine)
 
-        # Compare gradients across all ranks
-        assert len(ddp_grads) == len(deepspeed_grads), \
-            f"Gradient count mismatch - DDP has {len(ddp_grads)}, DeepSpeed has {len(deepspeed_grads)}"
-
-        for name in ddp_grads.keys():
-            assert name in deepspeed_grads, f"Parameter {name} missing in DeepSpeed gradients"
-
-            # Convert both to fp32 for comparison
-            ddp_grad_fp32 = ddp_grads[name].float()
-            deepspeed_grad_fp32 = deepspeed_grads[name].float()
-            allclose_on_all_ranks(
-                ddp_grad_fp32,
-                deepspeed_grad_fp32,
-                assert_message=f"Gradient for parameter {name} mismatch between DDP and DeepSpeed with leaf modules")
+        # Compare gradients
+        compare_gradients(ddp_grads, deepspeed_grads, "with leaf modules")
 
         model_engine.destroy()
 
@@ -731,38 +683,22 @@ class TestZeroUserBackwardLeafModule(DistributedTest):
         batch_size = 2
         lr = 1e-3
 
-        class LeafNonScalarModel(torch.nn.Module):
-            """Leaf module model that returns non-scalar output"""
-
-            def __init__(self, hidden_dim):
-                super().__init__()
-                self.branches = torch.nn.ModuleList([
-                    torch.nn.Linear(hidden_dim, hidden_dim),
-                    torch.nn.Linear(hidden_dim, hidden_dim),
-                ])
-
-            def forward(self, x):
-                # Use all branches - returns non-scalar output
-                return self.branches[0](x) + self.branches[1](x)
-
-        # Create two identical models
-        torch.manual_seed(42)
-        model_ddp = LeafNonScalarModel(hidden_dim=hidden_dim)
-
-        torch.manual_seed(42)
-        model_deepspeed = LeafNonScalarModel(hidden_dim=hidden_dim)
-
-        # Initialize DDP baseline
+        # Initialize distributed environment
         deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
         device = get_accelerator().current_device_name()
         rank = get_accelerator().current_device()
         dtype = preferred_dtype()
 
+        # Create DDP model
+        torch.manual_seed(42)
+        model_ddp = LeafNonScalarModel(hidden_dim=hidden_dim)
         model_ddp = model_ddp.to(device=device, dtype=dtype)
         model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
         optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
 
-        # Mark the ModuleList as a leaf module BEFORE initialization
+        # Create DeepSpeed model and mark leaf modules BEFORE initialization
+        torch.manual_seed(42)
+        model_deepspeed = LeafNonScalarModel(hidden_dim=hidden_dim)
         leaf_modules = set_z3_leaf_modules(model_deepspeed, [torch.nn.ModuleList])
         assert len(leaf_modules) == 1, "Expected exactly one ModuleList to be marked as leaf"
         assert z3_leaf_module(model_deepspeed.branches), "ModuleList should be marked as leaf module"
@@ -777,43 +713,24 @@ class TestZeroUserBackwardLeafModule(DistributedTest):
         assert len(model_engine.optimizer.leaf_parameters) == 1, \
             "Expected 1 leaf module in optimizer.leaf_parameters"
 
-        # Create same input for both models
+        # Create input data
         torch.manual_seed(123)
         x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
 
-        # DDP baseline: forward and non-scalar backward
+        # DDP: forward and non-scalar backward
         optimizer_ddp.zero_grad()
         output_ddp = model_ddp(x)
         grad_output = torch.ones_like(output_ddp)
         output_ddp.backward(grad_output)
-
-        # Collect DDP gradients
-        ddp_grads = {}
-        for name, param in model_ddp.named_parameters():
-            if param.grad is not None:
-                clean_name = name.replace('module.', '')
-                ddp_grads[clean_name] = param.grad.detach().clone().cpu()
+        ddp_grads = collect_ddp_gradients(model_ddp)
 
         # DeepSpeed: forward and non-scalar backward with leaf module
         output_deepspeed = model_engine(x)
         grad_output_ds = torch.ones_like(output_deepspeed)
         output_deepspeed.backward(grad_output_ds)
-
-        # Collect DeepSpeed gradients
         deepspeed_grads = collect_gradients_safe(model_engine)
 
         # Compare gradients
-        assert len(ddp_grads) == len(deepspeed_grads), \
-            f"Gradient count mismatch: DDP has {len(ddp_grads)}, DeepSpeed has {len(deepspeed_grads)}"
-
-        for name in ddp_grads.keys():
-            assert name in deepspeed_grads, f"Parameter {name} missing in DeepSpeed gradients"
-
-            ddp_grad_fp32 = ddp_grads[name].float()
-            deepspeed_grad_fp32 = deepspeed_grads[name].float()
-            allclose_on_all_ranks(
-                ddp_grad_fp32,
-                deepspeed_grad_fp32,
-                assert_message=f"Gradient for parameter {name} mismatch in leaf module non-scalar backward")
+        compare_gradients(ddp_grads, deepspeed_grads, "in leaf module non-scalar backward")
 
         model_engine.destroy()
