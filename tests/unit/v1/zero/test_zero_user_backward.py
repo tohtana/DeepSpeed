@@ -608,3 +608,212 @@ class TestZeroUserBackwardSeparateLoss(DistributedTest):
                                   assert_message=f"Gradients differ for parameter {name} between DDP and DeepSpeed")
 
         model_engine.destroy()
+
+
+class LeafModuleModel(torch.nn.Module):
+    """Model with ModuleList that uses all parameters - for testing leaf module compatibility"""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # ModuleList where all branches are used in forward pass
+        self.branches = torch.nn.ModuleList([
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+        ])
+        self.final_layer = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x, y):
+        # Use all branches - add their outputs together
+        x = self.branches[0](x) + self.branches[1](x)
+        x = self.final_layer(x)
+        loss = torch.nn.functional.cross_entropy(x, y)
+        return loss
+
+
+@pytest.mark.parametrize("zero_stage", [3])
+class TestZeroUserBackwardLeafModule(DistributedTest):
+    """Test leaf module behavior during backward passes in ZeRO Stage 3"""
+    world_size = 2
+
+    def test_leaf_module_backward(self, zero_stage):
+        """Test that leaf modules work correctly with user backward by comparing with PyTorch DDP
+
+        This test validates that the leaf_module_count and backward hooks are correctly
+        handled in create_reduce_and_remove_grad_hooks.
+        """
+        from deepspeed.utils import set_z3_leaf_modules, z3_leaf_module
+
+        hidden_dim = 4
+        batch_size = 2
+        lr = 1e-3
+
+        # Create two identical models
+        torch.manual_seed(42)
+        model_ddp = LeafModuleModel(hidden_dim=hidden_dim)
+
+        torch.manual_seed(42)
+        model_deepspeed = LeafModuleModel(hidden_dim=hidden_dim)
+
+        # Initialize DDP baseline
+        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
+        device = get_accelerator().current_device_name()
+        rank = get_accelerator().current_device()
+        dtype = preferred_dtype()
+
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
+
+        # Mark the ModuleList (branches) as a leaf module BEFORE initialization
+        leaf_modules = set_z3_leaf_modules(model_deepspeed, [torch.nn.ModuleList])
+        assert len(leaf_modules) == 1, "Expected exactly one ModuleList to be marked as leaf"
+        assert z3_leaf_module(model_deepspeed.branches), "ModuleList should be marked as leaf module"
+
+        # Initialize DeepSpeed
+        config = get_config_dict(zero_stage)
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_deepspeed,
+                                                     model_parameters=model_deepspeed.parameters())
+
+        # Verify leaf_module_count was set correctly
+        assert len(model_engine.optimizer.leaf_parameters) == 1, \
+            "Expected 1 leaf module in optimizer.leaf_parameters"
+
+        # Create same input for both models
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+        y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
+
+        # DDP baseline: forward and backward
+        optimizer_ddp.zero_grad()
+        loss_ddp = model_ddp(x, y)
+        loss_ddp.backward()
+
+        # Collect DDP gradients
+        ddp_grads = {}
+        for name, param in model_ddp.named_parameters():
+            if param.grad is not None:
+                clean_name = name.replace('module.', '')
+                ddp_grads[clean_name] = param.grad.detach().clone().cpu()
+
+        # DeepSpeed: forward and backward with leaf module
+        loss_deepspeed = model_engine(x, y)
+        loss_deepspeed.backward()
+
+        # Collect DeepSpeed gradients
+        deepspeed_grads = collect_gradients_safe(model_engine)
+
+        # Compare gradients across all ranks
+        assert len(ddp_grads) == len(deepspeed_grads), \
+            f"Gradient count mismatch - DDP has {len(ddp_grads)}, DeepSpeed has {len(deepspeed_grads)}"
+
+        for name in ddp_grads.keys():
+            assert name in deepspeed_grads, f"Parameter {name} missing in DeepSpeed gradients"
+
+            # Convert both to fp32 for comparison
+            ddp_grad_fp32 = ddp_grads[name].float()
+            deepspeed_grad_fp32 = deepspeed_grads[name].float()
+            allclose_on_all_ranks(
+                ddp_grad_fp32,
+                deepspeed_grad_fp32,
+                assert_message=f"Gradient for parameter {name} mismatch between DDP and DeepSpeed with leaf modules")
+
+        model_engine.destroy()
+
+    def test_leaf_module_non_scalar_backward(self, zero_stage):
+        """Test that leaf modules work correctly with non-scalar backward (tensor.backward(grad))
+
+        This specifically tests the interaction between leaf modules and non-scalar backward.
+        """
+        from deepspeed.utils import set_z3_leaf_modules, z3_leaf_module
+
+        hidden_dim = 4
+        batch_size = 2
+        lr = 1e-3
+
+        class LeafNonScalarModel(torch.nn.Module):
+            """Leaf module model that returns non-scalar output"""
+
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.branches = torch.nn.ModuleList([
+                    torch.nn.Linear(hidden_dim, hidden_dim),
+                    torch.nn.Linear(hidden_dim, hidden_dim),
+                ])
+
+            def forward(self, x):
+                # Use all branches - returns non-scalar output
+                return self.branches[0](x) + self.branches[1](x)
+
+        # Create two identical models
+        torch.manual_seed(42)
+        model_ddp = LeafNonScalarModel(hidden_dim=hidden_dim)
+
+        torch.manual_seed(42)
+        model_deepspeed = LeafNonScalarModel(hidden_dim=hidden_dim)
+
+        # Initialize DDP baseline
+        deepspeed.init_distributed(dist_backend=get_accelerator().communication_backend_name())
+        device = get_accelerator().current_device_name()
+        rank = get_accelerator().current_device()
+        dtype = preferred_dtype()
+
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=lr)
+
+        # Mark the ModuleList as a leaf module BEFORE initialization
+        leaf_modules = set_z3_leaf_modules(model_deepspeed, [torch.nn.ModuleList])
+        assert len(leaf_modules) == 1, "Expected exactly one ModuleList to be marked as leaf"
+        assert z3_leaf_module(model_deepspeed.branches), "ModuleList should be marked as leaf module"
+
+        # Initialize DeepSpeed
+        config = get_config_dict(zero_stage)
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_deepspeed,
+                                                     model_parameters=model_deepspeed.parameters())
+
+        # Verify leaf_module_count was set correctly
+        assert len(model_engine.optimizer.leaf_parameters) == 1, \
+            "Expected 1 leaf module in optimizer.leaf_parameters"
+
+        # Create same input for both models
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+
+        # DDP baseline: forward and non-scalar backward
+        optimizer_ddp.zero_grad()
+        output_ddp = model_ddp(x)
+        grad_output = torch.ones_like(output_ddp)
+        output_ddp.backward(grad_output)
+
+        # Collect DDP gradients
+        ddp_grads = {}
+        for name, param in model_ddp.named_parameters():
+            if param.grad is not None:
+                clean_name = name.replace('module.', '')
+                ddp_grads[clean_name] = param.grad.detach().clone().cpu()
+
+        # DeepSpeed: forward and non-scalar backward with leaf module
+        output_deepspeed = model_engine(x)
+        grad_output_ds = torch.ones_like(output_deepspeed)
+        output_deepspeed.backward(grad_output_ds)
+
+        # Collect DeepSpeed gradients
+        deepspeed_grads = collect_gradients_safe(model_engine)
+
+        # Compare gradients
+        assert len(ddp_grads) == len(deepspeed_grads), \
+            f"Gradient count mismatch: DDP has {len(ddp_grads)}, DeepSpeed has {len(deepspeed_grads)}"
+
+        for name in ddp_grads.keys():
+            assert name in deepspeed_grads, f"Parameter {name} missing in DeepSpeed gradients"
+
+            ddp_grad_fp32 = ddp_grads[name].float()
+            deepspeed_grad_fp32 = deepspeed_grads[name].float()
+            allclose_on_all_ranks(
+                ddp_grad_fp32,
+                deepspeed_grad_fp32,
+                assert_message=f"Gradient for parameter {name} mismatch in leaf module non-scalar backward")
+
+        model_engine.destroy()

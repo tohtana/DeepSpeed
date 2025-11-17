@@ -1235,7 +1235,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         for i, param_group in enumerate(self.fp16_groups):
             for param in param_group:
-                if param.requires_grad and not z3_leaf_parameter(param):
+                if z3_leaf_parameter(param):
+                    self.leaf_parameters[param.ds_z3_leaf_module].append(param)
+                elif param.requires_grad:
                     non_leaf_params_requiring_grad.append(param)
 
         leaf_module_count = len(self.leaf_parameters)
@@ -1261,9 +1263,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         self._grad_acc_hooks.append(register_grad_hook(param, reduce_partition_and_remove_grads))
 
-                    if z3_leaf_parameter(param):
-                        self.leaf_parameters[param.ds_z3_leaf_module].append(param)
-                    else:
+                    if not z3_leaf_parameter(param):
                         wrapper(param)
 
                     # Partition the parameter after creating the hook
