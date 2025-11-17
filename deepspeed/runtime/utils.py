@@ -1411,7 +1411,6 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
     if torch._C._current_graph_task_id() == -1:
         raise RuntimeError("count_used_parameters_in_backward must be called during backward execution")
 
-    grad_nodes = []
     seen_nodes = set()
     for param in parameters:
         if not isinstance(param, torch.Tensor) or not param.requires_grad:
@@ -1421,15 +1420,13 @@ def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) 
         if grad_fn is None:
             continue
 
-        grad_fn_id = id(grad_fn)
-        if grad_fn_id in seen_nodes:
+        if grad_fn in seen_nodes:
             continue
 
-        seen_nodes.add(grad_fn_id)
-        grad_nodes.append(grad_fn)
+        seen_nodes.add(grad_fn)
 
-    if not grad_nodes:
+    if not seen_nodes:
         return 0
 
-    participating = sum(map(torch._C._will_engine_execute_node, grad_nodes))
+    participating = sum(map(torch._C._will_engine_execute_node, seen_nodes))
     return int(participating)
