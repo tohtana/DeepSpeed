@@ -2339,8 +2339,6 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             return False
 
     def backward_prologue(self):
-        """Currently only scales the loss value. Defined for consistency of naming.
-        """
         if self.swap_optimizer:
             self.optimizer_swapper.pre_backward()
 
