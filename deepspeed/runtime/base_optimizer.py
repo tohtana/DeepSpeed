@@ -87,6 +87,20 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         else:
             return self.communication_data_type
 
+    def needs_scaler(self) -> bool:
+        """
+        Check if this optimizer requires loss scaling for correct backward pass.
+
+        Returns True if any of the following conditions are met:
+        - Custom loss scaler is enabled
+        - torch.autocast gradient scaler is active (fp16 only)
+        - Dynamic loss scaling is enabled (fp16 with DeepSpeed's loss scaler)
+
+        Returns False for bf16 or fp32, which don't require gradient scaling.
+        """
+        return (self.custom_loss_scaler or self.torch_autocast_gradscaler is not None
+                or (hasattr(self, 'dynamic_loss_scale') and self.dynamic_loss_scale))
+
     def scale_if_loss(self, value: Any) -> Any:
         """
         Applies loss scaling to the input value if it is a loss tensor.

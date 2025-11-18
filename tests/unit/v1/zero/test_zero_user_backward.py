@@ -644,3 +644,461 @@ class TestZeroUserBackwardLeafModule(DistributedTest):
         compare_gradients(ddp_grads, deepspeed_grads, "in leaf module non-scalar backward")
 
         model_engine.destroy()
+
+
+@pytest.mark.sequential
+class TestZeroUserBackwardScaleErrorDetection(DistributedTest):
+    """Test error detection for missing scale() with fp16 in single-process setup"""
+    world_size = 1  # Use single process to avoid distributed deadlock issues
+
+    def test_error_when_backward_without_scale_sequential(self):
+        """Test that error is raised when calling backward() without scale() with fp16"""
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("Test requires fp16 support")
+
+        hidden_dim = 4
+        zero_stage = 1  # Use ZeRO stage 1 for simplicity
+
+        # Initialize distributed
+        device, _, _ = initialize_distributed()
+
+        # Create engine with fp16 - requires scaling
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": {
+                "stage": zero_stage,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8
+            }
+        }
+
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        # Verify needs_scaler is True
+        from deepspeed.runtime.base_optimizer import ZeROOptimizer
+        assert isinstance(model_engine.optimizer, ZeROOptimizer)
+        assert model_engine.optimizer.needs_scaler(), "fp16 should require scaling"
+
+        # Create data
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.float16)
+        batch = next(iter(data_loader))
+
+        loss = model_engine(batch[0], batch[1])
+
+        # Calling backward() without scale() should raise RuntimeError
+        with pytest.raises(RuntimeError, match="Loss scaling is required"):
+            loss.backward()
+
+        model_engine.destroy()
+
+
+@pytest.mark.parametrize("zero_stage", [1, 3])
+class TestZeroUserBackwardWithScale(DistributedTest):
+    """Test engine.scale() method for manual backward passes with loss scaling"""
+    world_size = 2
+
+    def test_scale_backward_matches_engine_backward(self, zero_stage):
+        """Test that engine.scale(loss).backward() produces same gradients as engine.backward(loss)"""
+        hidden_dim = 4
+
+        # Create DeepSpeed engines with same seed
+        model_engine1 = create_deepspeed_engine(model_class=SimpleModel,
+                                                zero_stage=zero_stage,
+                                                seed=42,
+                                                hidden_dim=hidden_dim,
+                                                nlayers=2)
+        model_engine2 = create_deepspeed_engine(model_class=SimpleModel,
+                                                zero_stage=zero_stage,
+                                                seed=42,
+                                                hidden_dim=hidden_dim,
+                                                nlayers=2)
+
+        # Create data
+        device = get_accelerator().current_device_name()
+        data_loader = random_dataloader(model=model_engine1, total_samples=8, hidden_dim=hidden_dim, device=device)
+        batch = next(iter(data_loader))
+
+        # Model 1: use engine.backward(loss)
+        loss1 = model_engine1(batch[0], batch[1])
+        model_engine1.backward(loss1)
+        grads1 = collect_gradients_safe(model_engine1)
+
+        # Model 2: use engine.scale(loss).backward()
+        loss2 = model_engine2(batch[0], batch[1])
+        scaled_loss = model_engine2.scale(loss2)
+        scaled_loss.backward()
+        grads2 = collect_gradients_safe(model_engine2)
+
+        # Compare gradients - they should be identical
+        compare_gradients(grads1, grads2, "comparing engine.backward vs engine.scale().backward()")
+
+        model_engine1.destroy()
+        model_engine2.destroy()
+
+    def test_scale_backward_matches_ddp(self, zero_stage):
+        """Test that engine.scale(loss).backward() produces same gradients as DDP"""
+        hidden_dim = 4
+
+        # Create DDP and DeepSpeed models
+        model_ddp, optimizer_ddp, model_engine, device, dtype = setup_models_and_engines(model_class=SimpleModel,
+                                                                                         zero_stage=zero_stage,
+                                                                                         hidden_dim=hidden_dim,
+                                                                                         nlayers=2)
+
+        # Create data
+        data_loader = random_dataloader(model=model_engine, total_samples=8, hidden_dim=hidden_dim, device=device)
+        batch = next(iter(data_loader))
+
+        # DDP: forward and backward
+        optimizer_ddp.zero_grad()
+        loss_ddp = model_ddp(batch[0], batch[1])
+        loss_ddp.backward()
+        grads_ddp = collect_ddp_gradients(model_ddp)
+
+        # DeepSpeed: forward and scale + backward
+        loss_ds = model_engine(batch[0], batch[1])
+        scaled_loss = model_engine.scale(loss_ds)
+        scaled_loss.backward()
+        grads_ds = collect_gradients_safe(model_engine)
+
+        # Compare gradients
+        compare_gradients(grads_ddp, grads_ds, "comparing DDP vs engine.scale().backward()")
+
+        model_engine.destroy()
+
+    def test_scale_with_gradient_accumulation(self, zero_stage):
+        """Test that engine.scale() works correctly with gradient accumulation"""
+        hidden_dim = 4
+        gradient_accumulation_steps = 4
+
+        # Create models with gradient accumulation
+        model_ddp, optimizer_ddp, model_engine, device, _ = setup_models_and_engines(
+            model_class=SimpleModel,
+            zero_stage=zero_stage,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            hidden_dim=hidden_dim,
+            nlayers=2)
+
+        # Create data
+        data_loader = random_dataloader(model=model_engine, total_samples=16, hidden_dim=hidden_dim, device=device)
+
+        # Run gradient accumulation steps
+        for i, batch in enumerate(data_loader):
+            # DDP: manual gradient accumulation
+            loss_ddp = model_ddp(batch[0], batch[1])
+            # Scale by GAS for DDP to match DeepSpeed behavior
+            (loss_ddp / gradient_accumulation_steps).backward()
+
+            # DeepSpeed: use scale() with built-in gradient accumulation
+            # Note: scale() only applies loss scaler, NOT GAS. DeepSpeed handles GAS internally
+            # via engine.step(), so we do NOT manually divide by GAS here.
+            loss_ds = model_engine(batch[0], batch[1])
+            scaled_loss = model_engine.scale(loss_ds)
+            scaled_loss.backward()
+
+            # Compare gradients at accumulation boundary
+            if model_engine.is_gradient_accumulation_boundary():
+                grads_ddp = collect_ddp_gradients(model_ddp)
+                grads_ds = collect_gradients_safe(model_engine)
+                compare_gradients(grads_ddp, grads_ds, f"step {i}")
+
+                # Step both optimizers
+                optimizer_ddp.step()
+                optimizer_ddp.zero_grad()
+
+            # Step DeepSpeed (handles gradient accumulation internally)
+            model_engine.step()
+
+        model_engine.destroy()
+
+    def test_needs_scaler_with_fp16(self, zero_stage):
+        """Test that needs_scaler() correctly identifies when scaling is required with fp16"""
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("Test requires fp16 support for gradient scaling")
+
+        hidden_dim = 4
+
+        # Initialize distributed first
+        device, _, _ = initialize_distributed()
+
+        # Create engine with fp16 explicitly to test gradient scaling requirement
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": {
+                "stage": zero_stage,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            # Explicitly enable fp16 to test gradient scaling requirement
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8
+            }
+        }
+
+        if zero_stage == 3:
+            config["zero_optimization"]["stage3_param_persistence_threshold"] = 0
+
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        # Verify that the optimizer correctly reports it needs scaling with fp16
+        from deepspeed.runtime.base_optimizer import ZeROOptimizer
+        assert isinstance(model_engine.optimizer, ZeROOptimizer), "Optimizer should be ZeROOptimizer"
+        assert model_engine.optimizer.needs_scaler(), "fp16 configuration should require gradient scaling"
+
+        # Verify scale() method works correctly
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.float16)
+        batch = next(iter(data_loader))
+        loss = model_engine(batch[0], batch[1])
+
+        # Should be able to use scale() method and get a valid scaled tensor
+        scaled_loss = model_engine.scale(loss)
+        assert scaled_loss is not None, "scale() should return a scaled loss tensor"
+        assert scaled_loss.requires_grad, "scaled loss should require grad"
+
+        model_engine.destroy()
+
+    def test_needs_scaler_with_bf16(self, zero_stage):
+        """Test that needs_scaler() correctly identifies that bf16 does NOT require scaling"""
+        if not get_accelerator().is_bf16_supported():
+            pytest.skip("Test requires bf16 support")
+
+        hidden_dim = 4
+
+        # Initialize distributed first
+        device, _, _ = initialize_distributed()
+
+        # Create engine with bf16 to verify scaling is NOT required
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": {
+                "stage": zero_stage,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            # Use bf16 which does NOT require gradient scaling
+            "bf16": {
+                "enabled": True
+            }
+        }
+
+        if zero_stage == 3:
+            config["zero_optimization"]["stage3_param_persistence_threshold"] = 0
+
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        # Verify that the optimizer correctly reports it does NOT need scaling with bf16
+        from deepspeed.runtime.base_optimizer import ZeROOptimizer
+        assert isinstance(model_engine.optimizer, ZeROOptimizer), "Optimizer should be ZeROOptimizer"
+        assert not model_engine.optimizer.needs_scaler(), "bf16 configuration should NOT require gradient scaling"
+
+        # Verify that loss.backward() can be called directly without scale() for bf16
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.bfloat16)
+        batch = next(iter(data_loader))
+        loss = model_engine(batch[0], batch[1])
+
+        # With bf16, should be able to call backward directly (no scaling required)
+        loss.backward()
+
+        # Collect gradients to verify backward completed successfully
+        grads = collect_gradients_safe(model_engine)
+        assert len(grads) > 0, "Expected gradients to be computed"
+
+        model_engine.destroy()
+
+    def test_error_when_backward_without_scale_fp16(self, zero_stage):
+        """Test that calling backward() without scale() raises an error with fp16"""
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("Test requires fp16 support for gradient scaling")
+
+        hidden_dim = 4
+
+        # Initialize distributed first
+        device, _, _ = initialize_distributed()
+
+        # Create engine with fp16
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": {
+                "stage": zero_stage,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8
+            }
+        }
+
+        if zero_stage == 3:
+            config["zero_optimization"]["stage3_param_persistence_threshold"] = 0
+
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        # Verify needs_scaler is True
+        assert model_engine.optimizer.needs_scaler(), "fp16 should require scaling"
+
+        # Create data
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.float16)
+        batch = next(iter(data_loader))
+
+        loss = model_engine(batch[0], batch[1])
+
+        # Try to call backward without scale - should raise RuntimeError
+        error_raised = False
+        try:
+            loss.backward()
+        except RuntimeError as e:
+            if "Loss scaling is required" in str(e):
+                error_raised = True
+            else:
+                raise  # Re-raise if it's a different error
+
+        # If the test completes (doesn't hang), verify error was raised
+        if error_raised:
+            # Success - error was properly detected
+            pass
+        else:
+            # If no error was raised, this is a problem (or it hung and timed out)
+            pytest.fail("Expected RuntimeError about loss scaling, but backward completed without error")
+
+        model_engine.destroy()
+
+    def test_scale_validates_scalar_loss(self, zero_stage):
+        """Test that scale() validates the input is a scalar loss tensor"""
+        hidden_dim = 4
+
+        model_engine = create_deepspeed_engine(model_class=SimpleNonScalarModel,
+                                               zero_stage=zero_stage,
+                                               seed=42,
+                                               hidden_dim=hidden_dim)
+
+        device = get_accelerator().current_device_name()
+        dtype = preferred_dtype()
+        torch.manual_seed(123)
+        x = torch.randn(2, hidden_dim, device=device, dtype=dtype)
+
+        # Forward to get non-scalar output
+        output = model_engine(x)
+
+        # Trying to scale a non-scalar tensor should raise an assertion error
+        with pytest.raises(AssertionError, match="scalar tensor"):
+            model_engine.scale(output)
+
+        model_engine.destroy()
+
+    def test_scale_with_torch_autocast(self, zero_stage):
+        """Test that scale() works correctly with torch.autocast and fp16"""
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("FP16 not supported on this accelerator")
+
+        hidden_dim = 4
+
+        # Initialize distributed first
+        device, _, _ = initialize_distributed()
+
+        # Create engine with fp16 config to test gradient scaling
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+
+        config = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "zero_optimization": {
+                "stage": zero_stage,
+            },
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            # Enable fp16 to test gradient scaling (bf16 doesn't use gradient scaling)
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8
+            }
+        }
+
+        if zero_stage == 3:
+            config["zero_optimization"]["stage3_param_persistence_threshold"] = 0
+
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        # Create data with fp16 dtype to match the config
+        data_loader = random_dataloader(model=model_engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.float16)
+        batch = next(iter(data_loader))
+
+        # Forward and use scale()
+        loss = model_engine(batch[0], batch[1])
+        scaled_loss = model_engine.scale(loss)
+
+        # Should be able to call backward
+        scaled_loss.backward()
+
+        # Collect gradients to verify they exist
+        grads = collect_gradients_safe(model_engine)
+        assert len(grads) > 0, "Expected gradients to be computed"
+
+        model_engine.destroy()

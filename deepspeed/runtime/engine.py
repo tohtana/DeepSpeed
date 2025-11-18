@@ -259,6 +259,9 @@ class DeepSpeedEngine(Module):
         self.losses = None
         self.mesh_device = mesh_device
 
+        # Flag to indicate that scale() was called before manual backward pass
+        self._manual_backward_expected = False
+
         # for debug purposes - can then debug print: debug_get_module_name(module)
         debug_extract_module_and_param_names(model)
 
@@ -2291,9 +2294,10 @@ class DeepSpeedEngine(Module):
         # When necessary internal APIs are not available, we disable direct calls to tensor.backward()
         # and limit to engine.backward(loss) only.
         if not self._support_torch_style_backward and not self._running_engine_backward:
-            raise RuntimeError(
-                "Direct calls to tensor.backward() are not supported with this PyTorch version. Please use engine.backward(loss) instead."
-            )
+            raise RuntimeError("Direct calls to tensor.backward() are not supported in this configuration. "
+                               "This occurs when either: (1) your PyTorch version lacks required internal APIs, "
+                               "or (2) using ZeRO stage 0. "
+                               "Please use engine.backward(loss) instead.")
 
         see_memory_usage("Engine before backward", force=self.memory_breakdown())
 
@@ -2332,6 +2336,28 @@ class DeepSpeedEngine(Module):
 
     def _backward_post_hook(self):
         if not self._running_engine_backward:
+            # Check if loss scaling was required but not applied
+            needs_scaler = False
+            if isinstance(self.optimizer, ZeROOptimizer):
+                needs_scaler = self.optimizer.needs_scaler()
+            elif self.torch_autocast_z0_gradscaler is not None:
+                needs_scaler = True
+            elif self.amp_enabled():
+                needs_scaler = True
+
+            if needs_scaler and not self._manual_backward_expected:
+                # User called backward() directly without using engine.scale() or engine.backward()
+                error_msg = ("Loss scaling is required for this configuration, but backward() was called "
+                             "directly without scaling the loss. Please use one of the following:"
+                             " 1. engine.backward(loss)"
+                             " 2. engine.scale(loss).backward()")
+                if self.amp_enabled():
+                    error_msg += " Note: AMP (NVIDIA Apex) only supports engine.backward(loss)."
+                raise RuntimeError(error_msg)
+
+            # Clear the flag for next backward
+            self._manual_backward_expected = False
+
             self._backward_epilogue()
 
     @contextmanager
@@ -2353,6 +2379,58 @@ class DeepSpeedEngine(Module):
             yield
         finally:
             self.inside_no_sync_ctxt = False
+
+    def scale(self, loss):
+        r"""Apply loss scaler for manual backward pass.
+
+        Use this method when calling loss.backward() directly instead of engine.backward().
+        This applies the appropriate loss scaler for mixed precision training, allowing you
+        to manually control the backward pass while still benefiting from DeepSpeed's
+        gradient scaling functionality.
+
+        Example::
+
+            output = engine(input)
+            loss = criterion(output, target)
+            scaled_loss = engine.scale(loss)
+            scaled_loss.backward()  # Manual backward call
+            engine.step()
+
+        Arguments:
+            loss: Scalar loss tensor to be scaled
+
+        Returns:
+            Scaled loss tensor ready for .backward() call
+
+        Raises:
+            RuntimeError: If AMP (NVIDIA Apex) is enabled. AMP requires using engine.backward()
+                         directly as it uses a context manager that cannot be separated from
+                         the backward call.
+            AssertionError: If loss is not a scalar tensor with grad_fn, or if no optimizer
+                           is configured.
+        """
+        assert self.optimizer is not None and not isinstance(self.optimizer, DummyOptim), \
+            "must provide optimizer during init in order to use scale"
+        assert maybe_loss_for_backward(loss), \
+            "loss must be a scalar tensor with grad_fn. For non-scalar tensors, use tensor.backward(grad)"
+
+        # AMP (NVIDIA Apex) uses a context manager that wraps both scaling and backward,
+        # so it cannot be used with manual backward calls
+        if self.amp_enabled():
+            raise RuntimeError("engine.scale() is not compatible with AMP (NVIDIA Apex). "
+                               "When using AMP, you must call engine.backward(loss) instead of manual backward.")
+
+        # Apply loss scaler based on optimizer type
+        scaled_loss = loss
+        if isinstance(self.optimizer, ZeROOptimizer):
+            scaled_loss = self.optimizer.scale_if_loss(loss)
+        elif self.torch_autocast_z0_gradscaler:
+            scaled_loss = self.torch_autocast_z0_gradscaler.scale(loss)
+
+        # Mark that scale() was called for validation in backward hook
+        self._manual_backward_expected = True
+
+        return scaled_loss
 
     @instrument_w_nvtx
     def backward(self, loss, retain_graph=False, scale_wrt_gas=True):
