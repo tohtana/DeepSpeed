@@ -13,6 +13,8 @@ from unit.simple_model import SimpleModel, SimpleOptimizer, random_dataloader
 from unit.util import bf16_required_version_check
 from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
+from unit.v1.zero.test_zero_user_backward import (initialize_distributed, create_ddp_model, collect_ddp_gradients,
+                                                  collect_gradients_safe, compare_gradients)
 
 
 class TestAdamBF16ZeroOneCycleCompatibility(DistributedTest):
@@ -345,3 +347,89 @@ class TestZeroDtypeCocktail(DistributedTest):
             model.backward(loss)
             model.step()
         dist.reduce = orig_torch_reduce
+
+
+@pytest.mark.parametrize("bf16_optimizer_states,use_cpu_offload", [(False, True), (True, False)])
+class TestBF16MasterWeightsGradients(DistributedTest):
+    world_size = 2
+
+    def test_gradients_match_ddp(self, bf16_optimizer_states, use_cpu_offload):
+        if not bf16_required_version_check():
+            pytest.skip(
+                " DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
+            )
+
+        if use_cpu_offload and not deepspeed.ops.__compatible_ops__[CPUAdamBuilder.NAME]:
+            pytest.skip("cpu-adam is not compatible")
+
+        hidden_dim = 6
+        lr = 1e-3
+        seed = 123
+
+        device, rank, dtype = initialize_distributed()
+
+        model_ddp, optimizer_ddp = create_ddp_model(SimpleModel,
+                                                    device,
+                                                    rank,
+                                                    dtype,
+                                                    seed=seed,
+                                                    lr=lr,
+                                                    hidden_dim=hidden_dim,
+                                                    nlayers=2)
+
+        torch.manual_seed(seed)
+        ds_model = SimpleModel(hidden_dim, nlayers=2)
+
+        bf16_config = {
+            "enabled": True,
+            "bf16_master_weights_and_grads": True,
+        }
+        if bf16_optimizer_states:
+            bf16_config["bf16_optimizer_states"] = True
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 2,
+            "gradient_accumulation_steps": 1,
+            "steps_per_print": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": lr
+                }
+            },
+            "bf16": bf16_config,
+            "zero_optimization": {
+                "stage": 2,
+                "cpu_offload": use_cpu_offload
+            }
+        }
+
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=ds_model,
+                                               model_parameters=ds_model.parameters())
+
+        data_loader = random_dataloader(model=engine,
+                                        total_samples=8,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.bfloat16)
+        batch = next(iter(data_loader))
+
+        optimizer_ddp.zero_grad()
+        loss_ddp = model_ddp(batch[0], batch[1])
+        loss_ddp.backward()
+        grads_ddp = collect_ddp_gradients(model_ddp)
+
+        loss_ds = engine(batch[0], batch[1])
+        loss_ds.backward()
+        grads_ds = collect_gradients_safe(engine)
+
+        compare_gradients(grads_ddp,
+                          grads_ds,
+                          step_info=f"bf16_optimizer_states={bf16_optimizer_states}, cpu_offload={use_cpu_offload}")
+
+        optimizer_ddp.step()
+        optimizer_ddp.zero_grad()
+        engine.step()
+        engine.zero_grad()
+        engine.destroy()

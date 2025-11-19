@@ -1018,6 +1018,12 @@ class DeepSpeedEngine(Module):
     def fp16_master_weights_and_gradients(self):
         return self._config.float16_config.fp16_master_weights_and_grads
 
+    def bf16_master_weights_and_gradients(self):
+        return self._config.bfloat16_config.bf16_master_weights_and_grads
+
+    def bf16_optimizer_states(self):
+        return self._config.bfloat16_config.bf16_optimizer_states
+
     def amp_enabled(self):
         return self._config.amp_enabled
 
@@ -1832,6 +1838,8 @@ class DeepSpeedEngine(Module):
                 round_robin_gradients=round_robin_gradients,
                 has_moe_layers=self.has_moe_layers,
                 fp16_master_weights_and_gradients=self.fp16_master_weights_and_gradients(),
+                bf16_master_weights_and_gradients=self.bf16_master_weights_and_gradients(),
+                bf16_optimizer_states=self.bf16_optimizer_states(),
                 gradient_accumulation_dtype=gradient_accumulation_dtype,
                 communication_data_type=self.communication_data_type,
                 elastic_checkpoint=self.zero_elastic_checkpoint(),
