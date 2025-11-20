@@ -269,31 +269,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.round_robin_gradients = round_robin_gradients
 
         self.extra_large_param_to_reduce: Dict[int, torch.Tensor] = {}
-        self.fp16_master_weights_and_gradients = fp16_master_weights_and_gradients
-        self.bf16_master_weights_and_gradients = bf16_master_weights_and_gradients
-        self.bf16_optimizer_states = bf16_optimizer_states
-        assert not (self.fp16_master_weights_and_gradients and self.bf16_master_weights_and_gradients), \
-            "fp16_master_weights_and_gradients and bf16_master_weights_and_gradients are mutually exclusive."
-        if self.bf16_optimizer_states:
-            assert self.bf16_master_weights_and_gradients, "bf16_optimizer_states requires bf16_master_weights_and_gradients."
 
-        if self.fp16_master_weights_and_gradients:
+        def _enforce_cpu_offload():
             assert self.cpu_offload and type(self.optimizer) in [DeepSpeedCPUAdam], \
-            f"fp16_master_and_gradients requires optimizer to support keeping fp16 master and gradients while keeping the optimizer states in fp32."\
-            f"Currently only supported using ZeRO-Offload with DeepSpeedCPUAdam. But current setting is ZeRO-Offload:{self.cpu_offload} and optimizer type {type(self.optimizer)}." \
-            f"Either disable fp16_master_weights_and_gradients or enable {self.zero_stage_string} Offload with DeepSpeedCPUAdam."
+                f"Master weights feature requires {self.zero_stage_string} Offload with DeepSpeedCPUAdam. " \
+                f"Current ZeRO-Offload:{self.cpu_offload} optimizer type {type(self.optimizer)}."
 
-        if self.bf16_master_weights_and_gradients and not self.bf16_optimizer_states:
-            assert self.cpu_offload and type(self.optimizer) in [DeepSpeedCPUAdam], \
-            f"bf16_master_and_gradients with fp32 optimizer states requires DeepSpeedCPUAdam with ZeRO-Offload. Current ZeRO-Offload:{self.cpu_offload} optimizer type {type(self.optimizer)}." \
-            f"Either enable bf16_optimizer_states, disable bf16_master_weights_and_gradients, or enable {self.zero_stage_string} Offload with DeepSpeedCPUAdam."
-
-        if self.fp16_master_weights_and_gradients:
-            self.master_weights_and_grads_dtype = torch.float16
-        elif self.bf16_master_weights_and_gradients:
-            self.master_weights_and_grads_dtype = torch.bfloat16
-        else:
-            self.master_weights_and_grads_dtype = torch.float32
+        self.master_weights_and_grads_dtype = self._configure_master_weights(
+            fp16_master_weights_and_gradients=fp16_master_weights_and_gradients,
+            bf16_master_weights_and_gradients=bf16_master_weights_and_gradients,
+            bf16_optimizer_states=bf16_optimizer_states,
+            fp16_offload_validator=_enforce_cpu_offload,
+            bf16_fp32_offload_validator=_enforce_cpu_offload)
 
         self.low_precision_master_weights_and_grads = self.master_weights_and_grads_dtype != torch.float32
 

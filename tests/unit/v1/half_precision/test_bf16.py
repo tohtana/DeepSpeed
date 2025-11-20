@@ -349,11 +349,18 @@ class TestZeroDtypeCocktail(DistributedTest):
         dist.reduce = orig_torch_reduce
 
 
-@pytest.mark.parametrize("bf16_optimizer_states,use_cpu_offload", [(False, True), (True, False)])
+@pytest.mark.parametrize("bf16_optimizer_states,use_cpu_offload,zero_stage", [
+    pytest.param(False, True, 1, id="zero_stage_1_cpu_offload"),
+    pytest.param(True, False, 1, id="zero_stage_1_bf16_opt_states_True"),
+    pytest.param(False, True, 2, id="zero_stage_2_cpu_offload"),
+    pytest.param(True, False, 2, id="zero_stage_2_bf16_opt_states_True"),
+    pytest.param(False, True, 3, id="zero_stage_3_cpu_offload"),
+    pytest.param(True, False, 3, id="zero_stage_3_bf16_opt_states_True"),
+])
 class TestBF16MasterWeightsGradients(DistributedTest):
     world_size = 2
 
-    def test_gradients_match_ddp(self, bf16_optimizer_states, use_cpu_offload):
+    def test_gradients_match_ddp(self, bf16_optimizer_states, use_cpu_offload, zero_stage):
         if not bf16_required_version_check():
             pytest.skip(
                 " DeepSpeed BFloat16 tests need torch >= 1.10, NCCL >= 2.10.3, CUDA > =11.0 and HW support for BFloat16 to run correctly"
@@ -387,6 +394,10 @@ class TestBF16MasterWeightsGradients(DistributedTest):
         if bf16_optimizer_states:
             bf16_config["bf16_optimizer_states"] = True
 
+        zero_config = {"stage": zero_stage}
+        if use_cpu_offload:
+            zero_config["cpu_offload"] = True
+
         config_dict = {
             "train_micro_batch_size_per_gpu": 2,
             "gradient_accumulation_steps": 1,
@@ -398,10 +409,7 @@ class TestBF16MasterWeightsGradients(DistributedTest):
                 }
             },
             "bf16": bf16_config,
-            "zero_optimization": {
-                "stage": 2,
-                "cpu_offload": use_cpu_offload
-            }
+            "zero_optimization": zero_config
         }
 
         engine, _, _, _ = deepspeed.initialize(config=config_dict,
@@ -424,9 +432,11 @@ class TestBF16MasterWeightsGradients(DistributedTest):
         loss_ds.backward()
         grads_ds = collect_gradients_safe(engine)
 
-        compare_gradients(grads_ddp,
-                          grads_ds,
-                          step_info=f"bf16_optimizer_states={bf16_optimizer_states}, cpu_offload={use_cpu_offload}")
+        compare_gradients(
+            grads_ddp,
+            grads_ds,
+            step_info=
+            f"bf16_optimizer_states={bf16_optimizer_states}, cpu_offload={use_cpu_offload}, zero_stage={zero_stage}")
 
         optimizer_ddp.step()
         optimizer_ddp.zero_grad()
