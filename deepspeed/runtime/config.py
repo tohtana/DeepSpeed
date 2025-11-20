@@ -977,8 +977,8 @@ class DeepSpeedConfig(object):
 
         if self.float16_config.fp16_master_weights_and_grads:
             assert self.zero_enabled and self.zero_optimization_stage in (
-                ZeroStageEnum.gradients,
-                ZeroStageEnum.weights), "Fp16_master_weights_and_grads is only supported with ZeRO Stage 2 or 3."
+                ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients,
+                ZeroStageEnum.weights), "Fp16_master_weights_and_grads is only supported with ZeRO Stage 1, 2, or 3."
         if self.bfloat16_config.bf16_master_weights_and_grads:
             assert self.zero_enabled and self.zero_optimization_stage in (
                 ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients,

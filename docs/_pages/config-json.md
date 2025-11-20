@@ -288,7 +288,8 @@ Example of <i>**scheduler**</i>
 
 | ZeRO stage | Offload required? | Notes |
 | ---------- | ----------------- | ----- |
-| 0/1 | Not supported | |
+| 0 | Not supported | |
+| 1 | Yes (`offload_optimizer` with `DeepSpeedCPUAdam`) | Optimizer states stay fp32 on CPU. |
 | 2 | Yes (`offload_optimizer` with `DeepSpeedCPUAdam`) | Optimizer states stay fp32 on CPU. |
 | 3 | Yes (`offload_optimizer` with `DeepSpeedCPUAdam`) | Optimizer states stay fp32 on CPU. |
 
