@@ -377,7 +377,7 @@ Example of <i>**scheduler**</i>
 
 | Description                                                                                                                                                                                                                                                                                                                                                                                                     | Default |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| Configuration for using PyTorch's native automatic mixed precision training via [torch.autocast](https://pytorch.org/docs/stable/amp.html). This provides torch-compatible AMP functionality without requiring Apex. The gradient scaler is automatically applied in the DeepSpeed optimizer. Compatible with ZeRO stages 0, 1, 2, and 3. | None    |
+| Configuration for using PyTorch's native automatic mixed precision training via [torch.autocast](https://pytorch.org/docs/stable/amp.html). For detailed usage instructions, see the [Mixed Precision Training](https://deepspeed.readthedocs.io/en/latest/training.html#mixed-precision-training) documentation. | None    |
 
 ```json
 "torch_autocast": {
@@ -387,38 +387,12 @@ Example of <i>**scheduler**</i>
 }
 ```
 
-<i>**torch_autocast:enabled**</i>: [boolean]
+| Parameter | Type | Default | Description |
+| --------- | ---- | ------- | ----------- |
+| **enabled** | boolean | `false` | Enable torch.autocast (no manual `torch.autocast` call needed in your code). |
+| **dtype** | string | `"bfloat16"` | Lower precision dtype (`"bfloat16"` or `"float16"`). Also used for gradient/parameter communication of `lower_precision_safe_modules`. |
+| **lower_precision_safe_modules** | list | `["torch.nn.Linear", "torch.nn.Conv1d", "torch.nn.Conv2d", "torch.nn.Conv3d"]` | Module types for lower-precision communication (all-reduce/all-gather). |
 
-| Description                                                                                                                                                                      | Default |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| <i>**enabled**</i> is a **torch_autocast** parameter indicating whether or not torch.autocast is enabled. When enabled, you don't need to call torch.autocast in your code. | `false` |
-
-<i>**torch_autocast:dtype**</i>: [string]
-
-| Description                                                                                                                                                                                                                                                                                               | Default       |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| <i>**dtype**</i> is a **torch_autocast** parameter specifying the lower precision dtype passed to torch.autocast. Valid values are `"bfloat16"` or `"float16"`. Gradients for all-reduce (reduce-scatter) and parameters for all-gather (only for ZeRO Stage 3) of `lower_precision_safe_modules` are also downcasted to this dtype. | `"bfloat16"` |
-
-<i>**torch_autocast:lower_precision_safe_modules**</i>: [list of strings]
-
-| Description                                                                                                                                                                                                                                                                                                                                                                  | Default                                                                      |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| <i>**lower_precision_safe_modules**</i> is a **torch_autocast** parameter specifying the list of module types that will be downcasted for all-reduce (reduce-scatter) and all-gather (ZeRO Stage 3 only). The precision for PyTorch operators in forward/backward follows torch.autocast's policy, not this list. | `["torch.nn.Linear", "torch.nn.Conv1d", "torch.nn.Conv2d", "torch.nn.Conv3d"]` |
-
-**Note:** When using `torch.autocast` with manual backward passes (`loss.backward()` instead of `engine.backward()`), you must use `engine.scale(loss)` to apply the gradient scaler. For example:
-{: .notice--info}
-
-```python
-# Training loop with torch.autocast and manual backward
-for batch in data_loader:
-    loss = model_engine(batch)
-
-    # Apply loss scaling before manual backward
-    scaled_loss = model_engine.scale(loss)
-    scaled_loss.backward()
-
-    model_engine.step()
-```
 
 ### Gradient Clipping
 
