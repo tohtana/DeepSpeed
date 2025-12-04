@@ -1896,6 +1896,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                            param_group_idx,
                            return_tensor_list=False):
         if len(tensor_list) == 0:
+            # This condition can fire when we have small parameteters and many ranks.
             zero_buffer = torch.zeros(int(partition_size), dtype=dtype, device=device)
             if return_tensor_list:
                 return [zero_buffer]
