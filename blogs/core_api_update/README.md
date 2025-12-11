@@ -2,15 +2,14 @@
 
 DeepSpeed is continuously evolving its core APIs to feel more natural to PyTorch users while giving them more control over performance and memory.
 
-In this short update, we highlight two recent core improvements:
+In this short blog, we highlight two recent core improvements:
 
-* **PyTorch-compatible backward API** – you can now use standard `tensor.backward(...)` patterns with DeepSpeed engines, including non-scalar outputs. ([PR](https://github.com/deepspeedai/DeepSpeed/pull/7665))
-* **Low-precision master params / grads / optimizer states** – you can keep more state in bf16/fp16 to reduce memory usage and work better with `torch.autocast`. ([PR](https://github.com/deepspeedai/DeepSpeed/pull/7700))
+  * **PyTorch-compatible backward API** – You can now use standard `tensor.backward(...)` patterns with DeepSpeed engines, including non-scalar outputs. ([\#7665](https://github.com/deepspeedai/DeepSpeed/pull/7665))
+  * **Low-precision master params / grads / optimizer states** – You can keep more state in bf16/fp16 to reduce memory usage and work better with `torch.autocast`. ([\#7700](https://github.com/deepspeedai/DeepSpeed/pull/7700))
 
-These changes aim to make DeepSpeed feel closer to “vanilla PyTorch” while still providing ZeRO and mixed-precision benefits.
+These changes enable more flexible training pipelines and make DeepSpeed feel closer to “vanilla PyTorch”.
 
-
-## 1. PyTorch-compatible backward API
+## 1\. PyTorch-compatible backward API
 
 Traditionally, DeepSpeed’s training loop relied on the engine’s backward API:
 
@@ -20,149 +19,94 @@ model_engine.backward(loss)
 model_engine.step()
 ```
 
-This API had two notable constraints:
+This API was sufficient for traditional pretraining and fine-tuning pipelines. However, recent complex training pipelines require more flexibility. There were two major constraints:
 
-1. It only accepted a **scalar loss**.
-2. You had to call **`model_engine.backward(loss)`**, rather than using the usual PyTorch `loss.backward()` style.
+1.  It only accepted a **scalar loss**.
+2.  You had to call **`model_engine.backward(loss)`**, rather than using the usual PyTorch `loss.backward()` style.
 
-In plain PyTorch, many users rely on more flexible patterns like:
-
-```python
-output = model(batch)          # possibly non-scalar
-output.backward(out_grad)      # custom gradient
-```
-
-This is useful when:
-
-* You combine multiple models and losses.
-* The loss is defined separately from the main model.
-* You need to backprop through non-scalar tensors with custom gradients.
-
-Previously, trying the same pattern with a DeepSpeed engine could skip internal preprocessing/postprocessing in DeepSpeed (e.g., loss scaling and ZeRO-related logic), potentially leading to incorrect behavior.
-
-### What’s new
-
-DeepSpeed now **intercepts the standard PyTorch `.backward()` call on tensors**, so you can use PyTorch-style backward while still getting the correct DeepSpeed behavior.
-
-* You can call `.backward()` directly on tensors produced by a DeepSpeed engine.
-* **Non-scalar outputs** are supported (with a matching gradient input), currently for **ZeROOptimizer-based** setups.
-* When PyTorch’s internal hook APIs are not available, DeepSpeed will fall back to the traditional `model_engine.backward(loss)` path.
-
-### Example: scalar loss with PyTorch-style backward
+Due to these constraints, users could not simply implement patterns that plain PyTorch allows. Here are some examples:
 
 ```python
-import deepspeed
-import torch
+# 1. Combine multiple models and losses
+output1 = model1(batch1)
+output2 = model2(batch2)
+loss = criterion(output1, output2)
+loss.backward()
 
-model = MyModel()
-parameters = filter(lambda p: p.requires_grad, model.parameters())
+# 2. Define a loss function separately from the main model
+output = model(batch)
+loss = loss_fn(output)
+loss.backward()
 
-engine, optimizer, _, _ = deepspeed.initialize(
-    model=model,
-    model_parameters=parameters,
-    config="ds_config.json",
-)
-
-for batch in data_loader:
-    inputs, labels = batch
-    inputs = inputs.to(engine.device)
-    labels = labels.to(engine.device)
-
-    outputs = engine(inputs)
-    loss = torch.nn.functional.cross_entropy(outputs, labels)
-
-    # New: use standard PyTorch-style backward
-    loss.backward()
-
-    # DeepSpeed step still drives the optimizer / ZeRO logic
-    engine.step()
+# 3. Call backward through non-scalar tensors with custom gradients
+output = model(batch)
+output.backward(grad)
 ```
 
-This looks and feels like standard PyTorch, but under the hood DeepSpeed still runs the same backward preprocessing and epilogue logic that you would get from `engine.backward(loss)`.
+The DeepSpeed Engine was able to handle these use cases using internal APIs; however, this required code changes. Additionally, if a user employed these patterns, the DeepSpeed engine might skip internal preprocessing/postprocessing (such as loss scaling and ZeRO-related logic), potentially leading to incorrect behavior.
 
-### Example: non-scalar output with custom gradient
+With this API update, we can now use the same code as native PyTorch while keeping DeepSpeed's unique features, including ZeRO.
 
-DeepSpeed now supports non-scalar backward for ZeROOptimizer setups. For example:
+One example use case for this new API is [disaggregated hybrid parallelism](https://github.com/ray-project/multimodal-training) for multimodal models using [Ray](https://github.com/ray-project/ray). In this training pipeline, two Ray Actor groups handle the vision encoder and the LLM separately.
+
+On a backward pass, the LLM passes a gradient to the vision encoder, and the vision encoder calls the backward function with that gradient. However, because the gradient is a non-scalar tensor, such a use case wasn't officially supported by DeepSpeed APIs.
+
+Below is the pseudo-code for the two models running on different actors. Since they run in different processes, we pass gradients via Ray actor communication. As seen here, the gradient of the vision embedding is a non-scalar tensor. With this update, we can now simply call `self.vision_output.backward` while utilizing other DeepSpeed features, including ZeRO and highly efficient sequence parallelism (DeepSpeed-Ulysses).
 
 ```python
-# outputs: [batch, hidden] – non-scalar
-outputs = engine(inputs)
+# Runs on LLM actors
+def text_backward_step(self):
+    # ...
+    self.loss.backward()
+    return self.vision_embeddings.grad.detach().clone()
 
-# Custom gradient of the same shape as outputs
-grad_out = torch.ones_like(outputs) / outputs.numel()
-
-# Backward from a non-scalar tensor
-outputs.backward(grad_out)
-
-engine.step()
+# Runs on Vision actors
+def vision_backward_step(self, vision_embedding_grad):
+    self.vision_output.backward(gradient=vision_embedding_grad)
 ```
 
-This enables advanced scenarios like combining multiple models or passing custom gradients through intermediate activations, without having to manually call DeepSpeed’s internal prologue/epilogue APIs.
+## 2\. Low-precision master params, grads, and optimizer states
 
+DeepSpeed supports mixed precision, which computes in bfloat16 or float16 while its optimizer maintains **FP32 master parameters, gradients, and optimizer states**.
 
-## 2. Low-precision master params, grads, and optimizer states
+On the other hand, PyTorch now offers `torch.autocast`, a different approach for mixed precision that casts data types for precision-sensitive operators on the fly. As this often requires less peak memory, many recent training pipelines use this approach.
 
-DeepSpeed optimizers historically maintained **FP32 master parameters, gradients, and optimizer states**, even when training in fp16 or bf16.
+DeepSpeed supports `torch.autocast` via configuration (see the [API documentation](https://deepspeed.readthedocs.io/en/rtd-staging/training.html#pytorch-automatic-mixed-precision-amp)). While it is technically safer to keep FP32 model states (master parameters/gradients and optimizer states) even with `torch.autocast`, there are many cases where training converges stably without them. Previously, the lack of an option to bypass creating FP32 states limited the trainablity of large models with constrained hardware resources.
 
-On large models, this can significantly increase memory usage, especially when combined with ZeRO.
+To reduce memory usage in such cases, DeepSpeed now allows users to avoid creating FP32 states entirely.
 
-### What’s new
+### Enabling pure BF16/FP16 model states
 
-We’ve introduced new options that allow you to keep more optimizer-related state in **lower precision**, especially for bf16:
+For BF16 training, you can use the following settings under `bf16`:
 
-* Existing (previously undocumented) option under `fp16`:
+  * `bf16_master_weights_and_grads`: Keep master parameters and gradients in bf16.
+  * `bf16_optimizer_states`: Keep optimizer states (e.g., Adam moments) in bf16.
 
-  * `fp16_master_weights_and_gradients` for ZeRO stage 1/2.
-* New options under the `bf16` section:
+These configurations are compatible with ZeRO stages 1, 2, and 3. Note that there is also a supported mixed configuration where `bf16_master_weights_and_grads == true` and `bf16_optimizer_states == false`, but **only when using CPU offload**.
 
-  * `bf16_master_weights_and_grads`
-  * `bf16_optimizer_states`
+We offer similar support for FP16 training. You can use this setting under `fp16`:
 
-At a high level:
+  * `fp16_master_weights_and_gradients`: Keep master parameters and gradients in fp16.
 
-* `bf16_master_weights_and_grads = true`
-  → keep master parameters and gradients in bf16 instead of fp32.
-* `bf16_optimizer_states = true`
-  → keep optimizer states (e.g., Adam moments) in bf16.
+We actually offered this option in previous versions, but it was undocumented and worked only for ZeRO 1 and 2. We now officially support it, and it works for all ZeRO stages. We intentionally excluded `fp16_optimizer_states` as it is generally impractical due to convergence instability.
 
-There is also a supported mixed configuration where `bf16_master_weights_and_grads == true` and `bf16_optimizer_states == false`, but **only when using CPU offload**.
+A notable improvement is that we can combine these settings with `torch.autocast` support (via the [`torch_autocast` section](https://www.google.com/search?q=%5Bhttps://deepspeed.readthedocs.io/en/rtd-staging/training.html%23pytorch-automatic-mixed-precision-amp%5D\(https://deepspeed.readthedocs.io/en/rtd-staging/training.html%23pytorch-automatic-mixed-precision-amp\))). This combination drastically improves both memory efficiency and convergence.
 
-Additionally:
-
-* The same concept is extended beyond the original fp16+ZeRO1/2 support to **bf16** and **ZeRO3**.
-* `torch.autocast` support (via the `torch_autocast` section) can now be combined with `bf16`/`fp16` in the same config, which was not supported before.
-
-### Example: pure bf16 config with low-precision master state
+### Example: Pure bf16 config with low-precision master state
 
 Below is a simplified DeepSpeed config that keeps bf16 master weights, grads, and optimizer states, and uses `torch.autocast`:
 
-```jsonc
+```json
 {
-  "train_batch_size": 1024,
-
-  "optimizer": {
-    "type": "AdamW",
-    "params": {
-      "lr": 1e-4,
-      "betas": [0.9, 0.999],
-      "eps": 1e-8,
-      "weight_decay": 0.01
-    }
-  },
-
+...
   "bf16": {
     "enabled": true,
     "bf16_master_weights_and_grads": true,
     "bf16_optimizer_states": true
   },
-
   "zero_optimization": {
-    "stage": 2,
-    "offload_optimizer": {
-      "device": "none"
-    }
+    ...
   },
-
   "torch_autocast": {
     "enabled": true,
     "dtype": "bfloat16"
@@ -170,73 +114,36 @@ Below is a simplified DeepSpeed config that keeps bf16 master weights, grads, an
 }
 ```
 
-And a minimal training loop:
+Our [example script](https://github.com/tohtana/DeepSpeedExamples/tree/tohtana/bf16_master_weights_examples/training/bf16_master_weight) demonstrates the significant memory savings:
 
-```python
-import torch
-import deepspeed
+| Configuration | Allocated Memory | Peak Memory | Avg Step Time |
+|---------------|------------------|-------------|---------------|
+| Baseline (fp32 master) | 25.74 GB | 31.38 GB | 0.6016s |
+| BF16 low-precision (master + opt states) | **16.17 GB** | **18.93 GB** | 0.6427s |
 
-model = MyModel()
-parameters = filter(lambda p: p.requires_grad, model.parameters())
+To verify that BF16 low-precision training maintains numerical stability, we trained for 1000 steps on the Wikitext-103 dataset:
 
-engine, optimizer, _, _ = deepspeed.initialize(
-    model=model,
-    model_parameters=parameters,
-    config="ds_config_bf16.json",
-)
+| Configuration | Final Loss | Mean Loss |
+|---------------|------------|-----------|
+| Baseline (fp32 master) | 3.09 | 2.78 |
+| BF16 Low-Precision | 3.12 | 2.90 |
 
-for batch in data_loader:
-    inputs, labels = batch
-    inputs = inputs.to(engine.device)
-    labels = labels.to(engine.device)
-
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        outputs = engine(inputs)
-        loss = torch.nn.functional.cross_entropy(outputs, labels)
-
-    loss.backward()
-    engine.step()
-```
-
-This configuration:
-
-* Runs the forward pass in **bf16** using `torch.autocast`.
-* Keeps **master weights, grads, and optimizer states in bf16**, reducing memory footprint.
-* Works with ZeRO stage 2 (and similarly with stage 3) for better scalability.
-
----
+Please check out our [example](https://github.com/tohtana/DeepSpeedExamples/tree/tohtana/bf16_master_weights_examples/training/bf16_master_weight) for more details.
 
 ## Closing thoughts
 
 These core API improvements are incremental but important steps toward making DeepSpeed:
 
-* **More PyTorch-native** – training loops can increasingly look like standard PyTorch code.
-* **More memory-efficient** – especially when combined with bf16/fp16 and ZeRO on large models.
-* **Easier to compose** – enabling multi-model and custom-gradient workflows without custom DeepSpeed hooks.
+  * **More PyTorch-native** – Training loops can increasingly look like standard PyTorch code.
+  * **More memory-efficient** – Especially when combined with bf16/fp16 and ZeRO on large models.
+  * **Easier to compose** – Enabling multi-model and custom-gradient workflows without relying on DeepSpeed internal APIs.
 
 We're excited to see how you use these APIs in your own training setups, and we welcome feedback and issues on GitHub as you try them out.
-
----
 
 ## Related Tests
 
 For more usage examples, see the unit tests in the repository:
 
-### PyTorch-compatible backward API
-
-- [tests/unit/v1/zero/test_zero_user_backward.py](../../tests/unit/v1/zero/test_zero_user_backward.py)
-  - `TestZeroUserBackwardBasic` – Basic `loss.backward()` with ZeRO stages 1, 2, and 3
-  - `TestZeroUserBackwardNonScalar` – Non-scalar `tensor.backward(grad)` support
-  - `TestZeroUserBackwardGradAccumulation` – Gradient accumulation with user backward
-  - `TestZeroUserBackwardMultipleEngines` – Multiple engines with combined loss
-  - `TestZeroUserBackwardSeparateLoss` – Separate loss function pattern
-  - `TestZeroUserBackwardLeafModule` – Leaf module compatibility in ZeRO-3
-  - `TestZeroUserBackwardWithScale` – `engine.scale()` method for fp16 loss scaling
-
-### Low-precision master params/grads/optimizer states
-
-- [tests/unit/v1/half_precision/test_bf16.py](../../tests/unit/v1/half_precision/test_bf16.py)
-  - `TestBF16MasterWeightsGradients` – Tests `bf16_master_weights_and_grads` and `bf16_optimizer_states` options across ZeRO stages
-
-- [tests/unit/v1/half_precision/test_with_autocast.py](../../tests/unit/v1/half_precision/test_with_autocast.py)
-  - `TestTorchAutocastWithPrecisionModes` – Tests `torch_autocast` config combined with bf16/fp16 precision modes
+- [PyTorch-compatible backward API](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/zero/test_zero_user_backward.py)
+- [Low-precision master params/grads/optimizer states](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/half_precision/test_bf16.py)
+- [Combnation with torch.autocast](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/half_precision/test_with_autocast.py)
