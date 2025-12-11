@@ -106,7 +106,7 @@ from deepspeed.runtime.torch_autocast import init_autocast_params, get_default_a
 
 from .pipe.module import PipelineModule
 from .utils import get_ma_status
-from .compiler import is_compile_supported
+from .compiler import is_compile_supported, compiled_autograd
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
 from ..moe.layer import MoE
@@ -197,6 +197,9 @@ class EngineTimers(object):
                 FORWARD_GLOBAL_TIMER, BACKWARD_GLOBAL_TIMER, BACKWARD_INNER_GLOBAL_TIMER, BACKWARD_REDUCE_GLOBAL_TIMER,
                 STEP_GLOBAL_TIMER
             ]
+
+    def active_timers(self):
+        return self.micro_timers + self.global_timers
 
 
 class DeepSpeedEngine(Module):
@@ -407,6 +410,8 @@ class DeepSpeedEngine(Module):
                                           enable_global_timers=self.wall_clock_breakdown()
                                           or self.flops_profiler_enabled())
 
+        self.engine_timers_cache = {}
+
         if self.global_rank == 0:
             self._config.print("DeepSpeedEngine configuration")
             if self.dump_state():
@@ -445,6 +450,9 @@ class DeepSpeedEngine(Module):
             # that have been computed. When all gradients are ready, it calls `_backward_post_hook`.
             # See also: https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_full_backward_hook
             self.optimizer.register_grad_acc_post_hook(self._backward_post_hook)
+
+        self._is_compiled_autograd_enabled = False
+        self._compile_kwargs = {}
 
     def _optimized_linear_offload_setup(self):
         self.optimized_linear_base_weight_sharding = False
@@ -2331,7 +2339,10 @@ class DeepSpeedEngine(Module):
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary()
 
+        self._start_timers(self.engine_timers.backward_inner_timers)
+
     def _backward_epilogue(self):
+        self._stop_timers(self.engine_timers.backward_inner_timers)
         self._start_timers(self.engine_timers.backward_reduce_timers)
         if self.enable_backward_allreduce and not self.inside_no_sync_ctxt:
             # Traditional code path that allreduces the module parameter grads
@@ -2476,17 +2487,18 @@ class DeepSpeedEngine(Module):
         elif self.torch_autocast_z0_gradscaler:
             loss = self.torch_autocast_z0_gradscaler.scale(loss)
 
-        if self.zero_optimization() or not self.amp_enabled():
-            loss.backward(**backward_kwargs)
-        elif self.amp_enabled():
-            # AMP requires delaying unscale when inside gradient accumulation boundaries
-            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-            delay_unscale = not self.is_gradient_accumulation_boundary()
-            with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
-                scaled_loss.backward(**backward_kwargs)
+        with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
+            if self.zero_optimization() or not self.amp_enabled():
+                loss.backward(**backward_kwargs)
+            elif self.amp_enabled():
+                # AMP requires delaying unscale when inside gradient accumulation boundaries
+                # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+                delay_unscale = not self.is_gradient_accumulation_boundary()
+                with amp.scale_loss(loss, self.optimizer, delay_unscale=delay_unscale) as scaled_loss:
+                    scaled_loss.backward(**backward_kwargs)
 
-        # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
-        self._backward_epilogue()
+            # backward_epilogue is not called in a hook when self._support_torch_style_backward is False
+            self._backward_epilogue()
 
         self._running_engine_backward = False
 
@@ -2719,6 +2731,9 @@ class DeepSpeedEngine(Module):
             self._autotuning_exit()
 
         if self.wall_clock_breakdown():
+            # Update client accessible wall clock timers cache
+            self._update_wall_clock_timers()
+
             # Log micro timing and reset
             self.timers.log(names=self.engine_timers.micro_timers, memory_breakdown=self.memory_breakdown())
 
@@ -2747,6 +2762,17 @@ class DeepSpeedEngine(Module):
                 (self.global_steps >= self.flops_profiler_profile_step())
         for name in timer_names:
             self.timers(name).stop(record=record)
+
+    def _update_wall_clock_timers(self):
+        self.engine_timers_cache = {}
+        for name in self.engine_timers.active_timers():
+            self.engine_timers_cache[name] = self.timers(name).elapsed(reset=False)
+
+    def get_wall_clock_timers(self):
+        r"""
+            Return a dict snapshot of the Engine's wall clock timers.
+        """
+        return self.engine_timers_cache
 
     def _autotuning_exit(self):
         if self.global_rank == 0:
@@ -4205,7 +4231,11 @@ class DeepSpeedEngine(Module):
             gc.collect()
             get_accelerator().empty_cache()
 
-    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}, schedule=None) -> None:
+    def compile(self,
+                backend=get_accelerator().get_compile_backend(),
+                compile_kwargs={},
+                schedule=None,
+                compiled_autograd_enabled=False) -> None:
         """Compile the module using the specified backend and kwargs.
         If a compiler_fn is set, it will be used instead of torch.compile().
         """
@@ -4271,6 +4301,13 @@ class DeepSpeedEngine(Module):
             raise
 
         self._is_compiled = True
+        self._compile_kwargs = compile_kwargs
+        if compiled_autograd_enabled:
+            if not self._deepcompile_active:
+                self._is_compiled_autograd_enabled = compiled_autograd_enabled
+            else:
+                logger.warning("Compiled autograd is not compatible with DeepCompile, disabling compiled autograd.")
+                self._is_compiled_autograd_enabled = False
 
     def _set_deepcompile_active(self, active: bool) -> None:
         """Toggle DeepCompile runtime state and manage forward hooks accordingly."""
