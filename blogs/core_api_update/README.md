@@ -123,6 +123,14 @@ Our [example script](https://github.com/tohtana/DeepSpeedExamples/tree/tohtana/b
 
 To verify that BF16 low-precision training maintains numerical stability, we trained for 1000 steps on the Wikitext-103 dataset:
 
+<div align="center">
+
+<img src="assets/loss_comparison.png" width="800">
+
+*Loss curve comparison*
+
+</div>
+
 | Configuration | Final Loss | Mean Loss |
 |---------------|------------|-----------|
 | Baseline (fp32 master) | 3.09 | 2.78 |
