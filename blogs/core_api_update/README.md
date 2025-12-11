@@ -154,4 +154,4 @@ For more usage examples, see the unit tests in the repository:
 
 - [PyTorch-compatible backward API](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/zero/test_zero_user_backward.py)
 - [Low-precision master params/grads/optimizer states](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/half_precision/test_bf16.py)
-- [Combnation with torch.autocast](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/half_precision/test_with_autocast.py)
+- [Combination with torch.autocast](https://github.com/deepspeedai/DeepSpeed/tree/master/tests/unit/v1/half_precision/test_with_autocast.py)
