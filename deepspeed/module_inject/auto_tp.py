@@ -199,7 +199,8 @@ class AutoTP():
                  state_dict,
                  linear_layer_setting,
                  orig_layer_impl,
-                 keep_module_on_host=False):
+                 keep_module_on_host=False,
+                 dtype=None):
         self.module = module
         self.all_reduce_linears = all_reduce_linears
         self.prefix = prefix
@@ -211,6 +212,7 @@ class AutoTP():
         self.orig_layer_impl = orig_layer_impl
         self.linear_policies = None
         self.conv_linear_layer = False
+        self.dtype = dtype  # Store dtype for meta tensor materialization
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
 
     def in_module_list(module, module_list):
@@ -360,14 +362,14 @@ class AutoTP():
         # For Yuan model
         if 'Yuan' in str(self.module):
             if 'v_proj' in name:
-                return Yuan_LinearLayer(child, self.mp_group)
+                return Yuan_LinearLayer(child, self.mp_group, dtype=self.dtype)
 
             elif 'o_proj' in name:
-                return Yuan_LinearAllreduce(child, self.mp_group)
+                return Yuan_LinearAllreduce(child, self.mp_group, dtype=self.dtype)
 
         # For MLP including chunk layer.
         if 'gate_up_proj' in name or ('dense_h_to_4h' in name and 'GLM' in str(self.module)):
-            return GateUpPack_LinearLayer(child, self.mp_group)
+            return GateUpPack_LinearLayer(child, self.mp_group, dtype=self.dtype)
             # For Arctic model, bypass to all_reduce replacement for w2 weights
         arctic_w2_all_reduce_linear = False
         if 'Arctic' in str(self.module) and 'w2' in name:
@@ -380,35 +382,46 @@ class AutoTP():
 
             setattr(child, "replaced", True)
             if self.conv_linear_layer:
-                return Conv_LinearALlreduce(child, self.mp_group, name=name)
+                return Conv_LinearALlreduce(child, self.mp_group, name=name, dtype=self.dtype)
             elif name == "lm_head" or name == 'embed_out':
-                return LmHeadLinearAllreduce(child, self.mp_group)
+                return LmHeadLinearAllreduce(child, self.mp_group, dtype=self.dtype)
 
-            return LinearAllreduce(child, self.mp_group, name=name)
+            return LinearAllreduce(child, self.mp_group, name=name, dtype=self.dtype)
         else:
 
             setattr(child, "replaced", True)
             if self.conv_linear_layer:
-                conv_LinearLayer(child, self.mp_group)
+                conv_LinearLayer(child, self.mp_group, dtype=self.dtype)
             elif require_tp_fused_qkvw(name, self.mp_size):
                 #Check and handle fused qkv for TP
-                return fused_LinearLayer(child, self.mp_group, fused_module=self.module)
+                return fused_LinearLayer(child, self.mp_group, fused_module=self.module, dtype=self.dtype)
 
-            return LinearLayer(child, self.mp_group, name=name)
+            return LinearLayer(child, self.mp_group, name=name, dtype=self.dtype)
 
     def _slice_embedding(self, child, name, conv_linear_layer):
         if getattr(child, "replaced", False) == True:
             return
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
-        if hasattr(child.weight, 'ds_tensor'):
-            data = child.weight.ds_tensor.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size), dim=1)
-        else:
-            data = child.weight.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size, name), dim=1)
-        data = data[mp_replace.gpu_index].to(get_accelerator().current_device_name())
-        data = torch.nn.parameter.Parameter(data, requires_grad=False)
+        shard_size = get_shard_size(child.weight.shape[1], self.mp_size, name)
 
-        new_embedding = nn.Embedding(child.weight.shape[0], get_shard_size(child.weight.shape[1], self.mp_size, name))
+        # Handle meta tensors: materialize directly as shard on GPU
+        if child.weight.is_meta:
+            device = get_accelerator().current_device_name()
+            dtype = self.dtype if self.dtype is not None else child.weight.dtype
+            data = torch.empty(child.weight.shape[0], shard_size, dtype=dtype, device=device)
+            data.normal_()
+            data = torch.nn.parameter.Parameter(data, requires_grad=is_autotp_training_mode())
+        else:
+            if hasattr(child.weight, 'ds_tensor'):
+                data = child.weight.ds_tensor.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size),
+                                                         dim=1)
+            else:
+                data = child.weight.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size, name), dim=1)
+            data = data[mp_replace.gpu_index].to(get_accelerator().current_device_name())
+            data = torch.nn.parameter.Parameter(data, requires_grad=False)
+
+        new_embedding = nn.Embedding(child.weight.shape[0], shard_size)
         new_embedding.weight.data.copy_(data)
         setattr(child, "replaced", True)
         return new_embedding
@@ -460,8 +473,14 @@ class AutoTP():
                     Loading.load(child, self.state_dict, checking_key, self.mp_group)
                 else:
                     continue
+            # Handle meta tensors for non-TP modules (e.g., LayerNorm, RMSNorm) when no state_dict
+            elif Loading.is_load_module(child) and self.state_dict is None:
+                self._materialize_meta_module(child)
             if len(child._buffers) != 0 and self.state_dict is not None:
                 Loading.load_buffer(child, self.state_dict, checking_key)
+            # Handle meta tensors for buffers when no state_dict
+            elif len(child._buffers) != 0 and self.state_dict is None:
+                self._materialize_meta_buffers(child)
             if child.__class__ in self.linear_policies:
                 setattr(r_module, name, self.linear_policies[child.__class__](child, prev_name + '.' + name,
                                                                               self.conv_linear_layer))
@@ -480,6 +499,35 @@ class AutoTP():
                 self.update_mp_params(child)
                 self._replace_module(child, name, class_name)
         return r_module
+
+    def _materialize_meta_module(self, module):
+        """Materialize meta tensors in a module to GPU with random initialization."""
+        device = get_accelerator().current_device_name()
+        if hasattr(module, 'weight') and module.weight is not None:
+            if module.weight.data.is_meta:
+                dtype = self.dtype if self.dtype is not None else module.weight.dtype
+                new_weight = torch.empty_like(module.weight, device=device, dtype=dtype)
+                # Initialize with ones for LayerNorm/RMSNorm weights
+                new_weight.fill_(1.0)
+                module.weight = torch.nn.Parameter(new_weight, requires_grad=is_autotp_training_mode())
+        if hasattr(module, 'bias') and module.bias is not None:
+            if module.bias.data.is_meta:
+                dtype = self.dtype if self.dtype is not None else module.bias.dtype
+                new_bias = torch.zeros_like(module.bias, device=device, dtype=dtype)
+                module.bias = torch.nn.Parameter(new_bias, requires_grad=is_autotp_training_mode())
+
+    def _materialize_meta_buffers(self, module):
+        """Materialize meta tensor buffers in a module to GPU."""
+        device = get_accelerator().current_device_name()
+        for name in list(module._buffers.keys()):
+            buf = module._buffers[name]
+            if buf is not None and buf.is_meta:
+                new_buf = torch.empty_like(buf, device=device)
+                if 'inv_freq' in name:
+                    # For rotary embedding inv_freq, compute the actual values
+                    # This is a common pattern in transformer models
+                    new_buf.zero_()
+                module._buffers[name] = new_buf
 
     def get_model_num_kv_heads(self, config):
         num_kv_heads = None

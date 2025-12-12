@@ -391,6 +391,8 @@ class LinearAllreduce(TensorParallel_Layer):
         super(LinearAllreduce, self).__init__(mp_group, **kwargs)
         self.weight = module.weight
         self.bias = module.bias
+        # Store dtype from the module config if available (needed for meta tensor materialization)
+        self._dtype = kwargs.get('dtype', None)
 
         self._tp_partition([self.weight, self.bias])
         self.support_training = True
@@ -437,13 +439,29 @@ class LinearAllreduce(TensorParallel_Layer):
                     # don't slipt bias
                     return
                 if idx > 0:  # move bias to device at initialization
-                    _partition = self.move(param).detach()
+                    # Handle meta tensors for bias
+                    if param.is_meta:
+                        dtype = self._dtype if self._dtype is not None else param.dtype
+                        device = get_accelerator().current_device_name()
+                        _partition = torch.zeros(param.shape, dtype=dtype, device=device)
+                    else:
+                        _partition = self.move(param).detach()
                     params_list[idx].data = _partition
                     return
 
-                _partition = torch.chunk(param, self.tp_world_size, dim=-1)[self.tp_index]
-
-                _partition = self.move(_partition).detach()
+                # Handle meta tensors: materialize directly as shard on GPU
+                # LinearAllreduce shards along dim=-1 (input dimension)
+                if param.is_meta:
+                    shard_size = param.shape[-1] // self.tp_world_size
+                    shard_shape = param.shape[:-1] + (shard_size, )
+                    dtype = self._dtype if self._dtype is not None else param.dtype
+                    device = get_accelerator().current_device_name()
+                    _partition = torch.empty(shard_shape, dtype=dtype, device=device)
+                    # Initialize with random values for training
+                    _partition.normal_()
+                else:
+                    _partition = torch.chunk(param, self.tp_world_size, dim=-1)[self.tp_index]
+                    _partition = self.move(_partition).detach()
 
                 params_list[idx].data = _partition
 
@@ -468,6 +486,8 @@ class LinearLayer(TensorParallel_Layer):
         super(LinearLayer, self).__init__(mp_group, **kwargs)
         self.weight = module.weight
         self.bias = module.bias
+        # Store dtype from the module config if available (needed for meta tensor materialization)
+        self._dtype = kwargs.get('dtype', None)
         if not skip_partition:
             self._tp_partition([self.weight, self.bias])
         self.support_training = True
@@ -508,10 +528,19 @@ class LinearLayer(TensorParallel_Layer):
         for idx, param in enumerate(params_list):
             if param is None:
                 return
-            #split bias if provide
-            _partition = torch.chunk(param, self.tp_world_size, dim=0)[self.tp_index]
-
-            _partition = self.move(_partition).detach()
+            # Handle meta tensors: materialize directly as shard on GPU
+            if param.is_meta:
+                shard_size = param.shape[0] // self.tp_world_size
+                shard_shape = (shard_size, ) + param.shape[1:]
+                dtype = self._dtype if self._dtype is not None else param.dtype
+                device = get_accelerator().current_device_name()
+                _partition = torch.empty(shard_shape, dtype=dtype, device=device)
+                # Initialize with random values for training
+                _partition.normal_()
+            else:
+                #split bias if provide
+                _partition = torch.chunk(param, self.tp_world_size, dim=0)[self.tp_index]
+                _partition = self.move(_partition).detach()
 
             params_list[idx].data = _partition
 
@@ -570,9 +599,22 @@ class fused_LinearLayer(LinearLayer):
             if param is None:
                 return
 
-            _partition = prepare_tp_fused_qkvw(self.fused_module.module, param, self.tp_world_size, self.tp_index)
-
-            _partition = self.move(_partition).detach()
+            # Handle meta tensors: materialize directly as shard on GPU
+            if param.is_meta:
+                # For fused QKV, we need to calculate the correct shard size
+                # The fused QKV weight has shape (q_size + k_size + v_size, hidden_size)
+                # Each component is sharded by tp_world_size
+                total_out_features = param.shape[0]
+                shard_size = total_out_features // self.tp_world_size
+                shard_shape = (shard_size, ) + param.shape[1:]
+                dtype = self._dtype if self._dtype is not None else param.dtype
+                device = get_accelerator().current_device_name()
+                _partition = torch.empty(shard_shape, dtype=dtype, device=device)
+                # Initialize with random values for training
+                _partition.normal_()
+            else:
+                _partition = prepare_tp_fused_qkvw(self.fused_module.module, param, self.tp_world_size, self.tp_index)
+                _partition = self.move(_partition).detach()
 
             params_list[idx].data = _partition
 
@@ -628,10 +670,33 @@ class GateUpPack_LinearLayer(LinearLayer):
     # chatGLM2, chatGLM2
     @torch.no_grad()
     def _tp_partition(self, params_list):
-        weight, bias = shard_chunk_mlp(params_list[0].data, params_list[1], self.tp_index, self.tp_world_size)
-        params_list[0].data = self.move(weight).detach()
+        param = params_list[0]
+        bias_param = params_list[1] if len(params_list) > 1 else None
+
+        # Handle meta tensors: materialize directly as shard on GPU
+        if param.is_meta:
+            # For gate+up packed, the weight is (gate_size + up_size, hidden_size)
+            # Each component is sharded by tp_world_size
+            total_out_features = param.shape[0]
+            shard_size = total_out_features // self.tp_world_size
+            shard_shape = (shard_size, ) + param.shape[1:]
+            dtype = self._dtype if self._dtype is not None else param.dtype
+            device = get_accelerator().current_device_name()
+            weight = torch.empty(shard_shape, dtype=dtype, device=device)
+            weight.normal_()
+            bias = None
+            if bias_param is not None:
+                bias_shard_size = bias_param.shape[0] // self.tp_world_size
+                bias = torch.zeros(bias_shard_size, dtype=dtype, device=device)
+        else:
+            weight, bias = shard_chunk_mlp(param.data, bias_param, self.tp_index, self.tp_world_size)
+            weight = self.move(weight).detach()
+            if bias is not None:
+                bias = self.move(bias).detach()
+
+        params_list[0].data = weight
         if bias is not None:
-            params_list[1].data = self.move(bias).detach()
+            params_list[1].data = bias
 
 
 class Conv_LinearALlreduce(LinearAllreduce):
