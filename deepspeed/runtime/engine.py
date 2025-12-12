@@ -2357,6 +2357,8 @@ class DeepSpeedEngine(Module):
         self._stop_timers(self.engine_timers.backward_timers)
 
     def _backward_prologue_per_tensor(self, grad):
+        if grad is None:
+            return grad
         return grad / self.gradient_accumulation_steps()
 
     def _backward_post_hook(self):
