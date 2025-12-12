@@ -89,7 +89,15 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     engine.launch_compile_passes = launch_compile_passes
 
+    from .patch_fake_tensor import set_deepcompile_z3_active
+    set_deepcompile_z3_active(True)
+
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
+    # These configs may not exist in older PyTorch versions
+    if hasattr(torch._dynamo.config, 'force_parameter_static_shapes'):
+        torch._dynamo.config.force_parameter_static_shapes = False
+    if hasattr(torch._dynamo.config, 'force_nn_module_property_static_shapes'):
+        torch._dynamo.config.force_nn_module_property_static_shapes = False
 
     return make_backend(backend, compile_config, compile_kwargs=compile_kwargs)

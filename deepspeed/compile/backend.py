@@ -215,6 +215,12 @@ def run_opt_passes(opt_passes: List[Callable],
 
 
 def make_backend(backend, compile_config, compile_kwargs={}):
+    # Disable static shape guards for parameters to allow ZeRO3's dynamic parameter sharding
+    # These configs may not exist in older PyTorch versions
+    if hasattr(torch._dynamo.config, 'force_parameter_static_shapes'):
+        torch._dynamo.config.force_parameter_static_shapes = False
+    if hasattr(torch._dynamo.config, 'force_nn_module_property_static_shapes'):
+        torch._dynamo.config.force_nn_module_property_static_shapes = False
 
     register_custom_ops()
 
