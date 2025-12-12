@@ -292,17 +292,19 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             param_manager[graph_id] = DSGraphParamManager(gm.graph, real_inputs, param_indices)
 
             real_inputs_with_rng = real_inputs + tuple(sample_inputs[len(real_inputs):])
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order,
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: real_inputs_with_rng,
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=False,
-                debug_log=debug_log)
+            # Skip optimization passes if next_passes is None (already processed)
+            if next_passes is not None:
+                run_opt_passes(
+                    opt_passes=next_passes,
+                    gm=gm,
+                    graph_id=graph_id,
+                    graph_order=graph_order,
+                    profiling_results=profiling_results,
+                    create_inputs_fn=lambda: real_inputs_with_rng,
+                    mem_budget=.0,  # unused
+                    param_manager=param_manager,
+                    bwd=False,
+                    debug_log=debug_log)
 
             opt_pass_times.append(("fwd", graph_index, graph_id, time.time() - time_start))
 
@@ -312,6 +314,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             return gm.graph
 
         def make_bw_graph(gm, sample_inputs):
+            global next_passes
             time_start = time.time()
 
             graph_index = get_index_by_graph_id(graph_order, graph_id)
@@ -333,17 +336,19 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             else:
                 bwd_real_inputs = bwd_inputs_stack.pop()
 
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order,
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: tuple(bwd_real_inputs),
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=True,
-                debug_log=debug_log)
+            # Skip optimization passes if next_passes is None (already processed)
+            if next_passes is not None:
+                run_opt_passes(
+                    opt_passes=next_passes,
+                    gm=gm,
+                    graph_id=graph_id,
+                    graph_order=graph_order,
+                    profiling_results=profiling_results,
+                    create_inputs_fn=lambda: tuple(bwd_real_inputs),
+                    mem_budget=.0,  # unused
+                    param_manager=param_manager,
+                    bwd=True,
+                    debug_log=debug_log)
 
             # assert graph_id in param_manager, f"Graph {graph_id} not found in param_manager"
 
@@ -356,6 +361,9 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             frames_needing_bwd.remove(frame_id)
             if len(frames_needing_bwd) == 0:
                 unpatch_compiled_func()
+                # Clear next_passes after initial backward compilation completes
+                # to prevent repeated optimization passes on new graphs in PyTorch 2.9+
+                next_passes = None
 
             log_rank0(
                 f"Bwd end {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",
