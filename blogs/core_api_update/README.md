@@ -7,7 +7,7 @@ In this short blog, we highlight two recent core improvements:
   * **PyTorch-compatible backward API** – You can now use standard `tensor.backward(...)` patterns with DeepSpeed engines, including non-scalar outputs. ([\#7665](https://github.com/deepspeedai/DeepSpeed/pull/7665))
   * **Low-precision master params / grads / optimizer states** – You can keep more state in bf16/fp16 to reduce memory usage and work better with `torch.autocast`. ([\#7700](https://github.com/deepspeedai/DeepSpeed/pull/7700))
 
-These changes enable more flexible training pipelines and make DeepSpeed feel closer to “vanilla PyTorch”.
+These changes enable more flexible training pipelines, such as [disaggregated hybrid parallelism](https://www.anyscale.com/blog/30-faster-multimodal-ai-training-with-ray-and-disaggregated-hybrid) ([code](https://github.com/ray-project/multimodal-training)) for multimodal models using [Ray](https://github.com/ray-project/ray), and make DeepSpeed feel closer to “vanilla PyTorch”.
 
 ## 1\. PyTorch-compatible backward API
 
@@ -47,7 +47,7 @@ The DeepSpeed Engine was able to handle these use cases using internal APIs; how
 
 With this API update, we can now use the same code as native PyTorch while keeping DeepSpeed's unique features, including ZeRO.
 
-One example use case for this new API is [disaggregated hybrid parallelism](https://github.com/ray-project/multimodal-training) for multimodal models using [Ray](https://github.com/ray-project/ray). In this training pipeline, two Ray Actor groups handle the vision encoder and the LLM separately.
+One example use case for this new API is [disaggregated hybrid parallelism](https://www.anyscale.com/blog/30-faster-multimodal-ai-training-with-ray-and-disaggregated-hybrid) for multimodal models using [Ray](https://github.com/ray-project/ray). In this training pipeline, two Ray Actor groups handle the vision encoder and the LLM separately.
 
 On a backward pass, the LLM passes a gradient to the vision encoder, and the vision encoder calls the backward function with that gradient. However, because the gradient is a non-scalar tensor, such a use case wasn't officially supported by DeepSpeed APIs.
 
@@ -64,6 +64,9 @@ def text_backward_step(self):
 def vision_backward_step(self, vision_embedding_grad):
     self.vision_output.backward(gradient=vision_embedding_grad)
 ```
+
+Check out the [repository](https://github.com/ray-project/multimodal-training) for the complete training pipeline.
+
 
 ## 2\. Low-precision master params, grads, and optimizer states
 
@@ -114,7 +117,7 @@ Below is a simplified DeepSpeed config that keeps bf16 master weights, grads, an
 }
 ```
 
-Our [example script](https://github.com/tohtana/DeepSpeedExamples/tree/tohtana/bf16_master_weights_examples/training/bf16_master_weight) demonstrates the significant memory savings:
+Our [example script](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/bf16_master_weight) demonstrates the significant memory savings:
 
 | Configuration | Allocated Memory | Peak Memory | Avg Step Time |
 |---------------|------------------|-------------|---------------|
@@ -136,7 +139,7 @@ To verify that BF16 low-precision training maintains numerical stability, we tra
 | Baseline (fp32 master) | 3.09 | 2.78 |
 | BF16 Low-Precision | 3.12 | 2.90 |
 
-Please check out our [example](https://github.com/tohtana/DeepSpeedExamples/tree/tohtana/bf16_master_weights_examples/training/bf16_master_weight) for more details.
+Please check out our [example](https://github.com/deepspeedai/DeepSpeedExamples/tree/master/training/bf16_master_weight) for more details.
 
 ## Closing thoughts
 
