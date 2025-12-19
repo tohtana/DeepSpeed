@@ -102,13 +102,14 @@ Below is a simplified DeepSpeed config that keeps bf16 master weights, grads, an
 ```json
 {
 ...
+  "zero_optimization": {
+    "stage": 3,
+    ...
+  },
   "bf16": {
     "enabled": true,
     "bf16_master_weights_and_grads": true,
     "bf16_optimizer_states": true
-  },
-  "zero_optimization": {
-    ...
   },
   "torch_autocast": {
     "enabled": true,
