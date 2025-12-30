@@ -141,9 +141,6 @@ class OpenMPIRunner(MultiNodeRunner):
     def validate_args(self):
         super().validate_args()
 
-        # Validate and set MPI environment variables
-        self._setup_mpi_environment()
-
         #TODO: Allow for include/exclude at node-level but not gpu-level
         if self.args.include != "" or self.args.exclude != "":
             raise ValueError(f"{self.name} backend does not support worker include/exclusion")
@@ -493,3 +490,4 @@ class MVAPICHRunner(MultiNodeRunner):
                 python_exec.append("-m")
 
         return mpirun_cmd + export_cmd + python_exec + [self.user_script] + self.user_arguments
+
