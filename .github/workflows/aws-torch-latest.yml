@@ -90,4 +90,4 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest -n 4 --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
+          pytest -n 4 --forked --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
