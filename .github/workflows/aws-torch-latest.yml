@@ -37,7 +37,7 @@ jobs:
       options: --gpus all --shm-size "32G"
 
     env:
-      TORCH_VER: "2.8"
+      TORCH_VER: "2.7"
       CUDA_VER: "12.6"
 
     steps:
@@ -54,7 +54,7 @@ jobs:
 
       - name: Install PyTorch
         run: |
-          pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+          pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
 
       - name: Install Python dependencies
         run: |
@@ -80,8 +80,12 @@ jobs:
 
       - name: Install DeepSpeed
         run: |
+          # Initialize CUDA before install so setup.py can detect NCCL version
+          python -c "import torch; torch.cuda.init(); print(f'NCCL version: {torch.cuda.nccl.version()}')"
           pip install .
           ds_report
+          # Debug: Check captured torch_info values
+          python -c "from deepspeed.git_version_info import torch_info; print(f'torch_info: {torch_info}')"
 
       - name: Run unit tests
         run: |
