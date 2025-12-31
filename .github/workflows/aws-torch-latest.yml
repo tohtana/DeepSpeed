@@ -1,0 +1,82 @@
+################################################################################
+# DeepSpeed CI - AWS L40S GPU Tests (PyTorch Latest)
+#
+# Runs the same tests as modal-torch-latest.yml but on AWS self-hosted runners.
+# Uses 4x NVIDIA L40S GPUs on g6e.12xlarge instances.
+################################################################################
+
+name: aws-l40s-torch-latest
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - master
+
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'blogs/**'
+      - 'deepspeed/inference/v2/**'
+      - 'tests/unit/inference/v2/**'
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit Tests (L40S)
+    runs-on: [self-hosted, gpu-ci, gpu-l40s, l40s-4gpu, aws]
+
+    container:
+      image: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+      options: --gpus all --shm-size "16G"
+
+    env:
+      TORCH_VER: "2.6"
+      CUDA_VER: "12.4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Check container state
+        run: |
+          echo "=== GPU Information ==="
+          nvidia-smi
+          echo ""
+          echo "=== CUDA Version ==="
+          nvcc --version
+          echo ""
+          echo "=== Python/PyTorch Info ==="
+          python --version
+          python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+          python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+          python -c "import torch; print(f'CUDA devices: {torch.cuda.device_count()}')"
+          python -c "import torch; print(f'BF16 support: {torch.cuda.is_bf16_supported()}')"
+
+      - name: Install system dependencies
+        run: |
+          apt update && apt install -y libaio-dev
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements/requirements.txt
+          pip install -r requirements/requirements-dev.txt
+          pip install -r requirements/requirements-deepcompile.txt
+
+      - name: Install DeepSpeed
+        run: |
+          pip install .
+          ds_report
+
+      - name: Run unit tests
+        run: |
+          pytest -n 4 --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
