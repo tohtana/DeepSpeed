@@ -37,7 +37,7 @@ jobs:
       options: --gpus all --shm-size "16G"
 
     env:
-      TORCH_VER: "2.6"
+      TORCH_VER: "2.9"
       CUDA_VER: "12.4"
 
     steps:
@@ -54,9 +54,16 @@ jobs:
 
       - name: Install PyTorch
         run: |
-          pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu124
 
-      - name: Check container state
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements/requirements.txt
+          pip install -r requirements/requirements-dev.txt
+          pip install -r requirements/requirements-deepcompile.txt
+
+      - name: Check environment
         run: |
           echo "=== GPU Information ==="
           nvidia-smi
@@ -71,13 +78,6 @@ jobs:
           python -c "import torch; print(f'CUDA devices: {torch.cuda.device_count()}')"
           python -c "import torch; print(f'BF16 support: {torch.cuda.is_bf16_supported()}')"
 
-      - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements/requirements.txt
-          pip install -r requirements/requirements-dev.txt
-          pip install -r requirements/requirements-deepcompile.txt
-
       - name: Install DeepSpeed
         run: |
           pip install .
@@ -85,4 +85,4 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest -n 4 --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
+          pytest -n 2 --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
