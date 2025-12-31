@@ -82,7 +82,8 @@ jobs:
         run: |
           # Initialize CUDA before install so setup.py can detect NCCL version
           python -c "import torch; torch.cuda.init(); print(f'NCCL version: {torch.cuda.nccl.version()}')"
-          pip install .
+          # Use --no-build-isolation so setup.py can access pre-installed PyTorch
+          pip install --no-build-isolation .
           ds_report
           # Debug: Check captured torch_info values
           python -c "from deepspeed.git_version_info import torch_info; print(f'torch_info: {torch_info}')"
