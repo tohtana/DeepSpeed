@@ -43,7 +43,8 @@ jobs:
     steps:
       - name: Install git
         run: |
-          apt-get update && apt-get install -y git
+          apt-get update && apt-get install -y git git-lfs
+          git lfs install
 
       - name: Checkout repository
         uses: actions/checkout@v4
