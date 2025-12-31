@@ -41,6 +41,10 @@ jobs:
       CUDA_VER: "12.4"
 
     steps:
+      - name: Install git
+        run: |
+          apt-get update && apt-get install -y git
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
