@@ -5,7 +5,7 @@
 # Uses 4x NVIDIA L40S GPUs on g6e.12xlarge instances.
 ################################################################################
 
-name: aws-l40s-torch-latest
+name: aws-torch-latest
 
 on:
   workflow_dispatch:
