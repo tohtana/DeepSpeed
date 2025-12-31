@@ -33,12 +33,12 @@ jobs:
     runs-on: [self-hosted, gpu-ci, gpu-l40s, l40s-4gpu, aws]
 
     container:
-      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
       options: --gpus all --shm-size "16G"
 
     env:
       TORCH_VER: "2.9"
-      CUDA_VER: "12.4"
+      CUDA_VER: "12.6"
 
     steps:
       - name: Install system dependencies
@@ -54,7 +54,7 @@ jobs:
 
       - name: Install PyTorch
         run: |
-          pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 
       - name: Install Python dependencies
         run: |
