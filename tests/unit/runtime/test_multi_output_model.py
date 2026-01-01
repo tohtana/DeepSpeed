@@ -7,6 +7,7 @@ import torch
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 from pytest import approx
+from unit.util import torch_assert_close
 from unit.common import DistributedTest, preferred_dtype
 from unit.multi_output_model import MultiOutputModel, multi_output_dataloader
 
@@ -49,7 +50,7 @@ class TestTwoOutputModel(DistributedTest):
                                               targets=[1, 2])
         for n, batch in enumerate(data_loader):
             assert len(batch) % 2 == 0, \
-                 f"multi_output_dataloader failed to return even number of data samples (input+target)"
+                 "multi_output_dataloader failed to return even number of data samples (input+target)"
 
             midpoint = len(batch) // 2
             inputs, targets = batch[:midpoint], batch[midpoint:]
@@ -62,8 +63,8 @@ class TestTwoOutputModel(DistributedTest):
 
             summed_loss = sum(loss_tuple)
             scaled_loss = model.backward(summed_loss)
-            expected_scaled_loss = summed_loss.float() / grad_accumulation_steps
-            assert scaled_loss.item() == approx(expected_scaled_loss.item())
+            expected_scaled_loss = summed_loss / grad_accumulation_steps
+            torch_assert_close(scaled_loss, expected_scaled_loss)
 
             model.step()
 
@@ -107,7 +108,7 @@ class TestThreeOutputModel(DistributedTest):
                                               targets=[1, 2, 3])
         for n, batch in enumerate(data_loader):
             assert len(batch) % 2 == 0, \
-                 f"multi_output_dataloader failed to return even number of data samples (input+target)"
+                 "multi_output_dataloader failed to return even number of data samples (input+target)"
 
             midpoint = len(batch) // 2
             inputs, targets = batch[:midpoint], batch[midpoint:]
@@ -122,7 +123,7 @@ class TestThreeOutputModel(DistributedTest):
 
             summed_loss = sum(loss_tuple)
             scaled_loss = model.backward(summed_loss)
-            expected_scaled_loss = summed_loss.float() / grad_accumulation_steps
-            assert scaled_loss.item() == approx(expected_scaled_loss.item())
+            expected_scaled_loss = summed_loss / grad_accumulation_steps
+            torch_assert_close(scaled_loss, expected_scaled_loss)
 
             model.step()

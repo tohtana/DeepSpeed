@@ -22,7 +22,7 @@ try:
     from torch._six import inf
 except ModuleNotFoundError:
     from torch import inf
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Sequence
 from deepspeed import comm as dist
 from deepspeed.moe.utils import is_moe_param
 from deepspeed.utils import groups, logger
@@ -45,6 +45,45 @@ class DummyOptim():
     def __init__(self, params):
         self.param_groups = []
         self.param_groups.append({'params': params})
+
+
+def filter_empty_parameters(params):
+    """Filter out empty parameters (numel == 0) from optimizer params.
+
+    This is useful for optimizers that perform operations like division by numel,
+    which would produce NaNs for empty parameters.
+
+    Args:
+        params: Either a list/tuple of Parameters, or a list of parameter group dicts
+                (each dict has 'params' key with list of Parameters)
+
+    Returns:
+        Filtered params in the same format as input (list of Parameters or list of dicts)
+    """
+    if not isinstance(params, (list, tuple)) or len(params) == 0:
+        return params
+
+    # Check if first element is a dict (parameter groups) or a Parameter
+    if isinstance(params[0], dict):
+        # params is a list of parameter group dicts
+        filtered_params = []
+        for param_group in params:
+            filtered_group = {}
+            trainable_params = []
+            for key, value in param_group.items():
+                if key == 'params':
+                    # Filter out empty parameters
+                    trainable_params = [p for p in value if p.numel() > 0]
+                else:
+                    filtered_group[key] = value
+            # Only add group if it has non-empty parameters
+            if len(trainable_params) > 0:
+                filtered_group['params'] = trainable_params
+                filtered_params.append(filtered_group)
+        return filtered_params
+    else:
+        # params is a list of Parameters
+        return [p for p in params if p.numel() > 0]
 
 
 graph_cache = {}
@@ -103,8 +142,13 @@ def set_random_seed(seed):
     import numpy
     import random
     random.seed(seed)
-    numpy.random.seed(seed)
-    torch.manual_seed(seed)
+
+    # pytest-randomly passes a too large seed
+    # `numpy.random.default_rng` could be a better approach, but it requires more changes to use rngs explicitly
+    # numpy.random accepts only 32-bit integers
+    numpy.random.seed(seed % (2**32))
+    # torch.manual_seed accepts only 64-bit integers
+    torch.manual_seed(seed % (2**63))
 
 
 def is_model_parallel_parameter(p) -> bool:
@@ -778,15 +822,15 @@ def see_memory_usage(message, force=False):
     gc.collect()
 
     # Print message except when distributed but not rank 0
-    logger.info(message)
-    logger.info(f"MA {round(get_accelerator().memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
+    print(message)
+    print(f"MA {round(get_accelerator().memory_allocated() / (1024 * 1024 * 1024),2 )} GB \
         Max_MA {round(get_accelerator().max_memory_allocated() / (1024 * 1024 * 1024),2)} GB \
         CA {round(torch_memory_reserved() / (1024 * 1024 * 1024),2)} GB \
         Max_CA {round(torch_max_memory_reserved() / (1024 * 1024 * 1024))} GB ")
 
     vm_stats = psutil.virtual_memory()
     used_GB = round(((vm_stats.total - vm_stats.available) / (1024**3)), 2)
-    logger.info(f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
+    print(f'CPU Virtual Memory:  used = {used_GB} GB, percent = {vm_stats.percent}%')
 
     # get the peak memory to report correct data, so reset the counter for the next call
     get_accelerator().reset_peak_memory_stats()
@@ -846,7 +890,7 @@ def get_global_norm_of_tensors(input_tensors, norm_type=2, mpu=None, use_graph=F
         Total norm of the tensors (viewed as a single vector).
     """
     assert isinstance(input_tensors, Iterable), f'expected Iterable type not {type(input_tensors)}'
-    assert all([torch.is_tensor(t) for t in input_tensors]), f'expected list of only tensors'
+    assert all([torch.is_tensor(t) for t in input_tensors]), 'expected list of only tensors'
 
     norm_type = float(norm_type)
     all_norms = []
@@ -1160,8 +1204,8 @@ def compare_tensors_in_structures(inputs1: Union[List, Dict], inputs2: Union[Lis
             return False
         for val1, val2 in zip(inputs1, inputs2):
             if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
-                val1 = val1.to(get_accelerator().current_device())
-                val2 = val2.to(get_accelerator().current_device())
+                val1 = val1.to(torch.device(get_accelerator().current_device_name()))
+                val2 = val2.to(torch.device(get_accelerator().current_device_name()))
                 if not torch.equal(val1, val2):
                     return False
             elif val1 != val2:
@@ -1174,8 +1218,8 @@ def compare_tensors_in_structures(inputs1: Union[List, Dict], inputs2: Union[Lis
         for key in inputs1:
             val1, val2 = inputs1[key], inputs2[key]
             if isinstance(val1, torch.Tensor) and isinstance(val2, torch.Tensor):
-                val1 = val1.to(get_accelerator().current_device())
-                val2 = val2.to(get_accelerator().current_device())
+                val1 = val1.to(torch.device(get_accelerator().current_device_name()))
+                val2 = val2.to(torch.device(get_accelerator().current_device_name()))
                 if not torch.equal(val1, val2):
                     return False
             elif val1 != val2:
@@ -1183,3 +1227,245 @@ def compare_tensors_in_structures(inputs1: Union[List, Dict], inputs2: Union[Lis
         return True
 
     return False
+
+
+def maybe_loss_for_backward(value) -> bool:
+    """Check if the value is a loss tensor.
+    Conditions:
+    - The value must be a tensor.
+    - The tensor must have exactly one element.
+    - The tensor must have grad_fn defined.
+
+    Args:
+        value: The value to check.
+    """
+    return isinstance(value, torch.Tensor) and value.numel() == 1 and value.grad_fn is not None
+
+
+class OutputBackwardHookManager:
+    """
+    Manages backward hooks on output tensors to trigger preprocessing only once.
+
+    This is an alternative to register_full_backward_pre_hook that avoids warnings
+    and provides more fine-grained control over when preprocessing occurs.
+
+    The hook manager automatically manages its lifetime by attaching itself to the
+    output tensors. When the outputs are freed, the hook manager is also freed.
+
+    This manager handles two types of preprocessing:
+    1. Global preprocessing (run once per backward pass): timers, flags, setup
+    2. Per-tensor preprocessing (run for each output tensor): gradient scaling, loss logging
+
+    Usage:
+        # Only global preprocessing (run once)
+        hook_manager = OutputBackwardHookManager(
+            preprocess_once_fn=lambda: start_timers()
+        )
+
+        # Both global and per-tensor preprocessing
+        hook_manager = OutputBackwardHookManager(
+            preprocess_once_fn=lambda: start_timers(),
+            preprocess_per_tensor_fn=lambda tensor: scale_gradient(tensor)
+        )
+
+        outputs = model(*inputs)
+        hook_manager.register_hooks_on_outputs(outputs)
+        # No need to manually clean up - it's freed when outputs are freed
+    """
+
+    def __init__(self, preprocess_once_fn, preprocess_per_tensor_fn=None):
+        """
+        Args:
+            preprocess_once_fn: A callable that takes no arguments and performs
+                               one-time preprocessing before backward (e.g., start timers).
+                               Will only be called once per backward pass.
+            preprocess_per_tensor_fn: Optional callable that takes a tensor and returns
+                                     a potentially modified tensor. Called for each output
+                                     tensor during backward (e.g., gradient scaling).
+                                     If None, no per-tensor processing is done.
+        """
+        self.preprocess_once_fn = preprocess_once_fn
+        self.preprocess_per_tensor_fn = preprocess_per_tensor_fn
+        self.preprocess_done = False
+        self.hook_handles = []
+
+    def _make_backward_hook(self, tensor):
+        """
+        Creates a backward hook for a specific tensor.
+
+        Args:
+            tensor: The output tensor this hook is attached to
+        """
+
+        def backward_hook(grad):
+            # First, ensure global preprocessing happens once
+            if not self.preprocess_done:
+                self.preprocess_done = True
+                self.preprocess_once_fn()
+
+            # Then apply per-tensor preprocessing if provided
+            if self.preprocess_per_tensor_fn is not None:
+                # Per-tensor preprocessing receives the tensor
+                # It can perform operations like gradient scaling
+                grad = self.preprocess_per_tensor_fn(grad)
+
+            return grad
+
+        return backward_hook
+
+    def _traverse_and_register_hooks(self, outputs, first_tensor_holder):
+        """
+        Recursively traverse outputs to find tensors with grad_fn and register hooks.
+
+        Args:
+            outputs: Can be a tensor, tuple, list, dict, or nested structure of these.
+            first_tensor_holder: List to hold the first tensor found (for attaching self)
+        """
+        if isinstance(outputs, torch.Tensor):
+            if outputs.grad_fn is not None:
+                # Store reference to first tensor to attach hook manager lifetime
+                if not first_tensor_holder:
+                    first_tensor_holder.append(outputs)
+                # Pass the tensor to _make_backward_hook so per-tensor processing can access it
+                hook_handle = outputs.register_hook(self._make_backward_hook(outputs))
+                self.hook_handles.append(hook_handle)
+        elif isinstance(outputs, (tuple, list)):
+            for item in outputs:
+                self._traverse_and_register_hooks(item, first_tensor_holder)
+        elif isinstance(outputs, dict):
+            for value in outputs.values():
+                self._traverse_and_register_hooks(value, first_tensor_holder)
+
+    def register_hooks_on_outputs(self, outputs):
+        """
+        Register backward hooks on all output tensors that have grad_fn.
+
+        Args:
+            outputs: The outputs from the forward pass. Can be a tensor or nested structure.
+        """
+        # Reset state for new forward pass
+        self.preprocess_done = False
+        self.remove_hooks()
+
+        # Register hooks on all tensors with grad_fn
+        first_tensor_holder = []
+        self._traverse_and_register_hooks(outputs, first_tensor_holder)
+
+        # Attach this hook manager instance to the first output tensor
+        # This ensures the hook manager is kept alive as long as the outputs are alive
+        # and automatically freed when outputs are freed
+        if first_tensor_holder:
+            first_tensor = first_tensor_holder[0]
+            if not hasattr(first_tensor, '_backward_hook_managers'):
+                first_tensor._backward_hook_managers = []
+            first_tensor._backward_hook_managers.append(self)
+
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles.clear()
+
+    def reset(self):
+        """Reset the preprocessing flag without removing hooks."""
+        self.preprocess_done = False
+
+
+def register_output_backward_hooks(outputs, preprocess_once_fn, preprocess_per_tensor_fn=None):
+    """
+    Convenience function to register backward hooks on outputs.
+
+    This function creates a hook manager that is automatically tied to the lifetime
+    of the output tensors. When outputs are freed, the hook manager is also freed.
+
+    Args:
+        outputs: The outputs from forward pass (tensor, tuple, list, dict, or nested)
+        preprocess_once_fn: A callable that takes no arguments and performs one-time
+                           preprocessing before backward. Will only be called once per backward pass.
+        preprocess_per_tensor_fn: Optional callable that takes a tensor and performs
+                                 per-tensor preprocessing (e.g., gradient scaling).
+                                 Called for each output tensor during backward.
+
+    Returns:
+        The hook manager instance (usually not needed, as lifetime is automatic)
+
+    Example:
+        # Only global preprocessing
+        outputs = model(x)
+        register_output_backward_hooks(outputs, lambda: print("Backward starting!"))
+
+        # Both global and per-tensor preprocessing
+        outputs = model(x)
+        register_output_backward_hooks(
+            outputs,
+            preprocess_once_fn=lambda: start_timers(),
+            preprocess_per_tensor_fn=lambda tensor: scale_tensor(tensor)
+        )
+        # Hook manager is automatically freed when outputs are freed
+    """
+    hook_manager = OutputBackwardHookManager(preprocess_once_fn, preprocess_per_tensor_fn)
+    hook_manager.register_hooks_on_outputs(outputs)
+    return hook_manager
+
+
+def check_internal_apis_for_count_used_parameters() -> bool:
+    """
+    Ensure the Torch internal APIs needed by `count_used_parameters_in_backward` exist.
+    """
+    if not hasattr(torch.autograd.graph, '_get_grad_fn_or_grad_acc'):
+        return False
+
+    missing = [attr for attr in ("_current_graph_task_id", "_will_engine_execute_node") if not hasattr(torch._C, attr)]
+
+    if missing:
+        return False
+
+    return True
+
+
+def count_used_parameters_in_backward(parameters: Sequence[torch.nn.Parameter]) -> int:
+    """
+    Count the number of parameters that participate in the currently running backward graph.
+
+    This helper is designed to be invoked from within a backward hook where a graph task
+    is active. Parameters that do not require gradients, are detached, or are not touched
+    by the current backward pass are ignored.
+
+    torch.autograd.graph.register_multi_grad_hook is used for the purpose, but
+    its verification on tensor shapes throws an error with ZeRO3 (it expects original tensor shape).
+    So this function simplifies register_multi_grad_hook just to count used parameters.
+
+    Args:
+        parameters: Iterable of model parameters to inspect.
+
+    Returns:
+        The number of parameters whose gradient nodes will be executed by the autograd engine
+        for the active backward call.
+    """
+    assert check_internal_apis_for_count_used_parameters(), (
+        "count_used_parameters_in_backward requires internal PyTorch APIs that are not available "
+        "in this PyTorch build.")
+
+    from torch.autograd.graph import _get_grad_fn_or_grad_acc
+    if torch._C._current_graph_task_id() == -1:
+        raise RuntimeError("count_used_parameters_in_backward must be called during backward execution")
+
+    seen_nodes = set()
+    for param in parameters:
+        if not isinstance(param, torch.Tensor) or not param.requires_grad:
+            continue
+
+        grad_fn = _get_grad_fn_or_grad_acc(param)
+        if grad_fn is None:
+            continue
+
+        if grad_fn in seen_nodes:
+            continue
+
+        seen_nodes.add(grad_fn)
+
+    if not seen_nodes:
+        return 0
+
+    participating = sum(map(torch._C._will_engine_execute_node, seen_nodes))
+    return int(participating)

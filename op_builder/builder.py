@@ -420,6 +420,8 @@ class OpBuilder(ABC):
         if cpu_info['arch'].startswith('PPC_'):
             # gcc does not provide -march on PowerPC, use -mcpu instead
             return '-mcpu=native'
+        elif cpu_info['arch'].startswith('riscv64'):
+            return '-march=rv64gc'
         return '-march=native'
 
     def get_cuda_compile_flag(self):
@@ -430,7 +432,7 @@ class OpBuilder(ABC):
         except MissingCUDAException:
             print(f"{WARNING} {self.name} cuda is missing or is incompatible with installed torch, "
                   "only cpu ops can be compiled!")
-            return '-D__DISABLE_CUDA__'
+        return '-D__DISABLE_CUDA__'
 
     def _backup_cpuinfo(self):
         # Construct cpu_info dict from lscpu that is similar to what py-cpuinfo provides
@@ -455,6 +457,8 @@ class OpBuilder(ABC):
                 cpu_info['flags'] += 'avx2'
         elif 'ppc64le' in result:
             cpu_info['arch'] = "PPC_"
+        elif 'riscv64' in result:
+            cpu_info['arch'] = "riscv64"
 
         return cpu_info
 
@@ -518,7 +522,7 @@ class OpBuilder(ABC):
                             extra_compile_args={'cxx': self.strip_empty_entries(self.cxx_args())},
                             extra_link_args=self.strip_empty_entries(self.extra_ldflags()))
 
-    def load(self, verbose=True):
+    def load(self, verbose=False):
         if self.name in __class__._loaded_ops:
             return __class__._loaded_ops[self.name]
 
@@ -542,10 +546,11 @@ class OpBuilder(ABC):
             raise RuntimeError(
                 f"Unable to JIT load the {self.name} op due to it not being compatible due to hardware/software issue. {self.error_log}"
             )
+        from torch.utils.cpp_extension import verify_ninja_availability
         try:
-            import ninja  # noqa: F401 # type: ignore
-        except ImportError:
-            raise RuntimeError(f"Unable to JIT load the {self.name} op due to ninja not being installed.")
+            verify_ninja_availability()
+        except RuntimeError as e:
+            raise RuntimeError(f"Unable to JIT load the {self.name} op due to ninja not being installed.") from e
 
         if isinstance(self, CUDAOpBuilder) and not self.is_rocm_pytorch():
             self.build_for_cpu = not torch.cuda.is_available()
@@ -774,6 +779,7 @@ class CUDAOpBuilder(OpBuilder):
                 '-DROCM_VERSION_MAJOR=%s' % ROCM_MAJOR,
                 '-DROCM_VERSION_MINOR=%s' % ROCM_MINOR
             ]
+            self.enable_bf16 = True
         else:
             try:
                 nvcc_threads = int(os.getenv("DS_NVCC_THREADS", ""))

@@ -36,7 +36,7 @@ import deepspeed.comm as dist
 import torch
 
 model_name_or_path = 'hf-internal-testing/tiny-random-LlamaForCausalLM'
-max_length = 64
+seq_length = 64
 sequence_parallel_size = 2
 micro_batch_size = 1
 
@@ -74,8 +74,8 @@ mpu = UlyssesSPAttentionHF.register_with_transformers(
     model_name_or_path=model_name_or_path,
     core_attn_implementation="sdpa",
     sequence_parallel_size=sequence_parallel_size,
-    max_length=max_length,
     micro_batch_size=micro_batch_size,
+    seq_length=seq_length,
     seq_length_is_variable=True,
 )
 
@@ -116,11 +116,11 @@ for iter, batch in enumerate(dl):
     # differentiable weighted per-shard-loss aggregation across ranks
     losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)
     # special dealing with SFT that has prompt tokens that aren't used in loss computation
-    good_tokens = sum((shift_labels != -100).view(-1))
+    good_tokens = (shift_labels != -100).view(-1).sum()
     good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
     total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
     total_good_tokens = sum(good_tokens_per_rank)
-    loss = total_loss / total_good_tokens
+    loss = total_loss / max(total_good_tokens, 1)
 
     if dist.get_rank() == 0:
         print(f"{iter}: {loss=}")
@@ -151,15 +151,41 @@ mpu = UlyssesSPAttentionHF.register_with_transformers(
     model_name_or_path=model_name_or_path,
     core_attn_implementation="sdpa",
     sequence_parallel_size=sequence_parallel_size,
-    max_length=max_length,
     micro_batch_size=micro_batch_size,
+    seq_length=seq_length,
     seq_length_is_variable=True,
 )
 ```
 
 It also creates nccl process groups encapsulated by the `mpu` object it returns.
 
+For the `model_name_or_path` argument you can also pass the already existing HF Transformers `model` object.
+
 `UlyssesSPAttentionHF.register_with_transformers` has to be called before `from_pretrained` is called.
+
+If `seq_length_is_variable` is `True` (which is also the default value), `UlyssesSPAttentionHF` will recalculate the shapes on each `forward` based on the incoming batch's shapes - in which case you don't need to set `seq_length` - you can just skip it like so:
+```
+mpu = UlyssesSPAttentionHF.register_with_transformers(
+    model_name_or_path=model_name_or_path,
+    core_attn_implementation="sdpa",
+    sequence_parallel_size=sequence_parallel_size,
+    micro_batch_size=micro_batch_size,
+    seq_length_is_variable=True,
+)
+```
+
+If, however, all your batches have an identical sequence length, then you'd save a few microseconds per run with using the `seq_length_is_variable=False` code path, which will pre-measure all shapes once and re-use them in all runs:
+
+```
+mpu = UlyssesSPAttentionHF.register_with_transformers(
+    [...]
+    seq_length=seq_length,
+    seq_length_is_variable=False,
+)
+```
+
+If you pass `seq_length`, remember that it has to be divisible by `sequence_parallel_size`. And of course, this also applies to all batches, even if you use `seq_length_is_variable=True`.
+
 
 ### UlyssesSPDataLoaderAdapter
 
@@ -173,9 +199,9 @@ dl = UlyssesSPDataLoaderAdapter(
 )
 ```
 
-This takes an existing DataLoader object and returns a new one that will shard the batches on the sequence dimension and synchronize all GPUs of the replica to return only its corresponding shard.
+This takes an existing DataLoader object and returns a new one that will shard the batches on the sequence dimension and synchronize all GPUs of the replica to return to each rank only its corresponding sequence shard.
 
-It also takes care of pre-shifting labels and replacing `labels` with `shift_labels` in the batch.
+It also takes care of replacing `labels` with `shift_labels` in the batch, by pre-shifting labels, which is crucial for the correct loss calculation when using Ulysses sequence parallelism.
 
 ### Loss averaging
 
@@ -185,11 +211,11 @@ Since each rank processes a segment we need to average loss. To get the gradient
     # differentiable weighted per-shard-loss aggregation across ranks
     losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)
     # special dealing with SFT that has prompt tokens that aren't used in loss computation
-    good_tokens = sum((shift_labels != -100).view(-1))
+    good_tokens = (shift_labels != -100).view(-1).sum()
     good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
     total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
     total_good_tokens = sum(good_tokens_per_rank)
-    loss = total_loss / total_good_tokens
+    loss = total_loss / max(total_good_tokens, 1)
 ```
 
 In theory you could just average `losses_per_rank`, but the system supports variable sequence length so the last rank is likely to have a shorter sequence length and also use cases like SFT may have a variable number of tokens that contribute to the loss calculation, so it's best to compute a weighted loss.
@@ -258,16 +284,16 @@ If your model isn't supported by Liger-kernel you can use our implementation, wh
             output_unshard_dimension=0,  # loss is a scalar
             output_reduction="sum",
         )
-        total_good_items = sum((shift_labels != -100).squeeze())
-        loss = total_loss_sum / total_good_items
+        total_good_items = (shift_labels != -100).squeeze().sum()
+        loss = total_loss_sum / max(total_good_items, 1)
 
         # differentiable weighted per-shard-loss aggregation across ranks
         losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=self.sp_group)
-        good_tokens = sum((shift_labels != -100).view(-1))
+        good_tokens = (shift_labels != -100).view(-1).sum()
         good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=self.sp_group)
         total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(self.sp_world_size))
         total_good_tokens = sum(good_tokens_per_rank)
-        loss = total_loss / total_good_tokens
+        loss = total_loss / max(total_good_tokens, 1)
 
         return loss
 ```

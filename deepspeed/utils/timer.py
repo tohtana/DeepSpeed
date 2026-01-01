@@ -5,7 +5,7 @@
 
 import time
 from numpy import mean
-from deepspeed.utils.logging import log_dist
+from deepspeed.utils.logging import print_dist
 from deepspeed.accelerator import get_accelerator
 
 FORWARD_MICRO_TIMER = 'fwd_microstep'
@@ -88,7 +88,6 @@ class SynchronizedWallClockTimer:
                 self.elapsed_records = [et * 1000.0 for et in self.event_timers]
             else:
                 self.elapsed_records = [et.get_elapsed_msec() for et in self.event_timers]
-            self.event_timers.clear()
             return sum(self.elapsed_records)
 
         def reset(self):
@@ -142,13 +141,14 @@ class SynchronizedWallClockTimer:
     def log(self, names, normalizer=1.0, reset=True, memory_breakdown=False, ranks=None):
         """Log a group of timers."""
         assert normalizer > 0.0
-        string = f"time (ms)"
+        string = "time (ms)"
         for name in names:
             if name in self.timers:
                 elapsed_time = (self.timers[name].elapsed(reset=reset) / normalizer)
                 string += " | {}: {:.2f}".format(name, elapsed_time)
 
-        log_dist(string, ranks=ranks or [0])
+        # timers logging should be independent of the global log level it's already conditional on wall_clock_breakdown being True, so using use_logger=False will always print the stats
+        print_dist(string, ranks=ranks or [0])
 
     def get_mean(self, names, normalizer=1.0, reset=True):
         """Get the mean of a group of timers."""

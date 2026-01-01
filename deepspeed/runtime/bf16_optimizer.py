@@ -54,7 +54,7 @@ class BF16_Optimizer(ZeROOptimizer):
         self.param_names = param_names
         self.using_real_optimizer = not isinstance(self.optimizer, DummyOptim)
 
-        assert bfloat16_config.enabled, f"BF16Optimizer: requires bfloat16 to be enabled"
+        assert bfloat16_config.enabled, "BF16Optimizer: requires bfloat16 to be enabled"
         assert grad_acc_dtype in [torch.float32, torch.bfloat16
                                   ], f"BF16Optimizer: Unsupported gradient accumulation data type: {grad_acc_dtype}"
         self.grad_acc_dtype = grad_acc_dtype
@@ -316,18 +316,10 @@ class BF16_Optimizer(ZeROOptimizer):
 
         self.clear_hp_grads()
 
-    def backward(self, loss, retain_graph=False, update_hp_grads=True, clear_lp_grads=False, **bwd_kwargs):
-        """Perform a backward pass and copy the low-precision gradients to the
-        high-precision copy.
-
-        We copy/accumulate to the high-precision grads now to prevent accumulating in the
-        bf16 grads after successive backward() calls (i.e., grad accumulation steps > 1)
-
-        The low-precision grads are deallocated during this procedure.
-        """
+    def backward_prologue(self):
         self.clear_lp_grads()
-        loss.backward(retain_graph=retain_graph, **bwd_kwargs)
 
+    def backward_epilogue(self, update_hp_grads=True, clear_lp_grads=False, **bwd_kwargs):
         if update_hp_grads:
             self.update_hp_grads(clear_lp_grads=clear_lp_grads)
 
@@ -504,13 +496,13 @@ class BF16_Optimizer(ZeROOptimizer):
         current_rank_sd = state_dict_list[dp_rank]
 
         ckpt_version = current_rank_sd.get(DS_VERSION, False)
-        assert ckpt_version, f"Empty ds_version in checkpoint, not clear how to proceed"
+        assert ckpt_version, "Empty ds_version in checkpoint, not clear how to proceed"
         ckpt_version = pkg_version.parse(ckpt_version)
 
         self.clip_grad = current_rank_sd.get(CLIP_GRAD, self.clip_grad)
 
         if load_optimizer_states:
-            print(f"_load_legacy_checkpoint current_rank_sd[BASE_OPTIMIZER_STATE]")
+            print("_load_legacy_checkpoint current_rank_sd[BASE_OPTIMIZER_STATE]")
             self.optimizer.load_state_dict(current_rank_sd[BASE_OPTIMIZER_STATE])
 
         if load_from_fp32_weights:

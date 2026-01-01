@@ -29,14 +29,14 @@ def get_grad(param, zero_stage):
     #     return safe_get_full_grad(param)
 
 
-@pytest.mark.parametrize("zero_stage", [1, 3])
+@pytest.mark.parametrize("zero_stage", [2, 3])
 class TestUlyssesSPHF(DistributedTest):
     world_size = 2
 
     def test_ulysses_sp_hf(self, zero_stage):
         model_name_or_path = 'hf-internal-testing/tiny-random-LlamaForCausalLM'
         #model_name_or_path = 'Felladrin/Llama-160M-Chat-v1'
-        max_length = 64
+        seq_length = 64
         sequence_parallel_size = self.world_size
         micro_batch_size = 1
 
@@ -105,8 +105,8 @@ class TestUlyssesSPHF(DistributedTest):
             model_name_or_path=model_name_or_path,
             core_attn_implementation="sdpa",
             sequence_parallel_size=sequence_parallel_size,
-            max_length=max_length,
             micro_batch_size=micro_batch_size,
+            seq_length=seq_length,
             seq_length_is_variable=True,
         )
 
@@ -185,3 +185,50 @@ class TestUlyssesSPHF(DistributedTest):
             torch_assert_close(grad_a, grad_b, rtol=1.6e-02, atol=1e-03)
         else:
             torch_assert_close(grad_a, grad_b)
+
+
+class TestUlyssesSPHFPEFT(DistributedTest):
+    world_size = 2
+
+    def test_ulysses_sp_hf_with_peft_model(self):
+        """Test that UlyssesSPAttentionHF.register_with_transformers works with PEFT models.
+
+        PEFT models don't inherit from transformers.PreTrainedModel but have a config attribute.
+        This test verifies the duck-typing check for the config attribute works correctly.
+        """
+        model_name_or_path = 'hf-internal-testing/tiny-random-LlamaForCausalLM'
+        seq_length = 64
+        sequence_parallel_size = self.world_size
+        micro_batch_size = 1
+
+        # Create a mock PEFT model object that has config but doesn't inherit from PreTrainedModel
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(model_name_or_path)
+
+        class MockPEFTModel:
+            """Mock PEFT model that simulates PeftModel behavior"""
+
+            def __init__(self, config):
+                self.config = config
+
+        mock_peft_model = MockPEFTModel(hf_config)
+
+        # Test that register_with_transformers works with PEFT-like model object
+        # This should not crash and should use the config attribute via duck-typing
+        mpu = UlyssesSPAttentionHF.register_with_transformers(
+            model_name_or_path=mock_peft_model,
+            core_attn_implementation="sdpa",
+            sequence_parallel_size=sequence_parallel_size,
+            micro_batch_size=micro_batch_size,
+            seq_length=seq_length,
+            seq_length_is_variable=True,
+        )
+
+        # Verify mpu is created successfully
+        assert mpu is not None
+
+        # Verify that the sequence parallel groups are initialized
+        sp_group = groups._get_sequence_parallel_group()
+        assert sp_group is not None
+        sp_world_size = groups._get_sequence_parallel_world_size()
+        assert sp_world_size == sequence_parallel_size
