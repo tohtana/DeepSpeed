@@ -1,11 +1,12 @@
 ################################################################################
-# DeepSpeed CI - AWS L40S GPU Tests (PyTorch Latest)
+# DeepSpeed CI - AWS L40S GPU Tests (HuggingFace Accelerate Integration)
 #
-# Runs the same tests as modal-torch-latest.yml but on AWS self-hosted runners.
+# Runs the same tests as modal-accelerate.yml but on AWS self-hosted runners.
+# Tests DeepSpeed integration with HuggingFace Accelerate library.
 # Uses 4x NVIDIA L40S GPUs on g6e.12xlarge instances.
 ################################################################################
 
-name: aws-torch-latest
+name: aws-accelerate
 
 on:
   workflow_dispatch:
@@ -28,9 +29,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-tests:
-    name: Unit Tests (V1)
-    runs-on: [self-hosted, gpu-ci, gpu-l40s, l40s-4gpu, aws]
+  accelerate-tests:
+    name: Accelerate Integration Tests
+    runs-on: [self-hosted, gpu-ci, gpu-l40s, l40s-1gpu, aws]
 
     container:
       image: nvidia/cuda:12.6.3-devel-ubuntu22.04
@@ -61,7 +62,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements/requirements.txt
           pip install -r requirements/requirements-dev.txt
-          pip install -r requirements/requirements-deepcompile.txt
+          pip install datasets
 
       - name: Check environment
         run: |
@@ -88,6 +89,11 @@ jobs:
           # Debug: Check captured torch_info values
           python -c "from deepspeed.git_version_info import torch_info; print(f'torch_info: {torch_info}')"
 
-      - name: Run unit tests
+      - name: Clone and install Accelerate
         run: |
-          pytest -n 4 --forked --verbose tests/unit/v1/ --torch_ver=${{ env.TORCH_VER }} --cuda_ver=${{ env.CUDA_VER }}
+          git clone https://github.com/huggingface/accelerate
+          pip install "./accelerate[testing]"
+
+      - name: Run Accelerate DeepSpeed tests
+        run: |
+          pytest --forked --verbose ./accelerate/tests/deepspeed
