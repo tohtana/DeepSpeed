@@ -2491,13 +2491,21 @@ class DeepSpeedEngine(Module):
         # Used only for return value
         gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
 
-        # TODO: handle these scaling with direct calls to loss.backward()
-        if isinstance(self.optimizer, ZeROOptimizer):
-            loss = self.optimizer.scale_if_loss(loss)
-        elif self.torch_autocast_z0_gradscaler:
-            loss = self.torch_autocast_z0_gradscaler.scale(loss)
-
         with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
+            # ZenFlow requires exclusive control over the backward pass to manage its
+            # selective parameter updates and synchronization boundaries.
+            if self.zenflow:
+                self.optimizer.backward(loss, **backward_kwargs)
+                self._backward_epilogue()
+                self._running_engine_backward = False
+                return gas_scaled_loss
+
+            # TODO: handle these scaling with direct calls to loss.backward()
+            if isinstance(self.optimizer, ZeROOptimizer):
+                loss = self.optimizer.scale_if_loss(loss)
+            elif self.torch_autocast_z0_gradscaler:
+                loss = self.torch_autocast_z0_gradscaler.scale(loss)
+
             if self.zero_optimization() or not self.amp_enabled():
                 loss.backward(**backward_kwargs)
             elif self.amp_enabled():
