@@ -2316,6 +2316,13 @@ class DeepSpeedEngine(Module):
     def _backward_prologue(self):
         self._start_timers(self.engine_timers.backward_timers)
 
+        # ZenFlow requires the use of engine.backward(loss) to manage its
+        # specialized backward pass and synchronization logic.
+        if self.zenflow and not self._running_engine_backward:
+            raise RuntimeError("Direct calls to loss.backward() are not currently supported when ZenFlow is enabled. "
+                               "Please use engine.backward(loss) instead to allow ZenFlow to manage "
+                               "selective updates and synchronization.")
+
         # When necessary internal APIs are not available, we disable direct calls to tensor.backward()
         # and limit to engine.backward(loss) only.
         if not self._support_torch_style_backward and not self._running_engine_backward:
@@ -2491,6 +2498,12 @@ class DeepSpeedEngine(Module):
         # Used only for return value
         gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
 
+        # TODO: handle these scaling with direct calls to loss.backward()
+        if isinstance(self.optimizer, ZeROOptimizer):
+            gas_scaled_loss = self.optimizer.scale_if_loss(gas_scaled_loss)
+        elif self.torch_autocast_z0_gradscaler:
+            gas_scaled_loss = self.torch_autocast_z0_gradscaler.scale(gas_scaled_loss)
+
         with compiled_autograd(self._is_compiled_autograd_enabled, self._compile_kwargs):
             # ZenFlow requires exclusive control over the backward pass to manage its
             # selective parameter updates and synchronization boundaries.
@@ -2499,12 +2512,6 @@ class DeepSpeedEngine(Module):
                 self._backward_epilogue()
                 self._running_engine_backward = False
                 return gas_scaled_loss
-
-            # TODO: handle these scaling with direct calls to loss.backward()
-            if isinstance(self.optimizer, ZeROOptimizer):
-                loss = self.optimizer.scale_if_loss(loss)
-            elif self.torch_autocast_z0_gradscaler:
-                loss = self.torch_autocast_z0_gradscaler.scale(loss)
 
             if self.zero_optimization() or not self.amp_enabled():
                 loss.backward(**backward_kwargs)
