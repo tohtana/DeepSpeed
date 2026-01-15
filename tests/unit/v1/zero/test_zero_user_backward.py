@@ -1256,8 +1256,7 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
             f"No gradients computed with use_reentrant={use_reentrant} and ZeRO-3"
 
         # Compare gradients with DDP reference
-        compare_gradients(ddp_grads, ds_grads,
-                          f"with checkpointing use_reentrant={use_reentrant}")
+        compare_gradients(ddp_grads, ds_grads, f"with checkpointing use_reentrant={use_reentrant}")
 
         # Run optimizer step to verify full training loop works
         model_engine.step()
@@ -1297,7 +1296,7 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
         # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
         torch.manual_seed(123)
         x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
-        y = torch.randint(0, hidden_dim, (batch_size,), device=device)
+        y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
 
         # DDP: forward with scalar loss and backward
         optimizer_ddp.zero_grad()
@@ -1319,8 +1318,7 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
             f"No gradients computed with scalar loss, use_reentrant={use_reentrant}"
 
         # Compare gradients with DDP reference
-        compare_gradients(ddp_grads, ds_grads,
-                          f"scalar loss with checkpointing use_reentrant={use_reentrant}")
+        compare_gradients(ddp_grads, ds_grads, f"scalar loss with checkpointing use_reentrant={use_reentrant}")
 
         model_engine.destroy()
 
