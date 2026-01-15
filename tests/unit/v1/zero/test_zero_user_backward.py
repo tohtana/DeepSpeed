@@ -1148,3 +1148,223 @@ class TestZeroUserBackwardWithScale(DistributedTest):
         assert len(grads) > 0, "Expected gradients to be computed"
 
         model_engine.destroy()
+
+
+class CheckpointedModel(torch.nn.Module):
+    """Model that uses gradient checkpointing with configurable use_reentrant setting.
+
+    This model is designed to test the interaction between ZeRO-3 and gradient
+    checkpointing with both reentrant (use_reentrant=True) and non-reentrant
+    (use_reentrant=False) modes.
+    """
+
+    def __init__(self, hidden_dim, use_reentrant=True):
+        super().__init__()
+        self.use_reentrant = use_reentrant
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def _checkpointed_block(self, x):
+        """Block that will be checkpointed"""
+        x = self.linear1(x)
+        x = torch.nn.functional.relu(x)
+        x = self.linear2(x)
+        return x
+
+    def forward(self, x):
+        # Use gradient checkpointing on the middle block
+        if self.training:
+            from torch.utils.checkpoint import checkpoint
+            x = checkpoint(self._checkpointed_block, x, use_reentrant=self.use_reentrant)
+        else:
+            x = self._checkpointed_block(x)
+        x = self.linear3(x)
+        return x
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+class TestZeroUserBackwardWithCheckpointing(DistributedTest):
+    """Test ZeRO-3 with gradient checkpointing and non-scalar backward.
+
+    This test class validates the interaction between:
+    1. ZeRO-3 parameter partitioning
+    2. Gradient checkpointing (both reentrant and non-reentrant modes)
+    3. Non-scalar backward (tensor.backward(gradient=...))
+
+    Both use_reentrant=True and use_reentrant=False are supported with ZeRO-3.
+    Note: When using use_reentrant=True, input tensors should have requires_grad=True
+    for proper gradient computation through the checkpointed region.
+    """
+    world_size = 2
+
+    def test_checkpointed_non_scalar_backward_zero3(self, use_reentrant):
+        """Test that gradient checkpointing works with ZeRO-3 and non-scalar backward.
+
+        Verifies that tensor.backward(gradient=...) works correctly with ZeRO-3
+        and gradient checkpointing in both reentrant and non-reentrant modes.
+        """
+        hidden_dim = 8
+        batch_size = 2
+        zero_stage = 3
+
+        # Initialize distributed environment
+        device, rank, dtype = initialize_distributed()
+
+        # Create DDP model for reference (no checkpointing issues with DDP)
+        torch.manual_seed(42)
+        model_ddp = CheckpointedModel(hidden_dim=hidden_dim, use_reentrant=use_reentrant)
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=1e-3)
+
+        # Create DeepSpeed model with ZeRO-3
+        torch.manual_seed(42)
+        model_ds = CheckpointedModel(hidden_dim=hidden_dim, use_reentrant=use_reentrant)
+
+        config = get_config_dict(zero_stage)
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_ds,
+                                                     model_parameters=model_ds.parameters())
+
+        # Create input data
+        # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
+        # for proper gradient computation through the checkpointed region.
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+
+        # DDP: forward and non-scalar backward
+        optimizer_ddp.zero_grad()
+        output_ddp = model_ddp(x)
+        grad_output = torch.ones_like(output_ddp)
+        output_ddp.backward(grad_output)
+        ddp_grads = collect_ddp_gradients(model_ddp)
+
+        # DeepSpeed with ZeRO-3: forward and non-scalar backward
+        # This is the pattern used in disaggregated training
+        output_ds = model_engine(x.detach().requires_grad_(True))
+        grad_output_ds = torch.ones_like(output_ds)
+
+        # Non-scalar backward with gradient checkpointing
+        output_ds.backward(grad_output_ds)
+
+        # Collect and verify gradients
+        ds_grads = collect_gradients_safe(model_engine)
+
+        # Verify gradients were computed
+        assert len(ds_grads) > 0, \
+            f"No gradients computed with use_reentrant={use_reentrant} and ZeRO-3"
+
+        # Compare gradients with DDP reference
+        compare_gradients(ddp_grads, ds_grads,
+                          f"with checkpointing use_reentrant={use_reentrant}")
+
+        # Run optimizer step to verify full training loop works
+        model_engine.step()
+
+        model_engine.destroy()
+
+    def test_checkpointed_scalar_backward_zero3(self, use_reentrant):
+        """Test that gradient checkpointing works with ZeRO-3 and scalar backward.
+
+        Verifies that scalar loss.backward() works correctly with ZeRO-3 and
+        gradient checkpointing in both reentrant and non-reentrant modes.
+        """
+        hidden_dim = 8
+        batch_size = 2
+        zero_stage = 3
+
+        # Initialize distributed environment
+        device, rank, dtype = initialize_distributed()
+
+        # Create DDP model for reference
+        torch.manual_seed(42)
+        model_ddp = CheckpointedModel(hidden_dim=hidden_dim, use_reentrant=use_reentrant)
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.Adam(model_ddp.parameters(), lr=1e-3)
+
+        # Create DeepSpeed model with ZeRO-3
+        torch.manual_seed(42)
+        model_ds = CheckpointedModel(hidden_dim=hidden_dim, use_reentrant=use_reentrant)
+
+        config = get_config_dict(zero_stage)
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_ds,
+                                                     model_parameters=model_ds.parameters())
+
+        # Create input data
+        # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
+        torch.manual_seed(123)
+        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        y = torch.randint(0, hidden_dim, (batch_size,), device=device)
+
+        # DDP: forward with scalar loss and backward
+        optimizer_ddp.zero_grad()
+        output_ddp = model_ddp(x)
+        loss_ddp = torch.nn.functional.cross_entropy(output_ddp, y)
+        loss_ddp.backward()
+        ddp_grads = collect_ddp_gradients(model_ddp)
+
+        # DeepSpeed with ZeRO-3: forward with scalar loss and backward
+        output_ds = model_engine(x.detach().requires_grad_(True))
+        loss_ds = torch.nn.functional.cross_entropy(output_ds, y)
+        loss_ds.backward()
+
+        # Collect and verify gradients
+        ds_grads = collect_gradients_safe(model_engine)
+
+        # Verify gradients were computed
+        assert len(ds_grads) > 0, \
+            f"No gradients computed with scalar loss, use_reentrant={use_reentrant}"
+
+        # Compare gradients with DDP reference
+        compare_gradients(ddp_grads, ds_grads,
+                          f"scalar loss with checkpointing use_reentrant={use_reentrant}")
+
+        model_engine.destroy()
+
+    def test_checkpointed_multiple_backward_zero3(self, use_reentrant):
+        """Test multiple backward passes with checkpointing and ZeRO-3.
+
+        Verifies that consecutive training iterations work correctly with
+        gradient checkpointing in both reentrant and non-reentrant modes.
+        """
+
+        hidden_dim = 8
+        batch_size = 2
+        zero_stage = 3
+        num_iterations = 3
+
+        # Initialize distributed environment
+        device, rank, dtype = initialize_distributed()
+
+        # Create DeepSpeed model with ZeRO-3
+        torch.manual_seed(42)
+        model_ds = CheckpointedModel(hidden_dim=hidden_dim, use_reentrant=use_reentrant)
+
+        config = get_config_dict(zero_stage)
+        model_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                     model=model_ds,
+                                                     model_parameters=model_ds.parameters())
+
+        for iteration in range(num_iterations):
+            # Create input data with different seed each iteration
+            # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
+            torch.manual_seed(123 + iteration)
+            x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+
+            # Forward and non-scalar backward
+            output_ds = model_engine(x)
+            grad_output_ds = torch.ones_like(output_ds)
+            output_ds.backward(grad_output_ds)
+
+            # Collect and verify gradients
+            ds_grads = collect_gradients_safe(model_engine)
+            assert len(ds_grads) > 0, \
+                f"No gradients at iteration {iteration} with use_reentrant={use_reentrant}"
+
+            # Run optimizer step
+            model_engine.step()
+
+        model_engine.destroy()

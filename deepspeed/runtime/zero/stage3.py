@@ -1963,6 +1963,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         print_rank_0("Finished Tracing at Beginning of Step")
 
+        # Clear any stale params from ipg_buckets. This is needed because with
+        # reentrant checkpointing (use_reentrant=True), the backward pass can
+        # leave params in the buckets that weren't properly processed, causing
+        # errors in the next iteration.
+        for bucket in self.ipg_buckets.values():
+            bucket.params.clear()
+            bucket.elements = 0
+
     @instrument_w_nvtx
     def _get_norm_groups(self):
         norm_groups = []
