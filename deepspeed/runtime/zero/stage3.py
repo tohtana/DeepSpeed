@@ -122,6 +122,11 @@ class IPGBucketZ3:
         self.params.clear()
         self.elements = 0
 
+    def clear_params(self):
+        """Clear params and elements but keep buffer for reuse."""
+        self.params.clear()
+        self.elements = 0
+
 
 INITIAL_MICRO_STEP_ID = -1
 
@@ -1968,8 +1973,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # leave params in the buckets that weren't properly processed, causing
         # errors in the next iteration.
         for bucket in self.ipg_buckets.values():
-            bucket.params.clear()
-            bucket.elements = 0
+            bucket.clear_params()
 
     @instrument_w_nvtx
     def _get_norm_groups(self):
