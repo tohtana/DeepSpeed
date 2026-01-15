@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import deepspeed.comm as dist
 import deepspeed
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -1227,26 +1228,35 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
                                                      model=model_ds,
                                                      model_parameters=model_ds.parameters())
 
-        # Create input data
-        # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
-        # for proper gradient computation through the checkpointed region.
+        # Create input data - use separate tensors for DDP and DeepSpeed to avoid
+        # memory sharing issues during parallel test execution
         torch.manual_seed(123)
-        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
 
         # DDP: forward and non-scalar backward
         optimizer_ddp.zero_grad()
-        output_ddp = model_ddp(x)
+        output_ddp = model_ddp(x_ddp)
         grad_output = torch.ones_like(output_ddp)
         output_ddp.backward(grad_output)
+        get_accelerator().synchronize()  # Ensure CUDA ops complete
+        dist.barrier()  # Ensure all ranks complete gradient sync
         ddp_grads = collect_ddp_gradients(model_ddp)
 
         # DeepSpeed with ZeRO-3: forward and non-scalar backward
         # This is the pattern used in disaggregated training
-        output_ds = model_engine(x.detach().requires_grad_(True))
+        # Create fresh tensor with same seed for reproducibility
+        torch.manual_seed(123)
+        x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        output_ds = model_engine(x_ds)
         grad_output_ds = torch.ones_like(output_ds)
 
         # Non-scalar backward with gradient checkpointing
         output_ds.backward(grad_output_ds)
+
+        # Synchronize device before collecting gradients. ZeRO-3 uses async operations
+        # on separate streams for gradient reduction. With use_reentrant=True checkpointing,
+        # we need to ensure all operations complete before reading gradient data.
+        get_accelerator().synchronize()
 
         # Collect and verify gradients
         ds_grads = collect_gradients_safe(model_engine)
@@ -1292,23 +1302,33 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
                                                      model=model_ds,
                                                      model_parameters=model_ds.parameters())
 
-        # Create input data
-        # For reentrant checkpointing (use_reentrant=True), inputs need requires_grad=True
+        # Create input data - use separate tensors for DDP and DeepSpeed to avoid
+        # memory sharing issues during parallel test execution
         torch.manual_seed(123)
-        x = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         y = torch.randint(0, hidden_dim, (batch_size, ), device=device)
 
         # DDP: forward with scalar loss and backward
         optimizer_ddp.zero_grad()
-        output_ddp = model_ddp(x)
+        output_ddp = model_ddp(x_ddp)
         loss_ddp = torch.nn.functional.cross_entropy(output_ddp, y)
         loss_ddp.backward()
+        get_accelerator().synchronize()  # Ensure CUDA ops complete
+        dist.barrier()  # Ensure all ranks complete gradient sync
         ddp_grads = collect_ddp_gradients(model_ddp)
 
         # DeepSpeed with ZeRO-3: forward with scalar loss and backward
-        output_ds = model_engine(x.detach().requires_grad_(True))
+        # Create fresh tensor with same seed for reproducibility
+        torch.manual_seed(123)
+        x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        output_ds = model_engine(x_ds)
         loss_ds = torch.nn.functional.cross_entropy(output_ds, y)
         loss_ds.backward()
+
+        # Synchronize device before collecting gradients. ZeRO-3 uses async operations
+        # on separate streams for gradient reduction. With use_reentrant=True checkpointing,
+        # we need to ensure all operations complete before reading gradient data.
+        get_accelerator().synchronize()
 
         # Collect and verify gradients
         ds_grads = collect_gradients_safe(model_engine)
