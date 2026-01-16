@@ -2225,6 +2225,11 @@ class DeepSpeedEngine(Module):
             *inputs: Variable length input list
             **kwargs: variable length keyword arguments
         """
+        # Clear the backward seen flag at the start of each forward pass.
+        # This is used to track multiple gradient hook phases with reentrant checkpointing.
+        if isinstance(self.optimizer, ZeROOptimizer):
+            self.optimizer.clear_backward_seen_flag()
+
         if self.autotuning_profile_model_info():
             ma = get_ma_status()
 

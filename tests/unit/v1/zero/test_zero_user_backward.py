@@ -1257,6 +1257,7 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
         # on separate streams for gradient reduction. With use_reentrant=True checkpointing,
         # we need to ensure all operations complete before reading gradient data.
         get_accelerator().synchronize()
+        dist.barrier()  # Ensure all ranks complete backward before collecting gradients
 
         # Collect and verify gradients
         ds_grads = collect_gradients_safe(model_engine)
@@ -1323,12 +1324,14 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
         x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         output_ds = model_engine(x_ds)
         loss_ds = torch.nn.functional.cross_entropy(output_ds, y)
+
         loss_ds.backward()
 
         # Synchronize device before collecting gradients. ZeRO-3 uses async operations
         # on separate streams for gradient reduction. With use_reentrant=True checkpointing,
         # we need to ensure all operations complete before reading gradient data.
         get_accelerator().synchronize()
+        dist.barrier()  # Ensure all ranks complete backward before collecting gradients
 
         # Collect and verify gradients
         ds_grads = collect_gradients_safe(model_engine)
@@ -1376,6 +1379,10 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
             output_ds = model_engine(x)
             grad_output_ds = torch.ones_like(output_ds)
             output_ds.backward(grad_output_ds)
+
+            # Synchronize before collecting gradients to ensure async operations complete
+            get_accelerator().synchronize()
+            dist.barrier()
 
             # Collect and verify gradients
             ds_grads = collect_gradients_safe(model_engine)

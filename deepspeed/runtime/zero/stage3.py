@@ -1281,6 +1281,22 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                             if self._remaining_grad_acc_hooks == 0:
                                 self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
                                     non_leaf_params_requiring_grad) + leaf_module_count
+                                # With reentrant gradient checkpointing, gradient hooks can fire in
+                                # multiple phases within a single backward call. The first phase
+                                # triggers _backward_epilogue which calls exit_backward(), setting
+                                # _backward_active_depth to 0. When the next phase starts, we need
+                                # to re-enter backward to ensure post hooks run for that phase too.
+                                #
+                                # We detect this case by checking:
+                                # 1. _backward_active_depth == 0 (we've exited from previous phase)
+                                # 2. _backward_seen_this_step == True (backward was active earlier)
+                                #
+                                # This distinguishes from TiledFusedLogitsLoss which calls backward()
+                                # during forward - in that case _backward_seen_this_step is False
+                                # because enter_backward() was never called.
+                                if self._backward_active_depth == 0 and getattr(self, '_backward_seen_this_step',
+                                                                                False):
+                                    self.enter_backward()
 
                             self.reduce_ready_partitions_and_remove_grads(param)
 
@@ -1305,6 +1321,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     if self._remaining_grad_acc_hooks == 0:
                         self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
                             non_leaf_params_requiring_grad) + leaf_module_count
+                        # Re-enter backward for subsequent phases (see comment in reduce_partition_and_remove_grads)
+                        if self._backward_active_depth == 0 and getattr(self, '_backward_seen_this_step', False):
+                            self.enter_backward()
 
                     for param in params:
                         # this takes care of grads for MoE experts that didn't participate in the current iteration/layer

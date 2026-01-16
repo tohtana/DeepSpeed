@@ -24,6 +24,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
         self._remaining_grad_acc_hooks = 0
         self._grad_acc_post_hooks = []
         self._backward_active_depth = 0
+        self._backward_seen_this_step = False
 
     def load_hp_checkpoint_state_from_checkpoint_dir(self, lp_groups_name: str, checkpoint_dir: str) -> None:
         checkpoint_dir = os.path.join(checkpoint_dir, "zero")
@@ -152,10 +153,17 @@ class ZeROOptimizer(DeepSpeedOptimizer):
 
     def enter_backward(self):
         self._backward_active_depth += 1
+        # Track that backward has been active at some point in this step.
+        # This is used to detect subsequent gradient hook phases with reentrant checkpointing.
+        self._backward_seen_this_step = True
 
     def exit_backward(self):
         if self._backward_active_depth > 0:
             self._backward_active_depth -= 1
+
+    def clear_backward_seen_flag(self):
+        """Clear the backward seen flag at the start of each step."""
+        self._backward_seen_this_step = False
 
     def _configure_master_weights(self,
                                   fp16_master_weights_and_gradients=False,
