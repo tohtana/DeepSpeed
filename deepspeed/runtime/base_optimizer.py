@@ -36,8 +36,10 @@ class BackwardHookStateManager:
        but after checkpoint recomputation, it returns 4 (all params). We must NOT run
        the epilogue prematurely after Phase 1.
 
-       Solution: Track `_max_expected_hooks_seen` across all phases. The epilogue only
-       runs when `_hooks_fired_this_backward >= _max_expected_hooks_seen`.
+       Solution: Queue a post-backward callback on the autograd engine at the start of
+       backward and run the epilogue when the graph task completes. This avoids premature
+       epilogues across reentrant phases. The `_max_expected_hooks_seen` counter remains
+       as a fallback when the callback API is unavailable.
 
     2. **TiledFusedLogitsLoss and Similar Custom Autograd Functions**:
        Some custom autograd functions call `torch.autograd.backward()` from their
@@ -65,6 +67,8 @@ class BackwardHookStateManager:
         epilogue_ran_this_backward: True if epilogue ran (for micro_step_id management)
         hooks_fired_this_backward: Count of gradient hooks that have fired
         max_expected_hooks_seen: Maximum expected hook count seen (grows with reentrant)
+        post_backward_callback_queued: True if a post-backward callback is queued
+        post_backward_callback_graph_task_id: Graph task id for the queued callback
     """
 
     def __init__(self):
@@ -75,6 +79,8 @@ class BackwardHookStateManager:
         self.epilogue_ran_this_backward = False
         self.hooks_fired_this_backward = 0
         self.max_expected_hooks_seen = 0
+        self.post_backward_callback_queued = False
+        self.post_backward_callback_graph_task_id = None
 
     def register_grad_acc_post_hook(self, hook):
         """Register a callback to run when all gradient hooks have fired."""
@@ -119,6 +125,8 @@ class BackwardHookStateManager:
         self.hooks_fired_this_backward = 0
         self.max_expected_hooks_seen = 0
         self.epilogue_ran_this_backward = False
+        self.post_backward_callback_queued = False
+        self.post_backward_callback_graph_task_id = None
 
     def reenter_backward_if_needed(self):
         """Re-enter backward context for subsequent phases in reentrant checkpointing.
@@ -140,6 +148,31 @@ class BackwardHookStateManager:
             if self.backward_active_depth == 0 and self.backward_seen_this_step:
                 self.enter_backward()
 
+    def queue_post_backward_callback(self):
+        """Queue post-backward hooks to run after the current graph finishes."""
+        if self.post_backward_callback_queued:
+            return True
+        if self.backward_active_depth == 0:
+            return False
+
+        engine = getattr(torch.autograd.Variable, "_execution_engine", None)
+        if engine is None or not hasattr(engine, "queue_callback"):
+            return False
+        if not hasattr(torch._C, "_current_graph_task_id"):
+            return False
+
+        graph_task_id = torch._C._current_graph_task_id()
+        if graph_task_id == -1:
+            return False
+
+        def _run_post_backward():
+            self.run_grad_acc_post_hooks()
+
+        engine.queue_callback(_run_post_backward)
+        self.post_backward_callback_queued = True
+        self.post_backward_callback_graph_task_id = graph_task_id
+        return True
+
     def update_hook_state_and_maybe_run_epilogue(self, current_expected_count):
         """Update hook state after a gradient hook fires and run epilogue if all hooks have fired.
 
@@ -156,7 +189,13 @@ class BackwardHookStateManager:
         self.hooks_fired_this_backward += 1
         self.max_expected_hooks_seen = max(self.max_expected_hooks_seen, current_expected_count)
 
-        # Run epilogue only when we've processed ALL params that will participate.
+        # Prefer running post-backward hooks via autograd engine callback when available.
+        # This avoids premature epilogues with reentrant checkpointing.
+        if self.queue_post_backward_callback():
+            self.remaining_grad_acc_hooks = max(self.max_expected_hooks_seen - self.hooks_fired_this_backward, 0)
+            return
+
+        # Fallback: Run epilogue only when we've processed ALL params that will participate.
         # This is the maximum count we've seen (accounts for late-joining params
         # from reentrant checkpointing) and also excludes unused params.
         if self.hooks_fired_this_backward >= self.max_expected_hooks_seen:
@@ -367,6 +406,10 @@ class ZeROOptimizer(DeepSpeedOptimizer):
     def update_hook_state_and_maybe_run_epilogue(self, current_expected_count):
         """Update hook state after a gradient hook fires and run epilogue if all hooks have fired."""
         self._backward_hook_state.update_hook_state_and_maybe_run_epilogue(current_expected_count)
+
+    def queue_post_backward_callback(self):
+        """Queue post-backward hooks to run after autograd completes."""
+        return self._backward_hook_state.queue_post_backward_callback()
 
     def _configure_master_weights(self,
                                   fp16_master_weights_and_gradients=False,

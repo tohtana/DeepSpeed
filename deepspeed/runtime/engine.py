@@ -2345,6 +2345,7 @@ class DeepSpeedEngine(Module):
         if isinstance(self.optimizer, ZeROOptimizer):
             self.optimizer.backward_prologue()
             self.optimizer.enter_backward()
+            self.optimizer.queue_post_backward_callback()
 
         if self.zenflow and self.auto_update:
             self.optimizer.zenflow_state ^= 1
