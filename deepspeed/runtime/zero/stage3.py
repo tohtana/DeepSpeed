@@ -1825,6 +1825,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         Zero FP16 parameter grads.
         """
         self.micro_step_id = 0
+        # Reset the epilogue flag so the next forward doesn't increment micro_step_id.
+        # Without this, calling zero_grad() between backward and forward would cause
+        # micro_step_id to be incremented at the next forward, leading to incorrect
+        # gradient accumulation behavior.
+        self._epilogue_ran_this_backward = False
 
         # FP32 grad should never exist.
         # For speed, set model fp16 grad to None by default
