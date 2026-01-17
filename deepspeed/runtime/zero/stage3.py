@@ -1245,12 +1245,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     self.__param_id_to_grad_partition[param.ds_id]
                     if param.requires_grad else torch.zeros_like(param.ds_tensor) for param in sub_group
                 ]
-        # this method gets called after every backward. need to increment
-        # here because if it gets incremented in backward() the micro step
-        # id will be off by one when we do the reduce and partition at the.
-        # start of this method.
-        # TODO. make this less error prone
-        self.micro_step_id += 1
+        # This method gets called after every backward. With reentrant gradient
+        # checkpointing, it may be called multiple times per backward pass (once per phase).
+        # We track that the epilogue ran this backward so we can increment micro_step_id
+        # at the start of the NEXT forward pass. This ensures all phases within a backward
+        # use the same micro_step_id value (copy semantics for all, not accumulate).
+        # The increment is deferred to clear_backward_seen_flag() which runs in forward().
+        self._epilogue_ran_this_backward = True
 
     def overlapping_partition_gradients_reduce_epilogue(self):
         self.independent_gradient_partition_epilogue()
@@ -1278,31 +1279,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
-                            if self._remaining_grad_acc_hooks == 0:
-                                self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
-                                    non_leaf_params_requiring_grad) + leaf_module_count
-                                # With reentrant gradient checkpointing, gradient hooks can fire in
-                                # multiple phases within a single backward call. The first phase
-                                # triggers _backward_epilogue which calls exit_backward(), setting
-                                # _backward_active_depth to 0. When the next phase starts, we need
-                                # to re-enter backward to ensure post hooks run for that phase too.
-                                #
-                                # We detect this case by checking:
-                                # 1. _backward_active_depth == 0 (we've exited from previous phase)
-                                # 2. _backward_seen_this_step == True (backward was active earlier)
-                                #
-                                # This distinguishes from TiledFusedLogitsLoss which calls backward()
-                                # during forward - in that case _backward_seen_this_step is False
-                                # because enter_backward() was never called.
-                                if self._backward_active_depth == 0 and getattr(self, '_backward_seen_this_step',
-                                                                                False):
-                                    self.enter_backward()
+                            # Re-enter backward for subsequent phases in reentrant checkpointing
+                            self.reenter_backward_if_needed()
 
                             self.reduce_ready_partitions_and_remove_grads(param)
 
-                            self._remaining_grad_acc_hooks -= 1
-                            if self._remaining_grad_acc_hooks == 0:
-                                self.run_grad_acc_post_hooks()
+                            # Update hook state and run epilogue if all expected hooks have fired
+                            current_expected = count_used_parameters_in_backward(
+                                non_leaf_params_requiring_grad) + leaf_module_count
+                            self.update_hook_state_and_maybe_run_epilogue(current_expected)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, reduce_partition_and_remove_grads))
 
@@ -1318,12 +1303,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             def make_hook(params):
 
                 def reduce_leaf_module_grads(module, grad_input, grad_output):
-                    if self._remaining_grad_acc_hooks == 0:
-                        self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
-                            non_leaf_params_requiring_grad) + leaf_module_count
-                        # Re-enter backward for subsequent phases (see comment in reduce_partition_and_remove_grads)
-                        if self._backward_active_depth == 0 and getattr(self, '_backward_seen_this_step', False):
-                            self.enter_backward()
+                    self.reenter_backward_if_needed()
 
                     for param in params:
                         # this takes care of grads for MoE experts that didn't participate in the current iteration/layer
@@ -1331,9 +1311,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                             param.grad = torch.zeros_like(param)
                         self.reduce_ready_partitions_and_remove_grads(param)
 
-                    self._remaining_grad_acc_hooks -= 1
-                    if self._remaining_grad_acc_hooks == 0:
-                        self.run_grad_acc_post_hooks()
+                    current_expected = count_used_parameters_in_backward(
+                        non_leaf_params_requiring_grad) + leaf_module_count
+                    self.update_hook_state_and_maybe_run_epilogue(current_expected)
 
                 return reduce_leaf_module_grads
 
@@ -1859,6 +1839,24 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                         p.grad.detach_()
                         p.grad.zero_()
 
+    def clear_backward_seen_flag(self):
+        """Clear the backward seen flag and increment micro_step_id if epilogue ran.
+
+        This override defers the micro_step_id increment from the epilogue to here.
+        With reentrant gradient checkpointing, the epilogue may be called multiple
+        times per backward pass, but we only want to increment micro_step_id once
+        after the backward is complete. By incrementing here at the start of the
+        NEXT forward, all phases within a backward use the same micro_step_id value.
+        """
+        # Increment micro_step_id if the epilogue ran during the previous backward.
+        # This is deferred from independent_gradient_partition_epilogue() to ensure
+        # all phases within a backward use the same micro_step_id (copy semantics).
+        if self._epilogue_ran_this_backward:
+            self.micro_step_id += 1
+
+        # Call base class to reset flags (including _epilogue_ran_this_backward)
+        super().clear_backward_seen_flag()
+
     def _model_parallel_all_reduce(self, tensor, op):
         """ Perform all reduce within model parallel group, if any.
         """
@@ -1978,6 +1976,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _pre_step(self):
         self.micro_step_id = 0
+        # Also reset the epilogue flag so the next iteration starts fresh.
+        # Without this, the flag from the last backward before step() would cause
+        # an increment in the next forward(), which is wrong.
+        self._epilogue_ran_this_backward = False
 
         print_rank_0("Inside Step function")
         see_memory_usage("In step before checking overflow", force=False)

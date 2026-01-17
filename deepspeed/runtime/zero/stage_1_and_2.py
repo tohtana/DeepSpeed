@@ -999,22 +999,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     def wrapper(param, i):
 
                         def grad_handling_hook(*notneeded):
-                            if self._remaining_grad_acc_hooks == 0:
-                                self._remaining_grad_acc_hooks = count_used_parameters_in_backward(
-                                    all_params_requiring_grad)
-                                # With reentrant gradient checkpointing, gradient hooks can fire in
-                                # multiple phases within a single backward call. Re-enter backward
-                                # for subsequent phases to ensure post hooks run correctly.
-                                # (See detailed comment in stage3.py reduce_partition_and_remove_grads)
-                                if self._backward_active_depth == 0 and getattr(self, '_backward_seen_this_step',
-                                                                                False):
-                                    self.enter_backward()
-
+                            self.reenter_backward_if_needed()
                             self.process_gradients(param, i)
-
-                            self._remaining_grad_acc_hooks -= 1
-                            if self._remaining_grad_acc_hooks == 0:
-                                self.run_grad_acc_post_hooks()
+                            current_expected = count_used_parameters_in_backward(all_params_requiring_grad)
+                            self.update_hook_state_and_maybe_run_epilogue(current_expected)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
 
