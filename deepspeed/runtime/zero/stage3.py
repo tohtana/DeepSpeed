@@ -2376,6 +2376,25 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         if self.swap_optimizer:
             self.optimizer_swapper.post_backward()
 
+    def backward(self, loss, retain_graph=False):
+        """
+        Backward pass for Stage 3 optimizer.
+
+        When ZenFlow is enabled, this method handles the specialized backward
+        pass with loss scaling and ZenFlow's prologue/epilogue hooks.
+        """
+        self.backward_prologue()
+
+        self.enter_backward()
+        if self.custom_loss_scaler:
+            scaled_loss = self.external_loss_scale * loss
+            scaled_loss.backward(retain_graph=retain_graph)
+        else:
+            self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+
+        self.backward_epilogue()
+        self.exit_backward()
+
     def get_fp32_grad_partitions(self) -> Dict[int, Dict[int, Tensor]]:
         """get fp32 gradient partition dictionary
         accessed as grad_dict[parameter_group_index][parameter_index]
