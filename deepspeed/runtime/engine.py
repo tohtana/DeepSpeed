@@ -1120,6 +1120,9 @@ class DeepSpeedEngine(Module):
     def zero_log_trace_cache_warnings(self):
         return self._config.zero_config.log_trace_cache_warnings
 
+    def zero_allgather_sequential(self):
+        return self._config.zero_config.allgather_sequential
+
     def is_sanity_checks_enabled(self):
         return self._config.zero_config.enable_sanity_checks
 
@@ -1893,6 +1896,10 @@ class DeepSpeedEngine(Module):
                     ranks=[0])
                 if mics_shard_size > 0:
                     return self._return_mics_optimizer(optimizer, timers)
+
+                if self.zero_allgather_sequential():
+                    log_dist(f"If zero_allgather_sequential is True, set prefetch_bucket_size to 1", ranks=[0])
+                    self._config.zero_config.prefetch_bucket_size = 1
 
                 log_dist(f'Creating {model_dtype} ZeRO stage {zero_stage} optimizer', ranks=[0])
                 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
@@ -2938,6 +2945,11 @@ class DeepSpeedEngine(Module):
             if not param.requires_grad:
                 continue
 
+            # Skip empty parameters (numel=0) as they contribute nothing to gradient reduction
+            # and cause issues with flatten/unflatten operations
+            if param.numel() == 0:
+                continue
+
             if param.grad is None:
                 # In cases where there is an imbalance of empty grads across
                 # ranks we must create empty grads, this will ensure that every
@@ -3418,7 +3430,7 @@ class DeepSpeedEngine(Module):
             if self.optimizer is not None and hasattr(self.optimizer, 'refresh_fp32_params'):
                 self.optimizer.refresh_fp32_params()
         else:
-            has_zero_optimizer_state = self.zero_optimization() or self.bfloat16_enabled()
+            has_zero_optimizer_state = self.zero_optimization()
             if load_optimizer_states and self.optimizer is not None and not has_zero_optimizer_state:
                 if self.has_moe_layers:
                     largest_group_name = groups._get_max_expert_size_name()
@@ -3887,7 +3899,7 @@ class DeepSpeedEngine(Module):
 
         save_path = self._get_ckpt_name(save_dir, tag)
 
-        zero_optimizer_state = self.zero_optimization() or self.bfloat16_enabled()
+        zero_optimizer_state = self.zero_optimization()
 
         save_frozen_param = self.zero_optimization_partition_gradients() and not exclude_frozen_parameters
 
