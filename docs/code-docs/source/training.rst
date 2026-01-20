@@ -170,7 +170,7 @@ The same behavior can be controlled from the DeepSpeed config. Add a
 ``leaf_module`` block to ``zero_optimization`` specifying either classes,
 module names, or name suffixes (or any combination). While the example below shows three different ways (``classes``, ``names``, and ``name_suffixes``) to specify modules as leaf modules, typically you will use just one of these.
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
       "train_micro_batch_size_per_gpu": 1,
@@ -296,36 +296,44 @@ AutoTP training is enabled by sharding the model with
         config=ds_config,
     )
 
+.. note::
+   AutoTP training supports ZeRO stages 0, 1, and 2. ZeRO Stage 3 is not supported.
+
+Parameter partitioning
+~~~~~~~~~~~~~~~~~~~~~~
 TP sharding needs to know which parameter tensors should be partitioned and
 along which dimensions. AutoTP provides three ways to balance ready-to-use
 defaults with customizability:
 
-- Heuristics based on parameter names and model-specific rules.
-- ``autotp_preset`` for a built-in, model-family preset.
-- ``autotp_config`` for custom regex-based patterns and partition settings.
+* **Heuristics**: automatic sharding based on parameter names and model rules.
+* **Preset**: choose a built-in model family via ``autotp_preset``.
+* **Custom specs**: define regex patterns and partition rules via ``autotp_config``.
 
-Configuration (JSON) for AutoTP training lives under ``tensor_parallel``. If
-you are training a supported model (see :ref:`autotp-supported-models`), the
-heuristic rules automatically shard the model, so you only need to add
-``autotp_size``.
+Heuristic rules
+^^^^^^^^^^^^^^^
+Heuristics use parameter names and model-specific rules to decide how to shard
+layers. If you are training a supported model (see
+:ref:`autotp-supported-models`), the heuristic rules automatically shard the
+model, so you only need to add ``autotp_size``.
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
+      ...
       "tensor_parallel": {
         "autotp_size": 4
       },
       "zero_optimization": {
-        "stage": 2
+        ...
       },
-      "bf16": {
-        "enabled": true
-      }
+      ...
     }
 
-You can also explicitly specify the model family with ``autotp_preset``:
+Preset-based partitioning
+^^^^^^^^^^^^^^^^^^^^^^^^^
+You can explicitly specify the model family with ``autotp_preset``:
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
       "tensor_parallel": {
@@ -334,10 +342,12 @@ You can also explicitly specify the model family with ``autotp_preset``:
       }
     }
 
+Custom layer specs
+^^^^^^^^^^^^^^^^^^
 If you are training a custom model, you can use ``autotp_config`` to specify
 custom regex-based patterns and partition settings.
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
       "tensor_parallel": {
@@ -364,9 +374,11 @@ custom regex-based patterns and partition settings.
       }
     }
 
+You can also set ``use_default_specs`` to ``true`` to merge your custom
+patterns on top of the preset (when ``autotp_preset`` is provided).
+
 For fused or packed weights (for example QKV or gate/up projections), the
 ``shape`` and ``partition_dim`` options control sub-parameter partitioning.
-
 Sub-parameter partitioning lets AutoTP split a single weight tensor into
 logical chunks before applying tensor-parallel sharding. For example, the
 ``gate_up_proj`` weight can be viewed as two packed matrices (gate and up) by
@@ -382,7 +394,7 @@ to the explicit sizes (for example ``[(q_size, kv_size, kv_size), -1]``) and
 ``partition_dim`` to ``0`` so AutoTP splits the Q, K, and V regions first, then
 shards each region across tensor-parallel ranks.
 
-.. code-block:: json
+.. code-block:: javascript
 
     {
       "patterns": [".*\\.qkv_proj\\.weight$"],
@@ -395,8 +407,37 @@ shards each region across tensor-parallel ranks.
    :alt: AutoTP sub-parameter partitioning
 
 
-You can also set ``use_default_specs`` to ``true`` to merge your custom
-patterns on top of the preset (when ``autotp_preset`` is provided).
+Model-type filtering for shared configs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Use ``model_types`` when you want a single config to work across multiple model
+families but apply different specs. This is useful in shared training scripts
+or when patterns overlap across architectures.
+
+.. code-block:: javascript
+
+    {
+      "tensor_parallel": {
+        "autotp_size": 4,
+        "autotp_config": {
+          "layer_specs": [
+            {
+              "patterns": [".*\\.qkv_proj\\.weight$"],
+              "partition_type": "column",
+              "shape": [[q_size, kv_size, kv_size], -1],
+              "partition_dim": 0,
+              "model_types": ["llama"]
+            },
+            {
+              "patterns": [".*\\.qkv_proj\\.weight$"],
+              "partition_type": "column",
+              "shape": [3, -1],
+              "partition_dim": 0,
+              "model_types": ["qwen2"]
+            }
+          ]
+        }
+      }
+    }
 
 
 .. _autotp-supported-models:
@@ -416,6 +457,7 @@ The following model families are supported by built-in AutoTP presets:
 These strings are the values accepted by ``autotp_preset`` and are matched
 against the model type in ``model.config.model_type`` (case-insensitive). When
 ``autotp_preset`` is not set, AutoTP uses the legacy automatic sharding rules
-unless you provide a custom ``autotp_config``. The model type is only used to
-filter custom layer specs that include a ``model_types`` field (for example,
-``model.config.model_type == "llama"``).
+unless you provide a custom ``autotp_config``.
+These presets are also useful when you want to extend the default patterns:
+set ``use_default_specs`` to ``true`` in ``autotp_config`` to merge your custom
+specs on top of the selected preset.
