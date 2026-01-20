@@ -257,3 +257,165 @@ Besides the use of multiple DeepSpeedEngines, the above differs from typical usa
 You can call ``loss.backward()`` once for the shared loss.
 
 **Note:** Previously, you had to call ``_backward_epilogue`` on each model engine after ``loss.backward()``. However, starting from v0.18.3, DeepSpeed automatically handles this internally, so you no longer need to call ``_backward_epilogue`` manually.
+
+
+Automatic Tensor Parallel Training
+----------------------------------
+DeepSpeed supports **Automatic Tensor Parallel (AutoTP) training** for sharding
+model weights across GPUs while remaining compatible with ZeRO and standard
+training workflows. This training API is different from the inference-only
+tensor parallel API exposed by ``deepspeed.init_inference``.
+
+Tensor parallelism (TP) splits the computations and parameters of large layers
+across multiple GPUs so each rank holds only a shard of the weight matrix. This
+is an efficient way to train large-scale transformer models by reducing per-GPU
+memory pressure while keeping the layer math distributed across the TP group.
+
+AutoTP training is enabled by sharding the model with
+``deepspeed.tp_model_init`` and then initializing a training engine with
+``deepspeed.initialize``.
+
+.. code-block:: python
+
+    import deepspeed
+    import torch
+
+    # Optional: provide a tensor-parallel process group
+    tp_group = None
+
+    model = deepspeed.tp_model_init(
+        model,
+        tp_size=4,
+        dtype=torch.bfloat16,
+        tp_group=tp_group,
+    )
+
+    engine, optimizer, _, _ = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        config=ds_config,
+    )
+
+TP sharding needs to know which parameter tensors should be partitioned and
+along which dimensions. AutoTP provides three ways to balance ready-to-use
+defaults with customizability:
+
+- Heuristics based on parameter names and model-specific rules.
+- ``autotp_preset`` for a built-in, model-family preset.
+- ``autotp_config`` for custom regex-based patterns and partition settings.
+
+Configuration (JSON) for AutoTP training lives under ``tensor_parallel``. If
+you are training a supported model (see :ref:`autotp-supported-models`), the
+heuristic rules automatically shard the model, so you only need to add
+``autotp_size``.
+
+.. code-block:: json
+
+    {
+      "tensor_parallel": {
+        "autotp_size": 4
+      },
+      "zero_optimization": {
+        "stage": 2
+      },
+      "bf16": {
+        "enabled": true
+      }
+    }
+
+You can also explicitly specify the model family with ``autotp_preset``:
+
+.. code-block:: json
+
+    {
+      "tensor_parallel": {
+        "autotp_size": 4,
+        "autotp_preset": "llama"
+      }
+    }
+
+If you are training a custom model, you can use ``autotp_config`` to specify
+custom regex-based patterns and partition settings.
+
+.. code-block:: json
+
+    {
+      "tensor_parallel": {
+        "autotp_size": 4,
+        "autotp_config": {
+          "use_default_specs": false,
+          "layer_specs": [
+            {
+              "patterns": [".*\\.o_proj\\.weight$", ".*\\.down_proj\\.weight$"],
+              "partition_type": "row"
+            },
+            {
+              "patterns": [".*\\.[qkv]_proj\\.weight$"],
+              "partition_type": "column"
+            },
+            {
+              "patterns": [".*\\.gate_up_proj\\.weight$"],
+              "partition_type": "column",
+              "shape": [2, -1],
+              "partition_dim": 0
+            }
+          ]
+        }
+      }
+    }
+
+For fused or packed weights (for example QKV or gate/up projections), the
+``shape`` and ``partition_dim`` options control sub-parameter partitioning.
+
+Sub-parameter partitioning lets AutoTP split a single weight tensor into
+logical chunks before applying tensor-parallel sharding. For example, the
+``gate_up_proj`` weight can be viewed as two packed matrices (gate and up) by
+setting ``shape`` to ``[2, -1]`` and ``partition_dim`` to ``0``; AutoTP then
+partitions each chunk consistently across tensor-parallel ranks.
+
+.. image:: /_static/autotp-subparams-gate-up.png
+   :alt: AutoTP sub-parameter partitioning
+
+Another example is GQA-style fused QKV weights. The tensor can contain unequal
+Q/K/V segments stacked along the output dimension. For example, set ``shape``
+to the explicit sizes (for example ``[(q_size, kv_size, kv_size), -1]``) and
+``partition_dim`` to ``0`` so AutoTP splits the Q, K, and V regions first, then
+shards each region across tensor-parallel ranks.
+
+.. code-block:: json
+
+    {
+      "patterns": [".*\\.qkv_proj\\.weight$"],
+      "partition_type": "column",
+      "shape": [[q_size, kv_size, kv_size], -1],
+      "partition_dim": 0
+    }
+
+.. image:: /_static/autotp-subparams-gqa.png
+   :alt: AutoTP sub-parameter partitioning
+
+
+You can also set ``use_default_specs`` to ``true`` to merge your custom
+patterns on top of the preset (when ``autotp_preset`` is provided).
+
+
+.. _autotp-supported-models:
+
+Supported models
+~~~~~~~~~~~~~~~~
+The following model families are supported by built-in AutoTP presets:
+
+- ``llama``
+- ``bloom``
+- ``chatglm``
+- ``mixtral``
+- ``deepseek_v2``
+- ``qwen2``
+- ``phi3``
+
+These strings are the values accepted by ``autotp_preset`` and are matched
+against the model type in ``model.config.model_type`` (case-insensitive). When
+``autotp_preset`` is not set, AutoTP uses the legacy automatic sharding rules
+unless you provide a custom ``autotp_config``. The model type is only used to
+filter custom layer specs that include a ``model_types`` field (for example,
+``model.config.model_type == "llama"``).
