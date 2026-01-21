@@ -59,13 +59,13 @@ class TPTrainingConfig(DeepSpeedConfigModel):
     injection_policy_tuple: Optional[tuple] = None
 
     # New configurable AutoTP settings
-    autotp_config: Optional[Dict[str, Any]] = None
+    partition_config: Optional[Dict[str, Any]] = None
     """
     Configuration for the new configurable AutoTP API.
     Allows users to specify custom layer partitioning rules via TPLayerSpec.
 
     Example:
-        "autotp_config": {
+        "partition_config": {
             "use_default_specs": false,
             "layer_specs": [
                 {
@@ -112,7 +112,7 @@ class TPTrainingConfig(DeepSpeedConfigModel):
 
     ########################################
 
-    def get_autotp_config_object(self):
+    def get_partition_config_object(self):
         """
         Get the AutoTPConfig object from the configuration.
         Returns None if no custom config is specified.
@@ -126,8 +126,8 @@ class TPTrainingConfig(DeepSpeedConfigModel):
             config = AutoTPPresets.get_preset(self.autotp_preset)
 
         # Then check for custom config
-        if self.autotp_config:
-            custom_config = AutoTPConfig.from_dict(self.autotp_config)
+        if self.partition_config:
+            custom_config = AutoTPConfig.from_dict(self.partition_config)
             if config and custom_config.use_default_specs:
                 config = merge_autotp_configs(config, custom_config)
             else:

@@ -201,7 +201,7 @@ class AutoTP():
                  linear_layer_setting,
                  orig_layer_impl,
                  keep_module_on_host=False,
-                 autotp_config: Optional[AutoTPConfig] = None):
+                 partition_config: Optional[AutoTPConfig] = None):
         self.module = module
         self.all_reduce_linears = all_reduce_linears
         self.prefix = prefix
@@ -213,7 +213,7 @@ class AutoTP():
         self.orig_layer_impl = orig_layer_impl
         self.linear_policies = None
         self.conv_linear_layer = False
-        self.autotp_config = autotp_config
+        self.partition_config = partition_config
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
 
     def in_module_list(module, module_list):
@@ -357,8 +357,8 @@ class AutoTP():
         weight_shape = child.weight.shape
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
-        # If autotp_config is provided, use the new configurable API
-        if self.autotp_config is not None:
+        # If partition_config is provided, use the new configurable API
+        if self.partition_config is not None:
             return self._replace_with_config(child, name)
 
         # For TP layer skip, e.g., MoE gate, deepseek low rank layer skip
@@ -418,11 +418,11 @@ class AutoTP():
 
         # Find matching spec
         model_type = self._get_model_type()
-        spec = self.autotp_config.find_matching_spec(param_name, model_type)
+        spec = self.partition_config.find_matching_spec(param_name, model_type)
 
         if spec is None:
             # No matching spec found
-            if self.autotp_config.strict_mode:
+            if self.partition_config.strict_mode:
                 raise ValueError(f"No matching spec for {param_name}")
             # Default: column parallel for Linear layers
             spec = TPLayerSpec(patterns=[], partition_type=PartitionType.COLUMN)

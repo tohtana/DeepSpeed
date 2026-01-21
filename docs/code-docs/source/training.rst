@@ -307,7 +307,7 @@ defaults with customizability:
 
 * **Heuristics**: automatic sharding based on parameter names and model rules.
 * **Preset**: choose a built-in model family via ``autotp_preset``.
-* **Custom specs**: define regex patterns and partition rules via ``autotp_config``.
+* **Custom specs**: define regex patterns and partition rules via ``partition_config``.
 
 Heuristic rules
 ^^^^^^^^^^^^^^^
@@ -344,7 +344,7 @@ You can explicitly specify the model family with ``autotp_preset``:
 
 Custom layer specs
 ^^^^^^^^^^^^^^^^^^
-If you are training a custom model, you can use ``autotp_config`` to specify
+If you are training a custom model, you can use ``partition_config`` to specify
 custom regex-based patterns and partition settings.
 
 .. code-block:: javascript
@@ -352,7 +352,7 @@ custom regex-based patterns and partition settings.
     {
       "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_config": {
+        "partition_config": {
           "use_default_specs": false,
           "layer_specs": [
             {
@@ -418,7 +418,7 @@ or when patterns overlap across architectures.
     {
       "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_config": {
+        "partition_config": {
           "layer_specs": [
             {
               "patterns": [".*\\.qkv_proj\\.weight$"],
@@ -457,7 +457,7 @@ The following model families are supported by built-in AutoTP presets:
 These strings are the values accepted by ``autotp_preset`` and are matched
 against the model type in ``model.config.model_type`` (case-insensitive). When
 ``autotp_preset`` is not set, AutoTP uses the legacy automatic sharding rules
-unless you provide a custom ``autotp_config``.
+unless you provide a custom ``partition_config``.
 These presets are also useful when you want to extend the default patterns:
-set ``use_default_specs`` to ``true`` in ``autotp_config`` to merge your custom
+set ``use_default_specs`` to ``true`` in ``partition_config`` to merge your custom
 specs on top of the selected preset.

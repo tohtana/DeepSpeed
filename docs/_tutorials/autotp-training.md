@@ -46,7 +46,7 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
 # 3. Create tensor parallel process groups
 tp_size = 4
 dp_size = world_size // tp_size
-tp_group = create_tp_group(tp_size)     
+tp_group = create_tp_group(tp_size)
 
 # 4. Apply tensor parallel sharding
 model = deepspeed.tp_model_init(
@@ -94,13 +94,13 @@ For the list of available presets, see [supported models](../code-docs/training#
 
 ## Custom Patterns
 
-If you are training a custom model, define regex-based patterns and partition rules in `tensor_parallel.autotp_config`:
+If you are training a custom model, define regex-based patterns and partition rules in `tensor_parallel.partition_config`:
 
 ```json
 {
     "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_config": {
+        "partition_config": {
             "use_default_specs": false,
             "layer_specs": [
                 {
@@ -131,7 +131,7 @@ For models not covered by presets, define custom layer specs:
 {
     "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_config": {
+        "partition_config": {
             "use_default_specs": false,
             "layer_specs": [
                 {
@@ -161,7 +161,7 @@ For Grouped Query Attention with different Q/K/V sizes:
 ```json
 {
     "tensor_parallel": {
-        "autotp_config": {
+        "partition_config": {
             "layer_specs": [
                 {
                     "patterns": [".*\\.qkv_proj\\.weight$"],
