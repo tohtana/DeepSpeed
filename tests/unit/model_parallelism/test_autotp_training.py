@@ -16,7 +16,7 @@ from unit.simple_model import SimpleModel, random_dataloader
 from deepspeed.utils import groups
 from contextlib import contextmanager
 from torch import nn
-from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, set_autotp_mode
+from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, set_autotp_mode, is_autotp_training_mode
 from unit.checkpoint.common import compare_lr_scheduler_states, compare_optimizer_states
 import os
 from deepspeed.runtime.utils import is_model_parallel_parameter
@@ -25,6 +25,39 @@ from deepspeed.runtime.utils import is_model_parallel_parameter
 def skip_on_device():
     if get_accelerator().device_name() == 'xpu':
         pytest.skip("XPU requires a higher version for test")
+
+
+def reset_tp_model_init_state():
+    deepspeed._TP_MODEL_INIT_ARGS = None
+    set_autotp_mode(training=False)
+
+
+class DummyMPU:
+
+    def __init__(self, tp_world_size=1):
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.tp_world_size = tp_world_size
+        self.dp_group = dist.get_world_group()
+        self.tp_group = dist.get_world_group()
+
+    def get_model_parallel_rank(self):
+        return self.rank % self.tp_world_size
+
+    def get_model_parallel_world_size(self):
+        return self.tp_world_size
+
+    def get_data_parallel_rank(self):
+        return self.rank // self.tp_world_size
+
+    def get_data_parallel_world_size(self):
+        return self.world_size // self.tp_world_size
+
+    def get_data_parallel_group(self):
+        return self.dp_group
+
+    def get_model_parallel_group(self):
+        return self.tp_group
 
 
 class SequentialLinearModel(torch.nn.Module):
@@ -85,6 +118,101 @@ class TestTpParallelStates(DistributedTest):
         model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
         assert groups.get_tensor_model_parallel_world_size() == tp_size
         assert groups.get_data_parallel_world_size() == dp_size
+
+
+class TestTpModelInitCompatibility(DistributedTest):
+    world_size = 1
+    reuse_dist_env = False
+
+    def test_tp_model_init_merges_config(self):
+        skip_on_device()
+        reset_tp_model_init_state()
+        model = SimpleModel(hidden_dim=8)
+        deepspeed.tp_model_init(model, tp_size=1, dtype=preferred_dtype())
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 0,
+            }
+        }
+        engine, _, _, _ = deepspeed.initialize(model=model,
+                                               model_parameters=model.parameters(),
+                                               config=config_dict,
+                                               mpu=DummyMPU())
+        assert engine.autotp_size() == 1
+        assert is_autotp_training_mode()
+
+    def test_tp_model_init_config_autotp_size_mismatch(self):
+        skip_on_device()
+        reset_tp_model_init_state()
+        model = SimpleModel(hidden_dim=8)
+        deepspeed.tp_model_init(model, tp_size=1, dtype=preferred_dtype())
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "tensor_parallel": {
+                "autotp_size": 2,
+            },
+            "zero_optimization": {
+                "stage": 0,
+            }
+        }
+        with pytest.raises(ValueError, match="tensor_parallel.autotp_size"):
+            deepspeed.initialize(model=model,
+                                 model_parameters=model.parameters(),
+                                 config=config_dict,
+                                 mpu=DummyMPU())
+
+    def test_tp_model_init_requires_mpu_or_mesh_param(self):
+        skip_on_device()
+        reset_tp_model_init_state()
+        model = SimpleModel(hidden_dim=8)
+        deepspeed.tp_model_init(model, tp_size=1, dtype=preferred_dtype())
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 0,
+            }
+        }
+        with pytest.raises(ValueError, match="requires mpu or mesh_param"):
+            deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+    def test_tp_model_init_tp_group_rejects_mpu(self):
+        skip_on_device()
+        reset_tp_model_init_state()
+        model = SimpleModel(hidden_dim=8)
+        tp_group = dist.new_group(ranks=[0])
+        deepspeed.tp_model_init(model, tp_size=1, dtype=preferred_dtype(), tp_group=tp_group)
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "zero_optimization": {
+                "stage": 0,
+            }
+        }
+        with pytest.raises(ValueError, match="tp_model_init provided tp_group"):
+            deepspeed.initialize(model=model,
+                                 model_parameters=model.parameters(),
+                                 config=config_dict,
+                                 mpu=DummyMPU())
+
+    def test_tp_model_init_dtype_mismatch(self):
+        skip_on_device()
+        reset_tp_model_init_state()
+        model = SimpleModel(hidden_dim=8)
+        deepspeed.tp_model_init(model, tp_size=1, dtype=torch.float16)
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "bf16": {
+                "enabled": True,
+            },
+            "zero_optimization": {
+                "stage": 0,
+            }
+        }
+        with pytest.raises(ValueError, match="Conflicting dtype"):
+            deepspeed.initialize(model=model,
+                                 model_parameters=model.parameters(),
+                                 config=config_dict,
+                                 mpu=DummyMPU())
 
 
 @pytest.mark.parametrize("tp_size", [2, 4])
