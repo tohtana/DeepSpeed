@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import deepspeed.comm as dist
 import deepspeed
 from copy import deepcopy
 from torch import nn
@@ -76,6 +77,19 @@ def apply_autotp_with_partition_config(model, tp_size, partition_config):
     autotp.update_linear_policies()
     autotp._replace_module(model)
     return model
+
+
+def gather_subparam_output(output, subparam_sizes, mp_group):
+    tp_world_size = dist.get_world_size(group=mp_group)
+    local_sizes = [size // tp_world_size for size in subparam_sizes]
+    output_chunks = torch.split(output, local_sizes, dim=-1)
+    gathered_chunks = []
+    for chunk in output_chunks:
+        chunk = chunk.contiguous()
+        gathered = [torch.empty_like(chunk) for _ in range(tp_world_size)]
+        dist.all_gather(gathered, chunk, group=mp_group)
+        gathered_chunks.append(torch.cat(gathered, dim=-1))
+    return torch.cat(gathered_chunks, dim=-1)
 
 
 class TestAutoTPCustomPatterns(DistributedTest):
@@ -199,3 +213,35 @@ class TestAutoTPFusedWeights(DistributedTest):
         layer.gather_params([layer.weight, layer.bias])
         torch.testing.assert_close(layer.weight.data, full_weight)
         torch.testing.assert_close(layer.bias.data, full_bias)
+
+    def test_gqa_uneven_qkv_fused_forward(self):
+        skip_on_device()
+        groups._init_tp_mesh_device(tensor_model_parallel_size=2)
+
+        hidden_dim = 8
+        q_size, k_size, v_size = 8, 4, 4
+        torch.manual_seed(321)
+        linear = nn.Linear(hidden_dim,
+                           q_size + k_size + v_size,
+                           bias=True,
+                           dtype=preferred_dtype(),
+                           device=get_accelerator().current_device())
+        layer = SubParamLinearLayer(deepcopy(linear),
+                                    groups.get_tensor_model_parallel_group(),
+                                    shape=((q_size, k_size, v_size), -1),
+                                    partition_dim=0,
+                                    name="self_attn.qkv_proj")
+
+        torch.manual_seed(42)
+        inputs = torch.randn(2, hidden_dim, dtype=preferred_dtype(), device=get_accelerator().current_device())
+        full_output = linear(inputs)
+        tp_output = layer(inputs)
+
+        gathered_output = gather_subparam_output(tp_output, (q_size, k_size, v_size),
+                                                 groups.get_tensor_model_parallel_group())
+        atol = 1e-3
+        rtol = 2e-2
+        if preferred_dtype() is torch.float32:
+            atol = 1e-5
+            rtol = 1e-5
+        torch.testing.assert_close(gathered_output, full_output, atol=atol, rtol=rtol)

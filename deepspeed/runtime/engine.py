@@ -573,9 +573,8 @@ class DeepSpeedEngine(Module):
 
         tp_size = self.autotp_size()
         if tp_config.tensor_parallel.tp_size not in (1, tp_size):
-            raise ValueError(
-                f"tensor_parallel.tp.tp_size ({tp_config.tensor_parallel.tp_size}) "
-                f"does not match tensor_parallel.autotp_size ({tp_size}).")
+            raise ValueError(f"tensor_parallel.tp.tp_size ({tp_config.tensor_parallel.tp_size}) "
+                             f"does not match tensor_parallel.autotp_size ({tp_size}).")
         tp_config.tensor_parallel.tp_size = tp_size
         if tp_config.tensor_parallel.tp_group is None:
             tp_config.tensor_parallel.tp_group = groups.get_tensor_model_parallel_group()
