@@ -6,14 +6,13 @@
 import pytest
 import torch
 import deepspeed
-import deepspeed.comm as dist
 from copy import deepcopy
 from torch import nn
 
 from unit.common import DistributedTest, preferred_dtype
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import groups
-from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, SubParamLinearLayer, set_autotp_mode)
+from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, SubParamLinearLayer)
 from deepspeed.module_inject.autotp_config import AutoTPConfig
 from deepspeed.module_inject.auto_tp import AutoTP
 
@@ -36,7 +35,6 @@ class SequentialLinearModel(torch.nn.Module):
 
 
 def init_tp_engine(tp_size, partition_config=None):
-    set_autotp_mode(training=True)
     config_dict = {
         "train_micro_batch_size_per_gpu": 1,
         "optimizer": {
@@ -64,7 +62,6 @@ def init_tp_engine(tp_size, partition_config=None):
 
 
 def apply_autotp_with_partition_config(model, tp_size, partition_config):
-    set_autotp_mode(training=True)
     groups._init_tp_mesh_device(tensor_model_parallel_size=tp_size)
     autotp_config = AutoTPConfig.from_dict(partition_config)
     autotp = AutoTP(module=model,
@@ -88,7 +85,8 @@ class TestAutoTPCustomPatterns(DistributedTest):
     def test_custom_pattern_replacement(self):
         skip_on_device()
         partition_config = {
-            "use_default_specs": False,
+            "use_default_specs":
+            False,
             "layer_specs": [
                 {
                     "patterns": [".*linears\\.0\\.weight$"],
@@ -114,7 +112,8 @@ class TestAutoTPCustomPatterns(DistributedTest):
     def test_first_match_precedence(self):
         skip_on_device()
         partition_config = {
-            "use_default_specs": False,
+            "use_default_specs":
+            False,
             "layer_specs": [
                 {
                     "patterns": [".*linears\\.0\\.weight$"],
