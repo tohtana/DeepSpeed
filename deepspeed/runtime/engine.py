@@ -568,6 +568,8 @@ class DeepSpeedEngine(Module):
     def _apply_autotp_partitioning(self, model, tp_config):
         if getattr(model, "ds_autotp_parsed", False):
             return
+        if get_accelerator().is_available() and self.local_rank >= 0:
+            get_accelerator().set_device(self.local_rank)
 
         tp_size = self.autotp_size()
         if tp_config.tensor_parallel.tp_size not in (1, tp_size):
