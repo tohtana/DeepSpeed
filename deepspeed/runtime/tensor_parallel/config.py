@@ -86,7 +86,7 @@ class TPTrainingConfig(DeepSpeedConfigModel):
         }
     """
 
-    autotp_preset: Optional[str] = None
+    preset_model: Optional[str] = None
     """
     Use a built-in preset for common model architectures.
     Available presets: "llama", "bloom", "chatglm", "mixtral", "deepseek_v2", "qwen2", "phi3"
@@ -122,8 +122,8 @@ class TPTrainingConfig(DeepSpeedConfigModel):
         config = None
 
         # First check for preset
-        if self.autotp_preset:
-            config = AutoTPPresets.get_preset(self.autotp_preset)
+        if self.preset_model:
+            config = AutoTPPresets.get_preset(self.preset_model)
 
         # Then check for custom config
         if self.partition_config:

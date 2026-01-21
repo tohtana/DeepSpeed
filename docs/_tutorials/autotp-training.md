@@ -73,7 +73,7 @@ for batch in dataloader:
 
 ### Preset-based Sharding
 
-If your model matches a built-in preset, set `tensor_parallel.autotp_preset` in the DeepSpeed config:
+If your model matches a built-in preset, set `tensor_parallel.preset_model` in the DeepSpeed config:
 
 ```json
 {
@@ -83,7 +83,7 @@ If your model matches a built-in preset, set `tensor_parallel.autotp_preset` in 
     "zero_optimization": { "stage": 2 },
     "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_preset": "llama"
+        "preset_model": "llama"
     }
 }
 ```

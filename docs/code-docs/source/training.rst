@@ -306,7 +306,7 @@ along which dimensions. AutoTP provides three ways to balance ready-to-use
 defaults with customizability:
 
 * **Heuristics**: automatic sharding based on parameter names and model rules.
-* **Preset**: choose a built-in model family via ``autotp_preset``.
+* **Preset**: choose a built-in model family via ``preset_model``.
 * **Custom specs**: define regex patterns and partition rules via ``partition_config``.
 
 Heuristic rules
@@ -331,14 +331,14 @@ model, so you only need to add ``autotp_size``.
 
 Preset-based partitioning
 ^^^^^^^^^^^^^^^^^^^^^^^^^
-You can explicitly specify the model family with ``autotp_preset``:
+You can explicitly specify the model family with ``preset_model``:
 
 .. code-block:: javascript
 
     {
       "tensor_parallel": {
         "autotp_size": 4,
-        "autotp_preset": "llama"
+        "preset_model": "llama"
       }
     }
 
@@ -375,7 +375,7 @@ custom regex-based patterns and partition settings.
     }
 
 You can also set ``use_default_specs`` to ``true`` to merge your custom
-patterns on top of the preset (when ``autotp_preset`` is provided).
+patterns on top of the preset (when ``preset_model`` is provided).
 
 For fused or packed weights (for example QKV or gate/up projections), the
 ``shape`` and ``partition_dim`` options control sub-parameter partitioning.
@@ -454,9 +454,9 @@ The following model families are supported by built-in AutoTP presets:
 - ``qwen2``
 - ``phi3``
 
-These strings are the values accepted by ``autotp_preset`` and are matched
+These strings are the values accepted by ``preset_model`` and are matched
 against the model type in ``model.config.model_type`` (case-insensitive). When
-``autotp_preset`` is not set, AutoTP uses the legacy automatic sharding rules
+``preset_model`` is not set, AutoTP uses the legacy automatic sharding rules
 unless you provide a custom ``partition_config``.
 These presets are also useful when you want to extend the default patterns:
 set ``use_default_specs`` to ``true`` in ``partition_config`` to merge your custom
