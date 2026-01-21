@@ -271,33 +271,39 @@ across multiple GPUs so each rank holds only a shard of the weight matrix. This
 is an efficient way to train large-scale transformer models by reducing per-GPU
 memory pressure while keeping the layer math distributed across the TP group.
 
-AutoTP training is enabled by sharding the model with
-``deepspeed.tp_model_init`` and then initializing a training engine with
-``deepspeed.initialize``.
+AutoTP training is enabled by setting ``tensor_parallel`` in the DeepSpeed
+config and passing it to ``deepspeed.initialize``. DeepSpeed applies AutoTP
+sharding during engine initialization; calling ``deepspeed.tp_model_init``, which we previously used to initialize AutoTP, is now optional.
+See :ref:`autotp-training-init-details` for more details.
 
 .. code-block:: python
 
     import deepspeed
-    import torch
 
-    # Optional: provide a tensor-parallel process group
-    tp_group = None
-
-    model = deepspeed.tp_model_init(
-        model,
-        tp_size=4,
-        dtype=torch.bfloat16,
-        tp_group=tp_group,
-    )
+    ds_config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "zero_optimization": {"stage": 2},
+        "tensor_parallel": {"autotp_size": 4},
+    }
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
         optimizer=optimizer,
         config=ds_config,
+        mpu=mpu,  # optional: TP/DP process groups
     )
 
 .. note::
    AutoTP training supports ZeRO stages 0, 1, and 2. ZeRO Stage 3 is not supported.
+
+.. _autotp-training-init-details:
+
+Initialization behavior
+~~~~~~~~~~~~~~~~~~~~~~~
+
+AutoTP previously required calling ``set_autotp_mode(training=True)`` and ``deepspeed.tp_model_init`` before ``deepspeed.initialize``. Now we can include all the necessary configurations in the DeepSpeed config.
+We still support the traditional initialization path for backward compatibility.
+When you use both (i.e. calling ``set_autotp_mode(training=True)`` and ``deepspeed.tp_model_init`` and passing the config to ``deepspeed.initialize``), we will merge the settings at initialization. When we have conflicting settings, we will error out.
 
 Parameter partitioning
 ~~~~~~~~~~~~~~~~~~~~~~

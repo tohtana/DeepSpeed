@@ -731,7 +731,7 @@ Configuring the asynchronous I/O module for offloading parameter and optimizer s
 | Submit requests to storage device in an overlapped fashion without waiting for completion of earlier requests. | `true`  |
 
 ### Tensor Parallel (AutoTP)
-Configure AutoTP tensor parallelism for training with `deepspeed.tp_model_init()` and hybrid TP + ZeRO. AutoTP supports ZeRO stages 0, 1, and 2 (stage 3 is not supported).
+Configure AutoTP tensor parallelism for training via the DeepSpeed config and hybrid TP + ZeRO. AutoTP supports ZeRO stages 0, 1, and 2 (stage 3 is not supported). `deepspeed.tp_model_init()` remains supported for backward compatibility but is not required when `tensor_parallel` is set in the config.
 ```json
   "tensor_parallel": {
     "autotp_size": 4,

@@ -30,46 +30,45 @@ memory pressure while keeping the layer math distributed across the TP group.
 
 ### Basic Usage
 
-AutoTP-specific steps are calling `set_autotp_mode(training=True)` before creating the model and wrapping the model with `deepspeed.tp_model_init(...)` to shard weights across TP ranks. Once initialized, the training loop itself does not change.
+AutoTP training can be enabled entirely through the DeepSpeed config. When
+`tensor_parallel` is set in the config, `deepspeed.initialize(...)` applies
+AutoTP sharding during engine initialization, so the training loop itself does
+not change.
 
 ```python
 import torch
 import deepspeed
-from deepspeed.module_inject.layers import set_autotp_mode
 
-# 1. Enable training mode before model creation
-set_autotp_mode(training=True)
-
-# 2. Create your model
+# 1. Create your model
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B")
 
-# 3. Create tensor parallel process groups
-tp_size = 4
-dp_size = world_size // tp_size
-tp_group = create_tp_group(tp_size)
+# 2. Define the DeepSpeed config with tensor_parallel settings
+ds_config = {
+    "train_micro_batch_size_per_gpu": 1,
+    "zero_optimization": {"stage": 2},
+    "bf16": {"enabled": True},
+    "tensor_parallel": {"autotp_size": 4},
+}
 
-# 4. Apply tensor parallel sharding
-model = deepspeed.tp_model_init(
-    model,
-    tp_size=tp_size,
-    dtype=torch.bfloat16,
-    tp_group=tp_group
-)
-
-# 5. Initialize DeepSpeed with ZeRO
+# 3. Initialize DeepSpeed with AutoTP + ZeRO
 engine, optimizer, _, _ = deepspeed.initialize(
     model=model,
     optimizer=optimizer,
     config=ds_config,
-    mpu=mpu  # Model parallel unit
+    mpu=mpu  # Model parallel unit (optional if you provide tp_group elsewhere)
 )
 
-# 6. Train as usual
+# 4. Train as usual
 for batch in dataloader:
     outputs = engine(input_ids=batch["input_ids"], labels=batch["labels"])
     engine.backward(outputs.loss)
     engine.step()
 ```
+
+Compatibility note: For backward compatibility, you can still call
+`set_autotp_mode(training=True)` and `deepspeed.tp_model_init(...)`, but they
+are not required when the DeepSpeed config provides the necessary
+`tensor_parallel` settings.
 
 ### Preset-based Sharding
 

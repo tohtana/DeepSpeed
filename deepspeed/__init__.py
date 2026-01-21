@@ -392,6 +392,48 @@ def tp_model_init(model, tp_size, dtype, config=None, **kwargs):
     """
     Record tensor-parallel initialization arguments for training.
 
+    Note (compatibility and initialization behavior):
+    AutoTP sharding is applied during ``deepspeed.initialize(...)``. This
+    function exists for backward compatibility and only records TP arguments so
+    they can be validated and merged with the DeepSpeed config at initialization.
+    When you use both (i.e., calling ``set_autotp_mode(training=True)`` and
+    ``deepspeed.tp_model_init`` while also passing the config to
+    ``deepspeed.initialize``), DeepSpeed merges the settings at initialization.
+    Conflicting settings raise an error. The table below summarizes the behavior
+    across input combinations.
+
+    Inputs:
+    - TPI: tp_model_init was called? (Y/N)
+    - TPG: tp_model_init provided tp_group? (Y/N)
+    - CFG: tensor_parallel in DeepSpeed config? (Y/N)
+    - MPU: mpu passed to deepspeed.initialize()? (Y/N)
+
+    | TPI | TPG | CFG | MPU | Outcome                               | Notes |
+    |-----|-----|-----|-----|----------------------------------------|-------|
+    | N   | N   | N   | N   | Error                                  | No TP intent; nothing to initialize |
+    | N   | N   | N   | Y   | No AutoTP                              | mpu may be used for other MP, but TP not enabled |
+    | N   | N   | Y   | N   | Init AutoTP from config                | Use config; need TP group via config-driven init |
+    | N   | N   | Y   | Y   | Init AutoTP from config                | mpu used to build TP group |
+    | Y   | N   | N   | N   | Error                                  | No TP group source |
+    | Y   | N   | N   | Y   | Init AutoTP from tp_model_init         | Use recorded args + mpu for TP group |
+    | Y   | N   | Y   | N   | Init AutoTP from config                | Fill missing from TPI; error on mismatches; need TP group source |
+    | Y   | N   | Y   | Y   | Init AutoTP from config                | Fill missing from TPI; error on mismatches |
+    | Y   | Y   | N   | N   | Init AutoTP from tp_model_init         | Use recorded tp_group; config absent |
+    | Y   | Y   | N   | Y   | Error                                  | tp_group + mpu conflict |
+    | Y   | Y   | Y   | N   | Init AutoTP from config                | Error on mismatches; use tp_group from TPI; reject mpu |
+    | Y   | Y   | Y   | Y   | Error                                  | tp_group + mpu conflict |
+
+    Field-level merge rules when both tp_model_init and config exist:
+    - Canonical source: config
+    - Allowed: fill missing config fields from tp_model_init
+    - Error on mismatch: autotp_size, dtype, tp_group size or identity
+
+    Extra checks:
+    - If tp_group is provided, reject mpu.
+    - If tp_group is not provided, require mpu (or another TP group source).
+    - If tensor_parallel is absent and only tp_model_init was called, require
+      a TP group source (direct tp_group or mpu).
+
     Args:
         model (torch.nn.Module): The model to be initialized.
         tp_size (int): The tensor parallelism size.
