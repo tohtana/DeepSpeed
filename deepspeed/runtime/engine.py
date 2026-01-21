@@ -1507,8 +1507,6 @@ class DeepSpeedEngine(Module):
                 )
                 return BFLOAT16
             return FP16 if model_dtype == torch.float16 else DDP_BFLOAT16
-        elif model_dtype == torch.bfloat16 and grad_accum_dtype == torch.float32:
-            return BFLOAT16
         else:
             raise NotImplementedError(f"unsupported mix of {model_dtype=} and {grad_accum_dtype=}")
 
@@ -2971,6 +2969,11 @@ class DeepSpeedEngine(Module):
 
         for param_name, param in self.module.named_parameters():
             if not param.requires_grad:
+                continue
+
+            # Skip empty parameters (numel=0) as they contribute nothing to gradient reduction
+            # and cause issues with flatten/unflatten operations
+            if param.numel() == 0:
                 continue
 
             if param.grad is None:
