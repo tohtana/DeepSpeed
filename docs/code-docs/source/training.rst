@@ -170,7 +170,7 @@ The same behavior can be controlled from the DeepSpeed config. Add a
 ``leaf_module`` block to ``zero_optimization`` specifying either classes,
 module names, or name suffixes (or any combination). While the example below shows three different ways (``classes``, ``names``, and ``name_suffixes``) to specify modules as leaf modules, typically you will use just one of these.
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       "train_micro_batch_size_per_gpu": 1,
@@ -322,7 +322,7 @@ layers. If you are training a supported model (see
 :ref:`autotp-supported-models`), the heuristic rules automatically shard the
 model, so you only need to add ``autotp_size``.
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       ...
@@ -339,7 +339,7 @@ Preset-based partitioning
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 You can explicitly specify the model family with ``preset_model``:
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       "tensor_parallel": {
@@ -353,7 +353,7 @@ Custom layer specs
 If you are training a custom model, you can use ``partition_config`` to specify
 custom regex-based patterns and partition settings.
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       "tensor_parallel": {
@@ -400,7 +400,7 @@ to the explicit sizes (for example ``[(q_size, kv_size, kv_size), -1]``) and
 ``partition_dim`` to ``0`` so AutoTP splits the Q, K, and V regions first, then
 shards each region across tensor-parallel ranks.
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       "patterns": [".*\\.qkv_proj\\.weight$"],
@@ -419,7 +419,7 @@ Use ``model_types`` when you want a single config to work across multiple model
 families but apply different specs. This is useful in shared training scripts
 or when patterns overlap across architectures.
 
-.. code-block:: javascript
+.. code-block:: json
 
     {
       "tensor_parallel": {
