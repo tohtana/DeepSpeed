@@ -348,6 +348,11 @@ You can explicitly specify the model family with ``preset_model``:
       }
     }
 
+See :ref:`autotp-supported-models` for the supported preset names and the
+implementation in `AutoTPPresets <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/module_inject/autotp_config.py>`_.
+If you add a new model family, you can easily add a new preset by defining
+patterns like the existing presets, and we welcome PRs for those additions.
+
 Custom layer specs
 ^^^^^^^^^^^^^^^^^^
 If you are training a custom model, you can use ``partition_config`` to specify
@@ -459,6 +464,10 @@ The following model families are supported by built-in AutoTP presets:
 - ``deepseek_v2``
 - ``qwen2``
 - ``phi3``
+
+Preset definitions live in `AutoTPPresets <https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/module_inject/autotp_config.py>`_.
+If you add a new model family, you can easily add a new preset by defining
+patterns like the existing presets, and we welcome PRs for those additions.
 
 These strings are the values accepted by ``preset_model`` and are matched
 against the model type in ``model.config.model_type`` (case-insensitive). When
