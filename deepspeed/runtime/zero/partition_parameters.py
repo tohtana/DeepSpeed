@@ -2329,7 +2329,7 @@ class GatheredParameters:
             mutated = [p for p in self.params if p._version != self._param_versions.get(p, p._version)]
             mutated_any = bool(mutated)
             if self.params and dist.is_initialized():
-                device = self.params[0].device
+                device = torch.device(get_accelerator().current_device_name())
                 flag = torch.tensor([1 if mutated_any else 0], device=device, dtype=torch.int32)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.params[0].ds_process_group)
                 mutated_any = bool(int(flag.item()))

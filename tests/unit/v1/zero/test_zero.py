@@ -232,7 +232,7 @@ class TestZeroToFP32(DistributedTest):
                 orig_state_dict[name] = param.detach().cpu()
 
         if zero_stage == 3:
-            with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=None):
+            with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=0):
                 fp32_model = load_state_dict_from_zero_checkpoint(model.module, tmpdir)
                 fp32_state_dict = fp32_model.state_dict()
         else:
@@ -339,7 +339,7 @@ class TestZeroToFP32(DistributedTest):
                 orig_state_dict[name] = param.detach().cpu()
 
         if zero_stage == 3:
-            with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=None):
+            with deepspeed.zero.GatheredParameters(model.parameters(), modifier_rank=0):
                 fp32_model = load_state_dict_from_zero_checkpoint(model.module, tmpdir)
                 fp32_state_dict = fp32_model.state_dict()
         else:
