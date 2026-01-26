@@ -2326,19 +2326,25 @@ class GatheredParameters:
         if not self.enabled:
             return
         if self.src_rank is None:
-            mutated = [p for p in self.params if p._version != self._param_versions.get(p, p._version)]
-            mutated_any = bool(mutated)
+            check_mutation = True
             if self.params and dist.is_initialized():
-                backend = dist.get_backend(self.params[0].ds_process_group)
-                device = torch.device(
-                    get_accelerator().current_device_name()) if backend == "nccl" else torch.device("cpu")
-                flag = torch.tensor([1 if mutated_any else 0], device=device, dtype=torch.int32)
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.params[0].ds_process_group)
-                mutated_any = bool(int(flag.item()))
-            if mutated_any:
-                raise RuntimeError("Detected in-place modification of parameters inside `zero.GatheredParameters` "
-                                   "with `modifier_rank=None`. Use `modifier_rank=<rank>` when mutating parameters "
-                                   "so updates are broadcast consistently across ranks.")
+                if dist.get_world_size(group=self.params[0].ds_process_group) <= 1:
+                    check_mutation = False
+            if check_mutation:
+                mutated = [p for p in self.params if p._version != self._param_versions.get(p, p._version)]
+                mutated_any = bool(mutated)
+                if self.params and dist.is_initialized():
+                    backend = dist.get_backend(self.params[0].ds_process_group)
+                    device = torch.device(
+                        get_accelerator().current_device_name()) if backend == "nccl" else torch.device("cpu")
+                    flag = torch.tensor([1 if mutated_any else 0], device=device, dtype=torch.int32)
+                    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.params[0].ds_process_group)
+                    mutated_any = bool(int(flag.item()))
+                if mutated_any:
+                    raise RuntimeError(
+                        "Detected in-place modification of parameters inside `zero.GatheredParameters` "
+                        "with `modifier_rank=None`. Use `modifier_rank=<rank>` when mutating parameters "
+                        "so updates are broadcast consistently across ranks.")
             self.params[0].partition(param_list=self.params, has_been_updated=False)
             return
 
