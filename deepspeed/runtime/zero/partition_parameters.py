@@ -299,7 +299,10 @@ def get_all_subclasses(cls, include_root=True):
 @instrument_w_nvtx
 def free_param(param: Parameter) -> None:
     """Free underlying storage of a parameter."""
-    assert not param.ds_active_sub_modules, param.ds_summary()
+    if param.ds_active_sub_modules:
+        raise RuntimeError("Cannot free a ZeRO-3 parameter while it is still active in submodules. "
+                           "Ensure all submodules have released the parameter before it is freed. "
+                           f"param={param.ds_summary()}")
     if get_accelerator().on_accelerator(param.data):
         # need to make sure that we don't free the parameter while it is still
         # being used for computation
@@ -2316,11 +2319,24 @@ class GatheredParameters:
         if not self.enabled:
             return
         self.params[0].all_gather(param_list=self.params)
+        if self.src_rank is None:
+            self._param_versions = {p: p._version for p in self.params}
 
     def __exit__(self, *exc):
         if not self.enabled:
             return
         if self.src_rank is None:
+            mutated = [p for p in self.params if p._version != self._param_versions.get(p, p._version)]
+            mutated_any = bool(mutated)
+            if self.params and dist.is_initialized():
+                device = self.params[0].device
+                flag = torch.tensor([1 if mutated_any else 0], device=device, dtype=torch.int32)
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.params[0].ds_process_group)
+                mutated_any = bool(int(flag.item()))
+            if mutated_any:
+                raise RuntimeError("Detected in-place modification of parameters inside `zero.GatheredParameters` "
+                                   "with `modifier_rank=None`. Use `modifier_rank=<rank>` when mutating parameters "
+                                   "so updates are broadcast consistently across ranks.")
             self.params[0].partition(param_list=self.params, has_been_updated=False)
             return
 
