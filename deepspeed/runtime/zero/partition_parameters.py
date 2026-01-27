@@ -2324,7 +2324,20 @@ class GatheredParameters:
             self.params[0].partition(param_list=self.params, has_been_updated=False)
             return
 
-        handles = [dist.broadcast(p.data, self.src_rank, group=p.ds_process_group, async_op=True) for p in self.params]
-        for h in handles:
-            h.wait()
+        # Broadcast parameters from modifier_rank to all other ranks.
+        # Note: Parameters may have been moved to a different device (e.g., CPU) inside the
+        # GatheredParameters context. For example, load_state_dict_from_zero_checkpoint() moves
+        # the model to CPU before loading weights. Since NCCL requires GPU tensors, we move
+        # each parameter to the accelerator device before broadcast, then restore the original
+        # device. We process one parameter at a time to avoid increasing peak memory.
+        # See tests/unit/v1/zero/test_zero.py::TestZeroToFP32 for an example of this use case.
+        device = get_accelerator().current_device()
+        for p in self.params:
+            original_device = p.data.device
+            if original_device != device:
+                p.data = p.data.to(device)
+            dist.broadcast(p.data, self.src_rank, group=p.ds_process_group)
+            if p.data.device != original_device:
+                p.data = p.data.to(original_device)
+
         self.params[0].partition(param_list=self.params, has_been_updated=True)
