@@ -736,21 +736,6 @@ def get_local_rank():
     return get_local_rank_from_launcher()
 
 
-def get_backend(group=None):
-    """
-    Returns the backend of the given process group.
-    Args:
-        group (ProcessGroup, optional): The process group to work on. If None,
-            the default process group will be used.
-    Returns:
-        The backend of the given process group as a string.
-    """
-    global cdb
-    assert cdb is not None and cdb.is_initialized(
-    ), 'DeepSpeed backend not set, please initialize it using init_process_group()'
-    return cdb.get_backend(group)
-
-
 def get_global_rank(group=None, group_rank=0):
     global cdb
     assert cdb is not None and cdb.is_initialized(
