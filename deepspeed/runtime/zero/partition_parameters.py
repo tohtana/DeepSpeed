@@ -2346,6 +2346,18 @@ class GatheredParameters:
             self.params[0].partition(param_list=self.params, has_been_updated=False)
             return
 
+        # Broadcast parameters from modifier_rank to all other ranks.
+        # NCCL backend requires tensors to be on GPU. If parameters have been moved to a different
+        # device (e.g., CPU) inside the context, broadcasting will fail. Users should use
+        # modifier_rank=None if they don't need to broadcast updates across ranks.
+        expected_device = torch.device(get_accelerator().current_device_name())
+        for p in self.params:
+            if p.data.device != expected_device:
+                raise RuntimeError(
+                    f"Parameter {p.ds_id} is on {p.data.device} but broadcast requires it to be on {expected_device}. "
+                    f"When using GatheredParameters with modifier_rank set, parameters must remain on "
+                    f"the accelerator device. If you don't need to broadcast updates, use modifier_rank=None.")
+
         handles = [dist.broadcast(p.data, self.src_rank, group=p.ds_process_group, async_op=True) for p in self.params]
         for h in handles:
             h.wait()
