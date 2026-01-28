@@ -375,7 +375,41 @@ class TestSetZ3LeafModule(DistributedTest):
             batch[0].requires_grad = True
             # Model returns (output, loss, router_logits)
             output, loss, router_logits = model(batch[0], batch[1])
-            model.backward(loss)
+            # Include router_logits in the loss to ensure multiple backward paths
+            total_loss = loss + 0.01 * router_logits.mean()
+            model.backward(total_loss)
+            model.step()
+
+        model.destroy()
+
+    def test_multi_output_non_leaf_module_thread_safety(self):
+        """Ensure non-leaf modules returning multiple tensors remain thread-safe.
+
+        This covers the multi-output autograd multithreading case without marking the
+        module as a ZeRO leaf module.
+        """
+        torch.autograd.set_multithreading_enabled(True)
+
+        hidden_dim = 128
+        config_dict = self._create_zero_config(hidden_dim)
+
+        model = MultiOutputMoEBlock(hidden_dim, num_experts=4)
+        assert not z3_leaf_module(model)
+
+        model, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        data_loader = random_dataloader(model=model,
+                                        total_samples=10,
+                                        hidden_dim=hidden_dim,
+                                        device=model.device,
+                                        dtype=preferred_dtype())
+        dist.barrier()
+
+        for batch in data_loader:
+            batch[0].requires_grad = True
+            output, loss, router_logits = model(batch[0], batch[1])
+            total_loss = loss + 0.01 * router_logits.mean()
+            model.backward(total_loss)
             model.step()
 
         model.destroy()
