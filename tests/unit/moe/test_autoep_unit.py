@@ -2,15 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """Unit tests for AutoEP feature (all phases append test classes here)."""
 
-import math
 import pytest
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from unittest.mock import patch, MagicMock
 
 # === Phase 1: Configuration and Preset Definitions ===
 
@@ -258,21 +254,38 @@ class TestGroupCreation:
 # === Phase 2: TorchTitan Layer Port ===
 
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
-from deepspeed.moe.ep_experts import GroupedExperts, _run_experts_for_loop
+from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer, generate_permute_indices
 
 
 class TestTokenChoiceTopKRouter:
+
     def test_router_forward_shapes(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=None, num_limited_groups=None, top_k=2, score_func="softmax", route_norm=True, route_scale=1.0, gate_bias=False)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=None,
+                                       num_limited_groups=None,
+                                       top_k=2,
+                                       score_func="softmax",
+                                       route_norm=True,
+                                       route_scale=1.0,
+                                       gate_bias=False)
         x = torch.randn(100, 64)
         top_scores, selected_experts, num_tokens = router(x)
         assert top_scores.shape == (100, 2)
         assert selected_experts.shape == (100, 2)
-        assert num_tokens.shape == (8,)
+        assert num_tokens.shape == (8, )
 
     def test_router_softmax_scores_sum(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=None, num_limited_groups=None, top_k=2, score_func="softmax", route_norm=True, route_scale=1.0, gate_bias=False)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=None,
+                                       num_limited_groups=None,
+                                       top_k=2,
+                                       score_func="softmax",
+                                       route_norm=True,
+                                       route_scale=1.0,
+                                       gate_bias=False)
         x = torch.randn(50, 64)
         top_scores, _, _ = router(x)
         # With route_norm, scores should sum to ~1 per token (times route_scale=1.0)
@@ -280,25 +293,57 @@ class TestTokenChoiceTopKRouter:
         assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
 
     def test_router_sigmoid_scores_range(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=None, num_limited_groups=None, top_k=2, score_func="sigmoid", route_norm=False, route_scale=1.0, gate_bias=False)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=None,
+                                       num_limited_groups=None,
+                                       top_k=2,
+                                       score_func="sigmoid",
+                                       route_norm=False,
+                                       route_scale=1.0,
+                                       gate_bias=False)
         x = torch.randn(50, 64)
         top_scores, _, _ = router(x)
         assert (top_scores >= 0).all() and (top_scores <= 1).all()
 
     def test_router_group_limited_routing(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=4, num_limited_groups=2, top_k=2, score_func="softmax", route_norm=False, route_scale=1.0, gate_bias=False)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=4,
+                                       num_limited_groups=2,
+                                       top_k=2,
+                                       score_func="softmax",
+                                       route_norm=False,
+                                       route_scale=1.0,
+                                       gate_bias=False)
         x = torch.randn(50, 64)
         top_scores, selected_experts, num_tokens = router(x)
         assert top_scores.shape == (50, 2)
         assert selected_experts.shape == (50, 2)
 
     def test_router_gate_bias_copy(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=None, num_limited_groups=None, top_k=2, score_func="softmax", route_norm=True, route_scale=1.0, gate_bias=True)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=None,
+                                       num_limited_groups=None,
+                                       top_k=2,
+                                       score_func="softmax",
+                                       route_norm=True,
+                                       route_scale=1.0,
+                                       gate_bias=True)
         assert router.gate.bias is not None
-        assert router.gate.bias.shape == (8,)
+        assert router.gate.bias.shape == (8, )
 
     def test_router_deterministic(self):
-        router = TokenChoiceTopKRouter(dim=64, num_experts=8, num_expert_groups=None, num_limited_groups=None, top_k=2, score_func="softmax", route_norm=True, route_scale=1.0, gate_bias=False)
+        router = TokenChoiceTopKRouter(dim=64,
+                                       num_experts=8,
+                                       num_expert_groups=None,
+                                       num_limited_groups=None,
+                                       top_k=2,
+                                       score_func="softmax",
+                                       route_norm=True,
+                                       route_scale=1.0,
+                                       gate_bias=False)
         x = torch.randn(50, 64)
         out1 = router(x)
         out2 = router(x)
@@ -307,6 +352,7 @@ class TestTokenChoiceTopKRouter:
 
 
 class TestGroupedExperts:
+
     def test_grouped_experts_forward_shapes(self):
         experts = GroupedExperts(dim=64, hidden_dim=128, num_experts=4, use_grouped_mm=False)
         nn.init.normal_(experts.w1, std=0.02)
@@ -358,7 +404,6 @@ class TestGroupedExperts:
 
     def test_grouped_mm_fallback_when_unavailable(self):
         # Mock torch._grouped_mm as unavailable
-        import deepspeed.moe.ep_experts as ep_experts_mod
         original = getattr(torch, '_grouped_mm', None)
         try:
             if hasattr(torch, '_grouped_mm'):
@@ -370,21 +415,21 @@ class TestGroupedExperts:
                 torch._grouped_mm = original
 
     def test_cutlass_backend_raises_not_implemented(self):
-        from deepspeed.moe.ep_experts import GroupedExperts
         # Test that cutlass raises NotImplementedError if requested
         # This is tested via the backend attribute, not constructor
         pass  # CUTLASS path is out of scope for Phase 2
 
 
 class TestTokenReorderer:
+
     def test_token_reorderer_output_shapes(self):
         reorderer = TokenReorderer(num_experts=8, top_k=2)
         top_scores = torch.randn(50, 2)
         selected_experts = torch.randint(0, 8, (50, 2))
         scores_sorted, indices_sorted, num_tokens = reorderer(top_scores, selected_experts)
-        assert scores_sorted.shape == (100,)
-        assert indices_sorted.shape == (100,)
-        assert num_tokens.shape == (8,)
+        assert scores_sorted.shape == (100, )
+        assert indices_sorted.shape == (100, )
+        assert num_tokens.shape == (8, )
 
     def test_token_reorderer_index_coverage(self):
         reorderer = TokenReorderer(num_experts=4, top_k=2)
@@ -406,9 +451,12 @@ class TestTokenReorderer:
         experts_per_rank = 4
         num_ranks = 1
         max_len = 200
-        permuted_indices, m_sizes, m_offsets = generate_permute_indices(
-            tokens_per_expert_group, experts_per_rank, num_ranks, max_len, alignment, use_cpu=True
-        )
+        permuted_indices, m_sizes, m_offsets = generate_permute_indices(tokens_per_expert_group,
+                                                                        experts_per_rank,
+                                                                        num_ranks,
+                                                                        max_len,
+                                                                        alignment,
+                                                                        use_cpu=True)
         # All m_sizes should be multiples of alignment
         for s in m_sizes.tolist():
             assert s % alignment == 0, f"size {s} not aligned to {alignment}"
@@ -541,18 +589,28 @@ class TestWeightRepacking:
     def test_repack_fused_3d_shapes(self):
         experts = MockMoEExperts(num_experts=8, ffn_hidden=128, hidden_size=64)
         spec = MoELayerSpec(
-            moe_module_name="test", model_family="mixtral",
-            router_name="gate", experts_name="experts",
+            moe_module_name="test",
+            model_family="mixtral",
+            router_name="gate",
+            experts_name="experts",
             expert_storage="fused_3d",
-            expert_w1_name="gate_up_proj", expert_w2_name="down_proj",
+            expert_w1_name="gate_up_proj",
+            expert_w2_name="down_proj",
             expert_w3_name=None,
-            num_experts=8, top_k=2, hidden_size=64, ffn_hidden_size=128,
-            score_func="softmax", score_apply="post", route_norm=True,
-            gate_bias=False, return_router_logits=False,
+            num_experts=8,
+            top_k=2,
+            hidden_size=64,
+            ffn_hidden_size=128,
+            score_func="softmax",
+            score_apply="post",
+            route_norm=True,
+            gate_bias=False,
+            return_router_logits=False,
             router_logits_capture_target="none",
             router_logits_capture_index=None,
             router_logits_capture_layer_name=None,
-            has_shared_experts=False, shared_experts_name="",
+            has_shared_experts=False,
+            shared_experts_name="",
         )
         w1, w2, w3 = repack_expert_weights(experts, spec, ep_rank=0, ep_size=2)
         assert w1.shape == (4, 128, 64)
@@ -562,18 +620,28 @@ class TestWeightRepacking:
     def test_repack_fused_3d_correct_experts(self):
         experts = MockMoEExperts(num_experts=8, ffn_hidden=128, hidden_size=64)
         spec = MoELayerSpec(
-            moe_module_name="test", model_family="mixtral",
-            router_name="gate", experts_name="experts",
+            moe_module_name="test",
+            model_family="mixtral",
+            router_name="gate",
+            experts_name="experts",
             expert_storage="fused_3d",
-            expert_w1_name="gate_up_proj", expert_w2_name="down_proj",
+            expert_w1_name="gate_up_proj",
+            expert_w2_name="down_proj",
             expert_w3_name=None,
-            num_experts=8, top_k=2, hidden_size=64, ffn_hidden_size=128,
-            score_func="softmax", score_apply="post", route_norm=True,
-            gate_bias=False, return_router_logits=False,
+            num_experts=8,
+            top_k=2,
+            hidden_size=64,
+            ffn_hidden_size=128,
+            score_func="softmax",
+            score_apply="post",
+            route_norm=True,
+            gate_bias=False,
+            return_router_logits=False,
             router_logits_capture_target="none",
             router_logits_capture_index=None,
             router_logits_capture_layer_name=None,
-            has_shared_experts=False, shared_experts_name="",
+            has_shared_experts=False,
+            shared_experts_name="",
         )
         w1_r0, _, _ = repack_expert_weights(experts, spec, ep_rank=0, ep_size=2)
         w1_r1, _, _ = repack_expert_weights(experts, spec, ep_rank=1, ep_size=2)
@@ -585,18 +653,28 @@ class TestWeightRepacking:
     def test_repack_ep_size_1_full_model(self):
         experts = MockMoEExperts(num_experts=8, ffn_hidden=128, hidden_size=64)
         spec = MoELayerSpec(
-            moe_module_name="test", model_family="mixtral",
-            router_name="gate", experts_name="experts",
+            moe_module_name="test",
+            model_family="mixtral",
+            router_name="gate",
+            experts_name="experts",
             expert_storage="fused_3d",
-            expert_w1_name="gate_up_proj", expert_w2_name="down_proj",
+            expert_w1_name="gate_up_proj",
+            expert_w2_name="down_proj",
             expert_w3_name=None,
-            num_experts=8, top_k=2, hidden_size=64, ffn_hidden_size=128,
-            score_func="softmax", score_apply="post", route_norm=True,
-            gate_bias=False, return_router_logits=False,
+            num_experts=8,
+            top_k=2,
+            hidden_size=64,
+            ffn_hidden_size=128,
+            score_func="softmax",
+            score_apply="post",
+            route_norm=True,
+            gate_bias=False,
+            return_router_logits=False,
             router_logits_capture_target="none",
             router_logits_capture_index=None,
             router_logits_capture_layer_name=None,
-            has_shared_experts=False, shared_experts_name="",
+            has_shared_experts=False,
+            shared_experts_name="",
         )
         w1, w2, w3 = repack_expert_weights(experts, spec, ep_rank=0, ep_size=1)
         assert w1.shape[0] == 8
@@ -608,8 +686,6 @@ class TestWeightRepacking:
 
 from deepspeed.module_inject.auto_ep_layer import (
     AutoEPMoELayer,
-    RouterOutput,
-    SplitPlan,
     resolve_score_apply_mode,
     apply_scores_before_experts_if_enabled,
     combine_from_routed,

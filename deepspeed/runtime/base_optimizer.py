@@ -307,8 +307,11 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             for lp in lp_groups[i]:
                 if lp._hp_mapping is not None:
                     #print(f"Loading {self.param_names[lp]} {tp_rank=} {tp_world_size=}")
-                    step = lp.load_hp_checkpoint_state(os.path.join(checkpoint_dir, self.param_names[lp]), tp_rank,
-                                                       tp_world_size, ep_rank=ep_rank, ep_size=ep_size)
+                    step = lp.load_hp_checkpoint_state(os.path.join(checkpoint_dir, self.param_names[lp]),
+                                                       tp_rank,
+                                                       tp_world_size,
+                                                       ep_rank=ep_rank,
+                                                       ep_size=ep_size)
                     for key in lp._hp_mapping.get_optim_state_keys():
                         opt_keys.add(key)
                     steps.append(step)

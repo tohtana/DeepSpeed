@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """
 Token reordering and permutation utilities for expert parallelism.
 
@@ -11,8 +10,8 @@ utilities with adaptations for DeepSpeed:
   - Triton import guarded with try/except; pure-PyTorch fallback provided
   - Alignment config exposed as TOKEN_GROUP_ALIGN_SIZE_M
 
-This module is self-contained: no imports from deepspeed.module_inject,
-deepspeed.runtime, or torch.distributed.
+This module is self-contained: no imports from deepspeed.module_inject
+or deepspeed.runtime.
 """
 
 import logging
@@ -34,10 +33,8 @@ try:
 
     _TRITON_AVAILABLE = True
 except ImportError:
-    logger.info(
-        "Triton not available; using pure-PyTorch CPU fallback for "
-        "permutation index generation."
-    )
+    logger.info("Triton not available; using pure-PyTorch CPU fallback for "
+                "permutation index generation.")
 
 # ---------------------------------------------------------------------------
 # Alignment constant
@@ -51,10 +48,10 @@ TOKEN_GROUP_ALIGN_SIZE_M = 8
  - mxfp8: 32 (scaling block size)
 """
 
-
 # ---------------------------------------------------------------------------
 # Utility: round up
 # ---------------------------------------------------------------------------
+
 
 def _round_up(x: int, y: int) -> int:
     """Round *x* up to the nearest multiple of *y*."""
@@ -103,6 +100,7 @@ if _TRITON_AVAILABLE:
 # Triton wrapper
 # ===================================================================
 
+
 def fill_indices_wrapper(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -127,12 +125,10 @@ def fill_indices_wrapper(
             max_len,
         )
 
-    permuted_indices = torch.full(
-        (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
-    )
+    permuted_indices = torch.full((max_len, ), -1, dtype=torch.int32, device=tokens_per_expert_group.device)
 
     num_blocks = min(experts_per_rank, max_blocks)
-    grid = (num_blocks,)
+    grid = (num_blocks, )
 
     _fill_indices_kernel[grid](
         tokens_per_expert_group,
@@ -150,6 +146,7 @@ def fill_indices_wrapper(
 # CPU reference implementation (always available)
 # ===================================================================
 
+
 def fill_indices_cpu(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -160,7 +157,7 @@ def fill_indices_cpu(
 ) -> torch.Tensor:
     """Pure-PyTorch CPU reference for filling permutation indices."""
     permuted_indices = torch.full(
-        (max_len,),
+        (max_len, ),
         -1,
         dtype=torch.int32,
     )
@@ -184,6 +181,7 @@ def fill_indices_cpu(
 # ===================================================================
 # generate_permute_indices
 # ===================================================================
+
 
 def generate_permute_indices(
     tokens_per_expert_group: torch.Tensor,
@@ -211,9 +209,7 @@ def generate_permute_indices(
             - m_offsets: Cumulative sum of m_sizes.
     """
     # Prefix sum for start indices
-    start_index_values = (
-        torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group
-    )
+    start_index_values = (torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group)
 
     # Total tokens per expert across all ranks
     total_tokens_per_expert = tokens_per_expert_group.view(num_ranks, -1).sum(0)
@@ -222,9 +218,7 @@ def generate_permute_indices(
     total_tokens_per_expert = torch.clamp_min(total_tokens_per_expert, alignment)
 
     # Align chunk sizes (ceiling division * alignment)
-    m_sizes = (
-        (total_tokens_per_expert + alignment - 1) // alignment * alignment
-    ).to(torch.int32)
+    m_sizes = ((total_tokens_per_expert + alignment - 1) // alignment * alignment).to(torch.int32)
 
     # Write offsets per local expert
     m_offsets = torch.cumsum(m_sizes, 0)
@@ -255,6 +249,7 @@ def generate_permute_indices(
 # ===================================================================
 # _permute / _unpermute / indices_padding_wrapper
 # ===================================================================
+
 
 def _permute(
     x: torch.Tensor,
@@ -318,9 +313,8 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         num_local_experts = w1.shape[0]
         ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
 
-        input_shape, x, permuted_indices, num_tokens_per_expert = _permute(
-            x, num_tokens_per_expert, ep_degree, num_local_experts
-        )
+        input_shape, x, permuted_indices, num_tokens_per_expert = _permute(x, num_tokens_per_expert, ep_degree,
+                                                                           num_local_experts)
 
         out = func(w1, w2, w3, x, num_tokens_per_expert)
 
@@ -333,6 +327,7 @@ def indices_padding_wrapper(func: Callable) -> Callable:
 # ===================================================================
 # TokenReorderer
 # ===================================================================
+
 
 class TokenReorderer(nn.Module):
     """Reorder token indices to match expert order for efficient parallel
@@ -374,13 +369,9 @@ class TokenReorderer(nn.Module):
             max=self.num_experts,
         )
 
-        token_indices_experts_sorted = torch.argsort(
-            selected_experts_indices.view(-1), stable=True
-        )
+        token_indices_experts_sorted = torch.argsort(selected_experts_indices.view(-1), stable=True)
 
-        top_scores_experts_sorted = top_scores.view(-1)[
-            token_indices_experts_sorted
-        ]
+        top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
 
         return (
             top_scores_experts_sorted,

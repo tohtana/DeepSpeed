@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """
 Grouped expert computation for expert parallelism.
 
@@ -12,8 +11,8 @@ Ported from TorchTitan's GroupedExperts with adaptations for DeepSpeed:
   - Removed DTensor-specific code paths
   - CUTLASS backend raises NotImplementedError
 
-This module is self-contained: no imports from deepspeed.module_inject,
-deepspeed.runtime, or torch.distributed.
+This module is self-contained: no imports from deepspeed.module_inject
+or deepspeed.runtime.
 """
 
 import logging
@@ -24,10 +23,10 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Expert computation: for-loop fallback
 # ---------------------------------------------------------------------------
+
 
 def _run_experts_for_loop(
     w1: torch.Tensor,
@@ -57,7 +56,7 @@ def _run_experts_for_loop(
     num_padding = x.shape[0] - sum(num_tokens_per_expert_list)
 
     x_splits = torch.split(
-        x[: sum(num_tokens_per_expert_list)],
+        x[:sum(num_tokens_per_expert_list)],
         split_size_or_sections=num_tokens_per_expert_list,
         dim=0,
     )
@@ -85,6 +84,7 @@ def _run_experts_for_loop(
 # Expert computation: grouped GEMM (torch._grouped_mm)
 # ---------------------------------------------------------------------------
 
+
 def _run_experts_grouped_mm(
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -109,13 +109,11 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     cast_dtype = x.dtype
-    h = F.silu(
-        torch._grouped_mm(
-            x.to(cast_dtype),
-            w1.to(cast_dtype).transpose(-2, -1),
-            offs=offsets,
-        )
-    )
+    h = F.silu(torch._grouped_mm(
+        x.to(cast_dtype),
+        w1.to(cast_dtype).transpose(-2, -1),
+        offs=offsets,
+    ))
     h = h * torch._grouped_mm(
         x.to(cast_dtype),
         w3.to(cast_dtype).transpose(-2, -1),
@@ -133,6 +131,7 @@ def _run_experts_grouped_mm(
 # ---------------------------------------------------------------------------
 # GroupedExperts module
 # ---------------------------------------------------------------------------
+
 
 class GroupedExperts(nn.Module):
     """Grouped expert computation for MoE layers.
@@ -168,10 +167,8 @@ class GroupedExperts(nn.Module):
         # Check grouped_mm availability at construction time
         self._has_grouped_mm = hasattr(torch, "_grouped_mm")
         if use_grouped_mm and not self._has_grouped_mm:
-            logger.warning(
-                "torch._grouped_mm not available, falling back to "
-                "for-loop expert computation"
-            )
+            logger.warning("torch._grouped_mm not available, falling back to "
+                           "for-loop expert computation")
         self.use_grouped_mm = use_grouped_mm and self._has_grouped_mm
 
     def forward(
@@ -188,10 +185,6 @@ class GroupedExperts(nn.Module):
             Output tensor of shape ``(T, dim)``.
         """
         if self.use_grouped_mm:
-            return _run_experts_grouped_mm(
-                self.w1, self.w2, self.w3, x, num_tokens_per_expert
-            )
+            return _run_experts_grouped_mm(self.w1, self.w2, self.w3, x, num_tokens_per_expert)
         else:
-            return _run_experts_for_loop(
-                self.w1, self.w2, self.w3, x, num_tokens_per_expert
-            )
+            return _run_experts_for_loop(self.w1, self.w2, self.w3, x, num_tokens_per_expert)

@@ -2,16 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """Integration tests for AutoEP (multi-GPU, requires distributed backend)."""
 
 import pytest
 import torch
 import torch.nn as nn
 import deepspeed
-import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 from unit.common import DistributedTest
-
 
 # ---------------------------------------------------------------------------
 # Mock model fixtures
@@ -114,7 +112,7 @@ def _make_autoep_config(zero_stage=0, ep_size=2):
 def _seed_everything(seed=1234):
     """Set deterministic seeds for reproducibility."""
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    get_accelerator().manual_seed_all(seed)
 
 
 def _run_training_steps(engine, num_steps=3, seq_len=8, hidden_dim=64):
@@ -137,8 +135,8 @@ def _run_training_steps(engine, num_steps=3, seq_len=8, hidden_dim=64):
         total_norm = 0.0
         for p in engine.module.parameters():
             if p.grad is not None:
-                total_norm += p.grad.data.float().norm(2).item() ** 2
-        total_norm = total_norm ** 0.5
+                total_norm += p.grad.data.float().norm(2).item()**2
+        total_norm = total_norm**0.5
         grad_norms.append(total_norm)
 
         engine.step()
@@ -176,23 +174,17 @@ class TestAutoEPOnly(DistributedTest):
         for _, module in engine.module.named_modules():
             if isinstance(module, AutoEPMoELayer):
                 replaced_count += 1
-        assert replaced_count == 2, (
-            f"Expected 2 MoE layers replaced, found {replaced_count}"
-        )
+        assert replaced_count == 2, (f"Expected 2 MoE layers replaced, found {replaced_count}")
 
         # Run training steps
         losses, grad_norms = _run_training_steps(engine, num_steps=3)
 
         # All losses must be finite
         for i, loss_val in enumerate(losses):
-            assert torch.isfinite(torch.tensor(loss_val)), (
-                f"Loss at step {i} is not finite: {loss_val}"
-            )
+            assert torch.isfinite(torch.tensor(loss_val)), (f"Loss at step {i} is not finite: {loss_val}")
 
         # At least one step must have non-zero gradients
-        assert any(gn > 0 for gn in grad_norms), (
-            f"All gradient norms are zero: {grad_norms}"
-        )
+        assert any(gn > 0 for gn in grad_norms), (f"All gradient norms are zero: {grad_norms}")
 
     def test_zero2_ep_2gpu(self):
         """EP with ZeRO-2 training.
@@ -209,28 +201,17 @@ class TestAutoEPOnly(DistributedTest):
 
         # Verify replacement
         from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
-        replaced_count = sum(
-            1 for _, m in engine.module.named_modules()
-            if isinstance(m, AutoEPMoELayer)
-        )
-        assert replaced_count == 2, (
-            f"Expected 2 MoE layers replaced with ZeRO-2, found {replaced_count}"
-        )
+        replaced_count = sum(1 for _, m in engine.module.named_modules() if isinstance(m, AutoEPMoELayer))
+        assert replaced_count == 2, (f"Expected 2 MoE layers replaced with ZeRO-2, found {replaced_count}")
 
         # Snapshot parameter values before training
-        params_before = {
-            n: p.data.clone().float()
-            for n, p in engine.module.named_parameters()
-            if p.requires_grad
-        }
+        params_before = {n: p.data.clone().float() for n, p in engine.module.named_parameters() if p.requires_grad}
 
         # Run training steps (ignore grad norms since ZeRO-2 partitions them)
         losses, _ = _run_training_steps(engine, num_steps=3)
 
         for i, loss_val in enumerate(losses):
-            assert torch.isfinite(torch.tensor(loss_val)), (
-                f"Loss at step {i} is not finite: {loss_val}"
-            )
+            assert torch.isfinite(torch.tensor(loss_val)), (f"Loss at step {i} is not finite: {loss_val}")
 
         # Verify at least some parameters changed (optimizer step took effect)
         params_changed = 0

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """Expert weight repacking for AutoEP.
 
 Converts HuggingFace expert weight formats into TorchTitan-compatible
@@ -73,8 +72,8 @@ def _repack_fused_3d(
         # Split into w1 (gate) and w3 (up)
         ffn_hidden = w1_local.shape[1] // 2
         w1 = w1_local[:, :ffn_hidden, :].contiguous()  # [E_local, ffn, hidden]
-        w3 = w1_local[:, ffn_hidden:, :].contiguous()   # [E_local, ffn, hidden]
-        w2 = w2_local.contiguous()                       # [E_local, hidden, ffn]
+        w3 = w1_local[:, ffn_hidden:, :].contiguous()  # [E_local, ffn, hidden]
+        w2 = w2_local.contiguous()  # [E_local, hidden, ffn]
     else:
         # Separate w1 (gate), w3 (up)
         w3_full = getattr(experts_source, spec.expert_w3_name)
@@ -82,9 +81,9 @@ def _repack_fused_3d(
             w3_full = w3_full.data
         w3_local = w3_full[expert_start:expert_end].clone()
 
-        w1 = w1_local.contiguous()   # [E_local, ffn, hidden]
-        w2 = w2_local.contiguous()   # [E_local, hidden, ffn]
-        w3 = w3_local.contiguous()   # [E_local, ffn, hidden]
+        w1 = w1_local.contiguous()  # [E_local, ffn, hidden]
+        w2 = w2_local.contiguous()  # [E_local, hidden, ffn]
+        w3 = w3_local.contiguous()  # [E_local, ffn, hidden]
 
     return w1, w2, w3
 
@@ -153,8 +152,6 @@ def _get_expert_weight(expert_module: nn.Module, weight_name: str) -> torch.Tens
             if hasattr(child, 'weight'):
                 return child.weight
 
-    raise ValueError(
-        f"Could not find weight '{weight_name}' in expert module "
-        f"{type(expert_module).__name__}. Available attributes: "
-        f"{[n for n, _ in expert_module.named_parameters(recurse=False)]}"
-    )
+    raise ValueError(f"Could not find weight '{weight_name}' in expert module "
+                     f"{type(expert_module).__name__}. Available attributes: "
+                     f"{[n for n, _ in expert_module.named_parameters(recurse=False)]}")

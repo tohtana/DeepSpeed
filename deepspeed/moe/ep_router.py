@@ -2,13 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """
 Token-choice top-K router for expert parallelism.
 
 Ported from TorchTitan's TokenChoiceTopKRouter with adaptations for DeepSpeed.
-This module is self-contained: no imports from deepspeed.module_inject,
-deepspeed.runtime, or torch.distributed.
+This module is self-contained: no imports from deepspeed.module_inject
+or deepspeed.runtime.
 """
 
 import torch
@@ -82,41 +81,30 @@ class TokenChoiceTopKRouter(nn.Module):
             entries set to ``-inf``.
         """
         if self.num_limited_groups is None:
-            raise ValueError(
-                "num_limited_groups must be set when num_expert_groups is set"
-            )
+            raise ValueError("num_limited_groups must be set when num_expert_groups is set")
         assert self.num_expert_groups is not None
         if self.num_experts % self.num_expert_groups != 0:
-            raise ValueError(
-                f"num_experts ({self.num_experts}) must be divisible by "
-                f"num_expert_groups ({self.num_expert_groups})"
-            )
+            raise ValueError(f"num_experts ({self.num_experts}) must be divisible by "
+                             f"num_expert_groups ({self.num_expert_groups})")
 
         experts_per_group = self.num_experts // self.num_expert_groups
         if experts_per_group < 2:
-            raise ValueError(
-                f"experts_per_group ({experts_per_group}) must be >= 2"
-            )
+            raise ValueError(f"experts_per_group ({experts_per_group}) must be >= 2")
 
-        scores_grouped = scores_for_choice.view(
-            -1, self.num_expert_groups, experts_per_group
-        )
+        scores_grouped = scores_for_choice.view(-1, self.num_expert_groups, experts_per_group)
         # Score each group by the sum of its top-2 expert scores
         top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
         group_scores = top2_scores_in_group.sum(dim=-1)
 
         # Select top groups
-        _, group_idx = torch.topk(
-            group_scores, k=self.num_limited_groups, dim=-1, sorted=False
-        )
+        _, group_idx = torch.topk(group_scores, k=self.num_limited_groups, dim=-1, sorted=False)
 
         # Build mask: True = masked out (non-selected groups)
         group_mask = torch.ones_like(group_scores, dtype=torch.bool)
         group_mask.scatter_(1, group_idx, False)
 
-        scores_for_choice = scores_grouped.masked_fill(
-            group_mask.unsqueeze(-1), float("-inf")
-        ).view(-1, self.num_experts)
+        scores_for_choice = scores_grouped.masked_fill(group_mask.unsqueeze(-1),
+                                                       float("-inf")).view(-1, self.num_experts)
 
         return scores_for_choice
 
@@ -150,24 +138,16 @@ class TokenChoiceTopKRouter(nn.Module):
         elif self.score_func == "softmax":
             scores = F.softmax(scores.to(torch.float32), dim=1)
         else:
-            raise NotImplementedError(
-                f"Unknown score function: {self.score_func}"
-            )
+            raise NotImplementedError(f"Unknown score function: {self.score_func}")
 
-        scores_for_choice = (
-            scores if expert_bias is None else scores + expert_bias
-        )
+        scores_for_choice = (scores if expert_bias is None else scores + expert_bias)
 
         # Apply node-limited routing if configured
         if self.num_expert_groups is not None:
-            scores_for_choice = self._get_node_limited_routing_scores(
-                scores_for_choice
-            )
+            scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
 
         # Select top-k experts per token
-        _, selected_experts_indices = torch.topk(
-            scores_for_choice, k=self.top_k, dim=-1, sorted=False
-        )
+        _, selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
 
         # Gather original (unbiased) scores for selected experts
         top_scores = scores.gather(dim=1, index=selected_experts_indices)

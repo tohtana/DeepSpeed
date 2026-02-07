@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """AutoEP: Automatic Expert Parallelism for MoE models.
 
 Phase 3: MoE layer detection and structural validation.
@@ -104,10 +103,8 @@ def _infer_hidden_and_ffn_size(
                     if w1.ndim == 2:
                         return w1.shape[1], w1.shape[0]
 
-    raise ValueError(
-        f"Could not infer hidden_size/ffn_hidden_size from experts module "
-        f"with storage={storage}, preset.expert_w1={preset.expert_w1}"
-    )
+    raise ValueError(f"Could not infer hidden_size/ffn_hidden_size from experts module "
+                     f"with storage={storage}, preset.expert_w1={preset.expert_w1}")
 
 
 def _detect_forward_contract(
@@ -140,10 +137,8 @@ def _detect_forward_contract(
                     capture_index = 0
         elif isinstance(record_config, (list, tuple)):
             capture_index = 0
-        logger.debug(
-            f"Detected OutputRecorder on router class {router_class.__name__}: "
-            f"index={capture_index}, layer_name={capture_layer_name}"
-        )
+        logger.debug(f"Detected OutputRecorder on router class {router_class.__name__}: "
+                     f"index={capture_index}, layer_name={capture_layer_name}")
 
     # Check if MoE block has tuple return contract (legacy transformers)
     if hasattr(moe_module, '_can_record_outputs'):
@@ -194,10 +189,8 @@ class AutoEP:
                     continue
 
                 # Accept both: nn.ModuleList (legacy) and Experts class (transformers 5.0.0+)
-                has_expert_params = (
-                    isinstance(experts_child, nn.ModuleList)
-                    or _has_3d_expert_params(experts_child, preset)
-                )
+                has_expert_params = (isinstance(experts_child, nn.ModuleList)
+                                     or _has_3d_expert_params(experts_child, preset))
                 if not has_expert_params:
                     logger.debug(
                         "Skipping %s: '%s' child exists but has no expert parameters",
@@ -233,33 +226,26 @@ class AutoEP:
                     num_experts_from_weight = router_weight.shape[0]
                     hidden_from_weight = router_weight.shape[1]
                     if num_experts is not None and num_experts != num_experts_from_weight:
-                        raise ValueError(
-                            f"Config num_experts={num_experts} mismatches router weight "
-                            f"shape {router_weight.shape} (expected {num_experts_from_weight}) "
-                            f"in layer '{module_name}'"
-                        )
+                        raise ValueError(f"Config num_experts={num_experts} mismatches router weight "
+                                         f"shape {router_weight.shape} (expected {num_experts_from_weight}) "
+                                         f"in layer '{module_name}'")
                     num_experts = num_experts_from_weight
 
                 if num_experts is None:
-                    raise ValueError(
-                        f"Could not determine num_experts for layer '{module_name}'. "
-                        f"Set model.config.{preset.num_experts_attr} or use a preset."
-                    )
+                    raise ValueError(f"Could not determine num_experts for layer '{module_name}'. "
+                                     f"Set model.config.{preset.num_experts_attr} or use a preset.")
 
                 # Override top_k from config if user specified
                 if isinstance(self.config.top_k, int):
                     top_k = self.config.top_k
                 elif top_k is None:
-                    raise ValueError(
-                        f"Could not determine top_k for layer '{module_name}'. "
-                        f"Set model.config.{preset.top_k_attr} or config top_k."
-                    )
+                    raise ValueError(f"Could not determine top_k for layer '{module_name}'. "
+                                     f"Set model.config.{preset.top_k_attr} or config top_k.")
 
                 # Infer hidden sizes
                 try:
-                    hidden_size, ffn_hidden_size = _infer_hidden_and_ffn_size(
-                        experts_child, preset, storage, num_experts
-                    )
+                    hidden_size, ffn_hidden_size = _infer_hidden_and_ffn_size(experts_child, preset, storage,
+                                                                              num_experts)
                 except ValueError as e:
                     logger.warning(f"Skipping {module_name}: {e}")
                     continue
@@ -267,17 +253,13 @@ class AutoEP:
                 # Cross-validate hidden_size with router
                 if router_weight is not None and router_weight.ndim == 2:
                     if hidden_size != router_weight.shape[1]:
-                        raise ValueError(
-                            f"hidden_size={hidden_size} from expert weights mismatches "
-                            f"router weight dim={router_weight.shape[1]} in '{module_name}'"
-                        )
+                        raise ValueError(f"hidden_size={hidden_size} from expert weights mismatches "
+                                         f"router weight dim={router_weight.shape[1]} in '{module_name}'")
 
                 # Validate top_k <= num_experts
                 if top_k > num_experts:
-                    raise ValueError(
-                        f"top_k={top_k} exceeds num_experts={num_experts} "
-                        f"in layer '{module_name}'"
-                    )
+                    raise ValueError(f"top_k={top_k} exceeds num_experts={num_experts} "
+                                     f"in layer '{module_name}'")
 
                 # Resolve score_func
                 if self.config.score_func != "auto":
@@ -328,16 +310,12 @@ class AutoEP:
                 if self.model_config is not None:
                     jitter = getattr(self.model_config, 'router_jitter_noise', 0.0)
                     if jitter and jitter > 0:
-                        logger.warning(
-                            f"Layer {module_name}: model has router_jitter_noise={jitter}, "
-                            f"AutoEP router does not implement jitter."
-                        )
+                        logger.warning(f"Layer {module_name}: model has router_jitter_noise={jitter}, "
+                                       f"AutoEP router does not implement jitter.")
                     z_loss = getattr(self.model_config, 'router_z_loss_coef', 0.0)
                     if z_loss and z_loss > 0:
-                        logger.warning(
-                            f"Layer {module_name}: model has router_z_loss_coef={z_loss}, "
-                            f"AutoEP router does not implement z-loss."
-                        )
+                        logger.warning(f"Layer {module_name}: model has router_z_loss_coef={z_loss}, "
+                                       f"AutoEP router does not implement z-loss.")
 
                 spec = MoELayerSpec(
                     moe_module_name=module_name,
@@ -364,10 +342,8 @@ class AutoEP:
                     shared_experts_name=shared_name,
                 )
                 specs.append(spec)
-                logger.debug(
-                    f"Detected MoE layer: {module_name} (family={preset_name}, "
-                    f"experts={num_experts}, top_k={top_k}, storage={storage})"
-                )
+                logger.debug(f"Detected MoE layer: {module_name} (family={preset_name}, "
+                             f"experts={num_experts}, top_k={top_k}, storage={storage})")
 
         if not specs:
             logger.warning("AutoEP: no MoE layers detected in model.")
@@ -403,20 +379,16 @@ class AutoEP:
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
 
-        logger.info(
-            f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
-            f"(ep_size={ep_size}, ep_rank={ep_rank}, "
-            f"local_experts={replacement.num_local_experts})"
-        )
+        logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
+                    f"(ep_size={ep_size}, ep_rank={ep_rank}, "
+                    f"local_experts={replacement.num_local_experts})")
 
     def _resolve_presets(self) -> list[tuple[str, MoEModelPreset]]:
         """Determine which preset(s) to use for detection."""
         if self.config.preset_model is not None:
             if self.config.preset_model not in PRESET_MODELS:
-                raise ValueError(
-                    f"Unknown preset_model '{self.config.preset_model}'. "
-                    f"Available: {list(PRESET_MODELS.keys())}"
-                )
+                raise ValueError(f"Unknown preset_model '{self.config.preset_model}'. "
+                                 f"Available: {list(PRESET_MODELS.keys())}")
             return [(self.config.preset_model, PRESET_MODELS[self.config.preset_model])]
 
         # Auto-detect from model_type

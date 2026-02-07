@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """AutoEP MoE Layer: drop-in replacement for HF MoE blocks with EP support.
 
 Contains AutoEPMoELayer, compute_split_plan, _AllToAllV, and helper functions.
@@ -14,20 +13,18 @@ from typing import Literal, NamedTuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-
-from deepspeed.utils import logger
+import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
 from deepspeed.moe.ep_repack import repack_expert_weights
 
-
 # ---------------------------------------------------------------------------
 # Named tuples
 # ---------------------------------------------------------------------------
+
 
 class RouterOutput(NamedTuple):
     top_scores: torch.Tensor  # [T, K]
@@ -44,6 +41,7 @@ class SplitPlan(NamedTuple):
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
 
 def resolve_score_apply_mode(
     spec: MoELayerSpec,
@@ -62,9 +60,7 @@ def apply_scores_before_experts_if_enabled(
 ) -> torch.Tensor:
     """Pre-multiply token representations by router scores before expert compute."""
     if score_apply == "pre":
-        return (
-            routed_input.to(torch.float32) * top_scores.reshape(-1, 1)
-        ).to(routed_input.dtype)
+        return (routed_input.to(torch.float32) * top_scores.reshape(-1, 1)).to(routed_input.dtype)
     return routed_input
 
 
@@ -220,7 +216,7 @@ def permute_by_local_expert(
 
     # local_counts is already [E_local] - treat as 1 rank
     # Use CPU path when tokens are on CPU (e.g., unit tests without CUDA)
-    use_cpu = not tokens.is_cuda
+    use_cpu = not get_accelerator().on_accelerator(tokens)
     counts_for_permute = local_counts.cpu() if use_cpu else local_counts
     with torch.no_grad():
         permuted_indices, m_sizes, _offsets = generate_permute_indices(
@@ -236,7 +232,7 @@ def permute_by_local_expert(
         m_sizes = m_sizes.to(tokens.device)
 
     # Add padding row for out-of-bounds indices (index n_tokens -> zero row)
-    tokens_padded = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1],))))
+    tokens_padded = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1], ))))
     tokens_permuted = tokens_padded[permuted_indices, :]
 
     return tokens_permuted, permuted_indices, m_sizes, n_tokens
@@ -263,12 +259,12 @@ def unpermute_by_local_expert(
 
 
 def combine_from_routed(
-    expert_output: torch.Tensor,  # [N, H]
-    top_scores: torch.Tensor,  # [T, K]
-    token_indices_sorted: torch.Tensor,  # [N]
-    top_k: int,
-    score_apply: Literal["pre", "post"],
-    shape: tuple[int, int, int],  # (B, S, H)
+        expert_output: torch.Tensor,  # [N, H]
+        top_scores: torch.Tensor,  # [T, K]
+        token_indices_sorted: torch.Tensor,  # [N]
+        top_k: int,
+        score_apply: Literal["pre", "post"],
+        shape: tuple[int, int, int],  # (B, S, H)
 ) -> torch.Tensor:
     """Scatter-add expert outputs back to original token positions."""
     bsz, seqlen, hdim = shape
@@ -285,14 +281,10 @@ def combine_from_routed(
 
     if score_apply == "post":
         # Apply scores during combine
-        output = (
-            torch.bmm(
-                top_scores.reshape(-1, 1, top_k).float(),
-                output.float(),
-            )
-            .to(expert_output.dtype)
-            .squeeze(1)
-        )
+        output = (torch.bmm(
+            top_scores.reshape(-1, 1, top_k).float(),
+            output.float(),
+        ).to(expert_output.dtype).squeeze(1))
     else:
         # Scores already applied pre-experts, just sum over top_k
         output = output.sum(dim=1)
@@ -303,6 +295,7 @@ def combine_from_routed(
 # ---------------------------------------------------------------------------
 # AutoEPMoELayer
 # ---------------------------------------------------------------------------
+
 
 class AutoEPMoELayer(nn.Module):
     """Drop-in replacement for HF MoE blocks with Expert Parallelism support."""
@@ -373,7 +366,8 @@ class AutoEPMoELayer(nn.Module):
         self.experts.w3.data.copy_(w3)
 
         self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
-        self.shared_experts = getattr(source_module, spec.shared_experts_name, None) if spec.has_shared_experts else None
+        self.shared_experts = getattr(source_module, spec.shared_experts_name,
+                                      None) if spec.has_shared_experts else None
 
         # Mark expert params for EDP gradient reduction
         for param in self.experts.parameters():
@@ -472,14 +466,12 @@ class AutoEPMoELayer(nn.Module):
             self.tokens_per_expert.add_(ro.num_tokens_per_expert)
 
         # Reorder tokens by expert
-        top_scores_sorted, token_indices_sorted, _ = self.reorderer(
-            ro.top_scores, ro.selected_experts
-        )
+        top_scores_sorted, token_indices_sorted, _ = self.reorderer(ro.top_scores, ro.selected_experts)
 
         routed_input = x[token_indices_sorted // self.top_k]  # [N, H]
-        routed_input = apply_scores_before_experts_if_enabled(
-            routed_input, top_scores_sorted, score_apply=self.score_apply
-        )
+        routed_input = apply_scores_before_experts_if_enabled(routed_input,
+                                                              top_scores_sorted,
+                                                              score_apply=self.score_apply)
 
         if self.ep_size == 1:
             # No AllToAll needed - local computation only
@@ -491,8 +483,7 @@ class AutoEPMoELayer(nn.Module):
             ).int()
 
             routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, local_counts
-            )
+                routed_input, local_counts)
             expert_output = self.experts(routed_input_permuted, aligned_counts)
             expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
         else:
@@ -505,19 +496,14 @@ class AutoEPMoELayer(nn.Module):
                 ep_group=self.ep_group,
             )
 
-            routed_input = _AllToAllV.apply(
-                self.ep_group, routed_input, plan.input_splits, plan.output_splits
-            )
+            routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
 
             routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts
-            )
+                routed_input, plan.local_counts)
             expert_output = self.experts(routed_input, aligned_counts)
             expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
 
-            expert_output = _AllToAllV.apply(
-                self.ep_group, expert_output, plan.output_splits, plan.input_splits
-            )
+            expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
 
         output = combine_from_routed(
             expert_output,

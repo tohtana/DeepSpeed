@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """AutoEP universal checkpoint conversion utilities.
 
 Consolidates per-expert checkpoint files (and their optimizer states) into
@@ -33,22 +32,15 @@ def resolve_expert_ckpt_path(checkpoint_dir, moe_layer_id, global_expert_id):
         FileNotFoundError: No matching file found.
         NotImplementedError: Multiple matching files found (multi-mp_rank).
     """
-    pattern = os.path.join(
-        checkpoint_dir,
-        f'layer_{moe_layer_id}_expert_{global_expert_id}_mp_rank_*_model_states.pt'
-    )
+    pattern = os.path.join(checkpoint_dir, f'layer_{moe_layer_id}_expert_{global_expert_id}_mp_rank_*_model_states.pt')
     matches = glob.glob(pattern)
     if len(matches) == 0:
-        raise FileNotFoundError(
-            f"Expert checkpoint file not found: layer_{moe_layer_id} "
-            f"expert_{global_expert_id} in {checkpoint_dir}"
-        )
+        raise FileNotFoundError(f"Expert checkpoint file not found: layer_{moe_layer_id} "
+                                f"expert_{global_expert_id} in {checkpoint_dir}")
     if len(matches) > 1:
-        raise NotImplementedError(
-            f"Multiple expert checkpoint files found for layer_{moe_layer_id} "
-            f"expert_{global_expert_id}: {matches}. Multi-mp_rank expert files "
-            f"are not yet supported."
-        )
+        raise NotImplementedError(f"Multiple expert checkpoint files found for layer_{moe_layer_id} "
+                                  f"expert_{global_expert_id}: {matches}. Multi-mp_rank expert files "
+                                  f"are not yet supported.")
     return matches[0]
 
 
@@ -69,15 +61,11 @@ def consolidate_autoep_expert_files(checkpoint_dir, output_dir, autoep_layers_me
         RuntimeError: If metadata is missing or malformed.
     """
     if autoep_layers_metadata is None:
-        raise RuntimeError(
-            "AutoEP metadata is missing from checkpoint. Cannot consolidate "
-            "expert files without ds_autoep_layers metadata."
-        )
+        raise RuntimeError("AutoEP metadata is missing from checkpoint. Cannot consolidate "
+                           "expert files without ds_autoep_layers metadata.")
     if not isinstance(autoep_layers_metadata, list):
-        raise RuntimeError(
-            f"AutoEP metadata is malformed: expected list, got "
-            f"{type(autoep_layers_metadata).__name__}"
-        )
+        raise RuntimeError(f"AutoEP metadata is malformed: expected list, got "
+                           f"{type(autoep_layers_metadata).__name__}")
 
     for layer_info in autoep_layers_metadata:
         moe_layer_id = layer_info['moe_layer_id']
@@ -87,14 +75,11 @@ def consolidate_autoep_expert_files(checkpoint_dir, output_dir, autoep_layers_me
         for wname in ('w1', 'w2', 'w3'):
             expert_tensors = []
             for global_eid in range(num_experts):
-                ckpt_path = resolve_expert_ckpt_path(
-                    checkpoint_dir, moe_layer_id, global_eid)
+                ckpt_path = resolve_expert_ckpt_path(checkpoint_dir, moe_layer_id, global_eid)
                 sd = torch.load(ckpt_path, map_location='cpu', weights_only=False)
                 key = f"{prefix}.{wname}.{global_eid}"
                 if key not in sd:
-                    raise RuntimeError(
-                        f"Expected key '{key}' not found in {ckpt_path}"
-                    )
+                    raise RuntimeError(f"Expected key '{key}' not found in {ckpt_path}")
                 expert_tensors.append(sd[key])
 
             # Stack to full fused tensor [E_total, H, D]
@@ -112,8 +97,7 @@ def consolidate_autoep_expert_files(checkpoint_dir, output_dir, autoep_layers_me
             }, os.path.join(param_dir, "fp32.pt"))
 
 
-def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir,
-                                        autoep_layers_metadata, ep_size):
+def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layers_metadata, ep_size):
     """Consolidate expert optimizer states from expp_rank files into universal format.
 
     Loads optimizer states from all expp_rank_*_optim_states.pt files,
@@ -133,17 +117,12 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir,
         RuntimeError: If expert parameter states cannot be extracted.
     """
     if autoep_layers_metadata is None:
-        raise RuntimeError(
-            "AutoEP metadata is missing. Cannot consolidate optimizer states."
-        )
+        raise RuntimeError("AutoEP metadata is missing. Cannot consolidate optimizer states.")
 
     # Load all expp_rank optimizer states
     optim_states = []
     for rank in range(ep_size):
-        pattern = os.path.join(
-            checkpoint_dir,
-            f'expp_rank_{rank}_mp_rank_*_optim_states.pt'
-        )
+        pattern = os.path.join(checkpoint_dir, f'expp_rank_{rank}_mp_rank_*_optim_states.pt')
         matches = glob.glob(pattern)
         if not matches:
             # No optimizer state files (e.g., ZeRO handles optimizer differently)
@@ -202,9 +181,10 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir,
 
                 if found_any and len(rank_tensors) == ep_size:
                     full_tensor = torch.cat(rank_tensors, dim=0)
-                    torch.save({
-                        PARAM: full_tensor,
-                        CAT_DIM: 0,
-                        EP_IS_EXPERT_PARAM: True,
-                        EP_NUM_EXPERTS: num_experts,
-                    }, os.path.join(param_dir, f"{state_key}.pt"))
+                    torch.save(
+                        {
+                            PARAM: full_tensor,
+                            CAT_DIM: 0,
+                            EP_IS_EXPERT_PARAM: True,
+                            EP_NUM_EXPERTS: num_experts,
+                        }, os.path.join(param_dir, f"{state_key}.pt"))

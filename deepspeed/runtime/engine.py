@@ -3251,15 +3251,12 @@ class DeepSpeedEngine(Module):
             _AutoEPMoELayer = None
 
         has_autoep_layers = _AutoEPMoELayer is not None and model is not None and any(
-            isinstance(m, _AutoEPMoELayer) for _, m in model.named_modules()
-        )
+            isinstance(m, _AutoEPMoELayer) for _, m in model.named_modules())
 
         if old_moe_load:
             if has_autoep_layers:
-                raise RuntimeError(
-                    "Legacy checkpoint format (old_moe_load) is incompatible with AutoEP layers. "
-                    "Use Universal Checkpointing to convert the checkpoint first."
-                )
+                raise RuntimeError("Legacy checkpoint format (old_moe_load) is incompatible with AutoEP layers. "
+                                   "Use Universal Checkpointing to convert the checkpoint first.")
             expp_rank = groups._get_expert_data_parallel_rank(groups._get_max_expert_size_name())
 
             num_local_experts = max(num_experts) // groups._get_expert_parallel_world_size(
@@ -3288,32 +3285,25 @@ class DeepSpeedEngine(Module):
             if autoep_layers is not None:
                 if not isinstance(autoep_layers, list):
                     raise RuntimeError(
-                        f"ds_autoep_layers metadata is malformed: expected list, got {type(autoep_layers).__name__}"
-                    )
+                        f"ds_autoep_layers metadata is malformed: expected list, got {type(autoep_layers).__name__}")
                 seen_ids = set()
-                required_fields = {'moe_layer_id', 'module_path', 'num_experts', 'num_local_experts',
-                                   'ep_size', 'expert_key_prefix'}
+                required_fields = {
+                    'moe_layer_id', 'module_path', 'num_experts', 'num_local_experts', 'ep_size', 'expert_key_prefix'
+                }
                 for entry in autoep_layers:
                     if not isinstance(entry, dict):
                         raise RuntimeError(
-                            f"ds_autoep_layers entry is malformed: expected dict, got {type(entry).__name__}"
-                        )
+                            f"ds_autoep_layers entry is malformed: expected dict, got {type(entry).__name__}")
                     missing = required_fields - entry.keys()
                     if missing:
-                        raise RuntimeError(
-                            f"ds_autoep_layers entry is invalid: missing fields {sorted(missing)}"
-                        )
+                        raise RuntimeError(f"ds_autoep_layers entry is invalid: missing fields {sorted(missing)}")
                     lid = entry['moe_layer_id']
                     if lid in seen_ids:
-                        raise RuntimeError(
-                            f"ds_autoep_layers metadata has duplicate moe_layer_id: {lid}"
-                        )
+                        raise RuntimeError(f"ds_autoep_layers metadata has duplicate moe_layer_id: {lid}")
                     seen_ids.add(lid)
             elif has_autoep_layers:
-                logger.warning(
-                    "Checkpoint does not contain ds_autoep_layers metadata. "
-                    "Loading AutoEP expert weights using best-effort module detection."
-                )
+                logger.warning("Checkpoint does not contain ds_autoep_layers metadata. "
+                               "Loading AutoEP expert weights using best-effort module detection.")
 
             moe_layer_id = 0
             for n_module, module in model.named_modules():
@@ -3348,30 +3338,23 @@ class DeepSpeedEngine(Module):
 
                     for local_expert_id in range(num_local_experts):
                         global_expert_id = expp_rank * num_local_experts + local_expert_id
-                        expert_ckpt_path = DeepSpeedEngine._get_expert_ckpt_name(
-                            checkpoint_path, moe_layer_id, global_expert_id, tag, mpu)
+                        expert_ckpt_path = DeepSpeedEngine._get_expert_ckpt_name(checkpoint_path, moe_layer_id,
+                                                                                 global_expert_id, tag, mpu)
                         if not os.path.exists(expert_ckpt_path):
-                            raise FileNotFoundError(
-                                f"Expert checkpoint file not found: {expert_ckpt_path}. "
-                                f"Expected layer_{moe_layer_id} expert_{global_expert_id}."
-                            )
-                        expert_sd = checkpoint_engine.load(
-                            expert_ckpt_path, map_location=torch.device('cpu'))
+                            raise FileNotFoundError(f"Expert checkpoint file not found: {expert_ckpt_path}. "
+                                                    f"Expected layer_{moe_layer_id} expert_{global_expert_id}.")
+                        expert_sd = checkpoint_engine.load(expert_ckpt_path, map_location=torch.device('cpu'))
 
                         for wname in ('w1', 'w2', 'w3'):
                             fused_key = f"{module_prefix}experts.{wname}"
                             expert_key = f"{fused_key}.{global_expert_id}"
                             if expert_key not in expert_sd:
-                                raise RuntimeError(
-                                    f"Expert checkpoint file is corrupt: key '{expert_key}' not found "
-                                    f"in {expert_ckpt_path}"
-                                )
+                                raise RuntimeError(f"Expert checkpoint file is corrupt: key '{expert_key}' not found "
+                                                   f"in {expert_ckpt_path}")
                             tensor = expert_sd[expert_key]
                             if tensor.dim() != 2:
-                                raise RuntimeError(
-                                    f"Expert checkpoint file is corrupt: expected 2D tensor for "
-                                    f"'{expert_key}', got {tensor.dim()}D in {expert_ckpt_path}"
-                                )
+                                raise RuntimeError(f"Expert checkpoint file is corrupt: expected 2D tensor for "
+                                                   f"'{expert_key}', got {tensor.dim()}D in {expert_ckpt_path}")
                             stacked[wname].append(tensor)
 
                     # Stack back to fused [E_local, ...] format
@@ -4069,11 +4052,9 @@ class DeepSpeedEngine(Module):
                 })
                 autoep_group_names.add(group_name)
                 if len(autoep_group_names) > 1:
-                    raise RuntimeError(
-                        f"AutoEP checkpointing requires a single EP group size, but found "
-                        f"multiple groups: {sorted(autoep_group_names)}. "
-                        f"All AutoEPMoELayer instances must use the same ep_size."
-                    )
+                    raise RuntimeError(f"AutoEP checkpointing requires a single EP group size, but found "
+                                       f"multiple groups: {sorted(autoep_group_names)}. "
+                                       f"All AutoEPMoELayer instances must use the same ep_size.")
 
                 # Gate file writes behind writer guard
                 if not self.checkpoint_engine.is_data_parallel_writer(exp_dp_rank):
@@ -4088,11 +4069,9 @@ class DeepSpeedEngine(Module):
                         fused_key = f"{module_prefix}experts.{wname}"
                         param = getattr(module.experts, wname)
                         expert_state_dict[f"{fused_key}.{global_expert_id}"] = (
-                            param[local_expert_id].clone().detach()
-                        )
+                            param[local_expert_id].clone().detach())
 
-                    moe_save_path = self._get_expert_ckpt_name(
-                        save_dir, moe_layer_id, global_expert_id, tag, self.mpu)
+                    moe_save_path = self._get_expert_ckpt_name(save_dir, moe_layer_id, global_expert_id, tag, self.mpu)
                     saveable = expert_state_dict
                     if self.checkpoint_engine.preserves_storage_sharing():
                         saveable = clone_tensors_for_torch_save(expert_state_dict)
@@ -4164,10 +4143,8 @@ class DeepSpeedEngine(Module):
             reserved_keys = {'ds_autoep_layers', 'autoep_layers'}
             collisions = reserved_keys.intersection(client_state.keys())
             if collisions:
-                raise KeyError(
-                    f"client_state contains reserved checkpoint keys: {sorted(collisions)}. "
-                    f"These keys are used internally by DeepSpeed for AutoEP metadata."
-                )
+                raise KeyError(f"client_state contains reserved checkpoint keys: {sorted(collisions)}. "
+                               f"These keys are used internally by DeepSpeed for AutoEP metadata.")
             state.update(client_state)
             logger.info(f'Saving model checkpoint: {save_path}')
             saveable_state_dict = state

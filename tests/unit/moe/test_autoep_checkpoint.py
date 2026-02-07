@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """Tests for AutoEP checkpointing (save/load, metadata, universal stubs)."""
 
 import os
@@ -13,9 +12,8 @@ import torch.nn as nn
 
 import deepspeed
 import deepspeed.comm as dist
-from deepspeed.utils import groups
+from deepspeed.accelerator import get_accelerator
 from unit.common import DistributedTest
-
 
 # ---------------------------------------------------------------------------
 # Mock model fixtures (adapted from test_autoep_integration.py)
@@ -58,9 +56,7 @@ class MockMoETransformer(nn.Module):
         self.config.hidden_size = hidden_size
         self.config.intermediate_size = intermediate_size
         self.model = nn.Module()
-        self.model.layers = nn.ModuleList([
-            self._make_layer(num_experts, hidden_size) for _ in range(num_layers)
-        ])
+        self.model.layers = nn.ModuleList([self._make_layer(num_experts, hidden_size) for _ in range(num_layers)])
         self.lm_head = nn.Linear(hidden_size, 100)
 
     def _make_layer(self, num_experts, hidden_size):
@@ -98,7 +94,9 @@ def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
         "train_micro_batch_size_per_gpu": 1,
         "optimizer": {
             "type": "Adam",
-            "params": {"lr": 1e-4},
+            "params": {
+                "lr": 1e-4
+            },
         },
         "fp16": {
             "enabled": True,
@@ -120,15 +118,14 @@ def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
 
 def _seed_everything(seed=42):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    get_accelerator().manual_seed_all(seed)
 
 
 def _init_engine(ep_size=1, zero_stage=0, load_balance_coeff=_UNSET):
     """Create and initialize a DeepSpeed engine with AutoEP."""
     _seed_everything()
     model = MockMoETransformer()
-    config = _make_autoep_config(zero_stage=zero_stage, ep_size=ep_size,
-                                 load_balance_coeff=load_balance_coeff)
+    config = _make_autoep_config(zero_stage=zero_stage, ep_size=ep_size, load_balance_coeff=load_balance_coeff)
     engine, _, _, _ = deepspeed.initialize(model=model, config=config)
     return engine
 
@@ -189,6 +186,7 @@ class TestNonMoeStateDictFilter(DistributedTest):
         )
 
         class NativeMoEModel(nn.Module):
+
             def __init__(self):
                 super().__init__()
                 self.linear = nn.Linear(hidden_dim, hidden_dim)
@@ -203,7 +201,12 @@ class TestNonMoeStateDictFilter(DistributedTest):
         model = NativeMoEModel()
         config = {
             "train_micro_batch_size_per_gpu": 1,
-            "optimizer": {"type": "Adam", "params": {"lr": 1e-4}},
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-4
+                }
+            },
         }
         engine, _, _, _ = deepspeed.initialize(model=model, config=config)
 
@@ -338,8 +341,9 @@ class TestAutoEPSave(DistributedTest):
         assert isinstance(autoep_layers, list), "ds_autoep_layers should be a list"
         assert len(autoep_layers) == 2, f"Expected 2 AutoEP layers, got {len(autoep_layers)}"
 
-        required_fields = {'moe_layer_id', 'module_path', 'num_experts', 'num_local_experts',
-                           'ep_size', 'expert_key_prefix'}
+        required_fields = {
+            'moe_layer_id', 'module_path', 'num_experts', 'num_local_experts', 'ep_size', 'expert_key_prefix'
+        }
         for entry in autoep_layers:
             assert isinstance(entry, dict), f"Entry should be dict, got {type(entry)}"
             missing = required_fields - entry.keys()
@@ -381,29 +385,49 @@ class TestAutoEPLoad(DistributedTest):
 
         # Wrong type
         with pytest.raises(RuntimeError, match="malformed"):
-            DeepSpeedEngine.load_moe_state_dict(
-                checkpoint_path="/fake", tag="fake", state_dict={},
-                old_moe_load=False, model=nn.Linear(1, 1),
-                autoep_layers="not_a_list")
+            DeepSpeedEngine.load_moe_state_dict(checkpoint_path="/fake",
+                                                tag="fake",
+                                                state_dict={},
+                                                old_moe_load=False,
+                                                model=nn.Linear(1, 1),
+                                                autoep_layers="not_a_list")
 
         # Duplicate IDs
         with pytest.raises(RuntimeError, match="duplicate moe_layer_id"):
-            DeepSpeedEngine.load_moe_state_dict(
-                checkpoint_path="/fake", tag="fake", state_dict={},
-                old_moe_load=False, model=nn.Linear(1, 1),
-                autoep_layers=[
-                    {'moe_layer_id': 0, 'module_path': 'a', 'num_experts': 4,
-                     'num_local_experts': 4, 'ep_size': 1, 'expert_key_prefix': 'a.experts'},
-                    {'moe_layer_id': 0, 'module_path': 'b', 'num_experts': 4,
-                     'num_local_experts': 4, 'ep_size': 1, 'expert_key_prefix': 'b.experts'},
-                ])
+            DeepSpeedEngine.load_moe_state_dict(checkpoint_path="/fake",
+                                                tag="fake",
+                                                state_dict={},
+                                                old_moe_load=False,
+                                                model=nn.Linear(1, 1),
+                                                autoep_layers=[
+                                                    {
+                                                        'moe_layer_id': 0,
+                                                        'module_path': 'a',
+                                                        'num_experts': 4,
+                                                        'num_local_experts': 4,
+                                                        'ep_size': 1,
+                                                        'expert_key_prefix': 'a.experts'
+                                                    },
+                                                    {
+                                                        'moe_layer_id': 0,
+                                                        'module_path': 'b',
+                                                        'num_experts': 4,
+                                                        'num_local_experts': 4,
+                                                        'ep_size': 1,
+                                                        'expert_key_prefix': 'b.experts'
+                                                    },
+                                                ])
 
         # Missing fields
         with pytest.raises(RuntimeError, match="missing fields"):
-            DeepSpeedEngine.load_moe_state_dict(
-                checkpoint_path="/fake", tag="fake", state_dict={},
-                old_moe_load=False, model=nn.Linear(1, 1),
-                autoep_layers=[{'moe_layer_id': 0}])
+            DeepSpeedEngine.load_moe_state_dict(checkpoint_path="/fake",
+                                                tag="fake",
+                                                state_dict={},
+                                                old_moe_load=False,
+                                                model=nn.Linear(1, 1),
+                                                autoep_layers=[{
+                                                    'moe_layer_id': 0
+                                                }])
 
     def test_autoep_old_moe_load_rejected(self):
         """Legacy checkpoint format + AutoEP model -> explicit error."""
@@ -411,9 +435,11 @@ class TestAutoEPLoad(DistributedTest):
         from deepspeed.runtime.engine import DeepSpeedEngine
 
         with pytest.raises(RuntimeError, match="old_moe_load.*incompatible with AutoEP"):
-            DeepSpeedEngine.load_moe_state_dict(
-                checkpoint_path="/fake", tag="fake", state_dict={},
-                old_moe_load=True, model=engine.module)
+            DeepSpeedEngine.load_moe_state_dict(checkpoint_path="/fake",
+                                                tag="fake",
+                                                state_dict={},
+                                                old_moe_load=True,
+                                                model=engine.module)
 
     def test_autoep_corrupt_expert_file_fails_fast(self, tmpdir):
         """Tamper expert file (missing key), verify error."""
@@ -456,9 +482,7 @@ class TestAutoEPLoad(DistributedTest):
         engine2.load_checkpoint(save_dir, tag=tag)
 
         # Verify params match
-        for (n1, p1), (n2, p2) in zip(
-            engine.module.named_parameters(), engine2.module.named_parameters()
-        ):
+        for (n1, p1), (n2, p2) in zip(engine.module.named_parameters(), engine2.module.named_parameters()):
             assert torch.equal(p1.data.cpu(), p2.data.cpu()), f"Parameter {n1} mismatch after legacy load"
 
     def test_autoep_metadata_absent_warns_once(self, tmpdir):
@@ -481,22 +505,21 @@ class TestAutoEPLoad(DistributedTest):
         engine2.load_checkpoint(save_dir, tag=tag)
 
         # Verify params still match
-        for (n1, p1), (n2, p2) in zip(
-            engine.module.named_parameters(), engine2.module.named_parameters()
-        ):
+        for (n1, p1), (n2, p2) in zip(engine.module.named_parameters(), engine2.module.named_parameters()):
             assert torch.equal(p1.data.cpu(), p2.data.cpu()), \
                 f"Parameter {n1} mismatch after metadata-absent load"
 
     def test_num_local_experts_zero_rejected(self):
         """Force metadata with num_local_experts == 0; verify load rejects."""
-        from deepspeed.runtime.engine import DeepSpeedEngine
-
         # The validation should catch num_experts != num_local_experts * ep_size
         # when num_local_experts=0 and num_experts>0
         metadata = [{
-            'moe_layer_id': 0, 'module_path': 'test',
-            'num_experts': 4, 'num_local_experts': 0,
-            'ep_size': 4, 'expert_key_prefix': 'test.experts',
+            'moe_layer_id': 0,
+            'module_path': 'test',
+            'num_experts': 4,
+            'num_local_experts': 0,
+            'ep_size': 4,
+            'expert_key_prefix': 'test.experts',
         }]
         # This should pass validation since 4 == 0 * 4 is actually 0 != 4
         # But the load itself would fail when trying range(0) for experts.
@@ -655,7 +678,7 @@ class TestUniversalConvert(DistributedTest):
         """Run ds_to_universal on AutoEP checkpoint; verify universal_checkpoint_info."""
         # Local import to allow collection before Phase 5 code exists
         from deepspeed.checkpoint.autoep_universal import consolidate_autoep_expert_files
-        from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY, EXPERT_PARAMETER_PATTERNS
+        from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY
 
         engine = _init_engine(ep_size=1)
         save_dir = os.path.join(str(tmpdir), "ckpt")
@@ -766,7 +789,7 @@ class TestUniversalConvert(DistributedTest):
         """Verify expert optimizer states are consolidated with is_expert_param=True."""
         # This test validates Phase 5a optimizer consolidation
         from deepspeed.checkpoint.autoep_universal import consolidate_autoep_optimizer_states
-        from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY, EP_IS_EXPERT_PARAM
+        from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY
 
         engine = _init_engine(ep_size=1, zero_stage=0)
 
@@ -837,8 +860,11 @@ class TestUniversalLoad(DistributedTest):
         mock_param._hp_mapping = MockMapping()
         mock_param.load_hp_checkpoint_state = lambda *a, **kw: load_hp_checkpoint_state(mock_param, *a, **kw)
 
-        step = mock_param.load_hp_checkpoint_state(param_dir, tp_rank=0, tp_world_size=1,
-                                                    ep_rank=ep_rank, ep_size=ep_size)
+        step = mock_param.load_hp_checkpoint_state(param_dir,
+                                                   tp_rank=0,
+                                                   tp_world_size=1,
+                                                   ep_rank=ep_rank,
+                                                   ep_size=ep_size)
 
         # Verify the HP fragment was written correctly
         hp_fragment = mock_param._hp_mapping.get_hp_fragment()
@@ -883,8 +909,7 @@ class TestUniversalLoad(DistributedTest):
         mock_param.load_hp_checkpoint_state = lambda *a, **kw: load_hp_checkpoint_state(mock_param, *a, **kw)
 
         with pytest.raises((RuntimeError, AssertionError)):
-            mock_param.load_hp_checkpoint_state(param_dir, tp_rank=0, tp_world_size=1,
-                                                 ep_rank=0, ep_size=2)
+            mock_param.load_hp_checkpoint_state(param_dir, tp_rank=0, tp_world_size=1, ep_rank=0, ep_size=2)
 
     def test_universal_load_non_expert_unaffected(self, tmpdir):
         """Non-expert params still use TP slicing when ep_rank/ep_size are passed."""
@@ -921,5 +946,4 @@ class TestUniversalLoad(DistributedTest):
         mock_param.load_hp_checkpoint_state = lambda *a, **kw: load_hp_checkpoint_state(mock_param, *a, **kw)
 
         # Should work fine with ep_rank/ep_size passed
-        step = mock_param.load_hp_checkpoint_state(param_dir, tp_rank=0, tp_world_size=1,
-                                                    ep_rank=0, ep_size=2)
+        step = mock_param.load_hp_checkpoint_state(param_dir, tp_rank=0, tp_world_size=1, ep_rank=0, ep_size=2)

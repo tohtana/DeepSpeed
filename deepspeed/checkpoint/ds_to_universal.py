@@ -517,14 +517,11 @@ def main(args):
         if autoep_metadata is not None:
             consolidate_autoep_expert_files(args.input_folder, args.output_folder, autoep_metadata)
             ep_size = autoep_metadata[0]['ep_size'] if autoep_metadata else 1
-            consolidate_autoep_optimizer_states(
-                args.input_folder, args.output_folder, autoep_metadata, ep_size)
+            consolidate_autoep_optimizer_states(args.input_folder, args.output_folder, autoep_metadata, ep_size)
             print(f'    Consolidated {len(autoep_metadata)} AutoEP layer(s)')
         elif expert_files:
-            raise RuntimeError(
-                f"Found {len(expert_files)} expert checkpoint files but no AutoEP metadata "
-                f"(ds_autoep_layers) in the checkpoint. The checkpoint may be corrupt."
-            )
+            raise RuntimeError(f"Found {len(expert_files)} expert checkpoint files but no AutoEP metadata "
+                               f"(ds_autoep_layers) in the checkpoint. The checkpoint may be corrupt.")
         else:
             print('    No AutoEP layers found, skipping')
 
@@ -554,14 +551,13 @@ def main(args):
         stage3_expert_files = glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*_model_states.pt'))
         stage3_model_files_for_meta = glob.glob(os.path.join(args.input_folder, 'mp_rank_*_model_states.pt'))
         if stage3_model_files_for_meta:
-            _stage3_sd = torch.load(stage3_model_files_for_meta[0], map_location=torch.device('cpu'),
+            _stage3_sd = torch.load(stage3_model_files_for_meta[0],
+                                    map_location=torch.device('cpu'),
                                     weights_only=False)
             _stage3_autoep = _stage3_sd.get('ds_autoep_layers') or _stage3_sd.get('autoep_layers')
             if _stage3_autoep is not None:
-                raise NotImplementedError(
-                    "Stage 3 universal checkpoint conversion with AutoEP is not supported. "
-                    "AutoEP currently requires ZeRO Stage 1 or 2."
-                )
+                raise NotImplementedError("Stage 3 universal checkpoint conversion with AutoEP is not supported. "
+                                          "AutoEP currently requires ZeRO Stage 1 or 2.")
 
         model_files = _get_model_state_files(args.input_folder)
         param_shapes = _parse_model_states_stage3(model_files)

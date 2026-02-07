@@ -2,20 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-
 """AutoEP configuration: config parsing, model presets, and validation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from deepspeed.utils import logger
 
-
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class MoEModelPreset:
@@ -94,7 +93,8 @@ class AutoEPConfig:
 # ---------------------------------------------------------------------------
 
 PRESET_MODELS: dict[str, MoEModelPreset] = {
-    "mixtral": MoEModelPreset(
+    "mixtral":
+    MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",
         router_pattern="gate",
         experts_pattern="experts",
@@ -109,7 +109,8 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         route_norm=True,
         gate_bias=False,
     ),
-    "qwen3_moe": MoEModelPreset(
+    "qwen3_moe":
+    MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",
         router_pattern="gate",
         experts_pattern="experts",
@@ -126,7 +127,8 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         has_shared_experts=True,
         shared_experts_pattern="shared_expert",
     ),
-    "deepseek_v2": MoEModelPreset(
+    "deepseek_v2":
+    MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",
         router_pattern="gate",
         experts_pattern="experts",
@@ -143,7 +145,8 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         has_shared_experts=True,
         shared_experts_pattern="shared_experts",
     ),
-    "deepseek_v3": MoEModelPreset(
+    "deepseek_v3":
+    MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",
         router_pattern="gate",
         experts_pattern="experts",
@@ -160,7 +163,8 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         has_shared_experts=True,
         shared_experts_pattern="shared_experts",
     ),
-    "llama4": MoEModelPreset(
+    "llama4":
+    MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.feed_forward",
         router_pattern="router",
         experts_pattern="experts",
@@ -179,10 +183,10 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
     ),
 }
 
-
 # ---------------------------------------------------------------------------
 # Config parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     """Parse the 'expert_parallel' section from DS config JSON."""
@@ -215,6 +219,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
 # Validation helpers
 # ---------------------------------------------------------------------------
 
+
 def validate_autoep_config(
     config: AutoEPConfig,
     world_size: int,
@@ -228,73 +233,53 @@ def validate_autoep_config(
 
     # TP + SP mutual exclusivity
     if tp_size > 1 and sp_size > 1:
-        raise ValueError(
-            f"AutoEP does not support simultaneous TP (autotp_size={tp_size}) "
-            f"and SP (sequence_parallel_size={sp_size}). Use one or the other."
-        )
+        raise ValueError(f"AutoEP does not support simultaneous TP (autotp_size={tp_size}) "
+                         f"and SP (sequence_parallel_size={sp_size}). Use one or the other.")
 
     # ep_size must divide the stage size (world_size / pp_size)
     stage_size = world_size // pp_size
     if stage_size % config.autoep_size != 0:
-        raise ValueError(
-            f"autoep_size={config.autoep_size} must divide the stage size "
-            f"(world_size={world_size} / pp_size={pp_size} = {stage_size}). "
-            f"Valid autoep_size values: {_divisors(stage_size)}"
-        )
+        raise ValueError(f"autoep_size={config.autoep_size} must divide the stage size "
+                         f"(world_size={world_size} / pp_size={pp_size} = {stage_size}). "
+                         f"Valid autoep_size values: {_divisors(stage_size)}")
 
     # Validate preset_model if specified
     if config.preset_model is not None and config.preset_model not in PRESET_MODELS:
-        raise ValueError(
-            f"Unknown preset_model '{config.preset_model}'. "
-            f"Available presets: {list(PRESET_MODELS.keys())}"
-        )
+        raise ValueError(f"Unknown preset_model '{config.preset_model}'. "
+                         f"Available presets: {list(PRESET_MODELS.keys())}")
 
     # Validate grouped_mm_backend
     valid_backends = ("auto", "torch", "cutlass", "sequential")
     if config.grouped_mm_backend not in valid_backends:
-        raise ValueError(
-            f"grouped_mm_backend must be one of {valid_backends}, "
-            f"got '{config.grouped_mm_backend}'"
-        )
+        raise ValueError(f"grouped_mm_backend must be one of {valid_backends}, "
+                         f"got '{config.grouped_mm_backend}'")
 
     # Validate score_apply
     valid_score_apply = ("auto", "pre", "post")
     if config.score_apply not in valid_score_apply:
-        raise ValueError(
-            f"score_apply must be one of {valid_score_apply}, "
-            f"got '{config.score_apply}'"
-        )
+        raise ValueError(f"score_apply must be one of {valid_score_apply}, "
+                         f"got '{config.score_apply}'")
 
     # Validate score_func
     valid_score_func = ("auto", "softmax", "sigmoid")
     if config.score_func not in valid_score_func:
-        raise ValueError(
-            f"score_func must be one of {valid_score_func}, "
-            f"got '{config.score_func}'"
-        )
+        raise ValueError(f"score_func must be one of {valid_score_func}, "
+                         f"got '{config.score_func}'")
 
     # Validate num_expert_groups constraints
     if config.num_expert_groups is not None:
         if config.num_expert_groups < 1:
-            raise ValueError(
-                f"num_expert_groups must be >= 1, got {config.num_expert_groups}"
-            )
+            raise ValueError(f"num_expert_groups must be >= 1, got {config.num_expert_groups}")
         if config.num_limited_groups is not None and config.num_limited_groups > config.num_expert_groups:
-            raise ValueError(
-                f"num_limited_groups ({config.num_limited_groups}) must be <= "
-                f"num_expert_groups ({config.num_expert_groups})"
-            )
-        logger.warning(
-            "num_expert_groups is set; interaction with EP topology "
-            "is not yet optimized."
-        )
+            raise ValueError(f"num_limited_groups ({config.num_limited_groups}) must be <= "
+                             f"num_expert_groups ({config.num_expert_groups})")
+        logger.warning("num_expert_groups is set; interaction with EP topology "
+                       "is not yet optimized.")
 
     # Warn if autoep_size == 1 (no EP needed)
     if config.autoep_size == 1:
-        logger.warning(
-            "autoep_size=1 means every rank owns all experts with no AllToAll. "
-            "AutoEP replacement will be bypassed; the model runs as-is with DP."
-        )
+        logger.warning("autoep_size=1 means every rank owns all experts with no AllToAll. "
+                       "AutoEP replacement will be bypassed; the model runs as-is with DP.")
 
 
 def validate_autoep_post_detection(
@@ -309,34 +294,26 @@ def validate_autoep_post_detection(
         # ep_size must not exceed num_experts
         if config.autoep_size > spec.num_experts:
             valid_divisors = _divisors(spec.num_experts)
-            raise ValueError(
-                f"autoep_size={config.autoep_size} exceeds num_experts="
-                f"{spec.num_experts} in layer '{spec.moe_module_name}'. "
-                f"Each rank must own at least one expert. "
-                f"Valid autoep_size values (divisors of {spec.num_experts}): "
-                f"{valid_divisors}"
-            )
+            raise ValueError(f"autoep_size={config.autoep_size} exceeds num_experts="
+                             f"{spec.num_experts} in layer '{spec.moe_module_name}'. "
+                             f"Each rank must own at least one expert. "
+                             f"Valid autoep_size values (divisors of {spec.num_experts}): "
+                             f"{valid_divisors}")
 
         # num_experts must be divisible by ep_size
         if spec.num_experts % config.autoep_size != 0:
-            valid_sizes = [
-                d for d in _divisors(spec.num_experts) if d <= spec.num_experts
-            ]
-            raise ValueError(
-                f"num_experts={spec.num_experts} in layer "
-                f"'{spec.moe_module_name}' is not divisible by "
-                f"autoep_size={config.autoep_size}. "
-                f"Suggested autoep_size values: {valid_sizes}"
-            )
+            valid_sizes = [d for d in _divisors(spec.num_experts) if d <= spec.num_experts]
+            raise ValueError(f"num_experts={spec.num_experts} in layer "
+                             f"'{spec.moe_module_name}' is not divisible by "
+                             f"autoep_size={config.autoep_size}. "
+                             f"Suggested autoep_size values: {valid_sizes}")
 
         # Validate num_expert_groups divides num_experts
         if config.num_expert_groups is not None:
             if spec.num_experts % config.num_expert_groups != 0:
-                raise ValueError(
-                    f"num_expert_groups ({config.num_expert_groups}) must divide "
-                    f"num_experts ({spec.num_experts}) in layer "
-                    f"'{spec.moe_module_name}'"
-                )
+                raise ValueError(f"num_expert_groups ({config.num_expert_groups}) must divide "
+                                 f"num_experts ({spec.num_experts}) in layer "
+                                 f"'{spec.moe_module_name}'")
 
 
 def _divisors(n: int) -> list[int]:
