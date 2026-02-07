@@ -3243,8 +3243,23 @@ class DeepSpeedEngine(Module):
                             model=None,
                             mpu=None,
                             num_experts=1,
-                            checkpoint_engine=TorchCheckpointEngine()):
+                            checkpoint_engine=TorchCheckpointEngine(),
+                            autoep_layers=None):
+        try:
+            from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer as _AutoEPMoELayer
+        except ImportError:
+            _AutoEPMoELayer = None
+
+        has_autoep_layers = _AutoEPMoELayer is not None and model is not None and any(
+            isinstance(m, _AutoEPMoELayer) for _, m in model.named_modules()
+        )
+
         if old_moe_load:
+            if has_autoep_layers:
+                raise RuntimeError(
+                    "Legacy checkpoint format (old_moe_load) is incompatible with AutoEP layers. "
+                    "Use Universal Checkpointing to convert the checkpoint first."
+                )
             expp_rank = groups._get_expert_data_parallel_rank(groups._get_max_expert_size_name())
 
             num_local_experts = max(num_experts) // groups._get_expert_parallel_world_size(
@@ -3269,6 +3284,37 @@ class DeepSpeedEngine(Module):
                 state_dict.update(expert_state_dict)
 
         else:
+            # Validate AutoEP metadata if present
+            if autoep_layers is not None:
+                if not isinstance(autoep_layers, list):
+                    raise RuntimeError(
+                        f"ds_autoep_layers metadata is malformed: expected list, got {type(autoep_layers).__name__}"
+                    )
+                seen_ids = set()
+                required_fields = {'moe_layer_id', 'module_path', 'num_experts', 'num_local_experts',
+                                   'ep_size', 'expert_key_prefix'}
+                for entry in autoep_layers:
+                    if not isinstance(entry, dict):
+                        raise RuntimeError(
+                            f"ds_autoep_layers entry is malformed: expected dict, got {type(entry).__name__}"
+                        )
+                    missing = required_fields - entry.keys()
+                    if missing:
+                        raise RuntimeError(
+                            f"ds_autoep_layers entry is invalid: missing fields {sorted(missing)}"
+                        )
+                    lid = entry['moe_layer_id']
+                    if lid in seen_ids:
+                        raise RuntimeError(
+                            f"ds_autoep_layers metadata has duplicate moe_layer_id: {lid}"
+                        )
+                    seen_ids.add(lid)
+            elif has_autoep_layers:
+                logger.warning(
+                    "Checkpoint does not contain ds_autoep_layers metadata. "
+                    "Loading AutoEP expert weights using best-effort module detection."
+                )
+
             moe_layer_id = 0
             for n_module, module in model.named_modules():
                 if isinstance(module, MoE):  # and deepspeed.comm.get_rank() == 0:
@@ -3289,6 +3335,50 @@ class DeepSpeedEngine(Module):
                                                     f'{moe_str_prefix}{local_expert_id}')
                             expert_state_dict[local_key] = expert_state_dict.pop(key)
                         state_dict.update(expert_state_dict)
+                    moe_layer_id += 1
+
+                elif _AutoEPMoELayer is not None and isinstance(module, _AutoEPMoELayer):
+                    group_name = module.ep_group_name
+                    num_local_experts = module.num_local_experts
+                    expp_rank = groups._get_expert_parallel_rank(group_name)
+                    module_prefix = f"{n_module}." if n_module else ""
+
+                    # Collect per-expert tensors to stack
+                    stacked = {wname: [] for wname in ('w1', 'w2', 'w3')}
+
+                    for local_expert_id in range(num_local_experts):
+                        global_expert_id = expp_rank * num_local_experts + local_expert_id
+                        expert_ckpt_path = DeepSpeedEngine._get_expert_ckpt_name(
+                            checkpoint_path, moe_layer_id, global_expert_id, tag, mpu)
+                        if not os.path.exists(expert_ckpt_path):
+                            raise FileNotFoundError(
+                                f"Expert checkpoint file not found: {expert_ckpt_path}. "
+                                f"Expected layer_{moe_layer_id} expert_{global_expert_id}."
+                            )
+                        expert_sd = checkpoint_engine.load(
+                            expert_ckpt_path, map_location=torch.device('cpu'))
+
+                        for wname in ('w1', 'w2', 'w3'):
+                            fused_key = f"{module_prefix}experts.{wname}"
+                            expert_key = f"{fused_key}.{global_expert_id}"
+                            if expert_key not in expert_sd:
+                                raise RuntimeError(
+                                    f"Expert checkpoint file is corrupt: key '{expert_key}' not found "
+                                    f"in {expert_ckpt_path}"
+                                )
+                            tensor = expert_sd[expert_key]
+                            if tensor.dim() != 2:
+                                raise RuntimeError(
+                                    f"Expert checkpoint file is corrupt: expected 2D tensor for "
+                                    f"'{expert_key}', got {tensor.dim()}D in {expert_ckpt_path}"
+                                )
+                            stacked[wname].append(tensor)
+
+                    # Stack back to fused [E_local, ...] format
+                    for wname in ('w1', 'w2', 'w3'):
+                        fused_key = f"{module_prefix}experts.{wname}"
+                        state_dict[fused_key] = torch.stack(stacked[wname], dim=0)
+
                     moe_layer_id += 1
 
     def load_module_state_dict(self, checkpoint, strict=True, custom_load_fn=None, fetch_z3_params=False):
@@ -3526,6 +3616,10 @@ class DeepSpeedEngine(Module):
             old_moe_load = False
             if not isinstance(checkpoint['num_experts'], list):
                 old_moe_load = True
+            from deepspeed.checkpoint.constants import AUTOEP_LAYERS_KEY, AUTOEP_LAYERS_KEY_LEGACY
+            autoep_layers = checkpoint.get(AUTOEP_LAYERS_KEY)
+            if autoep_layers is None:
+                autoep_layers = checkpoint.get(AUTOEP_LAYERS_KEY_LEGACY)
             DeepSpeedEngine.load_moe_state_dict(load_dir,
                                                 tag,
                                                 state_dict=checkpoint['module'],
@@ -3533,7 +3627,8 @@ class DeepSpeedEngine(Module):
                                                 model=self.module,
                                                 mpu=self.mpu,
                                                 num_experts=self.num_experts,
-                                                checkpoint_engine=self.checkpoint_engine)
+                                                checkpoint_engine=self.checkpoint_engine,
+                                                autoep_layers=autoep_layers)
         if not self.load_universal_checkpoint():
             self.load_module_state_dict(checkpoint=checkpoint,
                                         strict=load_module_strict,
@@ -3859,23 +3954,52 @@ class DeepSpeedEngine(Module):
         dist.barrier()
 
     def _get_non_moe_state_dict(self, full_state_dict):
+        """Remove expert-param keys from state dict, keeping all non-expert params.
+
+        Handles both native MoE (deepspeed_moe.experts.*) and AutoEP (experts.w1/w2/w3).
+        Preserves: router weights, shared_experts, expert_bias, all non-MoE params.
         """
-            Get the state dict of the non-moe layers
-        """
-        for key in list(full_state_dict.keys()):
-            if 'expert' in key and 'moe.gate.wg.weight' not in key:
-                full_state_dict.pop(key)
+        try:
+            from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer as _AutoEPMoELayer
+        except ImportError:
+            _AutoEPMoELayer = None
+
+        expert_param_keys = set()
+
+        for n_module, module in self.module.named_modules():
+            module_prefix = f"{n_module}." if n_module else ""
+            if isinstance(module, MoE):
+                # Native MoE: remove keys with 'expert' except gate, scoped to this module
+                for key in full_state_dict.keys():
+                    if key.startswith(module_prefix) and 'expert' in key and 'moe.gate.wg.weight' not in key:
+                        expert_param_keys.add(key)
+            elif _AutoEPMoELayer is not None and isinstance(module, _AutoEPMoELayer):
+                # AutoEP: remove only the fused expert weight keys (w1, w2, w3)
+                experts_prefix = f"{module_prefix}experts."
+                for key in full_state_dict.keys():
+                    if key.startswith(experts_prefix) and key[len(experts_prefix):] in ('w1', 'w2', 'w3'):
+                        expert_param_keys.add(key)
+
+        for key in expert_param_keys:
+            full_state_dict.pop(key)
 
         return full_state_dict
 
     def _save_moe_checkpoint(self, save_dir, tag, client_state={}, exclude_frozen_parameters=False):
         save_path = self._get_ckpt_name(save_dir, tag)
 
+        try:
+            from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer as _AutoEPMoELayer
+        except ImportError:
+            _AutoEPMoELayer = None
+
         # A hack to save the checkpointing directory. Pipeline parallelism overrides
         # module_state_dict() and uses this path to save the model. module_state_dict()
         # then instead just returns None.
 
         # Using layer_#_export_# to save the model's expert state_dict
+        autoep_layer_info = []
+        autoep_group_names = set()
         moe_layer_id = 0
         for n_module, module in self.module.named_modules():
             if isinstance(module, MoE):  # and deepspeed.comm.get_rank() == 0:
@@ -3925,6 +4049,55 @@ class DeepSpeedEngine(Module):
                     if self.checkpoint_engine.preserves_storage_sharing():
                         saveable_state_dict = clone_tensors_for_torch_save(expert_state_dict)
                     self.checkpoint_engine.save(saveable_state_dict, moe_save_path)
+                moe_layer_id += 1
+
+            elif _AutoEPMoELayer is not None and isinstance(module, _AutoEPMoELayer):
+                group_name = module.ep_group_name
+                num_local_experts = module.num_local_experts
+                expp_rank = groups._get_expert_parallel_rank(group_name)
+                exp_dp_rank = groups._get_expert_data_parallel_rank(group_name)
+                module_prefix = f"{n_module}." if n_module else ""
+
+                # Collect metadata on ALL ranks (before writer guard)
+                autoep_layer_info.append({
+                    'moe_layer_id': moe_layer_id,
+                    'module_path': n_module,
+                    'num_experts': module.num_experts,
+                    'num_local_experts': num_local_experts,
+                    'ep_size': module.ep_size,
+                    'expert_key_prefix': f"{module_prefix}experts",
+                })
+                autoep_group_names.add(group_name)
+                if len(autoep_group_names) > 1:
+                    raise RuntimeError(
+                        f"AutoEP checkpointing requires a single EP group size, but found "
+                        f"multiple groups: {sorted(autoep_group_names)}. "
+                        f"All AutoEPMoELayer instances must use the same ep_size."
+                    )
+
+                # Gate file writes behind writer guard
+                if not self.checkpoint_engine.is_data_parallel_writer(exp_dp_rank):
+                    moe_layer_id += 1
+                    continue
+
+                # Slice fused 3D tensors into per-expert state dicts
+                for local_expert_id in range(num_local_experts):
+                    global_expert_id = expp_rank * num_local_experts + local_expert_id
+                    expert_state_dict = {}
+                    for wname in ('w1', 'w2', 'w3'):
+                        fused_key = f"{module_prefix}experts.{wname}"
+                        param = getattr(module.experts, wname)
+                        expert_state_dict[f"{fused_key}.{global_expert_id}"] = (
+                            param[local_expert_id].clone().detach()
+                        )
+
+                    moe_save_path = self._get_expert_ckpt_name(
+                        save_dir, moe_layer_id, global_expert_id, tag, self.mpu)
+                    saveable = expert_state_dict
+                    if self.checkpoint_engine.preserves_storage_sharing():
+                        saveable = clone_tensors_for_torch_save(expert_state_dict)
+                    self.checkpoint_engine.save(saveable, moe_save_path)
+
                 moe_layer_id += 1
 
         self._curr_ckpt_path = os.path.join(save_dir, tag)
@@ -3983,8 +4156,18 @@ class DeepSpeedEngine(Module):
                 'mp_world_size':
                 self.mp_world_size,
                 'num_experts':
-                self.num_experts
+                self.num_experts,
+                'ds_autoep_layers':
+                autoep_layer_info if autoep_layer_info else None,
             }
+            # Check for reserved-key collisions with client_state
+            reserved_keys = {'ds_autoep_layers', 'autoep_layers'}
+            collisions = reserved_keys.intersection(client_state.keys())
+            if collisions:
+                raise KeyError(
+                    f"client_state contains reserved checkpoint keys: {sorted(collisions)}. "
+                    f"These keys are used internally by DeepSpeed for AutoEP metadata."
+                )
             state.update(client_state)
             logger.info(f'Saving model checkpoint: {save_path}')
             saveable_state_dict = state
