@@ -11,6 +11,11 @@ from typing import Literal
 
 from deepspeed.utils import logger
 
+# Sentinel for "not specified in config, use preset default".
+# Unlike None (which means "fused gate+up, no separate w3"), _UNSET means
+# the user did not set the field at all.  Compare with `is _UNSET`.
+_UNSET = object()
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -86,6 +91,14 @@ class AutoEPConfig:
     top_k: int | str = "auto"  # int or "auto"
     load_balance_coeff: float | None = 1e-3
     routed_scaling_factor: float | str = "auto"  # float or "auto"
+    # Custom preset fields (override defaults in custom/built-in preset paths)
+    expert_w1: str | None = None
+    expert_w2: str | None = None
+    expert_w3: object = _UNSET  # _UNSET = use preset default; None = fused gate+up; str = custom name
+    num_experts_attr: str | None = None
+    top_k_attr: str | None = None
+    has_shared_experts: bool | None = None
+    shared_experts_pattern: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +224,17 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.top_k = param_dict.get("top_k", "auto")
     config.load_balance_coeff = param_dict.get("load_balance_coeff", 1e-3)
     config.routed_scaling_factor = param_dict.get("routed_scaling_factor", "auto")
+    config.expert_w1 = param_dict.get("expert_w1", None)
+    config.expert_w2 = param_dict.get("expert_w2", None)
+    # expert_w3: key absent → _UNSET (preset default); key present with null → None (fused); key present with string → custom name
+    if "expert_w3" in param_dict:
+        config.expert_w3 = param_dict["expert_w3"]  # None or string
+    else:
+        config.expert_w3 = _UNSET
+    config.num_experts_attr = param_dict.get("num_experts_attr", None)
+    config.top_k_attr = param_dict.get("top_k_attr", None)
+    config.has_shared_experts = param_dict.get("has_shared_experts", None)
+    config.shared_experts_pattern = param_dict.get("shared_experts_pattern", None)
 
     return config
 
@@ -280,6 +304,76 @@ def validate_autoep_config(
     if config.autoep_size == 1:
         logger.warning("autoep_size=1 means every rank owns all experts with no AllToAll. "
                        "AutoEP replacement will be bypassed; the model runs as-is with DP.")
+
+    # Helper validators (local to validate_autoep_config)
+    def _validate_attr_name(field_name: str, value, *, allow_dot: bool = False) -> None:
+        if value is None:
+            return
+        if not isinstance(value, str) or value == "":
+            raise ValueError(f"{field_name} must be a non-empty string")
+        if not allow_dot and "." in value:
+            raise ValueError(f"{field_name} must be a direct attribute name (no dots)")
+
+    # Validate expert weight names
+    _validate_attr_name("expert_w1", config.expert_w1)
+    _validate_attr_name("expert_w2", config.expert_w2)
+    if config.expert_w3 is not _UNSET and config.expert_w3 is not None:
+        _validate_attr_name("expert_w3", config.expert_w3)
+
+    # Validate model.config attribute names
+    _validate_attr_name("num_experts_attr", config.num_experts_attr)
+    _validate_attr_name("top_k_attr", config.top_k_attr)
+
+    # Validate child-name fields (direct attribute names, not regex/path)
+    _validate_attr_name("router_pattern", config.router_pattern)
+    _validate_attr_name("expert_pattern", config.expert_pattern)
+    _validate_attr_name("shared_experts_pattern", config.shared_experts_pattern)
+
+    # Validate has_shared_experts type
+    if config.has_shared_experts is not None and not isinstance(config.has_shared_experts, bool):
+        raise ValueError("has_shared_experts must be a boolean when set")
+
+    # Warn if explicit top_k overrides top_k_attr
+    if isinstance(config.top_k, int) and config.top_k_attr is not None:
+        logger.warning("top_k is explicitly set; top_k_attr will be ignored.")
+
+    # Validate shared expert field pairing
+    if config.has_shared_experts is True and not config.shared_experts_pattern:
+        logger.warning("has_shared_experts=True but shared_experts_pattern is not set. "
+                       "Shared expert detection requires both fields.")
+    if config.shared_experts_pattern and config.has_shared_experts is not True:
+        logger.warning(f"shared_experts_pattern='{config.shared_experts_pattern}' is set "
+                       f"but has_shared_experts is not True. Pattern will be ignored.")
+
+    # Warn if custom override fields are set alongside preset_model or auto-detect
+    custom_fields_set = []
+    if config.moe_layer_pattern is not None:
+        custom_fields_set.append("moe_layer_pattern")
+    if config.router_pattern is not None:
+        custom_fields_set.append("router_pattern")
+    if config.expert_pattern is not None:
+        custom_fields_set.append("expert_pattern")
+    if config.expert_w1 is not None:
+        custom_fields_set.append("expert_w1")
+    if config.expert_w2 is not None:
+        custom_fields_set.append("expert_w2")
+    if config.expert_w3 is not _UNSET:
+        custom_fields_set.append("expert_w3")
+    if config.num_experts_attr is not None:
+        custom_fields_set.append("num_experts_attr")
+    if config.top_k_attr is not None:
+        custom_fields_set.append("top_k_attr")
+    if config.has_shared_experts is not None:
+        custom_fields_set.append("has_shared_experts")
+    if config.shared_experts_pattern is not None:
+        custom_fields_set.append("shared_experts_pattern")
+    if custom_fields_set and config.preset_model is not None:
+        logger.warning(f"Custom preset fields {custom_fields_set} are set alongside "
+                       f"preset_model='{config.preset_model}'. Custom fields will override "
+                       f"preset defaults during detection.")
+    if custom_fields_set and config.preset_model is None and config.moe_layer_pattern is None:
+        logger.warning(f"Custom preset fields {custom_fields_set} are set without preset_model or "
+                       f"moe_layer_pattern. Overrides will apply to auto-detected presets or try-all.")
 
 
 def validate_autoep_post_detection(

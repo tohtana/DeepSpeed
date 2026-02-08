@@ -22,6 +22,7 @@ from deepspeed.module_inject.auto_ep_config import (
     MoELayerSpec,
     MoEModelPreset,
     PRESET_MODELS,
+    _UNSET,
 )
 
 
@@ -74,14 +75,19 @@ def _infer_hidden_and_ffn_size(
         w1_param = getattr(experts_module, preset.expert_w1, None)
         w2_param = getattr(experts_module, preset.expert_w2, None)
         if w1_param is not None and w2_param is not None:
-            # gate_up_proj: [num_experts, 2*ffn_hidden, hidden_size]
-            # down_proj: [num_experts, hidden_size, ffn_hidden]
             if preset.expert_w3 is None:
                 # Fused gate+up: w1 shape is [E, 2*ffn, hidden]
+                if w1_param.shape[1] % 2 != 0:
+                    raise ValueError(f"expert_w3=None expects fused gate+up weights, but "
+                                     f"{preset.expert_w1} has odd second dim {w1_param.shape}.")
                 hidden_size = w1_param.shape[2]
                 ffn_hidden_size = w1_param.shape[1] // 2
             else:
                 # Separate gate and up: w1 shape is [E, ffn, hidden]
+                w3_param = getattr(experts_module, preset.expert_w3, None)
+                if w3_param is None:
+                    raise ValueError(f"expert_w3='{preset.expert_w3}' is set but no such weight "
+                                     f"exists on experts module.")
                 hidden_size = w1_param.shape[2]
                 ffn_hidden_size = w1_param.shape[1]
             return hidden_size, ffn_hidden_size
@@ -383,13 +389,46 @@ class AutoEP:
                     f"(ep_size={ep_size}, ep_rank={ep_rank}, "
                     f"local_experts={replacement.num_local_experts})")
 
+    def _apply_config_overrides(self, preset: MoEModelPreset) -> MoEModelPreset:
+        """Apply user config field overrides to a resolved preset.
+
+        Only applies overrides for fields explicitly set by the user (non-default values).
+        Returns the original preset unchanged if no overrides are set.
+        """
+        overrides = {}
+        if self.config.moe_layer_pattern is not None:
+            overrides['moe_layer_pattern'] = self.config.moe_layer_pattern
+        if self.config.router_pattern is not None:
+            overrides['router_pattern'] = self.config.router_pattern
+        if self.config.expert_pattern is not None:
+            overrides['experts_pattern'] = self.config.expert_pattern
+        if self.config.expert_w1 is not None:
+            overrides['expert_w1'] = self.config.expert_w1
+        if self.config.expert_w2 is not None:
+            overrides['expert_w2'] = self.config.expert_w2
+        if self.config.expert_w3 is not _UNSET:
+            overrides['expert_w3'] = self.config.expert_w3
+        if self.config.num_experts_attr is not None:
+            overrides['num_experts_attr'] = self.config.num_experts_attr
+        if self.config.top_k_attr is not None:
+            overrides['top_k_attr'] = self.config.top_k_attr
+        if self.config.has_shared_experts is not None:
+            overrides['has_shared_experts'] = self.config.has_shared_experts
+        if self.config.shared_experts_pattern is not None:
+            overrides['shared_experts_pattern'] = self.config.shared_experts_pattern
+        if not overrides:
+            return preset
+        from dataclasses import replace
+        return replace(preset, **overrides)
+
     def _resolve_presets(self) -> list[tuple[str, MoEModelPreset]]:
         """Determine which preset(s) to use for detection."""
         if self.config.preset_model is not None:
             if self.config.preset_model not in PRESET_MODELS:
                 raise ValueError(f"Unknown preset_model '{self.config.preset_model}'. "
                                  f"Available: {list(PRESET_MODELS.keys())}")
-            return [(self.config.preset_model, PRESET_MODELS[self.config.preset_model])]
+            preset = self._apply_config_overrides(PRESET_MODELS[self.config.preset_model])
+            return [(self.config.preset_model, preset)]
 
         # Auto-detect from model_type
         if self.model_config is not None:
@@ -407,7 +446,8 @@ class AutoEP:
                 preset_name = type_map.get(model_type)
                 if preset_name and preset_name in PRESET_MODELS:
                     logger.info(f"AutoEP: auto-detected model_type='{model_type}', using preset '{preset_name}'")
-                    return [(preset_name, PRESET_MODELS[preset_name])]
+                    preset = self._apply_config_overrides(PRESET_MODELS[preset_name])
+                    return [(preset_name, preset)]
 
         # If custom patterns are provided, build an ad-hoc preset
         if self.config.moe_layer_pattern:
@@ -415,18 +455,21 @@ class AutoEP:
                 moe_layer_pattern=self.config.moe_layer_pattern,
                 router_pattern=self.config.router_pattern or "gate",
                 experts_pattern=self.config.expert_pattern or "experts",
-                expert_storage="fused_3d",
-                expert_w1="gate_up_proj",
-                expert_w2="down_proj",
-                expert_w3=None,
-                num_experts_attr="num_local_experts",
-                top_k_attr="num_experts_per_tok",
-                score_func="softmax",
-                score_apply="post",
-                route_norm=True,
-                gate_bias=False,
+                expert_storage="fused_3d",  # informational; actual detection by _detect_expert_storage()
+                expert_w1=self.config.expert_w1 or "gate_up_proj",
+                expert_w2=self.config.expert_w2 or "down_proj",
+                expert_w3=(None if self.config.expert_w3 is _UNSET else self.config.expert_w3),
+                num_experts_attr=self.config.num_experts_attr or "num_local_experts",
+                top_k_attr=self.config.top_k_attr or "num_experts_per_tok",
+                score_func=(self.config.score_func if self.config.score_func != "auto" else "softmax"),
+                score_apply=(self.config.score_apply if self.config.score_apply != "auto" else "post"),
+                route_norm=(self.config.route_norm if self.config.route_norm is not None else True),
+                gate_bias=False,  # always overridden by model introspection in ep_parser()
+                has_shared_experts=(self.config.has_shared_experts
+                                    if self.config.has_shared_experts is not None else False),
+                shared_experts_pattern=self.config.shared_experts_pattern or "",
             )
             return [("custom", custom_preset)]
 
         # Try all presets
-        return list(PRESET_MODELS.items())
+        return [(name, self._apply_config_overrides(p)) for name, p in PRESET_MODELS.items()]

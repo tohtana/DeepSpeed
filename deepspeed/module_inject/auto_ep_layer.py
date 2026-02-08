@@ -16,6 +16,7 @@ import torch.nn as nn
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec
+from deepspeed.utils import logger
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
@@ -345,8 +346,14 @@ class AutoEPMoELayer(nn.Module):
         if spec.gate_bias and getattr(source_gate, 'bias', None) is not None:
             self.router.gate.bias.data.copy_(source_gate.bias.data)
 
-        # Alias gate -> router for Qwen3 OutputRecorder path resolution
-        self.gate = self.router
+        # Alias router under the name OutputRecorder expects (layer_name if provided),
+        # but only when OutputRecorder captures from the router child and the alias is safe.
+        alias_target = spec.router_logits_capture_layer_name or spec.router_name
+        if spec.router_logits_capture_target == "router" and alias_target != "router":
+            if "." in alias_target or alias_target in ("experts", "shared_experts") or hasattr(self, alias_target):
+                logger.warning(f"Skipping router alias '{alias_target}' to avoid name collision.")
+            else:
+                setattr(self, alias_target, self.router)
 
         # Experts: extract local expert weights
         w1, w2, w3 = repack_expert_weights(

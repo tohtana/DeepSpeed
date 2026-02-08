@@ -18,6 +18,7 @@ from deepspeed.module_inject.auto_ep_config import (
     parse_autoep_config,
     validate_autoep_config,
     validate_autoep_post_detection,
+    _UNSET,
 )
 
 
@@ -44,6 +45,13 @@ class TestAutoEPConfig:
         assert config.top_k == "auto"
         assert config.load_balance_coeff == pytest.approx(1e-3)
         assert config.routed_scaling_factor == "auto"
+        assert config.expert_w1 is None
+        assert config.expert_w2 is None
+        assert config.expert_w3 is _UNSET
+        assert config.num_experts_attr is None
+        assert config.top_k_attr is None
+        assert config.has_shared_experts is None
+        assert config.shared_experts_pattern is None
 
     def test_parse_autoep_config_full(self):
         """All fields parsed from complete JSON."""
@@ -65,6 +73,13 @@ class TestAutoEPConfig:
             "top_k": 2,
             "load_balance_coeff": 0.01,
             "routed_scaling_factor": 1.5,
+            "expert_w1": "w1",
+            "expert_w2": "w2",
+            "expert_w3": "w3",
+            "num_experts_attr": "num_moe_experts",
+            "top_k_attr": "moe_top_k",
+            "has_shared_experts": True,
+            "shared_experts_pattern": "shared_expert",
         }
         config = parse_autoep_config(param_dict)
         assert config.enabled is True
@@ -84,6 +99,13 @@ class TestAutoEPConfig:
         assert config.top_k == 2
         assert config.load_balance_coeff == pytest.approx(0.01)
         assert config.routed_scaling_factor == 1.5
+        assert config.expert_w1 == "w1"
+        assert config.expert_w2 == "w2"
+        assert config.expert_w3 == "w3"
+        assert config.num_experts_attr == "num_moe_experts"
+        assert config.top_k_attr == "moe_top_k"
+        assert config.has_shared_experts is True
+        assert config.shared_experts_pattern == "shared_expert"
 
     def test_validate_ep_tp_mutual_exclusivity(self):
         """autotp_size>1 + sp_size>1 raises ValueError."""
@@ -221,6 +243,38 @@ class TestAutoEPConfig:
         assert mixtral.expert_w1 == "gate_up_proj"
         assert mixtral.expert_w3 is None
         assert mixtral.has_shared_experts is False
+
+    def test_validate_empty_expert_w1(self):
+        """Empty expert_w1 raises ValueError."""
+        config = AutoEPConfig(enabled=True, autoep_size=2, expert_w1="")
+        with pytest.raises(ValueError, match="expert_w1"):
+            validate_autoep_config(config, world_size=8, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_validate_empty_expert_w2(self):
+        """Empty expert_w2 raises ValueError."""
+        config = AutoEPConfig(enabled=True, autoep_size=2, expert_w2="")
+        with pytest.raises(ValueError, match="expert_w2"):
+            validate_autoep_config(config, world_size=8, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_validate_empty_expert_w3(self):
+        """Empty expert_w3 raises ValueError."""
+        config = AutoEPConfig(enabled=True, autoep_size=2, expert_w3="")
+        with pytest.raises(ValueError, match="expert_w3"):
+            validate_autoep_config(config, world_size=8, pp_size=1, tp_size=1, sp_size=1)
+
+    def test_parse_expert_w3_sentinel_semantics(self):
+        """expert_w3 sentinel: absent=_UNSET, null=None, string=custom name."""
+        # Key absent -> _UNSET (use preset default)
+        c1 = parse_autoep_config({})
+        assert c1.expert_w3 is _UNSET
+
+        # Key present with None -> None (fused gate+up, no separate w3)
+        c2 = parse_autoep_config({"expert_w3": None})
+        assert c2.expert_w3 is None
+
+        # Key present with string -> custom weight name
+        c3 = parse_autoep_config({"expert_w3": "up_proj"})
+        assert c3.expert_w3 == "up_proj"
 
 
 # === Phase 4: Generalized Group Creation ===
@@ -582,6 +636,115 @@ class TestMoEDetection:
         replaced = model.model.layers[0].mlp
         assert isinstance(replaced, _AutoEPMoELayer)
 
+    def test_custom_preset_uses_config_fields(self):
+        """Custom preset path reads expert_w1/w2/etc from config."""
+
+        class CustomExperts(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.w1 = nn.Parameter(torch.randn(4, 256, 64))
+                self.w2 = nn.Parameter(torch.randn(4, 64, 128))
+
+        class CustomMoEBlock(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.router = nn.Linear(64, 4, bias=True)
+                self.mlp_experts = CustomExperts()
+
+        class CustomModel(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.config = type('C', (), {
+                    'model_type': 'custom',
+                    'num_moe_experts': 4,
+                    'moe_top_k': 1,
+                })()
+                self.model = nn.Module()
+                layer = nn.Module()
+                layer.moe = CustomMoEBlock()
+                self.model.layers = nn.ModuleList([layer])
+
+        model = CustomModel()
+        config = AutoEPConfig(
+            enabled=True,
+            autoep_size=1,
+            moe_layer_pattern=r"model\.layers\.\d+\.moe",
+            router_pattern="router",
+            expert_pattern="mlp_experts",
+            expert_w1="w1",
+            expert_w2="w2",
+            expert_w3=None,  # fused gate+up
+            num_experts_attr="num_moe_experts",
+            top_k_attr="moe_top_k",
+            score_func="sigmoid",
+        )
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        spec = specs[0]
+        assert spec.expert_w1_name == "w1"
+        assert spec.expert_w2_name == "w2"
+        assert spec.expert_w3_name is None
+        assert spec.num_experts == 4
+        assert spec.top_k == 1
+        assert spec.gate_bias is True  # auto-detected from router bias
+        assert spec.score_func == "sigmoid"
+
+    def test_preset_model_with_config_overrides(self):
+        """Custom fields override preset_model values."""
+        model = MockMoETransformer(num_layers=2, moe_every_n=1)
+        config = AutoEPConfig(
+            enabled=True,
+            autoep_size=1,
+            preset_model="mixtral",
+            moe_layer_pattern=r"model\.layers\.\d+\.moe",
+            router_pattern="router",
+            num_experts_attr="custom_num_experts",
+        )
+        auto_ep = AutoEP(model, config)
+        presets = auto_ep._resolve_presets()
+        assert len(presets) == 1
+        name, preset = presets[0]
+        assert name == "mixtral"
+        assert preset.moe_layer_pattern == r"model\.layers\.\d+\.moe"
+        assert preset.router_pattern == "router"
+        assert preset.num_experts_attr == "custom_num_experts"
+        # Other fields remain from the preset
+        assert preset.expert_w1 == "gate_up_proj"
+
+    def test_apply_config_overrides_no_overrides_returns_same(self):
+        """_apply_config_overrides with default config returns same preset object."""
+        model = MockMoETransformer(num_layers=2, moe_every_n=1)
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        auto_ep = AutoEP(model, config)
+        original = PRESET_MODELS["mixtral"]
+        result = auto_ep._apply_config_overrides(original)
+        assert result is original  # same object, not a copy
+
+    def test_apply_config_overrides_expert_w3_none_overrides(self):
+        """expert_w3=None (fused) overrides preset's expert_w3."""
+        model = MockMoETransformer(num_layers=2, moe_every_n=1)
+        config = AutoEPConfig(enabled=True, autoep_size=1, expert_w3=None)
+        auto_ep = AutoEP(model, config)
+        # deepseek_v3 preset has expert_w3=None already, but let's verify with a preset that has non-None
+        p = auto_ep._apply_config_overrides(PRESET_MODELS["deepseek_v3"])
+        assert p.expert_w3 is None
+        # Since deepseek_v3 already has expert_w3=None, this is a no-op for w3 but
+        # expert_w3 is not _UNSET so it triggers override logic
+        assert p is not PRESET_MODELS["deepseek_v3"]
+
+    def test_apply_config_overrides_expert_w3_unset_no_override(self):
+        """expert_w3=_UNSET (default) does NOT override preset's expert_w3."""
+        model = MockMoETransformer(num_layers=2, moe_every_n=1)
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        assert config.expert_w3 is _UNSET
+        auto_ep = AutoEP(model, config)
+        p = auto_ep._apply_config_overrides(PRESET_MODELS["deepseek_v3"])
+        assert p is PRESET_MODELS["deepseek_v3"]  # same object (no overrides)
+
 
 class TestWeightRepacking:
     """Phase 3 tests for expert weight repacking."""
@@ -888,3 +1051,56 @@ class TestEngineAutoEPConfig:
         config = AutoEPConfig(enabled=True, autoep_size=1)
         layer = AutoEPMoELayer(spec, source, ep_size=1, ep_rank=0, config=config)
         assert layer.num_experts == 4
+
+    def test_gate_alias_present_when_router_capture_and_name_differs(self):
+        """Gate alias created for router_name != 'router' when capture_target == 'router'."""
+        source = MockMoEBlock(num_experts=4, ffn_hidden=128, hidden_size=64)
+        spec = _make_spec(
+            router_name="gate",
+            router_logits_capture_target="router",
+            router_logits_capture_layer_name=None,
+        )
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        layer = AutoEPMoELayer(spec, source, ep_size=1, ep_rank=0, config=config)
+        assert hasattr(layer, 'gate')
+        assert layer.gate is layer.router
+
+    def test_gate_alias_uses_capture_layer_name(self):
+        """Alias uses router_logits_capture_layer_name when provided."""
+        source = MockMoEBlock(num_experts=4, ffn_hidden=128, hidden_size=64)
+        source.router = source.gate
+        spec = _make_spec(
+            router_name="router",
+            router_logits_capture_target="router",
+            router_logits_capture_layer_name="gate",
+        )
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        layer = AutoEPMoELayer(spec, source, ep_size=1, ep_rank=0, config=config)
+        assert hasattr(layer, 'gate')
+        assert layer.gate is layer.router
+
+    def test_no_gate_alias_when_alias_target_is_router(self):
+        """No alias when alias_target resolves to 'router' (e.g., Llama4)."""
+        source = MockMoEBlock(num_experts=4, ffn_hidden=128, hidden_size=64)
+        source.router = source.gate
+        spec = _make_spec(
+            router_name="router",
+            router_logits_capture_target="router",
+            router_logits_capture_layer_name=None,
+        )
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        layer = AutoEPMoELayer(spec, source, ep_size=1, ep_rank=0, config=config)
+        assert not hasattr(layer, 'gate')
+
+    def test_no_gate_alias_when_no_capture(self):
+        """No alias when capture_target is 'none'."""
+        source = MockMoEBlock(num_experts=4, ffn_hidden=128, hidden_size=64)
+        spec = _make_spec(
+            router_name="gate",
+            router_logits_capture_target="none",
+            router_logits_capture_layer_name="gate",
+        )
+        config = AutoEPConfig(enabled=True, autoep_size=1)
+        layer = AutoEPMoELayer(spec, source, ep_size=1, ep_rank=0, config=config)
+        # No gate alias because capture_target != "router"
+        assert not hasattr(layer, 'gate')
