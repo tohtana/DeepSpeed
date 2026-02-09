@@ -811,6 +811,66 @@ class TestUniversalConvert(DistributedTest):
 
         consolidate_autoep_optimizer_states(ckpt_dir, output_dir, metadata, ep_size=1)
 
+    def test_universal_convert_optimizer_states_distinct_w123(self, tmpdir):
+        """Verify w1/w2/w3 map to distinct optimizer state entries."""
+        from deepspeed.checkpoint.autoep_universal import consolidate_autoep_optimizer_states
+        from deepspeed.checkpoint.constants import PARAM
+
+        ckpt_dir = os.path.join(str(tmpdir), "ckpt")
+        output_dir = os.path.join(str(tmpdir), "universal_output")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        num_local = 2
+        shape = (num_local, 4, 8)
+        optim_state = {
+            # Intentionally place w2 before w1 in state insertion order.
+            2: {
+                'exp_avg': torch.full(shape, 2.0),
+                'exp_avg_sq': torch.full(shape, 20.0),
+            },
+            3: {
+                'exp_avg': torch.full(shape, 3.0),
+                'exp_avg_sq': torch.full(shape, 30.0),
+            },
+            1: {
+                'exp_avg': torch.full(shape, 1.0),
+                'exp_avg_sq': torch.full(shape, 10.0),
+            },
+            99: {
+                'exp_avg': torch.zeros(8, 8),
+                'exp_avg_sq': torch.zeros(8, 8),
+            },
+        }
+        torch.save(
+            {
+                'optimizer': {
+                    # Param-group order should determine identity for w1/w2/w3.
+                    'param_groups': [{
+                        'params': [99, 1, 2, 3]
+                    }],
+                    'state': optim_state,
+                }
+            },
+            os.path.join(ckpt_dir, "expp_rank_0_mp_rank_00_optim_states.pt"),
+        )
+
+        metadata = [{
+            'moe_layer_id': 0,
+            'module_path': 'model.layers.0.mlp',
+            'num_experts': 2,
+            'num_local_experts': num_local,
+            'ep_size': 1,
+            'expert_key_prefix': 'model.layers.0.mlp.experts',
+        }]
+        consolidate_autoep_optimizer_states(ckpt_dir, output_dir, metadata, ep_size=1)
+
+        for wname, expected_avg, expected_avg_sq in (('w1', 1.0, 10.0), ('w2', 2.0, 20.0), ('w3', 3.0, 30.0)):
+            state_dir = os.path.join(output_dir, "zero", f"model.layers.0.mlp.experts.{wname}")
+            exp_avg = torch.load(os.path.join(state_dir, "exp_avg.pt"), map_location='cpu', weights_only=False)
+            exp_avg_sq = torch.load(os.path.join(state_dir, "exp_avg_sq.pt"), map_location='cpu', weights_only=False)
+            assert torch.equal(exp_avg[PARAM], torch.full(shape, expected_avg))
+            assert torch.equal(exp_avg_sq[PARAM], torch.full(shape, expected_avg_sq))
+
 
 class TestUniversalLoad(DistributedTest):
     world_size = 1

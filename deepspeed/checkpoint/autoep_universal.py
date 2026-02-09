@@ -20,6 +20,70 @@ from .constants import (
 )
 
 
+def _state_entry(state, param_id):
+    """Get optimizer state entry by param id, handling int/str key variants."""
+    if param_id in state:
+        return state[param_id]
+
+    pid_str = str(param_id)
+    if pid_str in state:
+        return state[pid_str]
+
+    if isinstance(param_id, str):
+        try:
+            pid_int = int(param_id)
+        except ValueError:
+            return None
+        return state.get(pid_int)
+
+    return None
+
+
+def _ordered_param_ids(optim_sd):
+    """Return optimizer param ids in param_groups order, deduplicated."""
+    ordered = []
+    seen = set()
+    for group in optim_sd.get('param_groups', []):
+        for param_id in group.get('params', []):
+            key = str(param_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(param_id)
+
+    if ordered:
+        return ordered
+
+    # Fallback for unexpected optimizer formats.
+    state = optim_sd.get('state', {})
+    return list(state.keys())
+
+
+def _param_name_to_id(optim_sd):
+    """Build optional mapping from parameter name to optimizer param id."""
+    mapping = {}
+    for group in optim_sd.get('param_groups', []):
+        params = group.get('params', [])
+        param_names = group.get('param_names', None)
+        if not isinstance(param_names, list):
+            continue
+        if len(param_names) != len(params):
+            continue
+        for param_id, param_name in zip(params, param_names):
+            mapping[param_name] = param_id
+    return mapping
+
+
+def _is_expert_optimizer_state(param_state, num_local):
+    for state_key in ('exp_avg', 'exp_avg_sq'):
+        tensor = param_state.get(state_key)
+        if tensor is None:
+            continue
+        if tensor.dim() == 3 and tensor.shape[0] == num_local:
+            return True
+    return False
+
+
 def resolve_expert_ckpt_path(checkpoint_dir, moe_layer_id, global_expert_id):
     """Find the expert checkpoint file for a given (layer, expert) pair.
 
@@ -139,47 +203,78 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layer
     if optim_sd is None:
         return
 
-    # Build parameter name -> optimizer state index mapping
-    # The optimizer state is organized by param groups and param index
-    param_groups = optim_sd.get('param_groups', [])
     state = optim_sd.get('state', {})
 
     if not state:
         return
+
+    ordered_param_ids = _ordered_param_ids(optim_sd)
+    name_to_param_id = _param_name_to_id(optim_sd)
+    consumed_param_ids = set()
 
     # For each AutoEP layer, extract and consolidate optimizer states
     for layer_info in autoep_layers_metadata:
         prefix = layer_info['expert_key_prefix']
         num_experts = layer_info['num_experts']
         num_local = layer_info['num_local_experts']
+        layer_param_ids = {}
+
+        # If optimizer state carries param names, map weights by exact identity.
+        for wname in ('w1', 'w2', 'w3'):
+            param_name = f"{prefix}.{wname}"
+            param_id = name_to_param_id.get(param_name)
+            if param_id is None:
+                continue
+            layer_param_ids[wname] = param_id
+            consumed_param_ids.add(str(param_id))
+
+        # Fallback: consume expert-like params in optimizer param_groups order.
+        missing_wnames = [w for w in ('w1', 'w2', 'w3') if w not in layer_param_ids]
+        if missing_wnames:
+            candidates = []
+            for param_id in ordered_param_ids:
+                if str(param_id) in consumed_param_ids:
+                    continue
+                param_state = _state_entry(state, param_id)
+                if param_state is None:
+                    continue
+                if not _is_expert_optimizer_state(param_state, num_local):
+                    continue
+                candidates.append(param_id)
+
+            for wname, param_id in zip(missing_wnames, candidates):
+                layer_param_ids[wname] = param_id
+                consumed_param_ids.add(str(param_id))
 
         for wname in ('w1', 'w2', 'w3'):
             param_name = f"{prefix}.{wname}"
             param_dir = os.path.join(output_dir, "zero", param_name)
             os.makedirs(param_dir, exist_ok=True)
+            param_id = layer_param_ids.get(wname)
+            if param_id is None:
+                continue
 
-            # Try to find and consolidate optimizer states for this parameter
-            # across all EP ranks
+            # Consolidate optimizer states for this specific expert parameter id.
             for state_key in ('exp_avg', 'exp_avg_sq'):
                 rank_tensors = []
-                found_any = False
 
                 for rank in range(ep_size):
                     rank_optim_sd = optim_states[rank].get('optimizer', {})
                     rank_state = rank_optim_sd.get('state', {})
+                    param_state = _state_entry(rank_state, param_id)
+                    if param_state is None:
+                        rank_tensors = []
+                        break
+                    tensor = param_state.get(state_key)
+                    if tensor is None:
+                        rank_tensors = []
+                        break
+                    if tensor.dim() != 3 or tensor.shape[0] != num_local:
+                        rank_tensors = []
+                        break
+                    rank_tensors.append(tensor)
 
-                    # Search through optimizer state entries for matching shape
-                    for idx, param_state in rank_state.items():
-                        if state_key in param_state:
-                            tensor = param_state[state_key]
-                            # Check if this looks like an expert tensor
-                            # (3D with first dim == num_local_experts)
-                            if tensor.dim() == 3 and tensor.shape[0] == num_local:
-                                rank_tensors.append(tensor)
-                                found_any = True
-                                break
-
-                if found_any and len(rank_tensors) == ep_size:
+                if len(rank_tensors) == ep_size:
                     full_tensor = torch.cat(rank_tensors, dim=0)
                     torch.save(
                         {
