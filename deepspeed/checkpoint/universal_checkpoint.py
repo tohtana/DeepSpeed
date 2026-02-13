@@ -9,7 +9,8 @@ import torch
 import types
 from typing import List, Tuple, Union
 from dataclasses import dataclass
-from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE)
+from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE,
+                        EP_IS_EXPERT_PARAM, EP_NUM_EXPERTS)
 
 
 @dataclass
@@ -19,7 +20,7 @@ class SubparamShape:
     partition_dim: int
 
 
-def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
+def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size, ep_rank=0, ep_size=1):
     hp_mapping = self._hp_mapping
     hp_mapping.optim_fragment = {}
 
@@ -42,6 +43,23 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
 
         full_hp_param = ckpt_dict[PARAM]
 
+        # EP-aware slicing for expert parameters saved in universal format.
+        # Must happen BEFORE shape-match check so that after slicing,
+        # full_hp_param.shape == self.shape triggers tp_rank=0, tp_world_size=1.
+        is_expert_param = ckpt_dict.get(EP_IS_EXPERT_PARAM, False)
+        if is_expert_param and ep_size > 1:
+            ep_num_experts = ckpt_dict.get(EP_NUM_EXPERTS)
+            assert ep_num_experts is not None, \
+                f"Expert param in {ckpt_file} missing '{EP_NUM_EXPERTS}' metadata"
+            assert full_hp_param.shape[0] == ep_num_experts, \
+                f"Expert param dim 0 ({full_hp_param.shape[0]}) != {EP_NUM_EXPERTS} ({ep_num_experts})"
+            assert ep_num_experts % ep_size == 0, \
+                f"num_experts ({ep_num_experts}) not divisible by ep_size ({ep_size})"
+            num_local = ep_num_experts // ep_size
+            ep_start = ep_rank * num_local
+            ep_end = ep_start + num_local
+            full_hp_param = full_hp_param[ep_start:ep_end]
+
         # need to deal with slices that were averaged.
         # the opposite of averaging here becomes an exact copy of the first slice
         # I thought of 2 ways:
@@ -62,7 +80,7 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size):
         # the converter to universal currently strips the original padding completely so the saved
         # weight is padding-free and we just need to add new padding depending on the target TP
         # degree
-        is_vocab_tensor = ckpt_dict.get(VOCAB_TENSOR, False)
+        is_vocab_tensor = ckpt_dict.get(VOCAB_TENSOR, False) and not is_expert_param
         if is_vocab_tensor:
             # In the absence of data passed from the user wrt new padded vocab specific to tp degree
             # we can again derive that data by reverse engineering the target shapes like so:
