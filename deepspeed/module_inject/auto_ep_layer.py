@@ -18,6 +18,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec
 from deepspeed.utils import logger
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
+from deepspeed.moe.ep_count import count_tokens_per_expert
 from deepspeed.moe.ep_experts import GroupedExperts
 from deepspeed.moe.ep_kernels import TokenReorderer
 from deepspeed.moe.ep_repack import repack_expert_weights
@@ -37,6 +38,7 @@ class SplitPlan(NamedTuple):
     input_splits: list[int]  # len=ep_size
     output_splits: list[int]  # len=ep_size
     local_counts: torch.Tensor  # [E_local]
+    local_counts_by_source: torch.Tensor  # [ep_size, E_local]
 
 
 # ---------------------------------------------------------------------------
@@ -74,31 +76,31 @@ def compute_split_plan(
 ) -> SplitPlan:
     """Compute AllToAllV split sizes for token dispatch/combine.
 
-    Returns SplitPlan with input_splits, output_splits, and local_counts.
+    Returns SplitPlan with input_splits, output_splits, local_counts, and
+    local_counts_by_source.
     """
     T_K = selected_experts.numel()
 
     if ep_size == 1:
         # No dispatch needed - all tokens stay local
-        num_tokens_per_expert = torch.histc(
-            selected_experts.view(-1).float(),
-            bins=num_experts,
-            min=0,
-            max=num_experts,
-        ).int()
+        num_tokens_per_expert = count_tokens_per_expert(
+            selected_experts,
+            num_experts,
+            out_dtype=torch.int32,
+        )
         return SplitPlan(
             input_splits=[T_K],
             output_splits=[T_K],
             local_counts=num_tokens_per_expert,
+            local_counts_by_source=num_tokens_per_expert.view(1, num_local_experts),
         )
 
     # Count tokens per expert globally
-    num_tokens_per_expert = torch.histc(
-        selected_experts.view(-1).float(),
-        bins=num_experts,
-        min=0,
-        max=num_experts,
-    ).int()
+    num_tokens_per_expert = count_tokens_per_expert(
+        selected_experts,
+        num_experts,
+        out_dtype=torch.int32,
+    )
 
     # Reshape to [ep_size, num_local_experts] to get per-rank counts
     count_matrix = num_tokens_per_expert.view(ep_size, num_local_experts)
@@ -120,7 +122,6 @@ def compute_split_plan(
 
     # local_counts: how many tokens this rank will process for each local expert
     # After receiving tokens, we need per-expert counts for this rank
-    ep_rank = dist.get_rank(group=ep_group)
     local_expert_counts = count_matrix[:, :].clone()  # [ep_size, E_local]
 
     # Exchange the detailed per-expert counts
@@ -142,6 +143,7 @@ def compute_split_plan(
         input_splits=input_splits,
         output_splits=output_splits,
         local_counts=local_counts,
+        local_counts_by_source=received_counts,
     )
 
 
@@ -207,7 +209,19 @@ def permute_by_local_expert(
     """
     from deepspeed.moe.ep_kernels import generate_permute_indices, TOKEN_GROUP_ALIGN_SIZE_M
 
-    num_local_experts = local_counts.shape[0]
+    if local_counts.ndim == 1:
+        # [E_local]: already aggregated over sources (ep_degree=1)
+        ep_degree = 1
+        num_local_experts = local_counts.shape[0]
+        local_counts_flat = local_counts
+    elif local_counts.ndim == 2:
+        # [ep_size, E_local]: preserve per-source layout for correct regrouping
+        ep_degree, num_local_experts = local_counts.shape
+        local_counts_flat = local_counts.reshape(-1)
+    else:
+        raise ValueError(
+            f"local_counts must have shape [E_local] or [ep_degree, E_local], got {tuple(local_counts.shape)}")
+
     n_tokens = tokens.shape[0]
     alignment = TOKEN_GROUP_ALIGN_SIZE_M
 
@@ -215,15 +229,14 @@ def permute_by_local_expert(
     x_padded_per_expert = n_tokens + num_local_experts * alignment
     padded_max_len = ((x_padded_per_expert + alignment - 1) // alignment) * alignment
 
-    # local_counts is already [E_local] - treat as 1 rank
     # Use CPU path when tokens are on CPU (e.g., unit tests without CUDA)
     use_cpu = not get_accelerator().on_accelerator(tokens)
-    counts_for_permute = local_counts.cpu() if use_cpu else local_counts
+    counts_for_permute = local_counts_flat.cpu() if use_cpu else local_counts_flat
     with torch.no_grad():
         permuted_indices, m_sizes, _offsets = generate_permute_indices(
             counts_for_permute,
             num_local_experts,
-            1,  # ep_degree=1 since tokens are already dispatched
+            ep_degree,
             padded_max_len,
             alignment,
             use_cpu=use_cpu,
@@ -482,12 +495,11 @@ class AutoEPMoELayer(nn.Module):
 
         if self.ep_size == 1:
             # No AllToAll needed - local computation only
-            local_counts = torch.histc(
-                ro.selected_experts.view(-1).float(),
-                bins=self.num_local_experts,
-                min=0,
-                max=self.num_local_experts,
-            ).int()
+            local_counts = count_tokens_per_expert(
+                ro.selected_experts,
+                self.num_local_experts,
+                out_dtype=torch.int32,
+            )
 
             routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
                 routed_input, local_counts)
@@ -506,7 +518,7 @@ class AutoEPMoELayer(nn.Module):
             routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
 
             routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts)
+                routed_input, plan.local_counts_by_source)
             expert_output = self.experts(routed_input, aligned_counts)
             expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
 
