@@ -384,8 +384,12 @@ class AutoEPMoELayer(nn.Module):
             dim=spec.hidden_size,
             hidden_dim=spec.ffn_hidden_size,
             num_experts=self.num_local_experts,
-            use_grouped_mm=config.use_grouped_mm,
+            # Debug mode prioritizes numerical parity with HF Mixtral over speed.
+            # Force for-loop experts to avoid grouped-mm kernel drift.
+            use_grouped_mm=(config.use_grouped_mm and not config.debug_mode),
         )
+        if config.debug_mode and config.use_grouped_mm:
+            logger.info("AutoEP debug_mode enabled: forcing use_grouped_mm=False for parity.")
         self.experts.w1.data.copy_(w1)
         self.experts.w2.data.copy_(w2)
         self.experts.w3.data.copy_(w3)
