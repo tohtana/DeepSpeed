@@ -13,6 +13,7 @@ or deepspeed.runtime.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from deepspeed.moe.ep_count import count_tokens_per_expert
 
 
 class TokenChoiceTopKRouter(nn.Module):
@@ -50,6 +51,7 @@ class TokenChoiceTopKRouter(nn.Module):
         route_norm: bool,
         route_scale: float,
         gate_bias: bool,
+        debug_mode: bool = False,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=gate_bias)
@@ -60,6 +62,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.score_func = score_func
         self.route_norm = route_norm
         self.route_scale = route_scale
+        self.debug_mode = debug_mode
 
     # ------------------------------------------------------------------
     # Node-limited (group-limited) routing
@@ -147,7 +150,13 @@ class TokenChoiceTopKRouter(nn.Module):
             scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
 
         # Select top-k experts per token
-        _, selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)
+        # Debug mode aligns with Mixtral's top-k ordering behavior.
+        _, selected_experts_indices = torch.topk(
+            scores_for_choice,
+            k=self.top_k,
+            dim=-1,
+            sorted=self.debug_mode,
+        )
 
         # Gather original (unbiased) scores for selected experts
         top_scores = scores.gather(dim=1, index=selected_experts_indices)
@@ -159,13 +168,12 @@ class TokenChoiceTopKRouter(nn.Module):
 
         top_scores = top_scores * self.route_scale
 
-        # Count tokens per expert
-        # histc requires float input on CPU, so cast indices
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1).float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        # Count tokens per expert.
+        num_tokens_per_expert = count_tokens_per_expert(
+            selected_experts_indices,
+            self.num_experts,
+            out_dtype=torch.float32,
+            deterministic_safe=self.debug_mode,
         )
 
         return top_scores, selected_experts_indices, num_tokens_per_expert

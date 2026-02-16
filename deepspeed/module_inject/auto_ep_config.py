@@ -91,6 +91,10 @@ class AutoEPConfig:
     top_k: int | str = "auto"  # int or "auto"
     load_balance_coeff: float | None = 1e-3
     routed_scaling_factor: float | str = "auto"  # float or "auto"
+    # Debug-only deterministic parity mode:
+    # - aligns top-k ordering with Mixtral behavior
+    # - enables deterministic-safe token counting fallback
+    debug_mode: bool = False
     # Custom preset fields (override defaults in custom/built-in preset paths)
     expert_w1: str | None = None
     expert_w2: str | None = None
@@ -224,6 +228,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.top_k = param_dict.get("top_k", "auto")
     config.load_balance_coeff = param_dict.get("load_balance_coeff", 1e-3)
     config.routed_scaling_factor = param_dict.get("routed_scaling_factor", "auto")
+    config.debug_mode = param_dict.get("debug_mode", False)
     config.expert_w1 = param_dict.get("expert_w1", None)
     config.expert_w2 = param_dict.get("expert_w2", None)
     # expert_w3: key absent → _UNSET (preset default); key present with null → None (fused); key present with string → custom name
@@ -289,6 +294,10 @@ def validate_autoep_config(
     if config.score_func not in valid_score_func:
         raise ValueError(f"score_func must be one of {valid_score_func}, "
                          f"got '{config.score_func}'")
+
+    # Validate debug_mode
+    if not isinstance(config.debug_mode, bool):
+        raise ValueError(f"debug_mode must be a boolean, got {type(config.debug_mode).__name__}")
 
     # Validate num_expert_groups constraints
     if config.num_expert_groups is not None:

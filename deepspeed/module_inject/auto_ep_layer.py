@@ -73,6 +73,7 @@ def compute_split_plan(
     ep_size: int,
     num_local_experts: int,
     ep_group: dist.ProcessGroup | None,
+    debug_mode: bool = False,
 ) -> SplitPlan:
     """Compute AllToAllV split sizes for token dispatch/combine.
 
@@ -87,6 +88,7 @@ def compute_split_plan(
             selected_experts,
             num_experts,
             out_dtype=torch.int32,
+            deterministic_safe=debug_mode,
         )
         return SplitPlan(
             input_splits=[T_K],
@@ -100,6 +102,7 @@ def compute_split_plan(
         selected_experts,
         num_experts,
         out_dtype=torch.int32,
+        deterministic_safe=debug_mode,
     )
 
     # Reshape to [ep_size, num_local_experts] to get per-rank counts
@@ -332,6 +335,7 @@ class AutoEPMoELayer(nn.Module):
         self.router_logits_capture_index = spec.router_logits_capture_index
         self.top_k = spec.top_k
         self.score_apply = resolve_score_apply_mode(spec, config.score_apply)
+        self.debug_mode = config.debug_mode
         route_norm = spec.route_norm if config.route_norm is None else config.route_norm
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -353,6 +357,7 @@ class AutoEPMoELayer(nn.Module):
             route_norm=route_norm,
             route_scale=config.route_scale,
             gate_bias=spec.gate_bias,
+            debug_mode=config.debug_mode,
         )
         # Copy gate weights
         self.router.gate.weight.data.copy_(source_gate.weight.data)
@@ -385,7 +390,11 @@ class AutoEPMoELayer(nn.Module):
         self.experts.w2.data.copy_(w2)
         self.experts.w3.data.copy_(w3)
 
-        self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
+        self.reorderer = TokenReorderer(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            debug_mode=config.debug_mode,
+        )
         self.shared_experts = getattr(source_module, spec.shared_experts_name,
                                       None) if spec.has_shared_experts else None
 
@@ -499,6 +508,7 @@ class AutoEPMoELayer(nn.Module):
                 ro.selected_experts,
                 self.num_local_experts,
                 out_dtype=torch.int32,
+                deterministic_safe=self.debug_mode,
             )
 
             routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
@@ -513,6 +523,7 @@ class AutoEPMoELayer(nn.Module):
                 ep_size=self.ep_size,
                 num_local_experts=self.num_local_experts,
                 ep_group=self.ep_group,
+                debug_mode=self.debug_mode,
             )
 
             routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)

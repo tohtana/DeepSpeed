@@ -19,6 +19,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+from deepspeed.moe.ep_count import count_tokens_per_expert
 
 logger = logging.getLogger(__name__)
 
@@ -338,10 +339,11 @@ class TokenReorderer(nn.Module):
         top_k (int): Number of experts each token is routed to.
     """
 
-    def __init__(self, num_experts: int, top_k: int):
+    def __init__(self, num_experts: int, top_k: int, debug_mode: bool = False):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.debug_mode = debug_mode
 
     def forward(
         self,
@@ -361,12 +363,11 @@ class TokenReorderer(nn.Module):
                   token-slot indices sorted by expert.
                 - num_tokens_per_expert ``(num_experts,)``: histogram.
         """
-        # histc requires float input on CPU, so cast indices
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1).float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        num_tokens_per_expert = count_tokens_per_expert(
+            selected_experts_indices,
+            self.num_experts,
+            out_dtype=torch.float32,
+            deterministic_safe=self.debug_mode,
         )
 
         token_indices_experts_sorted = torch.argsort(selected_experts_indices.view(-1), stable=True)
