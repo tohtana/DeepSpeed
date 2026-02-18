@@ -368,3 +368,66 @@ class TestCPUAdamSubgroup(DistributedTest):
             assert torch.equal(param_a.data, param_b.data)
             assert torch.equal(optimizer.state[param_a]['exp_avg'], optimizer.state[param_b]['exp_avg'])
             assert torch.equal(optimizer.state[param_a]['exp_avg_sq'], optimizer.state[param_b]['exp_avg_sq'])
+
+    def test_step_non_sequential_jump_consistent_across_param_keys(self):
+        """Non-sequential step jumps should stay deterministic across param keys."""
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        model_size = 128
+        target_steps = (1, 2, 5, 6)
+        base = torch.randn(model_size, device='cpu', dtype=torch.float32)
+        param_a = torch.nn.Parameter(base.clone())
+        param_b = torch.nn.Parameter(base.clone())
+
+        optimizer = DeepSpeedCPUAdam([param_a])
+        for target_step in target_steps:
+            grad = torch.randn(model_size, device='cpu', dtype=torch.float32)
+
+            if target_step > 2:
+                # Force a non-sequential jump (for example 2 -> 5) in the next update.
+                optimizer.state[param_a]['step'] = target_step - 1
+                optimizer.state[param_b]['step'] = target_step - 1
+
+            optimizer.param_groups[0]['params'] = [param_a]
+            param_a.grad = grad.clone()
+            optimizer.step()
+
+            optimizer.param_groups[0]['params'] = [param_b]
+            param_b.grad = grad.clone()
+            optimizer.step()
+
+            assert optimizer.state[param_a]['step'] == target_step
+            assert optimizer.state[param_b]['step'] == target_step
+            assert torch.equal(param_a.data, param_b.data)
+            assert torch.equal(optimizer.state[param_a]['exp_avg'], optimizer.state[param_b]['exp_avg'])
+            assert torch.equal(optimizer.state[param_a]['exp_avg_sq'], optimizer.state[param_b]['exp_avg_sq'])
+
+    def test_step_beta_change_mid_training_consistent_across_param_keys(self):
+        """Changing betas mid-training should stay deterministic across param keys."""
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+        model_size = 128
+        steps = 4
+        base = torch.randn(model_size, device='cpu', dtype=torch.float32)
+        param_a = torch.nn.Parameter(base.clone())
+        param_b = torch.nn.Parameter(base.clone())
+
+        optimizer = DeepSpeedCPUAdam([param_a], betas=(0.9, 0.999))
+        for logical_step in range(1, steps + 1):
+            grad = torch.randn(model_size, device='cpu', dtype=torch.float32)
+            if logical_step == 3:
+                optimizer.param_groups[0]['betas'] = (0.85, 0.997)
+
+            optimizer.param_groups[0]['params'] = [param_a]
+            param_a.grad = grad.clone()
+            optimizer.step()
+
+            optimizer.param_groups[0]['params'] = [param_b]
+            param_b.grad = grad.clone()
+            optimizer.step()
+
+            assert optimizer.state[param_a]['step'] == logical_step
+            assert optimizer.state[param_b]['step'] == logical_step
+            assert torch.equal(param_a.data, param_b.data)
+            assert torch.equal(optimizer.state[param_a]['exp_avg'], optimizer.state[param_b]['exp_avg'])
+            assert torch.equal(optimizer.state[param_a]['exp_avg_sq'], optimizer.state[param_b]['exp_avg_sq'])
