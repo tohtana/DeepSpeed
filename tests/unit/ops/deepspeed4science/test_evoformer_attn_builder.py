@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from deepspeed.ops.op_builder.builder import CUDAOpBuilder
-from deepspeed.ops.op_builder import EvoformerAttnBuilder
+# Import the concrete builder class instead of the accelerator-dispatched alias.
+from deepspeed.ops.op_builder.evoformer_attn import EvoformerAttnBuilder
 
 
 def test_filter_ccs_removes_below_70_and_keeps_ptx_suffix():
