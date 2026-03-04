@@ -134,7 +134,7 @@ forward-plus-loss block in your own ``torch.autocast`` context:
         logits = model_engine(input_ids)
         loss = loss_fn(logits.view(-1, vocab_size), labels.view(-1))
 
-Without the outer ``torch.autocast``, only the model forward pass benefits from
+Without the outer ``torch.autocast``, only the model's forward pass benefits from
 autocast; the loss function would run in full precision.
 
 When DeepSpeed detects a nested autocast context, it handles it as follows:
