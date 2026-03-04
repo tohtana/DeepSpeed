@@ -389,7 +389,7 @@ Example of <i>**scheduler**</i>
 
 | Parameter | Type | Default | Description |
 | --------- | ---- | ------- | ----------- |
-| **enabled** | boolean | `false` | Enable torch.autocast for `engine.forward()`. You may still add your own `torch.autocast` outside the engine to cover loss functions or other user-side code (see [nesting behavior](https://deepspeed.readthedocs.io/en/latest/training.html#using-torch-autocast-outside-the-engine)). |
+| **enabled** | boolean | `false` | Enable torch.autocast (no manual `torch.autocast` call needed in your code). |
 | **dtype** | string | `"bfloat16"` | Lower precision dtype (`"bfloat16"` or `"float16"`). Also used for gradient/parameter communication of `lower_precision_safe_modules`. |
 | **lower_precision_safe_modules** | list | `["torch.nn.Linear", "torch.nn.Conv1d", "torch.nn.Conv2d", "torch.nn.Conv3d"]` | Module types for lower-precision communication (all-reduce/all-gather). |
 
