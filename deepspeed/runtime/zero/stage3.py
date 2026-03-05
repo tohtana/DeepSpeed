@@ -1279,6 +1279,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
                         @instrument_w_nvtx
                         def reduce_partition_and_remove_grads(*notneeded):
+                            # Evaluate refresh condition before reenter_backward_if_needed()
                             refresh_expected = self.should_refresh_expected_hook_count()
                             # Re-enter backward for subsequent phases in reentrant checkpointing
                             self.reenter_backward_if_needed()
@@ -1307,6 +1308,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             def make_hook(params):
 
                 def reduce_leaf_module_grads(module, grad_input, grad_output):
+                    # Evaluate refresh condition before reenter_backward_if_needed()
                     refresh_expected = self.should_refresh_expected_hook_count()
                     self.reenter_backward_if_needed()
 
