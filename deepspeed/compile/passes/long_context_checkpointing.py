@@ -93,14 +93,8 @@ def register_long_context_checkpointing():
     lines = src.split('\n')
 
     # Locate the original should_ban_recomputation and the function after it.
-    start = next(
-        i for i, l in enumerate(lines)
-        if l.startswith('    def should_ban_recomputation(')
-    )
-    end = next(
-        i for i, l in enumerate(lines)
-        if i > start and l.startswith('    def ')
-    )
+    start = next(i for i, l in enumerate(lines) if l.startswith('    def should_ban_recomputation('))
+    end = next(i for i, l in enumerate(lines) if i > start and l.startswith('    def '))
 
     # Indent the replacement to the nesting level inside solve_min_cut (4 spaces).
     replacement = textwrap.indent(_CUSTOM_SHOULD_BAN, '    ')
