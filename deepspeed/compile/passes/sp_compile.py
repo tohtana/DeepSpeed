@@ -80,7 +80,7 @@ def pass_shard_seq_dim(gm: GraphModule, example_inputs):
     seq_symint = val.shape[1]
     assert isinstance(
         seq_symint,
-        torch.SymInt), f"expected sequence dimension to be of type `torch.SymInt` but found `{type(seq_symint)}`"
+        torch.SymInt), f"expected sequence dimension to be of type {torch.SymInt!r} but found {type(seq_symint)!r}"
 
     sym_seq_dim_node = find_node_by_name(gm, str(seq_symint))
     if sym_seq_dim_node is None:
@@ -192,7 +192,7 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             fake_inputs.append(fake_mode.from_tensor(t))
         else:
             fake_inputs.append(t)
-    FakeTensorProp(gm).propagate(*fake_inputs)
+    FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(*fake_inputs)
 
 
 def apply_autosp(gm: GraphModule,
