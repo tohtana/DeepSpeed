@@ -243,6 +243,10 @@ class TestShardTensorCompile:
         from deepspeed.compile.fx import find_node_by_name, get_node_shape_meta
         from deepspeed.compile.util import shard_tensor_node, get_input_id_node
 
+        # Regression test for the torch 2.9 bf16 trace where the SymInt
+        # placeholder can appear after input_ids. shard_tensor_node must still
+        # produce a lint-clean graph instead of inserting getitem before its
+        # symbolic slice dependencies.
         gm, _ = create_gm_nodes(seq_len=64)
         input_ids_node = get_input_id_node(gm)
         seq_symint = get_node_shape_meta(input_ids_node).shape[1]

@@ -57,6 +57,9 @@ def all_to_all(
 def all_to_all_fake(input: torch.Tensor, scatter_idx: int, gather_idx: int, name: str):
 
     def maybe_restore_sharded_dim(dim: torch.SymInt, factor: int):
+        # Torch 2.9 may keep `P * (s // P)` distinct from the original `s` during
+        # fake shape propagation. When the local dim is exactly `FloorDiv(s, P)`,
+        # restore the original symbol so downstream ops see a consistent sequence dim.
         node = getattr(dim, "node", None)
         if node is None:
             return dim * factor

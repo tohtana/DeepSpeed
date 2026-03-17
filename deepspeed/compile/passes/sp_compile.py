@@ -186,6 +186,9 @@ def pass_canonicalize(gm: GraphModule, real_inputs):
 def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
     fake_mode = None
     for node in gm.graph.nodes:
+        # Reuse the graph's existing fake mode when metadata is already present.
+        # Its ShapeEnv owns the symbolic dims captured during tracing, so using a
+        # fresh mode here can desynchronize fake inputs from graph metadata.
         if node.op == "placeholder" and "val" in node.meta:
             fake_val = node.meta["val"]
             if fake_val is not None and isinstance(fake_val, torch.Tensor):
@@ -198,6 +201,8 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             break
 
     if fake_mode is None:
+        # Some graphs do not carry fake tensor metadata yet; create a fallback
+        # mode so FakeTensorProp can still run shape-only execution.
         fake_mode = FakeTensorMode(shape_env=ShapeEnv())
 
     fake_inputs = []
@@ -207,6 +212,10 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
         else:
             fake_inputs.append(t)
 
+    # Torch 2.9 can fail fake propagation through SDPA's masked fake-CUDA path,
+    # even though this pass only needs output metadata. Temporarily clear
+    # attn_mask so shape propagation can proceed, then restore it immediately;
+    # SDPA output shapes are still determined by Q/K/V shapes, not mask values.
     saved_sdpa_masks = []
     for attn_node in get_sdpa_nodes(gm):
         attn_mask = attn_node.kwargs.get("attn_mask")
@@ -215,6 +224,8 @@ def pass_propagate_shapes(gm: torch.fx.GraphModule, real_inputs):
             attn_node.update_kwarg("attn_mask", None)
 
     try:
+        # fake_inputs are already created under fake_mode above, so run
+        # propagation without reconverting them into a different fake mode.
         FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(*fake_inputs)
     finally:
         for attn_node, attn_mask in saved_sdpa_masks:

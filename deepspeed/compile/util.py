@@ -601,6 +601,9 @@ def shard_tensor_node(gm: GraphModule, tensor_node: Node):
     indices = (slice_all, slice_range)
 
     positions = {node: i for i, node in enumerate(gm.graph.nodes)}
+    # Insert after the later dependency so the new getitem does not appear
+    # before the symbolic slice nodes in graph order. Torch 2.9 bf16 can place
+    # the SymInt placeholder after the tensor placeholder.
     anchor_node = slice_range if positions[slice_range] > positions[tensor_node] else tensor_node
     with gm.graph.inserting_after(anchor_node):
         sliced_node = gm.graph.call_function(
