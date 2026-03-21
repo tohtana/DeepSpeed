@@ -154,10 +154,7 @@ else:
 
 
 def zero3_linear_wrap(input, weight, bias=None):
-    if bias is None:
-        return LinearFunctionForZeroStage3.apply(input, weight)
-    else:
-        return LinearFunctionForZeroStage3.apply(input, weight, bias)
+    return LinearFunctionForZeroStage3.apply(input, weight, bias)
 
 
 class LinearModuleForZeroStage3(Module):
