@@ -44,7 +44,7 @@ if _SUPPORTS_SETUP_CONTEXT:
     class LinearFunctionForZeroStage3(torch.autograd.Function):
 
         @staticmethod
-        @autocast_custom_fwd
+        # bias is an optional argument
         def forward(input, weight, bias=None):
 
             if input.dim() == 2 and bias is not None:
@@ -60,7 +60,13 @@ if _SUPPORTS_SETUP_CONTEXT:
 
         @staticmethod
         def setup_context(ctx, inputs, output):
-            input, weight, bias = inputs
+            # Replicate autocast state that @autocast_custom_fwd normally sets on ctx,
+            # since the decorator assumes args[0] is ctx which is unavailable in the
+            # separate forward() + setup_context() pattern.
+            device_type = get_accelerator().device_name()
+            ctx._dtype = torch.get_autocast_dtype(device_type)
+            ctx._fwd_used_autocast = torch.is_autocast_enabled(device_type)
+            input, weight, bias = inputs[0], inputs[1], inputs[2] if len(inputs) > 2 else None
             ctx.save_for_backward(input, weight, bias)
 
         # This function has only a single output, so it gets only one gradient
