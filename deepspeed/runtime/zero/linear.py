@@ -71,8 +71,17 @@ if _SUPPORTS_SETUP_CONTEXT:
 
         # This function has only a single output, so it gets only one gradient
         @staticmethod
-        @autocast_custom_bwd
         def backward(ctx, grad_output):
+            # Do not use @autocast_custom_bwd here: it pairs with @autocast_custom_fwd on
+            # legacy forward(ctx, ...). With forward + setup_context, use AMP state from setup_context.
+            device_type = get_accelerator().device_name()
+            if getattr(ctx, "_fwd_used_autocast", False):
+                with torch.amp.autocast(device_type=device_type, enabled=True, dtype=ctx._dtype):
+                    return LinearFunctionForZeroStage3._backward_core(ctx, grad_output)
+            return LinearFunctionForZeroStage3._backward_core(ctx, grad_output)
+
+        @staticmethod
+        def _backward_core(ctx, grad_output):
             input, weight, bias = ctx.saved_tensors
 
             grad_input = grad_weight = grad_bias = None
