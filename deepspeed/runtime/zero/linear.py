@@ -32,8 +32,20 @@ def print_rank_0(message, debug=False, force=False):
         print(message)
 
 
-autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=get_accelerator().device_name())
-autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=get_accelerator().device_name())
+if hasattr(torch.amp, 'custom_fwd'):
+    # PyTorch >= 2.4
+    autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=get_accelerator().device_name())
+    autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=get_accelerator().device_name())
+elif hasattr(torch.cuda.amp, 'custom_fwd'):  #ignore-cuda
+    # PyTorch < 2.4 with CUDA support
+    autocast_custom_fwd = torch.cuda.amp.custom_fwd  #ignore-cuda
+    autocast_custom_bwd = torch.cuda.amp.custom_bwd  #ignore-cuda
+else:
+    from deepspeed.utils import logger
+    logger.warning("torch.amp.custom_fwd is not available. "
+                   "Mixed precision training may not work correctly.")
+    autocast_custom_fwd = lambda fn: fn
+    autocast_custom_bwd = lambda fn: fn
 
 
 class LinearFunctionForZeroStage3(torch.autograd.Function):
