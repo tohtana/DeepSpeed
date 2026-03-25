@@ -7,6 +7,16 @@
 # Usage: ./scripts/setup_pr7916.sh [--force-install] [--skip-install]
 # Env:   PR7916_VENV_DIR, PR7916_MAIN_REF (default master), PR7916_FORCE_INSTALL, PR7916_SKIP_INSTALL
 #
+# --- Recorded test environment (original bug report / CI reference) ---
+# OS:              Ubuntu 22.04
+# GPU:             NVIDIA H100 80GB PCIe
+# Python:          3.11
+# PyTorch:         2.8.0+cu128  (torch.version.cuda: 12.8)
+# DeepSpeed:       0.16.4 wheel (issue); PR validates against editable install + this script's venv
+# CUDA (driver):   12.8 (via PyTorch cu128 wheels; nvcc optional / often N/A)
+# Launcher:        deepspeed CLI (repro uses torchrun --standalone --nproc_per_node=1)
+# -------------------------------------------------------------------------
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,8 +41,26 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-print_versions() {
-  python -c "import torch, deepspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('deepspeed', deepspeed.__file__); print('deepspeed version', deepspeed.__version__)"
+print_runtime_env() {
+  python <<'PY'
+import platform
+import sys
+
+import deepspeed
+import torch
+
+print("==> Runtime environment (this session)")
+print(f"  python:          {sys.version.split()[0]} ({platform.system()} {platform.release()})")
+print(f"  torch:           {torch.__version__}")
+print(f"  torch.version.cuda: {torch.version.cuda}")
+if torch.cuda.is_available():
+    print(f"  cuda available:  yes ({torch.cuda.device_count()} device(s))")
+    print(f"  cuda device 0:   {torch.cuda.get_device_name(0)}")
+else:
+    print("  cuda available:  no")
+print(f"  deepspeed:       {deepspeed.__version__}")
+print(f"  deepspeed path:  {deepspeed.__file__}")
+PY
 }
 
 # Sets: full=1 → wipe + venv + pip; full=0 → activate existing only
@@ -79,7 +107,7 @@ setup_venv() {
     pip install pytest
   fi
 
-  print_versions
+  print_runtime_env
 }
 
 run_repro_compare() {
