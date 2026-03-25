@@ -13,6 +13,8 @@
 #
 # Usage (from repo root):
 #   ./scripts/setup_pr7916.sh
+#   ./scripts/setup_pr7916.sh --skip-install   # reuse .venvs/pr7916, no pip/venv setup
+#   PR7916_SKIP_INSTALL=1 ./scripts/setup_pr7916.sh
 #
 # Activate later:
 #   source .venvs/pr7916/bin/activate
@@ -24,30 +26,50 @@ cd "$ROOT"
 VENV_DIR="${PR7916_VENV_DIR:-$ROOT/.venvs/pr7916}"
 MAIN_REF="${PR7916_MAIN_REF:-master}"
 
-echo "==> Using venv: $VENV_DIR (only this path is removed if it already exists)"
-rm -rf "$VENV_DIR"
-mkdir -p "$(dirname "$VENV_DIR")"
-python3 -m venv "$VENV_DIR"
-# shellcheck source=/dev/null
-. "$VENV_DIR/bin/activate"
+SKIP_INSTALL=0
+case "${PR7916_SKIP_INSTALL:-}" in
+  1|true|yes|on) SKIP_INSTALL=1 ;;
+esac
+if [[ "${1:-}" == "--skip-install" ]]; then
+  SKIP_INSTALL=1
+  shift
+fi
 
-python -c 'import sys; assert sys.version_info[:2] == (3, 11), "Use Python 3.11 to match the bug report"' || {
-  echo "Warning: expected Python 3.11; found $(python -V)" >&2
-}
+if [[ "$SKIP_INSTALL" -eq 1 ]]; then
+  echo "==> Skipping venv recreate and pip installs (reuse $VENV_DIR)"
+  if [[ ! -f "$VENV_DIR/bin/activate" ]]; then
+    echo "error: venv not found at $VENV_DIR — run once without --skip-install first." >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  . "$VENV_DIR/bin/activate"
+  python -c "import torch, deepspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('deepspeed', deepspeed.__file__); print('deepspeed version', deepspeed.__version__)"
+else
+  echo "==> Using venv: $VENV_DIR (only this path is removed if it already exists)"
+  rm -rf "$VENV_DIR"
+  mkdir -p "$(dirname "$VENV_DIR")"
+  python3 -m venv "$VENV_DIR"
+  # shellcheck source=/dev/null
+  . "$VENV_DIR/bin/activate"
 
-pip install -U pip setuptools wheel
+  python -c 'import sys; assert sys.version_info[:2] == (3, 11), "Use Python 3.11 to match the bug report"' || {
+    echo "Warning: expected Python 3.11; found $(python -V)" >&2
+  }
 
-# PyTorch 2.8.0 + CUDA 12.8 (matches common functorch / ZeRO-3 bug reports)
-pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cu128
+  pip install -U pip setuptools wheel
 
-pip install -r requirements/requirements.txt
+  # PyTorch 2.8.0 + CUDA 12.8 (matches common functorch / ZeRO-3 bug reports)
+  pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cu128
 
-# Latest DeepSpeed = this git checkout (editable)
-pip install -e .
+  pip install -r requirements/requirements.txt
 
-pip install pytest
+  # Latest DeepSpeed = this git checkout (editable)
+  pip install -e .
 
-python -c "import torch, deepspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('deepspeed', deepspeed.__file__); print('deepspeed version', deepspeed.__version__)"
+  pip install pytest
+
+  python -c "import torch, deepspeed; print('torch', torch.__version__, 'cuda', torch.version.cuda); print('deepspeed', deepspeed.__file__); print('deepspeed version', deepspeed.__version__)"
+fi
 
 REPRO_SRC="$ROOT/scripts/repro_pr7916.py"
 if [[ ! -f "$REPRO_SRC" ]]; then
