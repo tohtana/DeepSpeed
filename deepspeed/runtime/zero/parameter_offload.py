@@ -467,7 +467,7 @@ class DeepSpeedZeRoOffload(object):
 
                     @staticmethod
                     def setup_context(ctx, inputs, output):
-                        (output_in,) = inputs
+                        (output_in, ) = inputs
                         ctx.module = module
                         if output_in.requires_grad:
                             #TODO SOME TIMES post backward does not seem to be triggered debug in detail

@@ -91,8 +91,8 @@ if _SUPPORTS_SETUP_CONTEXT:
                 grad_input = grad_output.matmul(weight)
             if ctx.needs_input_grad[1]:
                 if dim > 2:
-                    grad_weight = grad_output.reshape(-1,
-                                                      grad_output.shape[-1]).t().matmul(input.reshape(-1, input.shape[-1]))
+                    grad_weight = grad_output.reshape(-1, grad_output.shape[-1]).t().matmul(
+                        input.reshape(-1, input.shape[-1]))
                 else:
                     grad_weight = grad_output.t().matmul(input)
             if bias is not None and ctx.needs_input_grad[2]:
@@ -151,8 +151,8 @@ else:
             if ctx.needs_input_grad[1]:
                 #print("Computing grad weight")
                 if dim > 2:
-                    grad_weight = grad_output.reshape(-1,
-                                                      grad_output.shape[-1]).t().matmul(input.reshape(-1, input.shape[-1]))
+                    grad_weight = grad_output.reshape(-1, grad_output.shape[-1]).t().matmul(
+                        input.reshape(-1, input.shape[-1]))
                 else:
                     grad_weight = grad_output.t().matmul(input)
                 #print(f"Computed grad weight grad_weight {grad_weight.shape}")
