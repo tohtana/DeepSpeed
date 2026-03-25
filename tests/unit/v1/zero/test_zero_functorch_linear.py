@@ -2,26 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Regression: ZeRO-3 patched F.linear must work with torch.func transforms.
+"""Regression: ZeRO-3 linear autograd.Function must work with torch.func transforms.
 
-After deepspeed.initialize with ZeRO Stage 3, ``torch.nn.functional.linear`` is
-replaced with ``LinearFunctionForZeroStage3``. That autograd.Function must use
-the ``forward`` + ``setup_context`` pattern (PyTorch 2.0+); the legacy
-``forward(ctx, ...)`` + ``ctx.save_for_backward`` in forward raises::
+ZeRO Stage 3 uses ``LinearFunctionForZeroStage3`` (via ``zero3_linear_wrap``) as
+the memory-efficient linear path. After ``deepspeed.initialize``, global
+``torch.nn.functional.linear`` is often the built-in again, so tests call
+``zero3_linear_wrap`` directly—the same ``autograd.Function`` as when the patch
+is active. Legacy ``forward(ctx, ...)`` + ``ctx.save_for_backward`` in forward
+raises on strict functorch builds::
 
     RuntimeError: In order to use an autograd.Function with functorch
     transforms ... it must override the setup_context staticmethod.
-
-See ``repro_zero3_functorch_linear.py`` for a standalone script version.
 """
 
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import deepspeed
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.linear import zero3_linear_wrap
 
 from unit.common import DistributedTest
 
@@ -51,7 +51,7 @@ def _zero3_functorch_config():
 
 
 class TestZeroFunctorchLinearRegression(DistributedTest):
-    """``torch.func.grad_and_value`` over ZeRO-3 memory-efficient F.linear."""
+    """``torch.func.grad_and_value`` over ``zero3_linear_wrap`` / LinearFunctionForZeroStage3."""
 
     world_size = 1
 
@@ -73,8 +73,12 @@ class TestZeroFunctorchLinearRegression(DistributedTest):
         weight = torch.randn(8, 8, device=device, dtype=dtype, requires_grad=True)
         inp = torch.randn(2, 8, device=device, dtype=dtype, requires_grad=True)
 
+        with torch.enable_grad():
+            probe = zero3_linear_wrap(inp, weight, None)
+        assert "LinearFunctionForZeroStage3" in type(probe.grad_fn).__name__
+
         def loss_fn(w, x):
-            return F.linear(x, w, None).sum()
+            return zero3_linear_wrap(x, w, None).sum()
 
         grads, value = torch.func.grad_and_value(loss_fn, argnums=(0, 1))(weight, inp)
         assert torch.isfinite(value)
