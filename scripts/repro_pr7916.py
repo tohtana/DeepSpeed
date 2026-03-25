@@ -20,8 +20,8 @@
 #
 # Regression coverage: tests/unit/v1/zero/test_zero_functorch_linear.py
 #
-# Run from the DeepSpeed repo root (single GPU), after scripts/setup.sh:
-#   torchrun --standalone --nproc_per_node=1 scripts/repro_zero3_functorch_linear.py
+# Run from the DeepSpeed repo root (single GPU), after scripts/setup_pr7916.sh (or manually):
+#   torchrun --standalone --nproc_per_node=1 scripts/repro_pr7916.py
 #
 # To test an unfixed DeepSpeed tree without importing another checkout by mistake,
 # copy this file outside the repo (e.g. /tmp) and set PYTHONPATH to that tree:
