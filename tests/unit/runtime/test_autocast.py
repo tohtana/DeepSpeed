@@ -4,13 +4,13 @@
 # DeepSpeed Team
 
 import functools
-from types import SimpleNamespace
 
 import pytest
 import torch
 import deepspeed.runtime.zero.linear as zero_linear
 from deepspeed.runtime.zero.linear import LinearModuleForZeroStage3
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils.torch import required_torch_version
 from unit.common import DistributedTest
 
 
@@ -62,62 +62,28 @@ class TestAutoCastEnable(DistributedTest):
             assert output.dtype == torch.half or output.dtype == torch.bfloat16
 
 
-class _FakeAccelerator:
+def test_get_autocast_decorators_use_torch_amp_on_torch_2_4_or_newer():
+    if not required_torch_version(min_version=2.4):
+        pytest.skip('torch.amp.custom_fwd/custom_bwd are only available on torch >= 2.4')
 
-    def __init__(self, device_type):
-        self._device_type = device_type
+    device_type = get_accelerator().device_name()
 
-    def device_name(self):
-        return self._device_type
-
-
-def test_get_autocast_decorators_prefers_torch_amp(monkeypatch):
-
-    def custom_fwd(*args, **kwargs):
-        return None
-
-    def custom_bwd(*args, **kwargs):
-        return None
-
-    fake_torch = SimpleNamespace(amp=SimpleNamespace(custom_fwd=custom_fwd, custom_bwd=custom_bwd))
-    monkeypatch.setattr(zero_linear, 'torch', fake_torch)
-    monkeypatch.setattr(zero_linear, 'get_accelerator', lambda: _FakeAccelerator('cuda'))
-
-    autocast_custom_fwd, autocast_custom_bwd = zero_linear._get_autocast_decorators()
-
-    assert isinstance(autocast_custom_fwd, functools.partial)
-    assert isinstance(autocast_custom_bwd, functools.partial)
-    assert autocast_custom_fwd.func is custom_fwd
-    assert autocast_custom_bwd.func is custom_bwd
-    assert autocast_custom_fwd.keywords == {'device_type': 'cuda'}
-    assert autocast_custom_bwd.keywords == {'device_type': 'cuda'}
+    assert isinstance(zero_linear.autocast_custom_fwd, functools.partial)
+    assert isinstance(zero_linear.autocast_custom_bwd, functools.partial)
+    assert zero_linear.autocast_custom_fwd.func is torch.amp.custom_fwd
+    assert zero_linear.autocast_custom_bwd.func is torch.amp.custom_bwd
+    assert zero_linear.autocast_custom_fwd.keywords == {'device_type': device_type}
+    assert zero_linear.autocast_custom_bwd.keywords == {'device_type': device_type}
 
 
-def test_get_autocast_decorators_uses_legacy_backend_amp(monkeypatch):
+def test_get_autocast_decorators_use_legacy_amp_or_noop_before_torch_2_4():
+    if required_torch_version(min_version=2.4):
+        pytest.skip('legacy AMP fallback only applies on torch < 2.4')
 
-    def custom_fwd(*args, **kwargs):
-        return None
+    device_type = get_accelerator().device_name()
+    legacy_amp = getattr(getattr(torch, device_type, None), 'amp', None)
+    expected_custom_fwd = getattr(legacy_amp, 'custom_fwd', zero_linear.noop_decorator)
+    expected_custom_bwd = getattr(legacy_amp, 'custom_bwd', zero_linear.noop_decorator)
 
-    def custom_bwd(*args, **kwargs):
-        return None
-
-    fake_torch = SimpleNamespace(
-        amp=SimpleNamespace(), npu=SimpleNamespace(amp=SimpleNamespace(custom_fwd=custom_fwd, custom_bwd=custom_bwd)))
-    monkeypatch.setattr(zero_linear, 'torch', fake_torch)
-    monkeypatch.setattr(zero_linear, 'get_accelerator', lambda: _FakeAccelerator('npu'))
-
-    autocast_custom_fwd, autocast_custom_bwd = zero_linear._get_autocast_decorators()
-
-    assert autocast_custom_fwd is custom_fwd
-    assert autocast_custom_bwd is custom_bwd
-
-
-def test_get_autocast_decorators_falls_back_to_noop(monkeypatch):
-    fake_torch = SimpleNamespace(amp=SimpleNamespace())
-    monkeypatch.setattr(zero_linear, 'torch', fake_torch)
-    monkeypatch.setattr(zero_linear, 'get_accelerator', lambda: _FakeAccelerator('hpu'))
-
-    autocast_custom_fwd, autocast_custom_bwd = zero_linear._get_autocast_decorators()
-
-    assert autocast_custom_fwd is zero_linear.noop_decorator
-    assert autocast_custom_bwd is zero_linear.noop_decorator
+    assert zero_linear.autocast_custom_fwd is expected_custom_fwd
+    assert zero_linear.autocast_custom_bwd is expected_custom_bwd
