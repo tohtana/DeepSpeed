@@ -7,7 +7,7 @@
 ZeRO Stage 3 uses ``LinearFunctionForZeroStage3`` (via ``zero3_linear_wrap``) as
 the memory-efficient linear path. After ``deepspeed.initialize``, global
 ``torch.nn.functional.linear`` is often the built-in again, so tests call
-``zero3_linear_wrap`` directlyâthe same ``autograd.Function`` as when the patch
+``zero3_linear_wrap`` directly-the same ``autograd.Function`` as when the patch
 is active. Legacy ``forward(ctx, ...)`` + ``ctx.save_for_backward`` in forward
 raises on strict functorch builds::
 
