@@ -14,7 +14,6 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn as nn
 import deepspeed.comm as dist
-from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec
 from deepspeed.utils import logger
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
@@ -229,8 +228,9 @@ def permute_by_local_expert(
     x_padded_per_expert = n_tokens + num_local_experts * alignment
     padded_max_len = ((x_padded_per_expert + alignment - 1) // alignment) * alignment
 
-    # Use CPU path when tokens are on CPU (e.g., unit tests without CUDA)
-    use_cpu = not get_accelerator().on_accelerator(tokens)
+    # Use the pure-PyTorch path for host tensors. The CPU accelerator reports
+    # CPU tensors as "on accelerator", but Triton still requires a GPU driver.
+    use_cpu = tokens.device.type == "cpu"
     counts_for_permute = local_counts_flat.cpu() if use_cpu else local_counts_flat
     with torch.no_grad():
         permuted_indices, m_sizes, _offsets = generate_permute_indices(

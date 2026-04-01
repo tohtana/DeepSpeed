@@ -83,12 +83,35 @@ class MockMoETransformer(nn.Module):
 _UNSET = object()
 
 
+def _mixed_precision_config():
+    """Return a supported mixed-precision config for the current accelerator."""
+    accelerator = get_accelerator()
+    if accelerator.is_fp16_supported() and accelerator.device_name() != "cpu":
+        return {
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8,
+            },
+        }
+    if accelerator.is_bf16_supported():
+        return {"bf16": {"enabled": True}}
+    if accelerator.is_fp16_supported():
+        return {
+            "fp16": {
+                "enabled": True,
+                "initial_scale_power": 8,
+            },
+        }
+    pytest.skip("AutoEP checkpoint tests require fp16 or bf16 support")
+
+
 def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
     """Build a DeepSpeed config dict for AutoEP checkpoint tests.
 
     load_balance_coeff: default _UNSET keeps the AutoEP default (1e-3).
     Pass None to explicitly disable load balancing (no expert_bias).
-    Uses fp16 to match production usage (MoE checkpoint load path requires fp16/bf16).
+    Uses a supported mixed-precision mode because the MoE checkpoint load
+    path requires fp16 or bf16.
     """
     config = {
         "train_micro_batch_size_per_gpu": 1,
@@ -97,10 +120,6 @@ def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
             "params": {
                 "lr": 1e-4
             },
-        },
-        "fp16": {
-            "enabled": True,
-            "initial_scale_power": 8,
         },
         "expert_parallel": {
             "enabled": True,
@@ -111,6 +130,9 @@ def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
             "stage": zero_stage,
         },
     }
+    if get_accelerator().device_name() == "cpu":
+        config["optimizer"]["torch_adam"] = True
+    config.update(_mixed_precision_config())
     if load_balance_coeff is not _UNSET:
         config["expert_parallel"]["load_balance_coeff"] = load_balance_coeff
     return config
@@ -119,6 +141,14 @@ def _make_autoep_config(zero_stage=0, ep_size=1, load_balance_coeff=_UNSET):
 def _seed_everything(seed=42):
     torch.manual_seed(seed)
     get_accelerator().manual_seed_all(seed)
+
+
+def _engine_input_dtype(engine):
+    if engine.bfloat16_enabled():
+        return torch.bfloat16
+    if engine.fp16_enabled():
+        return torch.float16
+    return torch.float32
 
 
 def _init_engine(ep_size=1, zero_stage=0, load_balance_coeff=_UNSET):
@@ -569,7 +599,7 @@ class TestAutoEPCheckpoint2GPU(DistributedTest):
 
         # Run a few steps to get non-trivial weights
         for _ in range(2):
-            x = torch.randn(1, 8, 64, device=engine.device, dtype=torch.half)
+            x = torch.randn(1, 8, 64, device=engine.device, dtype=_engine_input_dtype(engine))
             loss = engine(x).mean()
             engine.backward(loss)
             engine.step()
@@ -604,14 +634,14 @@ class TestAutoEPCheckpoint2GPU(DistributedTest):
 
         # Train a few steps
         for _ in range(3):
-            x = torch.randn(1, 8, 64, device=engine.device, dtype=torch.half)
+            x = torch.randn(1, 8, 64, device=engine.device, dtype=_engine_input_dtype(engine))
             loss = engine(x).mean()
             engine.backward(loss)
             engine.step()
 
         # Compute a reference loss
         _seed_everything(seed=777)
-        x_ref = torch.randn(1, 8, 64, device=engine.device, dtype=torch.half)
+        x_ref = torch.randn(1, 8, 64, device=engine.device, dtype=_engine_input_dtype(engine))
         with torch.no_grad():
             loss_before = engine(x_ref).mean().item()
 
@@ -628,7 +658,7 @@ class TestAutoEPCheckpoint2GPU(DistributedTest):
 
         # Compute loss again with same input
         _seed_everything(seed=777)
-        x_ref2 = torch.randn(1, 8, 64, device=engine2.device, dtype=torch.half)
+        x_ref2 = torch.randn(1, 8, 64, device=engine2.device, dtype=_engine_input_dtype(engine2))
         with torch.no_grad():
             loss_after = engine2(x_ref2).mean().item()
 
@@ -794,7 +824,7 @@ class TestUniversalConvert(DistributedTest):
         engine = _init_engine(ep_size=1, zero_stage=0)
 
         # Train a step to populate optimizer state
-        x = torch.randn(1, 8, 64, device=engine.device, dtype=torch.half)
+        x = torch.randn(1, 8, 64, device=engine.device, dtype=_engine_input_dtype(engine))
         loss = engine(x).mean()
         engine.backward(loss)
         engine.step()
