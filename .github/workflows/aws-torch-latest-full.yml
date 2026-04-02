@@ -26,6 +26,9 @@ on:
         options:
           - '2.7.1-cu126'
           - '2.8.0-cu126'
+          - '2.9.1-cu126'
+          - '2.10.0-cu126'
+          - '2.11.0-cu126'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -120,6 +123,30 @@ jobs:
               torchvision_install_version='0.23.0'
               torchaudio_install_version='2.8.0'
               torch_test_version='2.8'
+              cuda_test_version='12.6'
+              pytorch_index_url='https://download.pytorch.org/whl/cu126'
+              ;;
+            '2.9.1-cu126')
+              torch_install_version='2.9.1'
+              torchvision_install_version='0.24.1'
+              torchaudio_install_version='2.9.1'
+              torch_test_version='2.9'
+              cuda_test_version='12.6'
+              pytorch_index_url='https://download.pytorch.org/whl/cu126'
+              ;;
+            '2.10.0-cu126')
+              torch_install_version='2.10.0'
+              torchvision_install_version='0.25.0'
+              torchaudio_install_version='2.10.0'
+              torch_test_version='2.10'
+              cuda_test_version='12.6'
+              pytorch_index_url='https://download.pytorch.org/whl/cu126'
+              ;;
+            '2.11.0-cu126')
+              torch_install_version='2.11.0'
+              torchvision_install_version='0.26.0'
+              torchaudio_install_version='2.11.0'
+              torch_test_version='2.11'
               cuda_test_version='12.6'
               pytorch_index_url='https://download.pytorch.org/whl/cu126'
               ;;
