@@ -37,8 +37,19 @@ def patch_fake_tensor():
     def wrap_to_fake_tensor_and_record_wrapper(t, *args, **kwargs):
         dummy_tensor = wrap_if_ds_param(t)
         ret = original_wrap_to_fake_tensor_and_record(dummy_tensor, *args, **kwargs)
+        tx = kwargs.get("tx") if "tx" in kwargs else args[0]
+        source = kwargs.get("source")
         if tracing_context := torch._guards.TracingContext.try_get():
             tracing_context.tensor_to_context[t] = tracing_context.tensor_to_context.pop(dummy_tensor)
+        if source is not None:
+            # Keep the full ds_shape symbolic context from the dummy tensor, but
+            # preserve the real ZeRO-3 partition size for TorchDynamo's
+            # tensor-match guards. PyTorch 2.9 started enforcing those guards
+            # for parameters during build_guards().
+            tx.output.input_source_to_sizes_strides[source] = {
+                "size": t.size(),
+                "stride": t.stride(),
+            }
         return ret
 
     torch._dynamo.variables.builder.wrap_to_fake_tensor_and_record = wrap_to_fake_tensor_and_record_wrapper
