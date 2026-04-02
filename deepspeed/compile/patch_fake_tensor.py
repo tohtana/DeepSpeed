@@ -29,6 +29,17 @@ def wrap_if_ds_param(t):
     return t
 
 
+def _get_guard_sizes_strides(t):
+    if hasattr(t, "ds_id"):
+        # ZeRO-3 may temporarily all-gather a parameter during tracing, but the
+        # stable module state used by TorchDynamo guards is the released
+        # partitioned form, where DeepSpeed resets param.data to empty(0).
+        released = torch.empty(0, dtype=t.dtype, device=t.device)
+        return released.size(), released.stride()
+
+    return t.size(), t.stride()
+
+
 def patch_fake_tensor():
     # dynamo tracer uses wrap_to_fake_tensor_and_record
     # Wrapping FakeTensorMode.from_tensor is not sufficient as dynamo generates SymbolicContext before calling from_tensor
@@ -43,12 +54,13 @@ def patch_fake_tensor():
             tracing_context.tensor_to_context[t] = tracing_context.tensor_to_context.pop(dummy_tensor)
         if source is not None:
             # Keep the full ds_shape symbolic context from the dummy tensor, but
-            # preserve the real ZeRO-3 partition size for TorchDynamo's
-            # tensor-match guards. PyTorch 2.9 started enforcing those guards
-            # for parameters during build_guards().
+            # use the stable released ZeRO-3 parameter representation for
+            # TorchDynamo's tensor-match guards. PyTorch 2.9 started enforcing
+            # those guards for parameters during build_guards().
+            size, stride = _get_guard_sizes_strides(t)
             tx.output.input_source_to_sizes_strides[source] = {
-                "size": t.size(),
-                "stride": t.stride(),
+                "size": size,
+                "stride": stride,
             }
         return ret
 
