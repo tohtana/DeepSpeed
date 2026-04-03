@@ -252,6 +252,7 @@ class DeepSpeedEngine(Module):
         self.num_experts = []
         self.gate_modules = []
         self.moe_layers = []
+        self._autoep_output_grad_scale = 1.0
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
@@ -1562,6 +1563,17 @@ class DeepSpeedEngine(Module):
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
         self.sequence_parallel_size = groups._get_sequence_parallel_world_size()
+        if _AutoEPMoELayer is not None:
+            autoep_group_names = {
+                module.ep_group_name
+                for _, module in self.module.named_modules() if isinstance(module, _AutoEPMoELayer)
+            }
+            if autoep_group_names:
+                if len(autoep_group_names) > 1:
+                    raise RuntimeError(f"AutoEP backward scaling requires a single EP group size, but found "
+                                       f"{sorted(autoep_group_names)}")
+                group_name = next(iter(autoep_group_names))
+                self._autoep_output_grad_scale = float(groups._get_expert_parallel_world_size(group_name))
         if self.sequence_parallel_size > 1:
             # Inserted Warning for PyTorch < 2.3
             if not required_torch_version(min_version=2.3):
@@ -2667,6 +2679,11 @@ class DeepSpeedEngine(Module):
 
         # Used only for return value
         gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
+        if self._autoep_output_grad_scale != 1.0:
+            # AutoEP runs one logical batch across an EP group, so each rank's scalar
+            # loss must be lifted back to the logical-batch view before backward.
+            loss = loss * self._autoep_output_grad_scale
+            gas_scaled_loss = gas_scaled_loss * self._autoep_output_grad_scale
 
         # TODO: handle these scaling with direct calls to loss.backward()
         if isinstance(self.optimizer, ZeROOptimizer):
