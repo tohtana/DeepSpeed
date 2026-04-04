@@ -4,9 +4,13 @@
 # DeepSpeed Team
 
 from typing import List, Optional, Literal
+
+from pydantic import Field, model_validator
+
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
 PassName = Literal["z1", "z3", "autosp"]
+Zero3TuningStrategy = Literal["baseline", "agent"]
 
 
 class CompileConfig(DeepSpeedConfigModel):
@@ -59,3 +63,38 @@ class CompileConfig(DeepSpeedConfigModel):
 
     passes: Optional[List[PassName]] = None
     """ Composes different optimizations. """
+
+    zero3_tuning_strategy: Zero3TuningStrategy = "baseline"
+    """ Controls how ZeRO-3 warmup tuning decisions are made. """
+
+    agent_command: Optional[List[str]] = None
+    """ Command argv used to invoke an external agent when agent tuning is enabled. """
+
+    agent_max_iterations: int = Field(3, gt=0)
+    """ Maximum number of agent-directed tuning iterations per graph invocation. """
+
+    agent_timeout_sec: int = Field(300, gt=0)
+    """ Timeout in seconds for each external agent invocation. """
+
+    @model_validator(mode="after")
+    def validate_agent_mode(self):
+        if self.zero3_tuning_strategy != "agent":
+            return self
+
+        if not self.agent_command or not isinstance(self.agent_command, list):
+            raise ValueError("compile.agent_command must be a non-empty argv list when "
+                             "compile.zero3_tuning_strategy='agent'")
+
+        if any(not isinstance(arg, str) or arg == "" for arg in self.agent_command):
+            raise ValueError("compile.agent_command must contain only non-empty strings when "
+                             "compile.zero3_tuning_strategy='agent'")
+
+        if self.offload_parameters:
+            raise ValueError("compile.zero3_tuning_strategy='agent' conflicts with "
+                             "compile.offload_parameters=True because the offload path has no warmup tuning step")
+
+        if self.passes is not None:
+            raise ValueError("compile.zero3_tuning_strategy='agent' conflicts with compile.passes because "
+                             "custom pass composition overrides the default ZeRO-3 warmup schedule")
+
+        return self

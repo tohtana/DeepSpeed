@@ -1920,7 +1920,7 @@ Different pruning sets, this is used for different pruning parameters. In this e
 
 ### AutoSP options
 
-DeepSpeed provides compiler-based optimization passes through the `compile` configuration. This includes enabling Ulysses-styled sequence paralllelism and a custom heuristic selective activation checkpointing pass. To enable Automatic Sequence Parallelism (AutoSP), configure the `compile` section:
+DeepSpeed provides compiler-based optimization passes through the `compile` configuration. This includes enabling Ulysses-styled sequence paralllelism and an experimental ZeRO-3 warmup tuning mode driven by an external local agent command. To enable Automatic Sequence Parallelism (AutoSP), configure the `compile` section:
 
 ```json
 {
@@ -1937,6 +1937,33 @@ DeepSpeed provides compiler-based optimization passes through the `compile` conf
 | Description                                                              | Default |
 | ------------------------------------------------------------------------ | ------- |
 | List of compiler passes to apply. Currently supported: `["autosp"]`.     | `[]`    |
+
+DeepCompile also supports an experimental agent-driven ZeRO-3 warmup tuning mode. The baseline heuristic path remains the default. Agent mode is only supported for non-offload ZeRO-3 tuning, and the configured command is executed as a trusted local argv list with `shell=False`.
+
+```json
+{
+    "zero_optimization": {"stage": 3},
+    "compile": {
+        "deepcompile": true,
+        "zero3_tuning_strategy": "agent",
+        "agent_command": ["python", "-c", "print('{\"decision\": \"finish\"}')"],
+        "agent_max_iterations": 2,
+        "agent_timeout_sec": 60
+    }
+}
+```
+
+| Option                   | Description                                                                                               | Default      |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- | ------------ |
+| `zero3_tuning_strategy`  | ZeRO-3 warmup tuning strategy. `baseline` preserves the current fixed passes. `agent` enables agent mode. | `"baseline"` |
+| `agent_command`          | External agent command argv list. Required when `zero3_tuning_strategy="agent"`.                         | `null`       |
+| `agent_max_iterations`   | Maximum number of agent-directed tuning iterations per graph invocation.                                  | `3`          |
+| `agent_timeout_sec`      | Timeout in seconds for each agent invocation.                                                             | `300`        |
+
+Agent mode conflicts with:
+
+- `compile.offload_parameters=true`
+- `compile.passes` set to a custom list
 
 ### Data Type options
 
