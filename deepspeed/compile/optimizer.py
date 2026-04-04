@@ -138,7 +138,7 @@ class AgentLoopOptimizer:
         return torch.device(get_accelerator().current_device_name())
 
     def _broadcast_status_and_plan(self, terminate: bool, plan: ToolExecutionPlan | None) -> ToolExecutionPlan | None:
-        if not dist.is_initialized():
+        if not dist.is_initialized() or dist.get_world_size() == 1:
             return plan
 
         status = torch.tensor([1 if terminate else 0], dtype=torch.uint8, device=self._device())

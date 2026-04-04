@@ -72,6 +72,8 @@ class TestSerializeAgentContext:
         assert payload["warmup_trace"][0]["action"] == "prefetch"
         assert payload["available_tools"][0]["name"] == "prefetch"
         assert payload["graph_summary"]["node_count"] == len(list(ctx.gm.graph.nodes))
+        assert payload["response_contract"]["schema"]["decision"] == "apply_tool | finish"
+        assert payload["response_contract"]["instructions"][0].startswith("Return exactly one JSON object")
         assert "graph_code" not in payload
 
     def test_serialize_context_avoids_rank_collectives(self, monkeypatch):

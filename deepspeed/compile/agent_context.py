@@ -146,6 +146,21 @@ def serialize_agent_context(ctx, trace_so_far: list[dict], available_tools: list
             "Use only the provided tools.",
             "Stop when further changes are unlikely to help.",
         ],
+        "response_contract": {
+            "instructions": [
+                "Return exactly one JSON object and no surrounding prose or markdown.",
+                "Set decision to 'apply_tool' or 'finish'.",
+                "When decision is 'apply_tool', set tool_name to one of the available tool names.",
+                "Use tool_kwargs as an object. Leave it empty in v1 unless a tool explicitly requires extra arguments.",
+                "Always include a short reason string.",
+            ],
+            "schema": {
+                "decision": "apply_tool | finish",
+                "tool_name": "prefetch | selective_gather | null",
+                "tool_kwargs": {},
+                "reason": "short explanation",
+            },
+        },
         "graph_role":
         graph_role,
         "memory_budget":

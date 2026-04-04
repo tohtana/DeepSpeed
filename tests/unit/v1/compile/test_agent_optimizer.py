@@ -66,6 +66,27 @@ def build_context():
 
 class TestAgentLoopOptimizer:
 
+    def test_broadcast_plan_skips_single_rank(self, monkeypatch):
+        _, ctx = build_context()
+        optimizer = AgentLoopOptimizer(FakeRunner([]), ctx.compile_config)
+        plan = ToolExecutionPlan(tool_name="prefetch", payload={"sequence": []}, reason="noop")
+        broadcast_called = False
+
+        monkeypatch.setattr("deepspeed.compile.optimizer.dist.is_initialized", lambda: True)
+        monkeypatch.setattr("deepspeed.compile.optimizer.dist.get_world_size", lambda: 1)
+
+        def fail_broadcast(*args, **kwargs):
+            nonlocal broadcast_called
+            broadcast_called = True
+            raise AssertionError("broadcast should not run for single-rank agent mode")
+
+        monkeypatch.setattr("deepspeed.compile.optimizer.dist.broadcast", fail_broadcast)
+
+        result = optimizer._broadcast_status_and_plan(False, plan)
+
+        assert result is plan
+        assert not broadcast_called
+
     def test_agent_loop_finish_immediately(self, monkeypatch):
         _, ctx = build_context()
         runner = FakeRunner(['{"decision":"finish","reason":"done"}'])
