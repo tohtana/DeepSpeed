@@ -3,7 +3,9 @@
 
 # DeepSpeed Team
 
+from dataclasses import asdict
 from typing import Dict, List, Callable, Tuple
+import copy
 import time
 import gc
 from collections import OrderedDict, deque
@@ -33,13 +35,17 @@ from .util import get_input_nodes, get_activation_node_names, get_index_by_graph
 from .partitioner import get_wrapped_partitioner
 from .inductor import register_custom_ops, patch_create_aot_dispatcher_function
 from .input_storage import InputStorage
+from .agent_runner import AgentRunner, AgentRunnerConfig
+from .optimizer import AgentLoopOptimizer, FixedPassOptimizer, OptimizationContext
 
 remaining_schedule = None
 next_pass_step = -1
 next_passes = None
+next_strategy_tag = "baseline"
 current_passes = None
 
 param_manager: Dict[int, DSGraphParamManager] = {}
+optimization_trace = []
 
 
 class GraphOrder:
@@ -76,26 +82,38 @@ def init_schedule(schedule):
 
     assert isinstance(schedule, list), f"schedule should be a list, but got {type(schedule)}"
 
-    for step, passes in schedule:
+    normalized_schedule = []
+    for entry in schedule:
+        assert len(entry) in (2, 3), f"Each schedule entry should have 2 or 3 elements, but got {len(entry)}"
+        if len(entry) == 2:
+            step, passes = entry
+            strategy_tag = "baseline"
+        else:
+            step, passes, strategy_tag = entry
         assert isinstance(step, int), f"Each step in schedule should be an integer, but got {type(step)}"
         assert isinstance(passes, list), f"Passes at a certain step should be a list, but got {type(passes)}"
+        assert isinstance(strategy_tag, str), f"strategy_tag should be a string, but got {type(strategy_tag)}"
+        normalized_schedule.append((step, passes, strategy_tag))
 
     global remaining_schedule
-    remaining_schedule = deque(schedule)
+    remaining_schedule = deque(normalized_schedule)
 
 
 def launch_compile_passes(global_steps: int):
-    global next_pass_step, next_passes
+    global next_pass_step, next_passes, next_strategy_tag, optimization_trace
 
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
-        _, next_passes = remaining_schedule.popleft()
-        log_rank0(f"Launching compile passes: global_steps={global_steps} passes={next_passes}", True)
+        _, next_passes, next_strategy_tag = remaining_schedule.popleft()
+        log_rank0(
+            f"Launching compile passes: global_steps={global_steps} strategy={next_strategy_tag} passes={next_passes}",
+            True)
 
         torch._dynamo.reset()
         get_deepcompile_handle().reset()
         graph_order_with_frame_id.clear()
         profiling_results.clear()
         param_manager.clear()
+        optimization_trace.clear()
 
 
 def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results):
@@ -214,6 +232,77 @@ def run_opt_passes(opt_passes: List[Callable],
             get_accelerator().empty_cache()
 
 
+def run_optimization(strategy_tag: str,
+                     opt_passes: List[Callable],
+                     gm: GraphModule,
+                     graph_id: int,
+                     graph_slot: Tuple[int, str],
+                     graph_order: List[Tuple[int, bool]],
+                     profiling_results,
+                     create_inputs_fn,
+                     mem_budget: float,
+                     param_manager,
+                     bwd: bool,
+                     compile_config,
+                     debug_log=False):
+
+    current_param_manager = param_manager[graph_id]
+    warmup_trace = copy.deepcopy(optimization_trace)
+    noop_rebuild = lambda: gm
+    ctx = OptimizationContext(gm=gm,
+                              graph_id=graph_id,
+                              graph_slot=graph_slot,
+                              graph_order=graph_order,
+                              profiling_results=profiling_results,
+                              create_inputs_fn=create_inputs_fn,
+                              rebuild_structural_baseline_fn=noop_rebuild,
+                              current_param_manager=current_param_manager,
+                              all_param_managers=param_manager,
+                              mem_budget=mem_budget,
+                              bwd=bwd,
+                              debug_log=debug_log,
+                              compile_config=compile_config,
+                              warmup_trace=warmup_trace)
+
+    fixed_optimizer = FixedPassOptimizer()
+    if strategy_tag == "baseline":
+        return fixed_optimizer.optimize(gm, opt_passes, ctx)
+
+    if strategy_tag != "agent":
+        raise ValueError(f"Unknown strategy_tag: {strategy_tag}")
+
+    structural_result = fixed_optimizer.optimize(gm, opt_passes, ctx)
+    baseline_graph = copy.deepcopy(gm.graph)
+    baseline_profile = copy.deepcopy(profiling_results[graph_id])
+
+    def rebuild_structural_baseline():
+        profiling_results[graph_id] = copy.deepcopy(baseline_profile)
+        rebuilt = GraphModule(gm, copy.deepcopy(baseline_graph))
+        rebuilt.recompile()
+        return rebuilt
+
+    agent_ctx = OptimizationContext(gm=gm,
+                                    graph_id=graph_id,
+                                    graph_slot=graph_slot,
+                                    graph_order=graph_order,
+                                    profiling_results=profiling_results,
+                                    create_inputs_fn=create_inputs_fn,
+                                    rebuild_structural_baseline_fn=rebuild_structural_baseline,
+                                    current_param_manager=current_param_manager,
+                                    all_param_managers=param_manager,
+                                    mem_budget=mem_budget,
+                                    bwd=bwd,
+                                    debug_log=debug_log,
+                                    compile_config=compile_config,
+                                    warmup_trace=warmup_trace)
+    runner = AgentRunner(
+        AgentRunnerConfig(command=compile_config.agent_command,
+                          timeout_sec=compile_config.agent_timeout_sec,
+                          debug_log=compile_config.debug_log))
+    agent_result = AgentLoopOptimizer(runner, compile_config).optimize(gm, agent_ctx)
+    return agent_result.__class__(trace=structural_result.trace + agent_result.trace)
+
+
 def make_backend(backend, compile_config, compile_kwargs={}):
 
     register_custom_ops()
@@ -263,6 +352,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
         def make_fw_graph(gm, sample_inputs):
             time_start = time.time()
             graph_index = len(graph_order) - 1
+            graph_slot = (graph_index, "fwd")
 
             if needs_backward:
                 if len(frames_needing_bwd) == 0:
@@ -286,17 +376,25 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             param_manager[graph_id] = DSGraphParamManager(gm.graph, real_inputs, param_indices)
 
             real_inputs_with_rng = real_inputs + tuple(sample_inputs[len(real_inputs):])
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order,
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: real_inputs_with_rng,
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=False,
-                debug_log=debug_log)
+            result = run_optimization(strategy_tag=next_strategy_tag,
+                                      opt_passes=next_passes,
+                                      gm=gm,
+                                      graph_id=graph_id,
+                                      graph_slot=graph_slot,
+                                      graph_order=graph_order,
+                                      profiling_results=profiling_results,
+                                      create_inputs_fn=lambda: real_inputs_with_rng,
+                                      mem_budget=.0,
+                                      param_manager=param_manager,
+                                      bwd=False,
+                                      compile_config=compile_config,
+                                      debug_log=debug_log)
+            for entry in result.trace:
+                optimization_trace.append({
+                    "graph_slot": list(graph_slot),
+                    "bwd": False,
+                    **asdict(entry),
+                })
 
             opt_pass_times.append(("fwd", graph_index, graph_id, time.time() - time_start))
 
@@ -309,6 +407,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             time_start = time.time()
 
             graph_index = get_index_by_graph_id(graph_order, graph_id)
+            graph_slot = (graph_index, "bwd")
             log_rank0(
                 f"Bwd start {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",
                 enable=debug_log)
@@ -327,17 +426,25 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             else:
                 bwd_real_inputs = bwd_inputs_stack.pop()
 
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order,
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: tuple(bwd_real_inputs),
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=True,
-                debug_log=debug_log)
+            result = run_optimization(strategy_tag=next_strategy_tag,
+                                      opt_passes=next_passes,
+                                      gm=gm,
+                                      graph_id=graph_id,
+                                      graph_slot=graph_slot,
+                                      graph_order=graph_order,
+                                      profiling_results=profiling_results,
+                                      create_inputs_fn=lambda: tuple(bwd_real_inputs),
+                                      mem_budget=.0,
+                                      param_manager=param_manager,
+                                      bwd=True,
+                                      compile_config=compile_config,
+                                      debug_log=debug_log)
+            for entry in result.trace:
+                optimization_trace.append({
+                    "graph_slot": list(graph_slot),
+                    "bwd": True,
+                    **asdict(entry),
+                })
 
             # assert graph_id in param_manager, f"Graph {graph_id} not found in param_manager"
 

@@ -61,12 +61,16 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
     if schedule is None:
         schedule = []
         if (compile_config.offload_parameters):
-            schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
+            schedule.append((0, [zero3_compile.add_z3_gather_release,
+                                 offload_parameters.offload_parameter_fwd], "baseline"))
         else:
-            schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append(
-                (WARMUP,
-                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
+            schedule.append((0, [zero3_compile.add_z3_gather_release], "baseline"))
+            if compile_config.zero3_tuning_strategy == "agent":
+                schedule.append((WARMUP, [zero3_compile.add_z3_gather_release], "agent"))
+            else:
+                schedule.append((WARMUP, [
+                    zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather
+                ], "baseline"))
 
     init_schedule(schedule)
 
@@ -83,7 +87,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
         # offloading opt states need additional setup
         from .passes.offload_adam_states import move_opt_states, move_opt_states_sync, init_offload_opt_states
-        for _, passes in schedule:
+        for entry in schedule:
+            passes = entry[1]
             if move_opt_states in passes or move_opt_states_sync in passes:
                 init_offload_opt_states(optimizer, dc)
 
