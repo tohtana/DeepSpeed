@@ -4,7 +4,6 @@
 # DeepSpeed Team
 
 from dataclasses import asdict, dataclass, field
-from datetime import timedelta
 from pathlib import Path
 import gc
 import json
@@ -142,11 +141,6 @@ class AgentLoopOptimizer:
         if not dist.is_initialized():
             return plan
 
-        try:
-            dist.monitored_barrier(timeout=timedelta(seconds=self.timeout_sec + 30))
-        except Exception:
-            pass
-
         status = torch.tensor([1 if terminate else 0], dtype=torch.uint8, device=self._device())
         dist.broadcast(status, src=0)
         if status.item() == 1:
@@ -164,11 +158,6 @@ class AgentLoopOptimizer:
         if dist.get_rank() != 0:
             payload = torch.zeros(length.item(), dtype=torch.uint8, device=self._device())
         dist.broadcast(payload, src=0)
-
-        try:
-            dist.monitored_barrier(timeout=timedelta(seconds=self.timeout_sec + 30))
-        except Exception:
-            pass
 
         if dist.get_rank() != 0:
             plan_payload = json.loads(bytes(payload.tolist()).decode("utf-8"))

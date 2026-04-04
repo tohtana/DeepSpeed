@@ -93,6 +93,32 @@ def _summarize_profile(profile, bwd: bool) -> dict:
     }
 
 
+def _summarize_graph(graph) -> dict:
+    nodes = list(graph.nodes)
+    op_histogram = {}
+    call_nodes = []
+    placeholders = []
+
+    for node in nodes:
+        op_histogram[node.op] = op_histogram.get(node.op, 0) + 1
+        if node.op == "placeholder" and len(placeholders) < 16:
+            placeholders.append(node.name)
+        if node.op.startswith("call") and len(call_nodes) < 32:
+            target = getattr(node.target, "__name__", None) or str(node.target)
+            call_nodes.append({
+                "name": node.name,
+                "op": node.op,
+                "target": target,
+            })
+
+    return {
+        "node_count": len(nodes),
+        "op_histogram": op_histogram,
+        "placeholders": placeholders,
+        "call_nodes": call_nodes,
+    }
+
+
 def serialize_agent_context(ctx, trace_so_far: list[dict], available_tools: list[dict]) -> str:
     graph_role = {
         "graph_slot": list(ctx.graph_slot),
@@ -112,12 +138,6 @@ def serialize_agent_context(ctx, trace_so_far: list[dict], available_tools: list
             "bwd_peak_memory": max([entry[3] for entry in profile.bwd_mem], default=0),
         })
 
-    graph_code = ""
-    try:
-        graph_code = ctx.gm.code
-    except Exception:
-        graph_code = ""
-
     payload = {
         "objective":
         "Modify the ZeRO-3 graph to maximize throughput for distributed training without exceeding memory limits.",
@@ -129,7 +149,7 @@ def serialize_agent_context(ctx, trace_so_far: list[dict], available_tools: list
         "graph_role":
         graph_role,
         "memory_budget":
-        agent_tools.get_memory_budget_summary(ctx.profiling_results),
+        agent_tools.get_memory_budget_summary(ctx.profiling_results, synchronize_ranks=False),
         "current_profile":
         current_profile,
         "cross_graph_summary":
@@ -138,10 +158,8 @@ def serialize_agent_context(ctx, trace_so_far: list[dict], available_tools: list
         trace_so_far,
         "available_tools":
         available_tools,
-        "graph":
-        str(ctx.gm.graph),
-        "graph_code":
-        graph_code,
+        "graph_summary":
+        _summarize_graph(ctx.gm.graph),
     }
     return json.dumps(payload, indent=2, default=str)
 

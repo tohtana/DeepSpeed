@@ -53,13 +53,14 @@ class TestSerializeAgentContext:
 
     def test_serialize_context_includes_graph_slot_and_trace(self, monkeypatch):
         ctx = build_context()
-        monkeypatch.setattr(
-            agent_tools, "get_memory_budget_summary", lambda _: {
-                "total_memory": 1000,
-                "peak_memory": 250,
-                "available_memory": 650,
-                "memory_margin": 0.1,
-            })
+        monkeypatch.setattr(agent_tools,
+                            "get_memory_budget_summary",
+                            lambda _, synchronize_ranks=True: {
+                                "total_memory": 1000,
+                                "peak_memory": 250,
+                                "available_memory": 650,
+                                "memory_margin": 0.1,
+                            })
 
         payload = json.loads(
             serialize_agent_context(ctx,
@@ -70,6 +71,29 @@ class TestSerializeAgentContext:
         assert payload["memory_budget"]["available_memory"] == 650
         assert payload["warmup_trace"][0]["action"] == "prefetch"
         assert payload["available_tools"][0]["name"] == "prefetch"
+        assert payload["graph_summary"]["node_count"] == len(list(ctx.gm.graph.nodes))
+        assert "graph_code" not in payload
+
+    def test_serialize_context_avoids_rank_collectives(self, monkeypatch):
+        ctx = build_context()
+
+        def fake_memory_budget_summary(_, synchronize_ranks=True):
+            assert synchronize_ranks is False
+            return {
+                "total_memory": 1000,
+                "peak_memory": 250,
+                "available_memory": 650,
+                "memory_margin": 0.1,
+            }
+
+        monkeypatch.setattr(agent_tools, "get_memory_budget_summary", fake_memory_budget_summary)
+
+        payload = json.loads(
+            serialize_agent_context(ctx,
+                                    trace_so_far=ctx.warmup_trace,
+                                    available_tools=agent_tools.get_available_tools(False, False, set())))
+
+        assert payload["memory_budget"]["available_memory"] == 650
 
 
 class TestParseAgentResponse:

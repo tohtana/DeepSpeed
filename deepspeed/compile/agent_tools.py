@@ -48,7 +48,7 @@ def is_last_backward_graph(graph_id: int, graph_order: list[tuple[int, bool]]) -
     return last_backward_graph_id is not None and graph_id == last_backward_graph_id
 
 
-def get_memory_budget_summary(profiling_results) -> dict:
+def get_memory_budget_summary(profiling_results, synchronize_ranks: bool = True) -> dict:
     peak_mem = 0
     for profile in profiling_results.values():
         if profile.fwd_mem:
@@ -57,7 +57,7 @@ def get_memory_budget_summary(profiling_results) -> dict:
             peak_mem = max(peak_mem, max(mem[3] for mem in profile.bwd_mem))
 
     total_mem = get_accelerator().total_memory()
-    if dist.is_initialized():
+    if synchronize_ranks and dist.is_initialized():
         vals_to_bcast = torch.tensor([total_mem], device=torch.device(get_accelerator().current_device()))
         dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN)
         total_mem = vals_to_bcast[0].item()

@@ -26,8 +26,6 @@ class TestDeepCompileAgent(DistributedTest):
     def test_zero3_agent_finish(self, tmpdir):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("CPU does not support this test yet")
-        if required_torch_version(min_version=2.9):
-            pytest.skip("DeepCompile ZeRO-3 is disabled on PyTorch >= 2.9 by the current runtime guard")
 
         log_path = str(tmpdir.join("agent_ranks.log"))
         os.environ["DEEPCOMPILE_AGENT_LOG"] = log_path
