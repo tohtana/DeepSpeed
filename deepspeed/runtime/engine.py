@@ -2580,6 +2580,13 @@ class DeepSpeedEngine(Module):
 
             self._backward_epilogue()
 
+    def _scale_loss_for_autoep(self, loss):
+        if self._autoep_output_grad_scale != 1.0:
+            # AutoEP runs one logical batch across an EP group, so each rank's scalar
+            # loss must be lifted back to the logical-batch view before backward.
+            return loss * self._autoep_output_grad_scale
+        return loss
+
     @contextmanager
     def no_sync(self):
         r"""
@@ -2641,11 +2648,11 @@ class DeepSpeedEngine(Module):
                                "When using AMP, you must call engine.backward(loss) instead of manual backward.")
 
         # Apply loss scaler based on optimizer type
-        scaled_loss = loss
+        scaled_loss = self._scale_loss_for_autoep(loss)
         if isinstance(self.optimizer, ZeROOptimizer):
-            scaled_loss = self.optimizer.scale_if_loss(loss)
+            scaled_loss = self.optimizer.scale_if_loss(scaled_loss)
         elif self.torch_autocast_z0_gradscaler:
-            scaled_loss = self.torch_autocast_z0_gradscaler.scale(loss)
+            scaled_loss = self.torch_autocast_z0_gradscaler.scale(scaled_loss)
 
         # Mark that scale() was called for validation in backward hook
         self._manual_backward_expected = True
@@ -2679,11 +2686,8 @@ class DeepSpeedEngine(Module):
 
         # Used only for return value
         gas_scaled_loss = loss / self.gradient_accumulation_steps() if scale_wrt_gas else loss
-        if self._autoep_output_grad_scale != 1.0:
-            # AutoEP runs one logical batch across an EP group, so each rank's scalar
-            # loss must be lifted back to the logical-batch view before backward.
-            loss = loss * self._autoep_output_grad_scale
-            gas_scaled_loss = gas_scaled_loss * self._autoep_output_grad_scale
+        loss = self._scale_loss_for_autoep(loss)
+        gas_scaled_loss = self._scale_loss_for_autoep(gas_scaled_loss)
 
         # TODO: handle these scaling with direct calls to loss.backward()
         if isinstance(self.optimizer, ZeROOptimizer):

@@ -120,7 +120,7 @@ def _make_local_batches(*, logical_dp_world_size, logical_dp_rank, grad_accum, s
     return batches
 
 
-def _run_until_boundary(engine, *, logical_dp_world_size, logical_dp_rank, grad_accum, seed):
+def _run_until_boundary(engine, *, logical_dp_world_size, logical_dp_rank, grad_accum, seed, use_manual_scale=False):
     batches = _make_local_batches(
         logical_dp_world_size=logical_dp_world_size,
         logical_dp_rank=logical_dp_rank,
@@ -137,7 +137,11 @@ def _run_until_boundary(engine, *, logical_dp_world_size, logical_dp_rank, grad_
             attention_mask=batch["attention_mask"],
             labels=batch["labels"],
         )
-        engine.backward(outputs.loss)
+        if use_manual_scale:
+            scaled_loss = engine.scale(outputs.loss)
+            scaled_loss.backward()
+        else:
+            engine.backward(outputs.loss)
         if batch_idx + 1 < len(batches):
             engine.step()
 
@@ -191,6 +195,17 @@ def _collect_zero2_expert_grads(engine):
     return grads
 
 
+def _assert_grad_maps_close(actual, expected, *, lhs_name, rhs_name, clip_grad):
+    for name in sorted(expected):
+        assert name in actual, f"Missing {lhs_name} param snapshot for {name}"
+        torch.testing.assert_close(actual[name],
+                                   expected[name],
+                                   atol=5e-3,
+                                   rtol=5e-3,
+                                   msg=(f"Gradient mismatch for {name} between {lhs_name} and {rhs_name} "
+                                        f"with clip_grad={clip_grad}"))
+
+
 class TestAutoEPGradParity(DistributedTest):
     world_size = 4
 
@@ -233,18 +248,65 @@ class TestAutoEPGradParity(DistributedTest):
         if dist.get_rank() != 0:
             return
 
-        for name in sorted(zero2_nonexpert):
-            assert name in autoep_nonexpert, f"Missing AutoEP param snapshot for {name}"
-            torch.testing.assert_close(autoep_nonexpert[name],
-                                       zero2_nonexpert[name],
-                                       atol=5e-3,
-                                       rtol=5e-3,
-                                       msg=f"Non-expert gradient mismatch for {name} with clip_grad={clip_grad}")
+        _assert_grad_maps_close(autoep_nonexpert,
+                                zero2_nonexpert,
+                                lhs_name="AutoEP",
+                                rhs_name="ZeRO-2",
+                                clip_grad=clip_grad)
+        _assert_grad_maps_close(autoep_expert,
+                                zero2_expert,
+                                lhs_name="AutoEP expert",
+                                rhs_name="ZeRO-2 expert",
+                                clip_grad=clip_grad)
 
-        for name in sorted(zero2_expert):
-            assert name in autoep_expert, f"Missing AutoEP expert snapshot for {name}"
-            torch.testing.assert_close(autoep_expert[name],
-                                       zero2_expert[name],
-                                       atol=5e-3,
-                                       rtol=5e-3,
-                                       msg=f"Expert gradient mismatch for {name} with clip_grad={clip_grad}")
+    @pytest.mark.parametrize("clip_grad", [0.0, 1.0])
+    def test_zero2_autoep_scale_matches_engine_backward(self, clip_grad):
+        ep_size = 2
+        seed = 1234
+
+        _seed_everything(seed)
+        model_config = _make_model_config()
+        reference_state = AutoModelForCausalLM.from_config(model_config).state_dict()
+
+        autoep_backward_model = AutoModelForCausalLM.from_config(model_config)
+        autoep_manual_model = AutoModelForCausalLM.from_config(model_config)
+        autoep_backward_model.load_state_dict(copy.deepcopy(reference_state))
+        autoep_manual_model.load_state_dict(copy.deepcopy(reference_state))
+
+        autoep_backward_engine, _, _, _ = deepspeed.initialize(model=autoep_backward_model,
+                                                               config=_make_autoep_zero2_config(clip_grad, ep_size))
+        autoep_manual_engine, _, _, _ = deepspeed.initialize(model=autoep_manual_model,
+                                                             config=_make_autoep_zero2_config(clip_grad, ep_size))
+
+        autoep_rank = dist.get_rank() // ep_size
+        _run_until_boundary(autoep_backward_engine,
+                            logical_dp_world_size=self.world_size // ep_size,
+                            logical_dp_rank=autoep_rank,
+                            grad_accum=2,
+                            seed=seed)
+        _run_until_boundary(autoep_manual_engine,
+                            logical_dp_world_size=self.world_size // ep_size,
+                            logical_dp_rank=autoep_rank,
+                            grad_accum=2,
+                            seed=seed,
+                            use_manual_scale=True)
+
+        autoep_backward_nonexpert = _collect_nonexpert_grads(autoep_backward_engine)
+        autoep_backward_expert = _collect_autoep_expert_grads(autoep_backward_engine)
+        autoep_manual_nonexpert = _collect_nonexpert_grads(autoep_manual_engine)
+        autoep_manual_expert = _collect_autoep_expert_grads(autoep_manual_engine)
+
+        dist.barrier()
+        if dist.get_rank() != 0:
+            return
+
+        _assert_grad_maps_close(autoep_manual_nonexpert,
+                                autoep_backward_nonexpert,
+                                lhs_name="AutoEP manual backward",
+                                rhs_name="AutoEP engine.backward",
+                                clip_grad=clip_grad)
+        _assert_grad_maps_close(autoep_manual_expert,
+                                autoep_backward_expert,
+                                lhs_name="AutoEP manual expert backward",
+                                rhs_name="AutoEP engine.backward expert",
+                                clip_grad=clip_grad)
