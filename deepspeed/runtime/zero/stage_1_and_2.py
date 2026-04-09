@@ -1179,9 +1179,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                            log=log,
                                            divide=divide,
                                            process_group=process_group)
+        if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+            allreduced.record_stream(self.reduction_stream)
         for buf, synced, bucket_rank in zip(small_bucket, self.unflatten(allreduced, small_bucket), bucket_ranks):
             if dist.get_rank(group=process_group) == bucket_rank:
                 buf.copy_(synced)
+                if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                    buf.record_stream(self.reduction_stream)
 
     def allreduce_and_scatter(self,
                               bucket,
@@ -1747,9 +1751,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 divide=divide,
                 process_group=process_group,
             )
+            if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                allreduced.record_stream(stream)
             if rank is None or rank == dist.get_rank(group=self.dp_process_group):
                 for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
                     buf.copy_(synced)
+                    if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                        buf.record_stream(stream)
 
     def allreduce_no_retain(
         self,
