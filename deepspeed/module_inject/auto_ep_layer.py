@@ -294,11 +294,9 @@ def combine_from_routed(
     output = output.reshape(T, top_k, hdim)
 
     if score_apply == "post":
-        # Apply scores during combine
-        output = (torch.bmm(
-            top_scores.reshape(-1, 1, top_k).float(),
-            output.float(),
-        ).to(expert_output.dtype).squeeze(1))
+        # Match the runtime HF grouped-mm path: apply routing weights per
+        # token-slot sample, then reduce over top-k.
+        output = (output.float() * top_scores.reshape(T, top_k, 1).float()).sum(dim=1).to(expert_output.dtype)
     else:
         # Scores already applied pre-experts, just sum over top_k
         output = output.sum(dim=1)
