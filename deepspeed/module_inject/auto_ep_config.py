@@ -300,10 +300,11 @@ def validate_autoep_config(
         logger.warning("num_expert_groups is set; interaction with EP topology "
                        "is not yet optimized.")
 
-    # Warn if autoep_size == 1 (no EP needed)
+    # Warn if autoep_size == 1 (degenerate EP case)
     if config.autoep_size == 1:
         logger.warning("autoep_size=1 means every rank owns all experts with no AllToAll. "
-                       "AutoEP replacement will be bypassed; the model runs as-is with DP.")
+                       "AutoEP replacement remains enabled, but expert-parallel communication "
+                       "is bypassed (degenerate case).")
 
     # Helper validators (local to validate_autoep_config)
     def _validate_attr_name(field_name: str, value, *, allow_dot: bool = False) -> None:
