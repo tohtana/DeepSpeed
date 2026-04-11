@@ -85,6 +85,7 @@ class AutoEPConfig:
     route_norm: bool | None = None  # None = auto-detect from model config
     route_scale: float = 1.0
     score_apply: Literal["auto", "pre", "post"] = "auto"
+    combine_impl: Literal["auto", "weighted_sum", "legacy_bmm"] = "auto"
     num_expert_groups: int | None = None
     num_limited_groups: int | None = None
     score_func: Literal["auto", "softmax", "sigmoid"] = "auto"
@@ -218,6 +219,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.route_norm = param_dict.get("route_norm", None)
     config.route_scale = param_dict.get("route_scale", 1.0)
     config.score_apply = param_dict.get("score_apply", "auto")
+    config.combine_impl = param_dict.get("combine_impl", "auto")
     config.num_expert_groups = param_dict.get("num_expert_groups", None)
     config.num_limited_groups = param_dict.get("num_limited_groups", None)
     config.score_func = param_dict.get("score_func", "auto")
@@ -284,6 +286,12 @@ def validate_autoep_config(
         raise ValueError(f"score_apply must be one of {valid_score_apply}, "
                          f"got '{config.score_apply}'")
 
+    # Validate combine_impl
+    valid_combine_impl = ("auto", "weighted_sum", "legacy_bmm")
+    if config.combine_impl not in valid_combine_impl:
+        raise ValueError(f"combine_impl must be one of {valid_combine_impl}, "
+                         f"got '{config.combine_impl}'")
+
     # Validate score_func
     valid_score_func = ("auto", "softmax", "sigmoid")
     if config.score_func not in valid_score_func:
@@ -303,7 +311,8 @@ def validate_autoep_config(
     # Warn if autoep_size == 1 (no EP needed)
     if config.autoep_size == 1:
         logger.warning("autoep_size=1 means every rank owns all experts with no AllToAll. "
-                       "AutoEP replacement will be bypassed; the model runs as-is with DP.")
+                       "AutoEP replacement remains enabled, but expert-parallel communication "
+                       "is bypassed because every rank owns all experts.")
 
     # Helper validators (local to validate_autoep_config)
     def _validate_attr_name(field_name: str, value, *, allow_dot: bool = False) -> None:

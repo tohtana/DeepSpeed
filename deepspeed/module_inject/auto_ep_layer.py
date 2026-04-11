@@ -55,6 +55,14 @@ def resolve_score_apply_mode(
     return spec.score_apply
 
 
+def resolve_combine_impl(
+    config_override: Literal["auto", "weighted_sum", "legacy_bmm"], ) -> Literal["weighted_sum", "legacy_bmm"]:
+    """Resolve combine implementation from config override or default."""
+    if config_override != "auto":
+        return config_override
+    return "weighted_sum"
+
+
 def apply_scores_before_experts_if_enabled(
     routed_input: torch.Tensor,
     top_scores: torch.Tensor,
@@ -278,6 +286,7 @@ def combine_from_routed(
         token_indices_sorted: torch.Tensor,  # [N]
         top_k: int,
         score_apply: Literal["pre", "post"],
+        combine_impl: Literal["weighted_sum", "legacy_bmm"],
         shape: tuple[int, int, int],  # (B, S, H)
 ) -> torch.Tensor:
     """Scatter-add expert outputs back to original token positions."""
@@ -294,9 +303,17 @@ def combine_from_routed(
     output = output.reshape(T, top_k, hdim)
 
     if score_apply == "post":
-        # Match the runtime HF grouped-mm path: apply routing weights per
-        # token-slot sample, then reduce over top-k.
-        output = (output.float() * top_scores.reshape(T, top_k, 1).float()).sum(dim=1).to(expert_output.dtype)
+        if combine_impl == "legacy_bmm":
+            # Legacy reduction path retained as a debug option for model-family
+            # verification. The weighted-sum path is the default.
+            output = torch.bmm(
+                top_scores.reshape(-1, 1, top_k).float(),
+                output.float(),
+            ).to(expert_output.dtype).squeeze(1)
+        else:
+            # Match the runtime HF grouped-mm path: apply routing weights per
+            # token-slot sample, then reduce over top-k.
+            output = (output.float() * top_scores.reshape(T, top_k, 1).float()).sum(dim=1).to(expert_output.dtype)
     else:
         # Scores already applied pre-experts, just sum over top_k
         output = output.sum(dim=1)
@@ -330,6 +347,7 @@ class AutoEPMoELayer(nn.Module):
         self.router_logits_capture_index = spec.router_logits_capture_index
         self.top_k = spec.top_k
         self.score_apply = resolve_score_apply_mode(spec, config.score_apply)
+        self.combine_impl = resolve_combine_impl(config.combine_impl)
         route_norm = spec.route_norm if config.route_norm is None else config.route_norm
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -528,6 +546,7 @@ class AutoEPMoELayer(nn.Module):
             token_indices_sorted=token_indices_sorted,
             top_k=self.top_k,
             score_apply=self.score_apply,
+            combine_impl=self.combine_impl,
             shape=(bsz, seqlen, hdim),
         )
 
