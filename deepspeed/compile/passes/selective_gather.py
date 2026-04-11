@@ -11,6 +11,7 @@ from torch.fx import GraphModule
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils import log_dist
 
 from ..util import get_deepcompile_handle
 from ..graph_param import DSGraphParamManager
@@ -23,8 +24,7 @@ MEM_MARGIN = 0.1
 
 
 def print_rank_0(message):
-    if dist.get_rank() == 0:
-        print(message)
+    log_dist(message, ranks=[0])
 
 
 def _compute_persistence_budget(all_graph_mem_records: List[List[Tuple[str, int, int, int]]], total_mem: int,
