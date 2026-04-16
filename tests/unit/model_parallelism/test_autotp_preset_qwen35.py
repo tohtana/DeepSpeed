@@ -6,6 +6,8 @@
 from copy import deepcopy
 from types import SimpleNamespace
 
+import deepspeed
+import deepspeed.comm as dist
 import pytest
 import torch
 from torch import nn
@@ -40,6 +42,34 @@ def make_mock_qwen35_config():
         linear_key_head_dim=4,
         linear_num_value_heads=2,
         linear_value_head_dim=8,
+    )
+
+
+def load_real_qwen35_classes():
+    try:
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+    except ImportError:
+        pytest.skip("transformers with Qwen3.5 support is required")
+    return Qwen3_5TextConfig, Qwen3_5ForCausalLM
+
+
+def make_real_qwen35_text_config():
+    qwen35_text_config, _ = load_real_qwen35_classes()
+    return qwen35_text_config(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_num_key_heads=4,
+        linear_key_head_dim=8,
+        linear_num_value_heads=4,
+        linear_value_head_dim=8,
+        attention_dropout=0.0,
+        use_cache=False,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
     )
 
 
@@ -374,3 +404,100 @@ class TestQwen35MockHybridModel(DistributedTest):
         full_output = baseline(inputs)
         tp_output = model(inputs)
         assert_close_for_preferred_dtype(tp_output, full_output)
+
+
+class TestQwen35RealHFModel(DistributedTest):
+    world_size = 2
+    reuse_dist_env = False
+
+    def _make_tp_config(self):
+        config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "tensor_parallel": {
+                "autotp_size": 2,
+                "preset_model": "qwen3_5",
+            },
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": 1e-4,
+                },
+            },
+            "zero_optimization": {
+                "stage": 0,
+            },
+            "steps_per_print": 1,
+        }
+        if preferred_dtype() == torch.float16:
+            config["fp16"] = {"enabled": True}
+        elif preferred_dtype() == torch.bfloat16:
+            config["bf16"] = {"enabled": True}
+        return config
+
+    def _seed_all(self, seed):
+        torch.manual_seed(seed)
+        get_accelerator().manual_seed_all(seed)
+
+    def _build_real_baseline_and_engine(self):
+        skip_on_device()
+        _, qwen35_for_causal_lm = load_real_qwen35_classes()
+
+        config = make_real_qwen35_text_config()
+        device = get_accelerator().current_device_name()
+
+        self._seed_all(1234)
+        baseline = qwen35_for_causal_lm(config).to(device=device, dtype=preferred_dtype())
+        baseline.eval()
+
+        model = deepcopy(baseline)
+        engine, _, _, _ = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            config=self._make_tp_config(),
+        )
+        engine.eval()
+        return baseline, engine, config, device
+
+    def test_real_qwen35_preset_replaces_supported_layers(self):
+        _, engine, _, _ = self._build_real_baseline_and_engine()
+
+        assert engine.autotp_size() == 2
+        assert isinstance(engine.module.model.layers[0].linear_attn.in_proj_qkv, SubParamLinearLayer)
+        assert isinstance(engine.module.model.layers[0].linear_attn.in_proj_z, LinearLayer)
+        assert isinstance(engine.module.model.layers[0].linear_attn.out_proj, LinearAllreduce)
+        assert isinstance(engine.module.model.layers[3].self_attn.q_proj, LinearLayer)
+        assert isinstance(engine.module.model.layers[3].self_attn.o_proj, LinearAllreduce)
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=RuntimeError,
+        reason="Qwen3.5 linear_attn.conv1d still expects the full mixed_qkv width after AutoTP sharding.",
+    )
+    def test_real_qwen35_first_forward_matches_baseline(self):
+        baseline, engine, config, device = self._build_real_baseline_and_engine()
+
+        self._seed_all(4321)
+        input_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
+        dist.broadcast(
+            input_ids,
+            src=groups.get_tensor_model_parallel_src_rank(),
+            group=groups.get_tensor_model_parallel_group(),
+        )
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            baseline_output = baseline(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=input_ids,
+                use_cache=False,
+            )
+            tp_output = engine(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=input_ids,
+                use_cache=False,
+            )
+
+        assert_close_for_preferred_dtype(tp_output.loss, baseline_output.loss)
+        assert_close_for_preferred_dtype(tp_output.logits, baseline_output.logits)
