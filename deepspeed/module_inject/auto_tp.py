@@ -477,6 +477,23 @@ class AutoTP():
 
         raise ValueError(f"Unknown AutoTP shape_resolver '{resolver}' for layer '{name}'.")
 
+    def _can_replace_qwen35_linear_attn(self, module, name: str) -> bool:
+        if self.partition_config is None:
+            return False
+        required_attrs = [
+            "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj", "conv1d", "dt_bias", "A_log",
+            "num_k_heads", "num_v_heads", "head_k_dim", "head_v_dim", "key_dim", "value_dim", "conv_dim"
+        ]
+        if not all(hasattr(module, attr) for attr in required_attrs):
+            return False
+
+        model_type = self._get_model_type()
+        spec = self.partition_config.find_matching_spec(f"{name}.in_proj_qkv.weight", model_type)
+        return spec is not None and getattr(spec, "shape_resolver", None) == "qwen3_5_linear_attn_qkv"
+
+    def _replace_qwen35_linear_attn(self, module, name: str):
+        return Qwen35LinearAttentionLayer(module, self.mp_group, name=name)
+
     def _create_row_parallel_layer(self, module, spec: TPLayerSpec, name: str):
         """Create row-parallel layer (AllReduce after forward)."""
         resolved_shape = self._resolve_spec_shape(spec, module, name)
@@ -618,6 +635,8 @@ class AutoTP():
                         if new_child is not None:
                             setattr(r_module, name, new_child)
                     # If no pattern matched or skip, leave embedding unchanged
+                elif self._can_replace_qwen35_linear_attn(child, full_name):
+                    setattr(r_module, name, self._replace_qwen35_linear_attn(child, full_name))
                 elif hasattr(child, "weight") and getattr(child.weight, "dim", lambda: 0)() == 2:
                     new_child = self._replace_with_config(child, full_name)
                     if new_child is not None:

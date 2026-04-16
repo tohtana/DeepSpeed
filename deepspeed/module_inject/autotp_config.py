@@ -515,16 +515,18 @@ class AutoTPPresets:
 
     @staticmethod
     def qwen3_5() -> AutoTPConfig:
-        """Qwen 3.5 dense model with partial linear-attention coverage.
+        """Qwen 3.5 dense model with gated linear-attention coverage.
 
         This preset covers:
         - standard self_attn projections in full-attention layers
         - mlp projections in every decoder layer
         - linear_attn.in_proj_qkv via config-derived unequal fused QKV splits
-        - linear_attn.in_proj_z and linear_attn.out_proj
+        - linear_attn.in_proj_z, linear_attn.in_proj_a, linear_attn.in_proj_b,
+          and linear_attn.out_proj
 
-        It intentionally does not cover linear_attn.in_proj_a/in_proj_b or
-        non-2D linear-attention state such as conv1d, norm, dt_bias, and A_log.
+        The built-in AutoTP replacement also shards the remaining local-head
+        state inside the gated linear-attention block, including conv1d,
+        dt_bias, and A_log.
         """
         return AutoTPConfig(layer_specs=[
             TPLayerSpec(
@@ -547,6 +549,10 @@ class AutoTPPresets:
             ),
             TPLayerSpec(
                 patterns=[r".*\.linear_attn\.in_proj_z\.weight$"],
+                partition_type=PartitionType.COLUMN,
+            ),
+            TPLayerSpec(
+                patterns=[r".*\.linear_attn\.in_proj_[ab]\.weight$"],
                 partition_type=PartitionType.COLUMN,
             ),
             TPLayerSpec(
