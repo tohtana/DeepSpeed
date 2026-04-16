@@ -30,11 +30,18 @@ def repack_expert_weights(
         w3: [E_local, ffn_hidden_size, hidden_size]
 
     For fused_3d storage where expert_w3 is None (gate+up fused):
-        Source gate_up_proj: [E, 2*ffn_hidden, hidden]
-        w1 = first half  (gate_proj): [E_local, ffn_hidden, hidden]
-        w3 = second half (up_proj):   [E_local, ffn_hidden, hidden]
-        Source down_proj: [E, hidden, ffn_hidden]
-        w2 = down_proj: [E_local, hidden, ffn_hidden]
+        Standard HF layout:
+            Source gate_up_proj: [E, 2*ffn_hidden, hidden]
+            Source down_proj: [E, hidden, ffn_hidden]
+
+        Llama4 layout:
+            Source gate_up_proj: [E, hidden, 2*ffn_hidden]
+            Source down_proj: [E, ffn_hidden, hidden]
+
+        In both cases, the returned grouped-expert tensors are normalized to:
+            w1 = gate_proj: [E_local, ffn_hidden, hidden]
+            w3 = up_proj:   [E_local, ffn_hidden, hidden]
+            w2 = down_proj: [E_local, hidden, ffn_hidden]
     """
     num_local_experts = spec.num_experts // ep_size
     expert_start = ep_rank * num_local_experts
@@ -68,12 +75,28 @@ def _repack_fused_3d(
     w2_local = w2_full[expert_start:expert_end].clone()
 
     if spec.expert_w3_name is None:
-        # Fused gate+up: gate_up_proj [E, 2*ffn, hidden]
-        # Split into w1 (gate) and w3 (up)
-        ffn_hidden = w1_local.shape[1] // 2
-        w1 = w1_local[:, :ffn_hidden, :].contiguous()  # [E_local, ffn, hidden]
-        w3 = w1_local[:, ffn_hidden:, :].contiguous()  # [E_local, ffn, hidden]
-        w2 = w2_local.contiguous()  # [E_local, hidden, ffn]
+        if w1_local.shape[1] % 2 == 0 and tuple(w2_local.shape[1:]) == (
+                w1_local.shape[2],
+                w1_local.shape[1] // 2,
+        ):
+            # Standard fused gate+up: gate_up_proj [E, 2*ffn, hidden]
+            ffn_hidden = w1_local.shape[1] // 2
+            w1 = w1_local[:, :ffn_hidden, :].contiguous()  # [E_local, ffn, hidden]
+            w3 = w1_local[:, ffn_hidden:, :].contiguous()  # [E_local, ffn, hidden]
+            w2 = w2_local.contiguous()  # [E_local, hidden, ffn]
+        elif w1_local.shape[2] % 2 == 0 and tuple(w2_local.shape[1:]) == (
+                w1_local.shape[2] // 2,
+                w1_local.shape[1],
+        ):
+            # Llama4 fused gate+up: gate_up_proj [E, hidden, 2*ffn]
+            ffn_hidden = w1_local.shape[2] // 2
+            w1 = w1_local[:, :, :ffn_hidden].transpose(1, 2).contiguous()  # [E_local, ffn, hidden]
+            w3 = w1_local[:, :, ffn_hidden:].transpose(1, 2).contiguous()  # [E_local, ffn, hidden]
+            w2 = w2_local.transpose(1, 2).contiguous()  # [E_local, hidden, ffn]
+        else:
+            raise ValueError("Unsupported fused expert weight layout for AutoEP repacking: "
+                             f"{spec.expert_w1_name}={tuple(w1_local.shape)}, "
+                             f"{spec.expert_w2_name}={tuple(w2_local.shape)}")
     else:
         # Separate w1 (gate), w3 (up)
         w3_full = getattr(experts_source, spec.expert_w3_name)

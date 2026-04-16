@@ -244,6 +244,12 @@ class TestAutoEPConfig:
         assert mixtral.expert_w3 is None
         assert mixtral.has_shared_experts is False
 
+        llama4 = PRESET_MODELS["llama4"]
+        assert llama4.score_func == "sigmoid"
+        assert llama4.score_apply == "pre"
+        assert llama4.router_pattern == "router"
+        assert llama4.has_shared_experts is True
+
     def test_validate_empty_expert_w1(self):
         """Empty expert_w1 raises ValueError."""
         config = AutoEPConfig(enabled=True, autoep_size=2, expert_w1="")
@@ -548,6 +554,42 @@ class MockMoEBlock(nn.Module):
         self.experts = MockMoEExperts(num_experts, ffn_hidden, hidden_size)
 
 
+class MockLlama4Config:
+    model_type = "llama4"
+    num_local_experts = 8
+    num_experts_per_tok = 1
+    hidden_size = 64
+    intermediate_size = 128
+
+
+class MockLlama4Experts(nn.Module):
+    """Mimics HF Llama4 hidden-first fused expert storage."""
+
+    def __init__(self, num_experts=8, ffn_hidden=128, hidden_size=64):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(torch.randn(num_experts, hidden_size, 2 * ffn_hidden))
+        self.down_proj = nn.Parameter(torch.randn(num_experts, ffn_hidden, hidden_size))
+
+
+class MockSharedExpert(nn.Module):
+
+    def __init__(self, hidden_size=64):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.down_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+
+class MockLlama4MoEBlock(nn.Module):
+    """Mimics model.layers.N.feed_forward for Llama4."""
+
+    def __init__(self, num_experts=8, ffn_hidden=128, hidden_size=64):
+        super().__init__()
+        self.router = nn.Linear(hidden_size, num_experts, bias=False)
+        self.experts = MockLlama4Experts(num_experts, ffn_hidden, hidden_size)
+        self.shared_expert = MockSharedExpert(hidden_size)
+
+
 class MockDenseBlock(nn.Module):
     """Dense FFN block (should be skipped by detection)."""
 
@@ -576,6 +618,22 @@ class MockMoETransformer(nn.Module):
                 layer.mlp = MockDenseBlock()
             layer.input_layernorm = nn.LayerNorm(64)
             layer.post_attention_layernorm = nn.LayerNorm(64)
+            layers.append(layer)
+        self.model.layers = nn.ModuleList(layers)
+
+
+class MockLlama4Transformer(nn.Module):
+    """Minimal transformer with Llama4-style MoE layers."""
+
+    def __init__(self, num_layers=2, num_experts=8):
+        super().__init__()
+        self.config = MockLlama4Config()
+        self.config.num_local_experts = num_experts
+        self.model = nn.Module()
+        layers = []
+        for _ in range(num_layers):
+            layer = nn.Module()
+            layer.feed_forward = MockLlama4MoEBlock(num_experts)
             layers.append(layer)
         self.model.layers = nn.ModuleList(layers)
 
@@ -624,6 +682,22 @@ class TestMoEDetection:
             assert isinstance(spec.ffn_hidden_size, int)
             assert spec.score_func in ("softmax", "sigmoid")
             assert spec.score_apply in ("pre", "post")
+
+    def test_detect_llama4_hidden_first_fused_layout(self):
+        """Llama4 hidden-first fused weights are detected with the correct contract."""
+        model = MockLlama4Transformer(num_layers=2, num_experts=8)
+        config = AutoEPConfig(enabled=True, autoep_size=2, preset_model="llama4")
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 2
+        for spec in specs:
+            assert spec.model_family == "llama4"
+            assert spec.hidden_size == 64
+            assert spec.ffn_hidden_size == 128
+            assert spec.score_apply == "pre"
+            assert spec.router_name == "router"
+            assert spec.has_shared_experts is True
+            assert spec.shared_experts_name == "shared_expert"
 
     def test_replace_moe_layer_works(self):
         """replace_moe_layer creates AutoEPMoELayer replacement."""
@@ -843,6 +917,43 @@ class TestWeightRepacking:
         assert w1.shape[0] == 8
         assert w2.shape[0] == 8
         assert w3.shape[0] == 8
+
+    def test_repack_llama4_hidden_first_fused_layout(self):
+        experts = MockLlama4Experts(num_experts=8, ffn_hidden=128, hidden_size=64)
+        spec = MoELayerSpec(
+            moe_module_name="test",
+            model_family="llama4",
+            router_name="router",
+            experts_name="experts",
+            expert_storage="fused_3d",
+            expert_w1_name="gate_up_proj",
+            expert_w2_name="down_proj",
+            expert_w3_name=None,
+            num_experts=8,
+            top_k=1,
+            hidden_size=64,
+            ffn_hidden_size=128,
+            score_func="sigmoid",
+            score_apply="pre",
+            route_norm=False,
+            gate_bias=False,
+            return_router_logits=True,
+            router_logits_capture_target="moe_block",
+            router_logits_capture_index=1,
+            router_logits_capture_layer_name=None,
+            has_shared_experts=True,
+            shared_experts_name="shared_expert",
+        )
+        w1, w2, w3 = repack_expert_weights(experts, spec, ep_rank=0, ep_size=2)
+        assert w1.shape == (4, 128, 64)
+        assert w2.shape == (4, 64, 128)
+        assert w3.shape == (4, 128, 64)
+        expected_w1 = experts.gate_up_proj.data[0:4, :, :128].transpose(1, 2)
+        expected_w2 = experts.down_proj.data[0:4].transpose(1, 2)
+        expected_w3 = experts.gate_up_proj.data[0:4, :, 128:].transpose(1, 2)
+        assert torch.equal(w1, expected_w1)
+        assert torch.equal(w2, expected_w2)
+        assert torch.equal(w3, expected_w3)
 
 
 # === Phase 5: AutoEP MoE Layer and Orchestrator ===

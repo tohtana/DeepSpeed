@@ -76,12 +76,26 @@ def _infer_hidden_and_ffn_size(
         w2_param = getattr(experts_module, preset.expert_w2, None)
         if w1_param is not None and w2_param is not None:
             if preset.expert_w3 is None:
-                # Fused gate+up: w1 shape is [E, 2*ffn, hidden]
-                if w1_param.shape[1] % 2 != 0:
-                    raise ValueError(f"expert_w3=None expects fused gate+up weights, but "
-                                     f"{preset.expert_w1} has odd second dim {w1_param.shape}.")
-                hidden_size = w1_param.shape[2]
-                ffn_hidden_size = w1_param.shape[1] // 2
+                # Most HF MoE families store fused gate+up as [E, 2*ffn, hidden]
+                # with down_proj as [E, hidden, ffn]. Llama4 stores the transpose:
+                # gate_up_proj [E, hidden, 2*ffn] and down_proj [E, ffn, hidden].
+                if w1_param.shape[1] % 2 == 0 and tuple(w2_param.shape[1:]) == (
+                        w1_param.shape[2],
+                        w1_param.shape[1] // 2,
+                ):
+                    hidden_size = w1_param.shape[2]
+                    ffn_hidden_size = w1_param.shape[1] // 2
+                elif w1_param.shape[2] % 2 == 0 and tuple(w2_param.shape[1:]) == (
+                        w1_param.shape[2] // 2,
+                        w1_param.shape[1],
+                ):
+                    hidden_size = w1_param.shape[1]
+                    ffn_hidden_size = w1_param.shape[2] // 2
+                else:
+                    raise ValueError("expert_w3=None expects fused gate+up weights with either "
+                                     f"[E, 2*ffn, hidden]/[E, hidden, ffn] or [E, hidden, 2*ffn]/[E, ffn, hidden], "
+                                     f"but got {preset.expert_w1}={tuple(w1_param.shape)} and "
+                                     f"{preset.expert_w2}={tuple(w2_param.shape)}.")
             else:
                 # Separate gate and up: w1 shape is [E, ffn, hidden]
                 w3_param = getattr(experts_module, preset.expert_w3, None)
