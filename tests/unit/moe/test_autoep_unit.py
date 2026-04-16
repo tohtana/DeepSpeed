@@ -920,7 +920,15 @@ class TestCombineFromRouted:
         expert_output = torch.randn(N, H)
         top_scores = torch.rand(T, K)
         token_indices = torch.arange(N)
-        out = combine_from_routed(expert_output, top_scores, token_indices, K, "post", (B, S, H))
+        out = combine_from_routed(
+            expert_output,
+            top_scores,
+            token_indices,
+            K,
+            "post",
+            "weighted_sum",
+            (B, S, H),
+        )
         assert out.shape == (B, S, H)
 
     def test_combine_from_routed_scatter_add(self):
@@ -930,7 +938,15 @@ class TestCombineFromRouted:
         expert_output = torch.ones(T * K, H)
         top_scores = torch.tensor([[0.6, 0.4], [0.7, 0.3]])
         token_indices = torch.arange(T * K)
-        out = combine_from_routed(expert_output, top_scores, token_indices, K, "post", (B, S, H))
+        out = combine_from_routed(
+            expert_output,
+            top_scores,
+            token_indices,
+            K,
+            "post",
+            "weighted_sum",
+            (B, S, H),
+        )
         # With post scoring: each token's output = weighted sum of expert outputs
         assert out.shape == (B, S, H)
         # Score sum for token 0 = 0.6 + 0.4 = 1.0, so output should be ~1.0
