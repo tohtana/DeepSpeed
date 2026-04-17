@@ -638,6 +638,52 @@ class MockLlama4Transformer(nn.Module):
         self.model.layers = nn.ModuleList(layers)
 
 
+class MockDeepSeekV3Config:
+    model_type = "deepseek_v3"
+    n_routed_experts = 8
+    num_experts_per_tok = 2
+    hidden_size = 64
+    moe_intermediate_size = 128
+
+
+class MockDeepSeekV3Expert(nn.Module):
+    """Mimics a single DeepSeekV3 expert with split gate/up/down projections."""
+
+    def __init__(self, hidden_size=64, ffn_hidden=128):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, ffn_hidden, bias=False)
+        self.up_proj = nn.Linear(hidden_size, ffn_hidden, bias=False)
+        self.down_proj = nn.Linear(ffn_hidden, hidden_size, bias=False)
+
+
+class MockDeepSeekV3MoEBlock(nn.Module):
+    """Mimics model.layers.N.mlp for DeepSeekV3-style MoE layers."""
+
+    def __init__(self, num_experts=8, ffn_hidden=128, hidden_size=64):
+        super().__init__()
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            MockDeepSeekV3Expert(hidden_size, ffn_hidden) for _ in range(num_experts)
+        ])
+        self.shared_experts = MockSharedExpert(hidden_size)
+
+
+class MockDeepSeekV3Transformer(nn.Module):
+    """Minimal transformer with DeepSeekV3-style ModuleList experts."""
+
+    def __init__(self, num_layers=2, num_experts=8):
+        super().__init__()
+        self.config = MockDeepSeekV3Config()
+        self.config.n_routed_experts = num_experts
+        self.model = nn.Module()
+        layers = []
+        for _ in range(num_layers):
+            layer = nn.Module()
+            layer.mlp = MockDeepSeekV3MoEBlock(num_experts)
+            layers.append(layer)
+        self.model.layers = nn.ModuleList(layers)
+
+
 class TestMoEDetection:
     """Phase 3 tests for MoE layer detection."""
 
@@ -698,6 +744,26 @@ class TestMoEDetection:
             assert spec.router_name == "router"
             assert spec.has_shared_experts is True
             assert spec.shared_experts_name == "shared_expert"
+
+    def test_autodetect_deepseek_v3_module_list_experts(self):
+        """DeepSeekV3 auto-detection uses split gate/up expert names for ModuleList experts."""
+        model = MockDeepSeekV3Transformer(num_layers=2, num_experts=8)
+        config = AutoEPConfig(enabled=True, autoep_size=2)
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 2
+        for spec in specs:
+            assert spec.model_family == "deepseek_v3"
+            assert spec.expert_storage == "module_list"
+            assert spec.expert_w1_name == "gate_proj"
+            assert spec.expert_w2_name == "down_proj"
+            assert spec.expert_w3_name == "up_proj"
+            assert spec.hidden_size == 64
+            assert spec.ffn_hidden_size == 128
+            assert spec.score_func == "sigmoid"
+            assert spec.route_norm is False
+            assert spec.has_shared_experts is True
+            assert spec.shared_experts_name == "shared_experts"
 
     def test_replace_moe_layer_works(self):
         """replace_moe_layer creates AutoEPMoELayer replacement."""
@@ -954,6 +1020,40 @@ class TestWeightRepacking:
         assert torch.equal(w1, expected_w1)
         assert torch.equal(w2, expected_w2)
         assert torch.equal(w3, expected_w3)
+
+    def test_repack_module_list_separate_gate_and_up(self):
+        experts = nn.ModuleList([MockDeepSeekV3Expert(hidden_size=64, ffn_hidden=128) for _ in range(8)])
+        spec = MoELayerSpec(
+            moe_module_name="test",
+            model_family="deepseek_v3",
+            router_name="gate",
+            experts_name="experts",
+            expert_storage="module_list",
+            expert_w1_name="gate_proj",
+            expert_w2_name="down_proj",
+            expert_w3_name="up_proj",
+            num_experts=8,
+            top_k=2,
+            hidden_size=64,
+            ffn_hidden_size=128,
+            score_func="sigmoid",
+            score_apply="post",
+            route_norm=False,
+            gate_bias=False,
+            return_router_logits=False,
+            router_logits_capture_target="none",
+            router_logits_capture_index=None,
+            router_logits_capture_layer_name=None,
+            has_shared_experts=True,
+            shared_experts_name="shared_experts",
+        )
+        w1, w2, w3 = repack_expert_weights(experts, spec, ep_rank=0, ep_size=2)
+        assert w1.shape == (4, 128, 64)
+        assert w2.shape == (4, 64, 128)
+        assert w3.shape == (4, 128, 64)
+        assert torch.equal(w1[0], experts[0].gate_proj.weight.data)
+        assert torch.equal(w2[0], experts[0].down_proj.weight.data)
+        assert torch.equal(w3[0], experts[0].up_proj.weight.data)
 
 
 # === Phase 5: AutoEP MoE Layer and Orchestrator ===
