@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import os
+
 import torch
 from deepspeed import comm as dist
 from packaging import version as pkg_version
@@ -303,6 +305,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # a single 32-bit partition of the parallel partitioned parameters
         # that this process will update
         self.single_partition_of_fp32_groups = []
+        self.single_partition_of_fp32_groups_share_storage = []
 
         # a 16-bit CPU param buffer for cpu offload
         if self.cpu_offload:
@@ -470,8 +473,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # A partition of the fp32 master weights that will be updated by this process.
             # Note that the params in single_partition_of_fp32_groups is cloned and detached
             # from the origin params of the model.
-            weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].detach().clone().to(
-                device=self.device, dtype=self.master_weights_and_grads_dtype)
+            use_bf16_partition_storage = (os.getenv("DEEPSPEED_ZERO_BF16_PARTITION_REUSE_PROTOTYPE") == "1"
+                                          and self.bf16_master_weights_and_gradients and self.bf16_optimizer_states
+                                          and not self.cpu_offload and not self.has_moe_layers
+                                          and self.dtype == torch.bfloat16
+                                          and self.master_weights_and_grads_dtype == torch.bfloat16
+                                          and type(self.optimizer) in [torch.optim.Adam, torch.optim.AdamW])
+            if use_bf16_partition_storage:
+                weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].detach()
+            else:
+                weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].detach().clone().to(
+                    device=self.device, dtype=self.master_weights_and_grads_dtype)
 
             if self.cpu_offload:
                 if self.cpu_offload_pin_memory:
@@ -488,6 +500,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     self.param_buffer_of_bit16_for_cpu_offload_groups.append(temp_buffer_bit16)
 
             self.single_partition_of_fp32_groups.append(weights_partition)
+            self.single_partition_of_fp32_groups_share_storage.append(use_bf16_partition_storage)
 
             # Set local optimizer to have flat params of its own partition.
             # After this, the local optimizer will only contain its own partition of params.
@@ -2203,7 +2216,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 del single_grad_partition
                 bit16_partitions = self.parallel_partitioned_bit16_groups[i]
                 fp32_partition = self.single_partition_of_fp32_groups[i]
-                bit16_partitions[partition_id].data.copy_(fp32_partition.data)
+                if not self.single_partition_of_fp32_groups_share_storage[i]:
+                    bit16_partitions[partition_id].data.copy_(fp32_partition.data)
                 self.timers(OPTIMIZER_STEP_TIMER).stop()
 
         see_memory_usage('After optimizer before all-gather')
