@@ -55,6 +55,7 @@ class TestAutoEPConfig:
         assert config.top_k_attr is None
         assert config.has_shared_experts is None
         assert config.shared_experts_pattern is None
+        assert config.shared_experts_gate_pattern is None
 
     def test_llama4_preset_default_sets_load_balance_coeff_none(self):
         """Llama4 preset disables dynamic expert_bias unless the user opts in."""
@@ -105,6 +106,7 @@ class TestAutoEPConfig:
             "top_k_attr": "moe_top_k",
             "has_shared_experts": True,
             "shared_experts_pattern": "shared_expert",
+            "shared_experts_gate_pattern": "shared_expert_gate",
         }
         config = parse_autoep_config(param_dict)
         assert config.enabled is True
@@ -131,6 +133,7 @@ class TestAutoEPConfig:
         assert config.top_k_attr == "moe_top_k"
         assert config.has_shared_experts is True
         assert config.shared_experts_pattern == "shared_expert"
+        assert config.shared_experts_gate_pattern == "shared_expert_gate"
 
     def test_validate_ep_tp_mutual_exclusivity(self):
         """autotp_size>1 + sp_size>1 raises ValueError."""
@@ -242,7 +245,7 @@ class TestAutoEPConfig:
 
     def test_preset_models_complete(self):
         """All 5 presets have required fields."""
-        expected = {"mixtral", "qwen3_moe", "deepseek_v2", "deepseek_v3", "llama4"}
+        expected = {"mixtral", "qwen2_moe", "qwen3_moe", "deepseek_v2", "deepseek_v3", "llama4"}
         assert set(PRESET_MODELS.keys()) == expected
         for name, preset in PRESET_MODELS.items():
             assert isinstance(preset, MoEModelPreset), f"Preset {name} is not MoEModelPreset"
@@ -274,6 +277,11 @@ class TestAutoEPConfig:
         assert llama4.score_apply == "pre"
         assert llama4.router_pattern == "router"
         assert llama4.has_shared_experts is True
+
+        qwen2 = PRESET_MODELS["qwen2_moe"]
+        assert qwen2.has_shared_experts is True
+        assert qwen2.shared_experts_pattern == "shared_expert"
+        assert qwen2.shared_experts_gate_pattern == "shared_expert_gate"
 
     def test_validate_empty_expert_w1(self):
         """Empty expert_w1 raises ValueError."""
@@ -1086,6 +1094,7 @@ def _make_spec(**kwargs):
         router_logits_capture_layer_name=None,
         has_shared_experts=False,
         shared_experts_name="",
+        shared_experts_gate_name="",
     )
     defaults.update(kwargs)
     return MoELayerSpec(**defaults)
@@ -1213,6 +1222,126 @@ class TestAutoEPMoELayerUnit:
         replaced = model.model.layers[0].mlp
         assert isinstance(replaced, AutoEPMoELayer)
         assert replaced._is_autoep_layer is True
+
+    def test_hf_qwen2_autoep_direct_moe_applies_shared_expert_gate(self):
+        """Qwen2 AutoEP carries shared_expert_gate and matches the direct MoE block."""
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "Qwen2MoeConfig") or not hasattr(transformers, "Qwen2MoeForCausalLM"):
+            pytest.skip("Installed transformers does not expose Qwen2MoeConfig/Qwen2MoeForCausalLM")
+
+        torch.manual_seed(1234)
+        config = transformers.Qwen2MoeConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            decoder_sparse_step=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=32,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+            use_cache=False,
+            use_sliding_window=False,
+        )
+        native_model = transformers.Qwen2MoeForCausalLM(config)
+        autoep_model = transformers.Qwen2MoeForCausalLM(config)
+        autoep_model.load_state_dict(copy.deepcopy(native_model.state_dict()))
+
+        autoep_config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "qwen2_moe",
+            "use_grouped_mm": False,
+        })
+        auto_ep = AutoEP(autoep_model, autoep_config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        assert specs[0].model_family == "qwen2_moe"
+        assert specs[0].has_shared_experts is True
+        assert specs[0].shared_experts_name == "shared_expert"
+        assert specs[0].shared_experts_gate_name == "shared_expert_gate"
+        auto_ep.replace_moe_layer(specs[0], ep_size=1, ep_rank=0)
+
+        native_moe = native_model.model.layers[0].mlp
+        autoep_moe = autoep_model.model.layers[0].mlp
+        assert isinstance(autoep_moe, AutoEPMoELayer)
+        assert autoep_moe.shared_experts_gate is not None
+        torch.testing.assert_close(autoep_moe.shared_experts_gate.weight, native_moe.shared_expert_gate.weight)
+
+        hidden_states = torch.randn(2, 5, 32)
+        native_model.eval()
+        autoep_model.eval()
+        with torch.no_grad():
+            native_output = native_moe(hidden_states)
+            autoep_output = autoep_moe(hidden_states)
+
+        torch.testing.assert_close(autoep_output, native_output, rtol=1e-5, atol=1e-6)
+
+    def test_hf_qwen3_causal_lm_matches_autoep_ce_only(self):
+        """Tiny Qwen3 CE-only CausalLM matches AutoEP and stays ungated."""
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "Qwen3MoeConfig") or not hasattr(transformers, "Qwen3MoeForCausalLM"):
+            pytest.skip("Installed transformers does not expose Qwen3MoeConfig/Qwen3MoeForCausalLM")
+
+        torch.manual_seed(1234)
+        config = transformers.Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            decoder_sparse_step=1,
+            moe_intermediate_size=16,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            output_router_logits=False,
+            tie_word_embeddings=False,
+            use_cache=False,
+            use_sliding_window=False,
+        )
+        native_model = transformers.Qwen3MoeForCausalLM(config)
+        autoep_model = transformers.Qwen3MoeForCausalLM(config)
+        autoep_model.load_state_dict(copy.deepcopy(native_model.state_dict()))
+
+        autoep_config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "qwen3_moe",
+            "use_grouped_mm": False,
+        })
+        auto_ep = AutoEP(autoep_model, autoep_config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        assert specs[0].model_family == "qwen3_moe"
+        assert specs[0].has_shared_experts is False
+        assert specs[0].shared_experts_gate_name == ""
+        for spec in specs:
+            auto_ep.replace_moe_layer(spec, ep_size=1, ep_rank=0)
+
+        autoep_layers = [module for module in autoep_model.modules() if isinstance(module, AutoEPMoELayer)]
+        assert len(autoep_layers) == 1
+        assert autoep_layers[0].shared_experts is None
+        assert autoep_layers[0].shared_experts_gate is None
+
+        input_ids = torch.tensor([[1, 5, 7, 9, 11]], dtype=torch.long)
+        labels = input_ids.clone()
+        native_model.eval()
+        autoep_model.eval()
+        with torch.no_grad():
+            native_outputs = native_model(input_ids=input_ids, labels=labels, output_router_logits=False)
+            autoep_outputs = autoep_model(input_ids=input_ids, labels=labels, output_router_logits=False)
+
+        torch.testing.assert_close(autoep_outputs.logits, native_outputs.logits, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(autoep_outputs.loss, native_outputs.loss, rtol=1e-5, atol=1e-6)
 
     def test_hf_llama4_autoep_direct_moe_returns_flat_contract(self):
         """AutoEP's Llama4 replacement matches Llama4TextMoe's direct tuple shapes."""

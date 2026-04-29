@@ -404,6 +404,8 @@ class AutoEPMoELayer(nn.Module):
         self.reorderer = TokenReorderer(num_experts=self.num_experts, top_k=self.top_k)
         self.shared_experts = getattr(source_module, spec.shared_experts_name,
                                       None) if spec.has_shared_experts else None
+        self.shared_experts_gate = getattr(source_module, spec.shared_experts_gate_name,
+                                           None) if spec.shared_experts_gate_name else None
 
         # Mark expert params for EDP gradient reduction
         for param in self.experts.parameters():
@@ -415,6 +417,9 @@ class AutoEPMoELayer(nn.Module):
             param.allreduce = True
         if self.shared_experts is not None:
             for param in self.shared_experts.parameters():
+                param.allreduce = True
+        if self.shared_experts_gate is not None:
+            for param in self.shared_experts_gate.parameters():
                 param.allreduce = True
 
         # Load balancing buffers
@@ -557,11 +562,19 @@ class AutoEPMoELayer(nn.Module):
         if self.model_family == "llama4":
             output = output.reshape(-1, hdim)
             shared_expert_input = x
+        elif self.shared_experts_gate is not None:
+            shared_expert_input = x
         else:
             shared_expert_input = hidden_states
 
         if self.shared_experts is not None:
-            output = output + self.shared_experts(shared_expert_input)
+            shared_expert_output = self.shared_experts(shared_expert_input)
+            if self.shared_experts_gate is not None:
+                shared_expert_gate = torch.sigmoid(self.shared_experts_gate(shared_expert_input))
+                shared_expert_output = shared_expert_gate * shared_expert_output
+            if shared_expert_output.shape != output.shape:
+                shared_expert_output = shared_expert_output.reshape_as(output)
+            output = output + shared_expert_output
 
         if self.return_router_logits:
             logits = self._cached_router_logits

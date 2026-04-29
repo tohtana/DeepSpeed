@@ -327,11 +327,16 @@ class AutoEP:
                 # Check shared experts
                 has_shared = False
                 shared_name = ""
+                shared_gate_name = ""
                 if preset.has_shared_experts and preset.shared_experts_pattern:
                     shared = getattr(module, preset.shared_experts_pattern, None)
                     if shared is not None:
                         has_shared = True
                         shared_name = preset.shared_experts_pattern
+                        if preset.shared_experts_gate_pattern:
+                            shared_gate = getattr(module, preset.shared_experts_gate_pattern, None)
+                            if shared_gate is not None:
+                                shared_gate_name = preset.shared_experts_gate_pattern
 
                 # Warn about router stochasticity/precision settings
                 if self.model_config is not None:
@@ -367,6 +372,7 @@ class AutoEP:
                     router_logits_capture_layer_name=capture_layer_name,
                     has_shared_experts=has_shared,
                     shared_experts_name=shared_name,
+                    shared_experts_gate_name=shared_gate_name,
                 )
                 specs.append(spec)
                 logger.debug(f"Detected MoE layer: {module_name} (family={preset_name}, "
@@ -437,6 +443,8 @@ class AutoEP:
             overrides['has_shared_experts'] = self.config.has_shared_experts
         if self.config.shared_experts_pattern is not None:
             overrides['shared_experts_pattern'] = self.config.shared_experts_pattern
+        if self.config.shared_experts_gate_pattern is not None:
+            overrides['shared_experts_gate_pattern'] = self.config.shared_experts_gate_pattern
         if not overrides:
             return preset
         from dataclasses import replace
@@ -459,7 +467,7 @@ class AutoEP:
                 type_map = {
                     'mixtral': 'mixtral',
                     'qwen3_moe': 'qwen3_moe',
-                    'qwen2_moe': 'qwen3_moe',  # Qwen2-MoE uses same pattern
+                    'qwen2_moe': 'qwen2_moe',
                     'deepseek_v2': 'deepseek_v2',
                     'deepseek_v3': 'deepseek_v3',
                     'llama4': 'llama4',
@@ -490,6 +498,7 @@ class AutoEP:
                 has_shared_experts=(self.config.has_shared_experts
                                     if self.config.has_shared_experts is not None else False),
                 shared_experts_pattern=self.config.shared_experts_pattern or "",
+                shared_experts_gate_pattern=self.config.shared_experts_gate_pattern or "",
             )
             return [("custom", custom_preset)]
 

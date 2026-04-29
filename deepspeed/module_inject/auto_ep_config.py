@@ -41,6 +41,7 @@ class MoEModelPreset:
     gate_bias: bool  # Whether router gate has bias
     has_shared_experts: bool = False
     shared_experts_pattern: str = ""
+    shared_experts_gate_pattern: str = ""
     autoep_config_defaults: dict[str, Any] = field(default_factory=dict)
 
 
@@ -70,6 +71,7 @@ class MoELayerSpec:
     router_logits_capture_layer_name: str | None
     has_shared_experts: bool
     shared_experts_name: str
+    shared_experts_gate_name: str = ""
 
 
 @dataclass
@@ -102,6 +104,7 @@ class AutoEPConfig:
     top_k_attr: str | None = None
     has_shared_experts: bool | None = None
     shared_experts_pattern: str | None = None
+    shared_experts_gate_pattern: str | None = None
     _load_balance_coeff_explicit: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -150,6 +153,25 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         gate_bias=False,
         has_shared_experts=True,
         shared_experts_pattern="shared_expert",
+    ),
+    "qwen2_moe":
+    MoEModelPreset(
+        moe_layer_pattern=r"model\.layers\.\d+\.mlp",
+        router_pattern="gate",
+        experts_pattern="experts",
+        expert_storage="fused_3d",
+        expert_w1="gate_up_proj",
+        expert_w2="down_proj",
+        expert_w3=None,
+        num_experts_attr="num_experts",
+        top_k_attr="num_experts_per_tok",
+        score_func="softmax",
+        score_apply="post",
+        route_norm=True,
+        gate_bias=False,
+        has_shared_experts=True,
+        shared_experts_pattern="shared_expert",
+        shared_experts_gate_pattern="shared_expert_gate",
     ),
     "deepseek_v2":
     MoEModelPreset(
@@ -280,6 +302,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.top_k_attr = param_dict.get("top_k_attr", None)
     config.has_shared_experts = param_dict.get("has_shared_experts", None)
     config.shared_experts_pattern = param_dict.get("shared_experts_pattern", None)
+    config.shared_experts_gate_pattern = param_dict.get("shared_experts_gate_pattern", None)
 
     return config
 
@@ -380,6 +403,7 @@ def validate_autoep_config(
     _validate_attr_name("router_pattern", config.router_pattern)
     _validate_attr_name("expert_pattern", config.expert_pattern)
     _validate_attr_name("shared_experts_pattern", config.shared_experts_pattern)
+    _validate_attr_name("shared_experts_gate_pattern", config.shared_experts_gate_pattern)
 
     # Validate has_shared_experts type
     if config.has_shared_experts is not None and not isinstance(config.has_shared_experts, bool):
@@ -395,6 +419,9 @@ def validate_autoep_config(
                        "Shared expert detection requires both fields.")
     if config.shared_experts_pattern and config.has_shared_experts is not True:
         logger.warning(f"shared_experts_pattern='{config.shared_experts_pattern}' is set "
+                       f"but has_shared_experts is not True. Pattern will be ignored.")
+    if config.shared_experts_gate_pattern and config.has_shared_experts is not True:
+        logger.warning(f"shared_experts_gate_pattern='{config.shared_experts_gate_pattern}' is set "
                        f"but has_shared_experts is not True. Pattern will be ignored.")
 
     # Warn if custom override fields are set alongside preset_model or auto-detect
@@ -419,6 +446,8 @@ def validate_autoep_config(
         custom_fields_set.append("has_shared_experts")
     if config.shared_experts_pattern is not None:
         custom_fields_set.append("shared_experts_pattern")
+    if config.shared_experts_gate_pattern is not None:
+        custom_fields_set.append("shared_experts_gate_pattern")
     if custom_fields_set and config.preset_model is not None:
         logger.warning(f"Custom preset fields {custom_fields_set} are set alongside "
                        f"preset_model='{config.preset_model}'. Custom fields will override "
