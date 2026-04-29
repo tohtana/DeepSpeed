@@ -4,6 +4,8 @@
 # DeepSpeed Team
 """Unit tests for AutoEP feature (all phases append test classes here)."""
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -16,6 +18,7 @@ from deepspeed.module_inject.auto_ep_config import (
     MoELayerSpec,
     PRESET_MODELS,
     parse_autoep_config,
+    resolve_autoep_config_defaults,
     validate_autoep_config,
     validate_autoep_post_detection,
     _UNSET,
@@ -52,6 +55,28 @@ class TestAutoEPConfig:
         assert config.top_k_attr is None
         assert config.has_shared_experts is None
         assert config.shared_experts_pattern is None
+
+    def test_llama4_preset_default_sets_load_balance_coeff_none(self):
+        """Llama4 preset disables dynamic expert_bias unless the user opts in."""
+        config = parse_autoep_config({"enabled": True, "preset_model": "llama4"})
+        assert config.load_balance_coeff == pytest.approx(1e-3)
+
+        resolved = resolve_autoep_config_defaults(config, config.preset_model)
+
+        assert resolved.load_balance_coeff is None
+        assert config.load_balance_coeff == pytest.approx(1e-3)
+
+    def test_llama4_explicit_load_balance_coeff_overrides_preset_default(self):
+        """Explicit user load_balance_coeff survives Llama4 preset resolution."""
+        config = parse_autoep_config({
+            "enabled": True,
+            "preset_model": "llama4",
+            "load_balance_coeff": 0.02,
+        })
+
+        resolved = resolve_autoep_config_defaults(config, config.preset_model)
+
+        assert resolved.load_balance_coeff == pytest.approx(0.02)
 
     def test_parse_autoep_config_full(self):
         """All fields parsed from complete JSON."""
@@ -590,6 +615,10 @@ class MockLlama4MoEBlock(nn.Module):
         self.shared_expert = MockSharedExpert(hidden_size)
 
 
+class MockRecordingRouter(nn.Linear):
+    _can_record_outputs = {"router_logits": {"index": 1, "layer_name": "router"}}
+
+
 class MockDenseBlock(nn.Module):
     """Dense FFN block (should be skipped by detection)."""
 
@@ -696,8 +725,74 @@ class TestMoEDetection:
             assert spec.ffn_hidden_size == 128
             assert spec.score_apply == "pre"
             assert spec.router_name == "router"
+            assert spec.return_router_logits is True
+            assert spec.router_logits_capture_target == "router"
             assert spec.has_shared_experts is True
             assert spec.shared_experts_name == "shared_expert"
+
+    def test_detect_llama4_router_capture_still_returns_tuple(self):
+        """Router-level output recording must not suppress Llama4's MoE tuple contract."""
+        model = MockLlama4Transformer(num_layers=1, num_experts=8)
+        model.model.layers[0].feed_forward.router = MockRecordingRouter(64, 8, bias=False)
+        config = AutoEPConfig(enabled=True, autoep_size=2, preset_model="llama4")
+
+        specs = AutoEP(model, config).ep_parser()
+
+        assert len(specs) == 1
+        assert specs[0].return_router_logits is True
+        assert specs[0].router_logits_capture_target == "router"
+
+    def test_llama4_preset_layer_disables_expert_bias_by_default(self):
+        """preset_model='llama4' resolves load_balance_coeff=None for layer construction."""
+        model = MockLlama4Transformer(num_layers=1, num_experts=4)
+        config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "llama4",
+        })
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        auto_ep.replace_moe_layer(specs[0], ep_size=1, ep_rank=0)
+
+        replaced = model.model.layers[0].feed_forward
+        assert replaced.load_balance_coeff is None
+        assert replaced.expert_bias is None
+        assert "expert_bias" not in dict(replaced.named_buffers())
+
+    def test_llama4_explicit_load_balance_coeff_keeps_expert_bias(self):
+        """Explicit load_balance_coeff for llama4 opts back into expert_bias."""
+        model = MockLlama4Transformer(num_layers=1, num_experts=4)
+        config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "llama4",
+            "load_balance_coeff": 0.02,
+        })
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        auto_ep.replace_moe_layer(specs[0], ep_size=1, ep_rank=0)
+
+        replaced = model.model.layers[0].feed_forward
+        assert replaced.load_balance_coeff == pytest.approx(0.02)
+        assert replaced.expert_bias is not None
+        assert "expert_bias" in dict(replaced.named_buffers())
+
+    def test_auto_detect_llama4_layer_disables_expert_bias_by_default(self):
+        """Auto-detected model_type='llama4' also applies the llama4 preset default."""
+        model = MockLlama4Transformer(num_layers=1, num_experts=4)
+        config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+        })
+        auto_ep = AutoEP(model, config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        assert specs[0].model_family == "llama4"
+        auto_ep.replace_moe_layer(specs[0], ep_size=1, ep_rank=0)
+
+        replaced = model.model.layers[0].feed_forward
+        assert replaced.load_balance_coeff is None
+        assert replaced.expert_bias is None
 
     def test_replace_moe_layer_works(self):
         """replace_moe_layer creates AutoEPMoELayer replacement."""
@@ -1118,6 +1213,127 @@ class TestAutoEPMoELayerUnit:
         replaced = model.model.layers[0].mlp
         assert isinstance(replaced, AutoEPMoELayer)
         assert replaced._is_autoep_layer is True
+
+    def test_hf_llama4_autoep_direct_moe_returns_flat_contract(self):
+        """AutoEP's Llama4 replacement matches Llama4TextMoe's direct tuple shapes."""
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "Llama4ForCausalLM") or not hasattr(transformers, "Llama4TextConfig"):
+            pytest.skip("Installed transformers does not expose Llama4ForCausalLM/Llama4TextConfig")
+
+        torch.manual_seed(1234)
+        config = transformers.Llama4TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=16,
+            intermediate_size_mlp=16,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            num_local_experts=4,
+            num_experts_per_tok=1,
+            moe_layers=[0],
+            interleave_moe_layer_step=1,
+            output_router_logits=False,
+            router_jitter_noise=0.0,
+            tie_word_embeddings=False,
+            use_cache=False,
+            attention_chunk_size=64,
+            attn_temperature_tuning=False,
+            no_rope_layers=[0],
+        )
+        native_model = transformers.Llama4ForCausalLM(config)
+        autoep_model = transformers.Llama4ForCausalLM(config)
+        autoep_model.load_state_dict(copy.deepcopy(native_model.state_dict()))
+
+        autoep_config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "llama4",
+            "use_grouped_mm": False,
+        })
+        auto_ep = AutoEP(autoep_model, autoep_config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        assert specs[0].return_router_logits is True
+        auto_ep.replace_moe_layer(specs[0], ep_size=1, ep_rank=0)
+
+        native_moe = native_model.model.layers[0].feed_forward
+        autoep_moe = [module for module in autoep_model.modules() if isinstance(module, AutoEPMoELayer)][0]
+        hidden_states = torch.randn(2, 5, 32)
+        native_model.eval()
+        autoep_model.eval()
+
+        with torch.no_grad():
+            native_output, native_router_logits = native_moe(hidden_states)
+            autoep_output, autoep_router_logits = autoep_moe(hidden_states)
+
+        assert autoep_output.shape == (10, 32)
+        assert autoep_router_logits.shape == (10, 4)
+        torch.testing.assert_close(autoep_output, native_output, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(autoep_router_logits, native_router_logits, rtol=1e-5, atol=1e-6)
+
+    def test_hf_llama4_causal_lm_matches_autoep_without_load_balance_default(self):
+        """Tiny real HF Llama4 CausalLM matches AutoEP with the llama4 preset default."""
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "Llama4ForCausalLM") or not hasattr(transformers, "Llama4TextConfig"):
+            pytest.skip("Installed transformers does not expose Llama4ForCausalLM/Llama4TextConfig")
+
+        torch.manual_seed(1234)
+        config = transformers.Llama4TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=16,
+            intermediate_size_mlp=16,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=64,
+            num_local_experts=4,
+            num_experts_per_tok=1,
+            moe_layers=[0],
+            interleave_moe_layer_step=1,
+            output_router_logits=False,
+            router_jitter_noise=0.0,
+            tie_word_embeddings=False,
+            use_cache=False,
+            attention_chunk_size=64,
+            attn_temperature_tuning=False,
+            no_rope_layers=[0],
+        )
+        native_model = transformers.Llama4ForCausalLM(config)
+        autoep_model = transformers.Llama4ForCausalLM(config)
+        autoep_model.load_state_dict(copy.deepcopy(native_model.state_dict()))
+
+        autoep_config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 1,
+            "preset_model": "llama4",
+            "use_grouped_mm": False,
+        })
+        auto_ep = AutoEP(autoep_model, autoep_config)
+        specs = auto_ep.ep_parser()
+        assert len(specs) == 1
+        for spec in specs:
+            auto_ep.replace_moe_layer(spec, ep_size=1, ep_rank=0)
+
+        autoep_layers = [module for module in autoep_model.modules() if isinstance(module, AutoEPMoELayer)]
+        assert len(autoep_layers) == 1
+        assert autoep_layers[0].load_balance_coeff is None
+        assert autoep_layers[0].expert_bias is None
+
+        input_ids = torch.tensor([[1, 5, 7, 9, 11]], dtype=torch.long)
+        labels = input_ids.clone()
+        native_model.eval()
+        autoep_model.eval()
+        with torch.no_grad():
+            native_outputs = native_model(input_ids=input_ids, labels=labels)
+            autoep_outputs = autoep_model(input_ids=input_ids, labels=labels)
+
+        torch.testing.assert_close(autoep_outputs.logits, native_outputs.logits, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(autoep_outputs.loss, native_outputs.loss, rtol=1e-5, atol=1e-6)
 
 
 # === Phase 6: Engine + Mappings ===

@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+import copy
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from deepspeed.utils import logger
 
@@ -40,6 +41,7 @@ class MoEModelPreset:
     gate_bias: bool  # Whether router gate has bias
     has_shared_experts: bool = False
     shared_experts_pattern: str = ""
+    autoep_config_defaults: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -90,7 +92,7 @@ class AutoEPConfig:
     num_limited_groups: int | None = None
     score_func: Literal["auto", "softmax", "sigmoid"] = "auto"
     top_k: int | str = "auto"  # int or "auto"
-    load_balance_coeff: float | None = 1e-3
+    load_balance_coeff: float | None | object = _UNSET
     routed_scaling_factor: float | str = "auto"  # float or "auto"
     # Custom preset fields (override defaults in custom/built-in preset paths)
     expert_w1: str | None = None
@@ -100,6 +102,14 @@ class AutoEPConfig:
     top_k_attr: str | None = None
     has_shared_experts: bool | None = None
     shared_experts_pattern: str | None = None
+    _load_balance_coeff_explicit: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.load_balance_coeff is _UNSET:
+            self.load_balance_coeff = 1e-3
+            self._load_balance_coeff_explicit = False
+        else:
+            self._load_balance_coeff_explicit = True
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +204,36 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         gate_bias=False,
         has_shared_experts=True,
         shared_experts_pattern="shared_expert",
+        autoep_config_defaults={"load_balance_coeff": None},
     ),
 }
+
+_PRESET_DEFAULT_EXPLICIT_FLAGS = {
+    "load_balance_coeff": "_load_balance_coeff_explicit",
+}
+
+
+def resolve_autoep_config_defaults(config: AutoEPConfig, preset_name: str | None) -> AutoEPConfig:
+    """Return config with preset-level AutoEP defaults applied where the user did not override.
+
+    The returned config is a shallow copy so resolving one preset does not permanently
+    change the base config used for another preset or a later auto-detection pass.
+    """
+    if preset_name is None or preset_name not in PRESET_MODELS:
+        return config
+
+    preset_defaults = PRESET_MODELS[preset_name].autoep_config_defaults
+    if not preset_defaults:
+        return config
+
+    resolved = copy.copy(config)
+    for field_name, default_value in preset_defaults.items():
+        explicit_flag = _PRESET_DEFAULT_EXPLICIT_FLAGS.get(field_name)
+        if explicit_flag is None:
+            continue
+        if not getattr(config, explicit_flag, False):
+            setattr(resolved, field_name, default_value)
+    return resolved
 
 # ---------------------------------------------------------------------------
 # Config parsing
@@ -224,7 +262,12 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.num_limited_groups = param_dict.get("num_limited_groups", None)
     config.score_func = param_dict.get("score_func", "auto")
     config.top_k = param_dict.get("top_k", "auto")
-    config.load_balance_coeff = param_dict.get("load_balance_coeff", 1e-3)
+    if "load_balance_coeff" in param_dict:
+        config.load_balance_coeff = param_dict["load_balance_coeff"]
+        config._load_balance_coeff_explicit = True
+    else:
+        config.load_balance_coeff = 1e-3
+        config._load_balance_coeff_explicit = False
     config.routed_scaling_factor = param_dict.get("routed_scaling_factor", "auto")
     config.expert_w1 = param_dict.get("expert_w1", None)
     config.expert_w2 = param_dict.get("expert_w2", None)

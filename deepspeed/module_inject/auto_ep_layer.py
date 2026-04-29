@@ -14,7 +14,7 @@ from typing import Literal, NamedTuple
 import torch
 import torch.nn as nn
 import deepspeed.comm as dist
-from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec
+from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
 from deepspeed.utils import logger
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_count import count_tokens_per_expert
@@ -418,7 +418,8 @@ class AutoEPMoELayer(nn.Module):
                 param.allreduce = True
 
         # Load balancing buffers
-        self.load_balance_coeff = config.load_balance_coeff
+        resolved_config = resolve_autoep_config_defaults(config, spec.model_family)
+        self.load_balance_coeff = resolved_config.load_balance_coeff
         buf_device = source_gate.weight.device
         if self.load_balance_coeff is not None:
             self.register_buffer(
@@ -446,11 +447,13 @@ class AutoEPMoELayer(nn.Module):
         def hook_fn(module, input, output):
             x = input[0]  # [T, H]
             logits = module.gate(x)  # [T, E_global]
-            # Apply activation for HF semantic parity
-            if self.router.score_func == "softmax":
-                logits = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
-            elif self.router.score_func == "sigmoid":
-                logits = torch.sigmoid(logits.float()).to(logits.dtype)
+            # Llama4TextMoe returns raw router logits. Other currently
+            # supported router-capture contracts expect post-score values.
+            if self.model_family != "llama4":
+                if self.router.score_func == "softmax":
+                    logits = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
+                elif self.router.score_func == "sigmoid":
+                    logits = torch.sigmoid(logits.float()).to(logits.dtype)
             self._cached_router_logits = logits
 
         self.router.register_forward_hook(hook_fn)
@@ -489,7 +492,8 @@ class AutoEPMoELayer(nn.Module):
             hidden_states: [B, S, H]
 
         Returns:
-            [B, S, H] or ([B, S, H], [T, E]) if return_router_logits
+            [B, S, H] or ([B, S, H], [T, E]) if return_router_logits.
+            Llama4 returns ([T, H], [T, E]) to match HF Llama4TextMoe.
         """
         bsz, seqlen, hdim = hidden_states.shape
         x = hidden_states.reshape(-1, hdim)  # [T, H]
@@ -550,8 +554,14 @@ class AutoEPMoELayer(nn.Module):
             shape=(bsz, seqlen, hdim),
         )
 
+        if self.model_family == "llama4":
+            output = output.reshape(-1, hdim)
+            shared_expert_input = x
+        else:
+            shared_expert_input = hidden_states
+
         if self.shared_experts is not None:
-            output = output + self.shared_experts(hidden_states)
+            output = output + self.shared_experts(shared_expert_input)
 
         if self.return_router_logits:
             logits = self._cached_router_logits

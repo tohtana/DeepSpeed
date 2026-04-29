@@ -316,6 +316,13 @@ class AutoEP:
                 # Detect forward contract
                 return_router_logits, capture_target, capture_index, capture_layer_name = \
                     _detect_forward_contract(module, router_child)
+                if preset_name == "llama4":
+                    # HF Llama4TextMoe always returns (hidden_states, router_logits);
+                    # the decoder layer unpacks that tuple even when CausalLM loss
+                    # ignores router logits.
+                    return_router_logits = True
+                    if capture_target == "none":
+                        capture_target = "router"
 
                 # Check shared experts
                 has_shared = False
@@ -456,6 +463,7 @@ class AutoEP:
                     'deepseek_v2': 'deepseek_v2',
                     'deepseek_v3': 'deepseek_v3',
                     'llama4': 'llama4',
+                    'llama4_text': 'llama4',
                 }
                 preset_name = type_map.get(model_type)
                 if preset_name and preset_name in PRESET_MODELS:
