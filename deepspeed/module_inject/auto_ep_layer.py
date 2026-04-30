@@ -1,5 +1,10 @@
-# Copyright (c) Microsoft Corporation.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) DeepSpeed Team.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
+#
+# Portions of this file are derived from TorchTitan.
+# See THIRD_PARTY_NOTICES.md for the BSD-3-Clause notice.
 
 # DeepSpeed Team
 """AutoEP MoE Layer: drop-in replacement for HF MoE blocks with EP support.

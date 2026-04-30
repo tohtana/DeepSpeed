@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -256,6 +256,7 @@ def resolve_autoep_config_defaults(config: AutoEPConfig, preset_name: str | None
         if not getattr(config, explicit_flag, False):
             setattr(resolved, field_name, default_value)
     return resolved
+
 
 # ---------------------------------------------------------------------------
 # Config parsing
