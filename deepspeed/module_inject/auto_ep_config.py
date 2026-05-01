@@ -173,6 +173,25 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         shared_experts_pattern="shared_expert",
         shared_experts_gate_pattern="shared_expert_gate",
     ),
+    "qwen3_5_moe":
+    MoEModelPreset(
+        moe_layer_pattern=r"model\.layers\.\d+\.mlp",
+        router_pattern="gate",
+        experts_pattern="experts",
+        expert_storage="fused_3d",
+        expert_w1="gate_up_proj",
+        expert_w2="down_proj",
+        expert_w3=None,
+        num_experts_attr="num_experts",
+        top_k_attr="num_experts_per_tok",
+        score_func="softmax",
+        score_apply="post",
+        route_norm=True,
+        gate_bias=False,
+        has_shared_experts=True,
+        shared_experts_pattern="shared_expert",
+        shared_experts_gate_pattern="shared_expert_gate",
+    ),
     "deepseek_v2":
     MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",

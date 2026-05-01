@@ -457,8 +457,8 @@ class AutoEPMoELayer(nn.Module):
         def hook_fn(module, input, output):
             x = input[0]  # [T, H]
             logits = module.gate(x)  # [T, E_global]
-            # Llama4TextMoe returns raw router logits. Other currently
-            # supported router-capture contracts expect post-score values.
+            # Llama4TextMoe captures raw gate logits. Other currently supported
+            # router-capture contracts expect post-score values.
             if self.model_family != "llama4":
                 if self.router.score_func == "softmax":
                     logits = torch.softmax(logits.float(), dim=-1).to(logits.dtype)

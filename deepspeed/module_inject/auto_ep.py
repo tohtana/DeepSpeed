@@ -26,6 +26,28 @@ from deepspeed.module_inject.auto_ep_config import (
 )
 
 
+def _remove_transformers_output_capture_hooks(model: nn.Module) -> int:
+    """Remove HF output-capturing hooks so they can be reinstalled after AutoEP conversion."""
+    removed = 0
+    for module in model.modules():
+        hooks = getattr(module, "_forward_hooks", None)
+        if not hooks:
+            continue
+
+        for hook_id, hook in list(hooks.items()):
+            if getattr(hook, "__name__", "") != "output_capturing_hook":
+                continue
+            del hooks[hook_id]
+            removed += 1
+            hooks_with_kwargs = getattr(module, "_forward_hooks_with_kwargs", None)
+            if hooks_with_kwargs is not None:
+                hooks_with_kwargs.pop(hook_id, None)
+            hooks_always_called = getattr(module, "_forward_hooks_always_called", None)
+            if hooks_always_called is not None:
+                hooks_always_called.pop(hook_id, None)
+    return removed
+
+
 def _has_3d_expert_params(module: nn.Module, preset: MoEModelPreset) -> bool:
     """Check if module stores expert weights as 3D parameter tensors (transformers 5.0.0+).
 
@@ -183,6 +205,7 @@ class AutoEP:
         self.model = model
         self.config = config
         self.model_config = getattr(model, 'config', None)
+        self._retargeted_transformers_output_recorders: set[str] = set()
 
     def ep_parser(self) -> list[MoELayerSpec]:
         """Traverse model and detect MoE layers. Returns list of MoELayerSpec."""
@@ -316,6 +339,15 @@ class AutoEP:
                 # Detect forward contract
                 return_router_logits, capture_target, capture_index, capture_layer_name = \
                     _detect_forward_contract(module, router_child)
+                if preset_name == "qwen3_5_moe":
+                    # Qwen3.5 HF captures softmaxed router output through an
+                    # OutputRecorder on Qwen3_5MoeTopKRouter. AutoEP replaces
+                    # the owning MoE block, so the replacement returns that
+                    # value at output index 1 for recorder retargeting during
+                    # layer replacement.
+                    return_router_logits = True
+                    capture_target = "router"
+                    capture_index = 1
                 if preset_name == "llama4":
                     # HF Llama4TextMoe always returns (hidden_states, router_logits);
                     # the decoder layer unpacks that tuple even when CausalLM loss
@@ -411,10 +443,63 @@ class AutoEP:
 
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
+        self._retarget_transformers_output_recorders(spec, replacement)
 
         logger.info(f"AutoEP: replaced '{spec.moe_module_name}' with AutoEPMoELayer "
                     f"(ep_size={ep_size}, ep_rank={ep_rank}, "
                     f"local_experts={replacement.num_local_experts})")
+
+    def _retarget_transformers_output_recorders(self, spec: MoELayerSpec, replacement: nn.Module) -> None:
+        """Retarget HF output capture after AutoEP replaces a recorded MoE module."""
+        if spec.model_family != "qwen3_5_moe":
+            return
+
+        recorder_key = f"{spec.model_family}:{replacement.__class__.__module__}.{replacement.__class__.__qualname__}"
+        if recorder_key in self._retargeted_transformers_output_recorders:
+            return
+        self._retargeted_transformers_output_recorders.add(recorder_key)
+
+        try:
+            from transformers.utils.output_capturing import _CAN_RECORD_REGISTRY, OutputRecorder
+        except Exception as exc:
+            logger.warning(f"AutoEP: could not retarget Qwen3.5 router-logit output capture: {exc}")
+            return
+
+        retargeted = 0
+        replacement_cls = replacement.__class__
+        for module in self.model.modules():
+            module_config = getattr(module, "config", None)
+            model_type = getattr(module_config, "model_type", None)
+            class_name = module.__class__.__name__
+            if model_type != "qwen3_5_moe_text" and "Qwen3_5Moe" not in class_name:
+                continue
+
+            registry_key = str(module.__class__)
+            record_outputs = getattr(module, "_can_record_outputs", None)
+            registry_outputs = _CAN_RECORD_REGISTRY.get(registry_key)
+            base_outputs = record_outputs if isinstance(record_outputs, dict) else registry_outputs
+            if not isinstance(base_outputs, dict) or "router_logits" not in base_outputs:
+                continue
+
+            retargeted_outputs = dict(base_outputs)
+            retargeted_outputs["router_logits"] = OutputRecorder(replacement_cls, index=1)
+            module._can_record_outputs = retargeted_outputs
+            _CAN_RECORD_REGISTRY[registry_key] = retargeted_outputs
+
+            if getattr(module, "_output_capturing_hooks_installed", False):
+                removed = _remove_transformers_output_capture_hooks(module)
+                if removed:
+                    logger.debug(f"AutoEP: removed {removed} stale HF output-capturing hook(s) "
+                                 f"from {class_name}.")
+            module._output_capturing_hooks_installed = False
+            retargeted += 1
+
+        if retargeted:
+            logger.info("AutoEP: retargeted Qwen3.5 HF router-logit output capture to record "
+                        f"{replacement_cls.__name__} output index 1 on {retargeted} module(s).")
+        else:
+            logger.warning("AutoEP: Qwen3.5 AutoEP conversion did not find a HF output-capture registry "
+                           "entry for router_logits.")
 
     def _apply_config_overrides(self, preset: MoEModelPreset) -> MoEModelPreset:
         """Apply user config field overrides to a resolved preset.
@@ -468,6 +553,7 @@ class AutoEP:
                     'mixtral': 'mixtral',
                     'qwen3_moe': 'qwen3_moe',
                     'qwen2_moe': 'qwen2_moe',
+                    'qwen3_5_moe_text': 'qwen3_5_moe',
                     'deepseek_v2': 'deepseek_v2',
                     'deepseek_v3': 'deepseek_v3',
                     'llama4': 'llama4',
