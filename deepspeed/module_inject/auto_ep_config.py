@@ -154,6 +154,25 @@ PRESET_MODELS: dict[str, MoEModelPreset] = {
         has_shared_experts=True,
         shared_experts_pattern="shared_expert",
     ),
+    "qwen3_5_moe":
+    MoEModelPreset(
+        moe_layer_pattern=r"(?:model(?:\.language_model)?\.)?layers\.\d+\.mlp",
+        router_pattern="gate",
+        experts_pattern="experts",
+        expert_storage="fused_3d",
+        expert_w1="gate_up_proj",
+        expert_w2="down_proj",
+        expert_w3=None,
+        num_experts_attr="num_experts",
+        top_k_attr="num_experts_per_tok",
+        score_func="softmax",
+        score_apply="post",
+        route_norm=True,
+        gate_bias=False,
+        has_shared_experts=True,
+        shared_experts_pattern="shared_expert",
+        shared_experts_gate_pattern="shared_expert_gate",
+    ),
     "qwen2_moe":
     MoEModelPreset(
         moe_layer_pattern=r"model\.layers\.\d+\.mlp",
@@ -256,6 +275,7 @@ def resolve_autoep_config_defaults(config: AutoEPConfig, preset_name: str | None
         if not getattr(config, explicit_flag, False):
             setattr(resolved, field_name, default_value)
     return resolved
+
 
 # ---------------------------------------------------------------------------
 # Config parsing

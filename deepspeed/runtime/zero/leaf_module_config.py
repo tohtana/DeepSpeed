@@ -12,6 +12,7 @@ DEFAULT_LEAF_MODULE_CLASSES: List[str] = [
     "transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock",
     "transformers.models.qwen2_moe.modeling_qwen2_moe.Qwen2MoeSparseMoeBlock",
     "transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock",
+    "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeSparseMoeBlock",
 ]
 DEFAULT_LEAF_MODULE_NAMES: List[str] = []
 DEFAULT_LEAF_MODULE_NAME_SUFFIXES: List[str] = []

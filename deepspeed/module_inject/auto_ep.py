@@ -41,14 +41,25 @@ def _has_3d_expert_params(module: nn.Module, preset: MoEModelPreset) -> bool:
     return False
 
 
+def _get_config_attr(model_config, attr_name: str):
+    """Extract an AutoEP config value from either the active config or its text sub-config."""
+    value = getattr(model_config, attr_name, None)
+    if value is not None:
+        return value
+    text_config = getattr(model_config, "text_config", None)
+    if text_config is not None:
+        return getattr(text_config, attr_name, None)
+    return None
+
+
 def _get_num_experts_from_config(model_config, preset: MoEModelPreset) -> int | None:
     """Extract num_experts from model.config using the preset's attribute name."""
-    return getattr(model_config, preset.num_experts_attr, None)
+    return _get_config_attr(model_config, preset.num_experts_attr)
 
 
 def _get_top_k_from_config(model_config, preset: MoEModelPreset) -> int | None:
     """Extract top_k from model.config using the preset's attribute name."""
-    return getattr(model_config, preset.top_k_attr, None)
+    return _get_config_attr(model_config, preset.top_k_attr)
 
 
 def _detect_expert_storage(experts_module: nn.Module, preset: MoEModelPreset) -> Literal["fused_3d", "module_list"]:
@@ -467,6 +478,8 @@ class AutoEP:
                 type_map = {
                     'mixtral': 'mixtral',
                     'qwen3_moe': 'qwen3_moe',
+                    'qwen3_5_moe': 'qwen3_5_moe',
+                    'qwen3_5_moe_text': 'qwen3_5_moe',
                     'qwen2_moe': 'qwen2_moe',
                     'deepseek_v2': 'deepseek_v2',
                     'deepseek_v3': 'deepseek_v3',

@@ -214,6 +214,10 @@ def test_set_leaf_modules_by_suffix_missing():
 def test_zero_leaf_module_default_config():
     config = DeepSpeedZeroConfig()
     assert config.leaf_module.classes == DEFAULT_LEAF_MODULE_CLASSES
+    assert (
+        "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeSparseMoeBlock"
+        in config.leaf_module.classes
+    )
     assert config.leaf_module.names == DEFAULT_LEAF_MODULE_NAMES
     assert config.leaf_module.name_suffixes == DEFAULT_LEAF_MODULE_NAME_SUFFIXES
 
