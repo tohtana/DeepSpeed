@@ -14,6 +14,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from deepspeed.runtime.zenflow import zenflow_utils
 
 import gc
+import math
 from typing import Container
 from deepspeed.runtime.zero.offload_states import offload_optimizer_states, reload_optimizer_states
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
@@ -39,6 +40,7 @@ from deepspeed.checkpoint.constants import (DS_VERSION, GROUP_PADDINGS, PARTITIO
                                             BASE_OPTIMIZER_STATE_STEP, CLIP_GRAD, ZERO_STAGE, PARAM_SLICE_MAPPINGS)
 from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state
 from deepspeed.checkpoint import enable_universal_checkpoint
+from deepspeed.checkpoint.constants import UNIVERSAL_CHECKPOINT_INFO
 
 from deepspeed.utils import groups
 from deepspeed.utils.debug import debug_param2name
@@ -76,7 +78,7 @@ def isclose(a, b, rtol=1e-09, atol=0.0):
 
 
 def lcm(x, y):
-    from fractions import gcd  # or can import gcd from `math` in Python 3
+    from math import gcd
     return x * y // gcd(x, y)
 
 
@@ -366,18 +368,29 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # not sure why apex was cloning the weights before flattening
             # removing cloning here
 
-            see_memory_usage(f"Before moving param group {i} to CPU")
-            # move all the parameters to cpu to free up GPU space for creating flat buffer
-
-            # Create temp CPU param copies, free accelerator tensors
-            orig_group_numel = 0
-            for param in self.bit16_groups[i]:
-                orig_group_numel += param.numel()
-                param.cpu_data = param.data.cpu()
-                param.data = torch.empty(1).to(param.device)
+            # Compute group size for memory check (need 2x model size on accelerator to flatten in place: params + flat copy)
+            orig_group_numel = sum(param.numel() for param in self.bit16_groups[i])
+            alignment = self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i])
+            aligned_numel = int(math.ceil(orig_group_numel / alignment)) * alignment
+            param_dtype = self.bit16_groups[i][0].dtype
+            element_size = torch.tensor([], dtype=param_dtype).element_size()
+            flat_buffer_bytes = aligned_numel * element_size
 
             empty_cache()
-            see_memory_usage(f"After moving param group {i} to CPU", force=False)
+            accelerator = get_accelerator()
+            available_memory = accelerator.available_memory() if accelerator.is_available() else 0
+            # Flatten on accelerator device if we have enough memory for the flat buffer
+            flatten_on_accelerator = (accelerator.is_available() and (available_memory >= flat_buffer_bytes))
+
+            if not flatten_on_accelerator:
+                see_memory_usage(f"Before moving param group {i} to CPU")
+                # move all the parameters to cpu to free up accelerator memory for creating flat buffer
+                for param in self.bit16_groups[i]:
+                    param.cpu_data = param.data.cpu()
+                    param.data = torch.empty(1).to(param.device)
+
+                empty_cache()
+                see_memory_usage(f"After moving param group {i} to CPU", force=False)
 
             # Reorder group parameters for load balancing of gradient partitioning during backward among ranks.
             # This ensures that gradients are reduced in a fashion such that ownership round robins among the ranks.
@@ -396,24 +409,36 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # Create meta tensors list, ordered according to round_robin_tensors
             meta_tensors = []
             for param in round_robin_tensors:
-                meta_tensors.append(torch.zeros_like(param.cpu_data, device="meta"))
+                if flatten_on_accelerator:
+                    meta_tensors.append(torch.zeros_like(param.data, device="meta"))
+                else:
+                    meta_tensors.append(torch.zeros_like(param.cpu_data, device="meta"))
             self.round_robin_bit16_meta.append(meta_tensors)
 
-            # create flat buffer in CPU
-            flattened_buffer = self.flatten_dense_tensors_aligned(
-                self.round_robin_bit16_groups[i],
-                self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i]),
-                use_cpu_data=True)
+            if flatten_on_accelerator:
+                logger.info(f"Flattening param group {i} on {accelerator.device_name()} (sufficient memory)")
+                flattened_buffer = self.flatten_dense_tensors_aligned(self.round_robin_bit16_groups[i],
+                                                                      alignment,
+                                                                      use_cpu_data=False).detach()
+                self.bit16_groups_flat.append(flattened_buffer)
+                see_memory_usage(f"After flattening param group {i} on {accelerator.device_name()}", force=False)
+            else:
+                logger.info(f"Flattening param group {i} on CPU (insufficient memory)")
 
-            # free temp CPU params
-            for param in self.bit16_groups[i]:
-                del param.cpu_data
+                flattened_buffer = self.flatten_dense_tensors_aligned(self.round_robin_bit16_groups[i],
+                                                                      alignment,
+                                                                      use_cpu_data=True)
 
-            # Move CPU flat tensor to the accelerator memory.
-            self.bit16_groups_flat.append(flattened_buffer.to(get_accelerator().current_device_name()))
-            del flattened_buffer
+                # free temp CPU params
+                for param in self.bit16_groups[i]:
+                    del param.cpu_data
 
-            see_memory_usage(f"After flattening and moving param group {i} to GPU", force=False)
+                # Move CPU flat tensor to the accelerator memory.
+                self.bit16_groups_flat.append(flattened_buffer.to(get_accelerator().current_device_name()))
+                del flattened_buffer
+
+                see_memory_usage(f"After flattening and moving param group {i} to {get_accelerator().device_name()}",
+                                 force=False)
 
             if dist.get_rank(group=self.real_dp_process_group[i]) == 0:
                 see_memory_usage(f"After Flattening and after emptying param group {i} cache", force=False)
@@ -610,15 +635,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             assert self.loss_scaler.cur_scale == 1.0
             assert not self.dynamic_loss_scale
 
-        see_memory_usage("Before initializing optimizer states", force=True)
+        see_memory_usage("Before initializing optimizer states", force=False)
         self.initialize_optimizer_states()
-        see_memory_usage("After initializing optimizer states", force=True)
+        see_memory_usage("After initializing optimizer states", force=False)
 
         if dist.get_rank() == 0:
             logger.info("optimizer state initialized")
 
         if dist.get_rank(group=self.dp_process_group) == 0:
-            see_memory_usage("After initializing ZeRO optimizer", force=True)
+            see_memory_usage("After initializing ZeRO optimizer", force=False)
 
         self._link_all_hp_params()
         self._hp_optimizer_states_linked = False
@@ -640,8 +665,18 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.print_rank_0("Removed grad acc hooks")
 
     def _enable_universal_checkpoint(self):
+        self._universal_checkpoint_info = None
         for lp_param_group in self.bit16_groups:
+            if self._universal_checkpoint_info is None:
+                for param in lp_param_group:
+                    autotp_uc_info = getattr(param, UNIVERSAL_CHECKPOINT_INFO, None)
+                    if autotp_uc_info is not None:
+                        self._universal_checkpoint_info = autotp_uc_info
+                        break
             enable_universal_checkpoint(param_list=lp_param_group)
+
+    def _get_universal_checkpoint_info(self):
+        return getattr(self, '_universal_checkpoint_info', None)
 
     def _create_param_mapping(self):
         param_mapping = []
@@ -1023,9 +1058,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     def wrapper(param, i):
 
                         def grad_handling_hook(*notneeded):
+                            # Evaluate refresh condition before reenter_backward_if_needed()
+                            refresh_expected = self.should_refresh_expected_hook_count()
                             self.reenter_backward_if_needed()
                             self.process_gradients(param, i)
-                            current_expected = count_used_parameters_in_backward(all_params_requiring_grad)
+                            if refresh_expected:
+                                current_expected = count_used_parameters_in_backward(all_params_requiring_grad)
+                            else:
+                                current_expected = self._max_expected_hooks_seen
                             self.update_hook_state_and_maybe_run_epilogue(current_expected)
 
                         self._grad_acc_hooks.append(register_grad_hook(param, grad_handling_hook))
@@ -1057,6 +1097,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 bucket.index = 1 - bucket.index
             self.report_ipg_memory_usage("In ipg_remove_grads after reduce_ipg_grads", param.numel())
 
+        # deal with a use-case of transient grads that will be generated in a loop for the same computation involving some model params - e.g. when performing a tiled memory calculation that shards the normal single sub-module call into a loop over a shards.
+        if not getattr(param, "ds_grad_is_ready", True):
+            return
+
         param_id = self.get_param_id(param)
         assert self.params_already_reduced[param_id] == False, \
             f"The parameter {debug_param2name(param)} has already been reduced. \
@@ -1080,10 +1124,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         assert grad_reduc is not None, f"rank {dist.get_rank()} - Invalid to reduce Param {param_id} with None gradient"
 
-        # deal with a use-case of transient grads that will be generated in a loop for the same computation involving some model params - e.g. when performing a tiled memory calculation that shards the normal single sub-module call into a loop over a shards.
-        if getattr(param, "ds_grad_is_ready", True):
-            bucket.grads.append(grad_reduc)
-            bucket.params.append((i, param.param_idx_in_group, param_id))
+        bucket.grads.append(grad_reduc)
+        bucket.params.append((i, param.param_idx_in_group, param_id))
 
         #make sure the average tensor function knows how to average the gradients
         if is_moe_param(param):
@@ -1137,9 +1179,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                            log=log,
                                            divide=divide,
                                            process_group=process_group)
+        if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+            allreduced.record_stream(self.reduction_stream)
         for buf, synced, bucket_rank in zip(small_bucket, self.unflatten(allreduced, small_bucket), bucket_ranks):
             if dist.get_rank(group=process_group) == bucket_rank:
                 buf.copy_(synced)
+                if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                    buf.record_stream(self.reduction_stream)
 
     def allreduce_and_scatter(self,
                               bucket,
@@ -1369,8 +1415,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         if self.micro_step_id > 0:
             accumulate_gradients()
-        else:
-            copy_gradients_to_cpu()
+        copy_gradients_to_cpu()
 
     def set_norm_for_param_grad(self, param):
         param_id = self.get_param_id(param)
@@ -1542,7 +1587,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     param = self.bit16_groups[group_idx][param_idx_in_group]
 
                     assert self.params_already_reduced[param_id] == False, \
-                        f"The parameter {param_id} has already been reduced. \
+                        f"The parameter {debug_param2name(param)} has already been reduced. \
                         Gradient computed twice for this partition. \
                         Multiple gradient reduction is currently not supported"
 
@@ -1705,9 +1750,13 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 divide=divide,
                 process_group=process_group,
             )
+            if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                allreduced.record_stream(stream)
             if rank is None or rank == dist.get_rank(group=self.dp_process_group):
                 for buf, synced in zip(small_bucket, self.unflatten(allreduced, small_bucket)):
                     buf.copy_(synced)
+                    if self.overlap_comm and not get_accelerator().resolves_data_dependency():
+                        buf.record_stream(stream)
 
     def allreduce_no_retain(
         self,
@@ -2398,6 +2447,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         state_dict[DS_VERSION] = version
         state_dict[PARAM_SLICE_MAPPINGS] = self._param_slice_mappings
+
+        autotp_uc_info = self._get_universal_checkpoint_info()
+        if autotp_uc_info is not None:
+            state_dict[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
 
         return state_dict
 
