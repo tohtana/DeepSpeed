@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import torch
+import os
 from deepspeed import comm as dist
 from packaging import version as pkg_version
 from collections import OrderedDict, defaultdict
@@ -170,7 +171,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  bf16_master_weights_and_gradients=False,
                  bf16_optimizer_states=False,
                  elastic_checkpoint=False,
-                 check_grad_overflow=True):
+                 check_grad_overflow=True,
+                 module=None):
 
         super().__init__()
 
@@ -508,6 +510,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.reduce_bucket_size = int(reduce_bucket_size)
         self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
         self.allgather_bucket_size = int(allgather_bucket_size)
+        self._zero12_overlap_param_gather_requested = os.getenv("DEEPSPEED_ZERO12_OVERLAP_PARAM_GATHER",
+                                                                "0").lower() in ("1", "true", "yes", "on")
+        self._zero12_overlap_param_gather_enabled = False
+        self._zero12_overlap_param_gather_hooks = []
+        self._zero12_overlap_param_gather_pending = {}
+        self._zero12_overlap_param_gather_param_blocks = {}
+        self._zero12_overlap_param_gather_module_blocks = {}
+        self._zero12_overlap_param_gather_block_sizes = []
+        self._zero12_overlap_param_gather_bucket_size = self.allgather_bucket_size
+        self._configure_zero12_overlap_param_gather(module)
 
         self.reduction_stream = None if get_accelerator().is_synchronized_device() else get_accelerator().Stream()
         #self.copy_grad_stream = get_accelerator().Stream()
@@ -656,6 +668,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
 
     def destroy(self):
+        self._zero12_overlap_wait_all_pending("destroy")
+        for hook in getattr(self, "_zero12_overlap_param_gather_hooks", []):
+            hook.remove()
+        self._zero12_overlap_param_gather_hooks = []
         for i, _ in enumerate(self.optimizer.param_groups):
             for p in self.bit16_groups[i]:
                 if getattr(p, '_hp_mapping', None):
@@ -762,6 +778,175 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for param_index, param in enumerate(self.bit16_groups[group_index]):
             new_index = self.round_robin_bit16_indices[group_index][param_index]
             param.data = self.round_robin_bit16_groups[group_index][new_index].data
+
+    def _disable_zero12_overlap_param_gather(self, reason):
+        if self._zero12_overlap_param_gather_requested and dist.get_rank() == 0:
+            logger.warning(f"DEEPSPEED_ZERO12_OVERLAP_PARAM_GATHER disabled: {reason}. "
+                           "Falling back to blocking ZeRO-1/2 parameter all-gather.")
+        self._zero12_overlap_param_gather_enabled = False
+
+    def _zero12_overlap_group_block_size(self, group_index, partition_numel, dp_world_size):
+        bucket_size = self._zero12_overlap_param_gather_bucket_size
+        if bucket_size <= 0:
+            return 0
+        num_shards = max(1, partition_numel * dp_world_size // bucket_size)
+        block_size = partition_numel // num_shards
+        block_size = block_size - (block_size % self.nccl_start_alignment_factor)
+        if block_size == 0:
+            block_size = partition_numel
+        return block_size
+
+    def _zero12_overlap_param_block_ids(self, group_index, start_offset, numel, block_size=None):
+        if numel == 0:
+            return set()
+
+        partitions = self.parallel_partitioned_bit16_groups[group_index]
+        partition_size = partitions[0].numel()
+        if block_size is None:
+            block_size = self._zero12_overlap_param_gather_block_sizes[group_index]
+        if partition_size == 0 or block_size == 0:
+            return set()
+
+        end_offset = start_offset + numel
+        block_ids = set()
+        partition_start = start_offset // partition_size
+        partition_end = (end_offset - 1) // partition_size
+        for partition_id in range(partition_start, partition_end + 1):
+            local_start = 0 if partition_id > partition_start else start_offset % partition_size
+            local_end = partition_size if partition_id < partition_end else ((end_offset - 1) % partition_size) + 1
+            first_block = local_start // block_size
+            last_block = (local_end - 1) // block_size
+            for block_id in range(first_block, last_block + 1):
+                block_ids.add((group_index, block_id))
+        return block_ids
+
+    def _zero12_overlap_build_param_block_map(self):
+        param_blocks = {}
+        block_sizes = []
+
+        for group_index, param_group in enumerate(self.round_robin_bit16_groups):
+            partitions = self.parallel_partitioned_bit16_groups[group_index]
+            partition_numel = partitions[0].numel()
+            if any(partition.numel() != partition_numel for partition in partitions):
+                raise ValueError("uneven ZeRO-1/2 low-precision partitions are not supported")
+
+            dp_world_size = dist.get_world_size(group=self.real_dp_process_group[group_index])
+            block_size = self._zero12_overlap_group_block_size(group_index, partition_numel, dp_world_size)
+            if block_size <= 0:
+                raise ValueError("invalid overlap parameter gather block size")
+            block_sizes.append(block_size)
+
+            offset = 0
+            for param in param_group:
+                param_blocks[id(param)] = frozenset(
+                    self._zero12_overlap_param_block_ids(group_index, offset, param.numel(), block_size=block_size))
+                offset += param.numel()
+
+        self._zero12_overlap_param_gather_block_sizes = block_sizes
+        self._zero12_overlap_param_gather_param_blocks = param_blocks
+
+    def _zero12_overlap_register_module_hooks(self, module):
+        module_blocks = {}
+        hooks = []
+
+        for child_module in module.modules():
+            blocks = set()
+            for param in child_module.parameters(recurse=False):
+                blocks.update(self._zero12_overlap_param_gather_param_blocks.get(id(param), ()))
+            if not blocks:
+                continue
+            module_blocks[id(child_module)] = frozenset(blocks)
+            hooks.append(child_module.register_forward_pre_hook(self._zero12_overlap_forward_pre_hook))
+
+        if not hooks:
+            raise ValueError("no module direct parameters mapped to ZeRO-1/2 refresh blocks")
+
+        self._zero12_overlap_param_gather_module_blocks = module_blocks
+        self._zero12_overlap_param_gather_hooks = hooks
+
+    def _configure_zero12_overlap_param_gather(self, module):
+        if not self._zero12_overlap_param_gather_requested:
+            return
+        try:
+            self._zero12_overlap_param_gather_bucket_size = int(
+                os.getenv("DEEPSPEED_ZERO12_OVERLAP_PARAM_GATHER_BUCKET_SIZE", str(self.allgather_bucket_size)))
+        except ValueError as exc:
+            self._disable_zero12_overlap_param_gather(f"invalid bucket size: {exc}")
+            return
+        if self.cpu_offload:
+            self._disable_zero12_overlap_param_gather("CPU optimizer offload is not supported")
+            return
+        if self.has_moe_layers:
+            self._disable_zero12_overlap_param_gather("MoE parameter groups are not supported")
+            return
+        if module is None:
+            self._disable_zero12_overlap_param_gather("module context is unavailable")
+            return
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            self._disable_zero12_overlap_param_gather(f"model dtype {self.dtype} is not low precision")
+            return
+        if any(flat.device.type == "cpu" for flat in self.bit16_groups_flat):
+            self._disable_zero12_overlap_param_gather("low-precision flat buffers are on CPU")
+            return
+
+        try:
+            self._zero12_overlap_build_param_block_map()
+            self._zero12_overlap_register_module_hooks(module)
+        except Exception as exc:
+            self._disable_zero12_overlap_param_gather(str(exc))
+            return
+
+        self._zero12_overlap_param_gather_enabled = True
+        if dist.get_rank() == 0:
+            logger.info("DEEPSPEED_ZERO12_OVERLAP_PARAM_GATHER enabled for ZeRO-1/2 parameter refresh "
+                        f"with bucket size {self._zero12_overlap_param_gather_bucket_size}.")
+
+    def _zero12_overlap_forward_pre_hook(self, module, inputs):
+        blocks = self._zero12_overlap_param_gather_module_blocks.get(id(module), ())
+        self._zero12_overlap_wait_blocks(blocks)
+
+    def _zero12_overlap_wait_blocks(self, block_ids):
+        if not self._zero12_overlap_param_gather_pending:
+            return
+        for block_id in sorted(block_ids):
+            pending = self._zero12_overlap_param_gather_pending.pop(block_id, None)
+            if pending is None:
+                continue
+            handle, _shard_list = pending
+            handle.wait()
+
+    def _zero12_overlap_wait_all_pending(self, reason):
+        if not getattr(self, "_zero12_overlap_param_gather_pending", None):
+            return
+        if dist.get_rank() == 0:
+            logger.info(f"Waiting for pending ZeRO-1/2 overlapped parameter refresh blocks before {reason}.")
+        self._zero12_overlap_wait_blocks(list(self._zero12_overlap_param_gather_pending.keys()))
+
+    def _zero12_overlap_start_param_gather(self):
+        self._zero12_overlap_wait_all_pending("launching a new parameter refresh")
+        self._zero12_overlap_param_gather_pending = {}
+
+        for group_index, partitioned_params in enumerate(self.parallel_partitioned_bit16_groups):
+            dp_group = self.real_dp_process_group[group_index]
+            partition_id = dist.get_rank(group=dp_group)
+            dp_world_size = dist.get_world_size(group=dp_group)
+            if dp_world_size == 1:
+                continue
+
+            partition_numel = partitioned_params[partition_id].numel()
+            block_size = self._zero12_overlap_param_gather_block_sizes[group_index]
+            block_id = 0
+            offset = 0
+            while offset < partition_numel:
+                num_elements = min(block_size, partition_numel - offset)
+                shard_list = [
+                    partitioned_params[dp_id].narrow(0, offset, num_elements).detach()
+                    for dp_id in range(dp_world_size)
+                ]
+                handle = dist.all_gather(shard_list, shard_list[partition_id], group=dp_group, async_op=True)
+                self._zero12_overlap_param_gather_pending[(group_index, block_id)] = (handle, shard_list)
+                offset += num_elements
+                block_id += 1
 
     def _round_robin_reorder(self, tensor_list, num_partitions):
 
@@ -2114,6 +2299,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         Not supporting closure.
         """
+        self._zero12_overlap_wait_all_pending("optimizer step")
         self.micro_step_id = INITIAL_MICRO_STEP_ID
 
         see_memory_usage("In step before checking overflow")
@@ -2217,16 +2403,20 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.timers(OPTIMIZER_ALLGATHER_TIMER).start()
         # Gather the updated weights from everyone.
         # Then all partitions of the model parameters are updated and ready for next round forward.
-        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
-                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
-                             dp_process_group=self.real_dp_process_group,
-                             start_alignment_factor=self.nccl_start_alignment_factor,
-                             allgather_bucket_size=self.allgather_bucket_size)
+        if self._zero12_overlap_param_gather_enabled:
+            self._zero12_overlap_start_param_gather()
+        else:
+            all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                                 partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                                 dp_process_group=self.real_dp_process_group,
+                                 start_alignment_factor=self.nccl_start_alignment_factor,
+                                 allgather_bucket_size=self.allgather_bucket_size)
         self.timers(OPTIMIZER_ALLGATHER_TIMER).stop()
 
-        # TODO: we probably don't need this? just to be safe
-        for i in range(len(self.bit16_groups)):
-            self._update_model_bit16_weights(i)
+        if not self._zero12_overlap_param_gather_enabled:
+            # TODO: we probably don't need this? just to be safe
+            for i in range(len(self.bit16_groups)):
+                self._update_model_bit16_weights(i)
 
         self.timers.log(OPTIMIZER_TIMERS)
         see_memory_usage('After zero_optimizer step')
@@ -2235,6 +2425,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     @torch.no_grad()
     def update_lp_params(self):
+        self._zero12_overlap_wait_all_pending("explicit low-precision parameter update")
         for i, (bit16_partitions, fp32_partition) in enumerate(
                 zip(self.parallel_partitioned_bit16_groups, self.single_partition_of_fp32_groups)):
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
