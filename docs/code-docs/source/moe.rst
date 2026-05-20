@@ -55,7 +55,13 @@ Transformers build that exposes the matching config/model classes,
      - ``5.0.0``
      -
 
-**ZeRO compatibility:** Stages 0, 1, and 2. Stage 3 is not supported.
+**ZeRO compatibility:** Stages 0, 1, and 2, plus constrained Stage 3 support.
+Stage 3 requires AutoEP-managed MoE layers and does not support native
+DeepSpeed MoE layers, AutoTP, sequence parallelism, MiCS, hpZeRO secondary
+tensor groups, non-1 expert tensor parallelism, or quantized gradients. Stage 3
+checkpoint load is same-topology only with optimizer state; module-only loads,
+optimizer-state-free loads, Universal Checkpoint conversion, and topology
+changes are not supported.
 
 **Usage:**
 
@@ -86,12 +92,14 @@ Transformers build that exposes the matching config/model classes,
   for functional testing on a single GPU.
 - AutoEP currently cannot be combined with AutoTP
   (``tensor_parallel.autotp_size > 1``); support is planned as follow-up work.
-- Checkpoint save/load requires matching ``autoep_size``.
-  To change ``autoep_size`` across runs for the same AutoEP-detected model
-  topology, convert the checkpoint to Universal Checkpoint format and load it
-  with ``checkpoint.load_universal``; see the
+- Checkpoint save/load requires matching ``autoep_size`` unless Universal
+  Checkpointing is used with ZeRO Stage 1 or Stage 2. To change
+  ``autoep_size`` across runs for the same AutoEP-detected model topology,
+  convert a ZeRO Stage 1 or Stage 2 checkpoint to Universal Checkpoint format
+  and load it with ``checkpoint.load_universal``; see the
   `Universal Checkpointing tutorial </tutorials/universal-checkpointing/>`__
-  for the detailed flow and constraints.
+  for the detailed flow and constraints. ZeRO Stage 3 AutoEP checkpoints must
+  be loaded with the same topology.
 - DeepSeek-V2 and DeepSeek-V3 AutoEP do not support load-balance expert bias
   yet. The built-in DeepSeek presets disable it by default; explicit non-null
   values fail.
