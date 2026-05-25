@@ -146,6 +146,14 @@ class MockLlama4Config:
     intermediate_size = 128
 
 
+class MockLlama4ConditionalConfig:
+    model_type = "llama4"
+
+    def __init__(self, num_experts=8):
+        self.text_config = MockLlama4Config()
+        self.text_config.num_local_experts = num_experts
+
+
 class MockLlama4Experts(nn.Module):
 
     def __init__(self, num_experts=8, ffn_hidden=128, hidden_size=64):
@@ -192,8 +200,7 @@ class MockLlama4ConditionalGeneration(nn.Module):
 
     def __init__(self, num_layers=2, num_experts=8):
         super().__init__()
-        self.config = MockLlama4Config()
-        self.config.num_local_experts = num_experts
+        self.config = MockLlama4ConditionalConfig(num_experts)
         self.language_model = nn.Module()
         self.language_model.model = nn.Module()
         self.language_model.model.layers = nn.ModuleList(
@@ -897,6 +904,7 @@ class TestModelDetectionAndReplacement:
         assert len(specs) == 1
         assert specs[0].moe_module_name == "language_model.model.layers.0.feed_forward"
         assert specs[0].model_family == "llama4"
+        assert specs[0].top_k == 1
 
     def test_hf_llama4_autoep_direct_moe_returns_flat_contract(self):
         transformers = pytest.importorskip("transformers")

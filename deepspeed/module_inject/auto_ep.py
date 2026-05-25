@@ -107,14 +107,38 @@ def _has_3d_expert_params(module: nn.Module, preset: MoEModelPreset) -> bool:
     return False
 
 
+def _iter_model_config_candidates(model_config):
+    """Yield top-level and nested HF config objects that can carry MoE attrs."""
+    seen = set()
+    pending = [model_config]
+    while pending:
+        config = pending.pop(0)
+        if config is None or id(config) in seen:
+            continue
+        seen.add(id(config))
+        yield config
+        for attr_name in ("text_config", "language_config", "llm_config"):
+            nested_config = getattr(config, attr_name, None)
+            if nested_config is not None:
+                pending.append(nested_config)
+
+
 def _get_num_experts_from_config(model_config, preset: MoEModelPreset) -> int | None:
     """Extract num_experts from model.config using the preset's attribute name."""
-    return getattr(model_config, preset.num_experts_attr, None)
+    for config in _iter_model_config_candidates(model_config):
+        value = getattr(config, preset.num_experts_attr, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _get_top_k_from_config(model_config, preset: MoEModelPreset) -> int | None:
     """Extract top_k from model.config using the preset's attribute name."""
-    return getattr(model_config, preset.top_k_attr, None)
+    for config in _iter_model_config_candidates(model_config):
+        value = getattr(config, preset.top_k_attr, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _as_finite_float(value, field_name: str) -> float:
