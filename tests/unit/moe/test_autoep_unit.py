@@ -188,6 +188,18 @@ class MockLlama4Transformer(nn.Module):
         return layer
 
 
+class MockLlama4ConditionalGeneration(nn.Module):
+
+    def __init__(self, num_layers=2, num_experts=8):
+        super().__init__()
+        self.config = MockLlama4Config()
+        self.config.num_local_experts = num_experts
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Module()
+        self.language_model.model.layers = nn.ModuleList(
+            [MockLlama4Transformer._make_layer(num_experts) for _ in range(num_layers)])
+
+
 class MockDeepSeekV3Config:
     model_type = "deepseek_v3"
     n_routed_experts = 8
@@ -877,6 +889,14 @@ class TestModelDetectionAndReplacement:
         assert w1.shape == (4, 128, 64)
         assert w2.shape == (4, 64, 128)
         assert w3.shape == (4, 128, 64)
+
+    def test_llama4_detection_accepts_conditional_generation_prefix(self):
+        model = MockLlama4ConditionalGeneration(num_layers=1, num_experts=8)
+        specs = AutoEP(model, _runtime_config(enabled=True, autoep_size=2, preset_model="llama4")).ep_parser()
+
+        assert len(specs) == 1
+        assert specs[0].moe_module_name == "language_model.model.layers.0.feed_forward"
+        assert specs[0].model_family == "llama4"
 
     def test_hf_llama4_autoep_direct_moe_returns_flat_contract(self):
         transformers = pytest.importorskip("transformers")

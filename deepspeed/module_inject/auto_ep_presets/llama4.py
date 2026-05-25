@@ -11,7 +11,7 @@ from deepspeed.module_inject.auto_ep_presets.base import AutoEPPresetAdapter, Fo
 PRESET_NAME = "llama4"
 
 PRESET = MoEModelPreset(
-    moe_layer_pattern=r"model\.layers\.\d+\.feed_forward",
+    moe_layer_pattern=r"(?:language_model\.)?model\.layers\.\d+\.feed_forward",
     router_pattern="router",
     experts_pattern="experts",
     expert_storage="fused_3d",
