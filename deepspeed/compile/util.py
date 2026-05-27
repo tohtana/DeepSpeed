@@ -465,7 +465,14 @@ def add_mem_profile_nodes(graph: Graph, prefix: str):
 
 
 def is_release_node(n: Node) -> bool:
-    return n.target == torch.ops.dc.release_param.default
+    return n.target in (torch.ops.dc.release_param.default, torch.ops.dc.release_param_with_gathered.default)
+
+
+def get_release_ds_id(n: Node) -> int:
+    assert is_release_node(n)
+    if n.target == torch.ops.dc.release_param_with_gathered.default:
+        return n.args[3]
+    return n.args[2]
 
 
 def get_index_by_graph_id(graph_order, target_graph_id):

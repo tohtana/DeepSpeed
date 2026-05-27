@@ -16,6 +16,7 @@ TORCH_LIBRARY(dc, m)
         "                      ScalarType[]? dtypes = None) -> ()");
     m.def("wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)");
     m.def("release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)");
+    m.def("release_param_with_gathered(Tensor(a) a, Tensor gathered, int graph_id, int id, int n_users) -> Tensor(a)");
     m.def("reduce_grad(Tensor a, int graph_id, int id) -> Tensor");
     m.def("free_tensors(Tensor[] a) -> ()");
     m.def("offload_tensor(Tensor a, int id, int id) -> Tensor");
@@ -35,6 +36,7 @@ TORCH_LIBRARY_IMPL(dc, CPU, m)
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused);
     m.impl("wait_allgather", &dc::wait_allgather);
     m.impl("release_param", &dc::release_param);
+    m.impl("release_param_with_gathered", &dc::release_param_with_gathered);
     m.impl("reduce_grad", &dc::reduce_grad);
     m.impl("free_tensors", &dc::free_tensors);
     m.impl("offload_tensor", &dc::offload_tensor);
@@ -54,6 +56,7 @@ TORCH_LIBRARY_IMPL(dc, CUDA, m)
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused);
     m.impl("wait_allgather", &dc::wait_allgather);
     m.impl("release_param", &dc::release_param);
+    m.impl("release_param_with_gathered", &dc::release_param_with_gathered);
     m.impl("reduce_grad", &dc::reduce_grad);
     m.impl("free_tensors", &dc::free_tensors);
     m.impl("offload_tensor", &dc::offload_tensor);
@@ -72,6 +75,7 @@ TORCH_LIBRARY_IMPL(dc, Meta, m)
     m.impl("allgather_param", &dc::allgather_param_meta);
     m.impl("prefetch_params_fused", &dc::prefetch_params_fused_meta);
     m.impl("release_param", &dc::release_param_meta);
+    m.impl("release_param_with_gathered", &dc::release_param_with_gathered_meta);
     m.impl("wait_allgather", &dc::wait_allgather_meta);
     m.impl("reduce_grad", &dc::reduce_grad_meta);
     m.impl("free_tensors", &dc::free_tensors_meta);

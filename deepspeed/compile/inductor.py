@@ -237,6 +237,9 @@ def register_custom_ops():
     register_fallback_no_reuse(torch.ops.dc.allgather_param.default, never_reuse_input=False, never_reuse_output=True)
     register_fallback_no_reuse(torch.ops.dc.wait_allgather.default, never_reuse_input=True, never_reuse_output=True)
     register_fallback_no_reuse(torch.ops.dc.release_param.default, never_reuse_input=True, never_reuse_output=False)
+    register_fallback_no_reuse(torch.ops.dc.release_param_with_gathered.default,
+                               never_reuse_input=True,
+                               never_reuse_output=False)
     register_fallback_no_reuse(torch.ops.dc.reduce_grad.default,
                                never_reuse_input=True,
                                never_reuse_output=True,

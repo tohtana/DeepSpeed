@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.compile.config import CompileConfig
 from deepspeed.compile.passes import prefetch as prefetch_pass
+from deepspeed.compile.passes.zero3_compile import add_gather_and_release
 from deepspeed.compile.util import get_deepcompile_handle, is_deepcompile_supported
 from unit.common import DistributedTest
 
@@ -208,6 +210,31 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
                                                                    [9061, 9062])
         assert default_node.target == torch.ops.dc.prefetch_params_fused.default
         assert len(default_node.args) == 3
+
+    def test_release_node_keeps_gathered_param_live_as_input(self):
+        graph_id, ds_id = 9065, 9066
+        get_deepcompile_handle()
+
+        graph = Graph()
+        param = graph.placeholder("param")
+        activation = graph.placeholder("activation")
+        matmul = graph.call_function(torch.ops.aten.mm.default, args=(activation, param))
+        graph.output(matmul)
+        param.meta["val"] = torch.empty((4, 4), device=self._device(), dtype=torch.float32)
+
+        param_manager = SimpleNamespace(ds_ids={"param": ds_id},
+                                        params={"param": SimpleNamespace(dtype=torch.float32)})
+
+        transformed = add_gather_and_release(graph_id, graph, param_manager, [param])
+
+        release_nodes = [
+            n for n in transformed.nodes if n.target == torch.ops.dc.release_param_with_gathered.default
+        ]
+        assert len(release_nodes) == 1
+        release_node = release_nodes[0]
+        assert release_node.args[0].target == torch.ops.aten.mm.default
+        assert release_node.args[1].target == torch.ops.dc.wait_allgather.default
+        assert release_node.args[3] == ds_id
 
     def test_backward_side_gather_release_storage_resized(self):
         graph_id, ds_id = 9070, 9071
