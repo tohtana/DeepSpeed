@@ -599,15 +599,25 @@ at::Tensor allgather_param_meta(at::Tensor param_tensor,
     return output_buf;
 }
 
-at::Tensor release_param(at::Tensor dummy, long graph_id, long ds_id, long n_users)
+at::Tensor release_param(at::Tensor dummy,
+                         at::Tensor gathered,
+                         long graph_id,
+                         long ds_id,
+                         long n_users)
 {
+    (void)gathered;
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
     executor->releaseParam(ds_id, n_users);
     return dummy;
 }
 
-at::Tensor release_param_meta(at::Tensor dummy, long graph_id, long ds_id, long n_users)
+at::Tensor release_param_meta(at::Tensor dummy,
+                              at::Tensor gathered,
+                              long graph_id,
+                              long ds_id,
+                              long n_users)
 {
+    (void)gathered;
     return dummy;
 }
 

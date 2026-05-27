@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-from .util import get_last_uses, is_release_node
+from .util import get_last_uses, is_release_node, get_release_ds_id
 from .fx import get_output_node
 
 
@@ -289,7 +289,7 @@ def fast_free_schedule(graph: Graph, available_mem: int, output_size: int, debug
     release_nodes = defaultdict(list)
     for n in unscheduled:
         if is_release_node(n):
-            release_nodes[n.args[2]].append(n)
+            release_nodes[get_release_ds_id(n)].append(n)
 
     ag_nodes_in_path = {}
     for ag_node in unscheduled_ags:

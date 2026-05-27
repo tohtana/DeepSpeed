@@ -45,14 +45,22 @@ def add_allgather(graph_id: int, graph: Graph, node: Node, ds_id: int, dtype: to
                                     meta=_make_node_meta(node, ds_id, False))
     new_wait_node.meta["val"] = new_ag_node.meta["val"]
 
-    return new_ag_node
+    return new_wait_node
 
 
-def add_release(graph_id: int, graph: Graph, node: Node, release_node: Node, ds_id: int, n_users: int):
+def add_release(
+    graph_id: int,
+    graph: Graph,
+    node: Node,
+    gathered_node: Node,
+    release_node: Node,
+    ds_id: int,
+    n_users: int,
+):
     new_node = add_postprocess(graph,
                                node,
                                torch.ops.dc.release_param.default,
-                               extra_args=[graph_id, ds_id, n_users],
+                               extra_args=[gathered_node, graph_id, ds_id, n_users],
                                name=f"release_ds_param_{release_node.target}_{node.name}_{ds_id}",
                                meta=_make_node_meta(node, ds_id, False))
     new_node.meta["val"] = None
@@ -86,7 +94,7 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
                 fuse_typecast = True
                 target_dtype = casted_dtype
 
-        add_allgather(graph_id, graph, pn, param_manager.ds_ids[pn.name], target_dtype)
+        gathered_node = add_allgather(graph_id, graph, pn, param_manager.ds_ids[pn.name], target_dtype)
         if fuse_typecast:
             users = node_to_uses[typecast_node]
             wait_node = typecast_node.args[0]
@@ -100,19 +108,19 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
 
         ds_id = param_manager.ds_ids[pn.name]
         for user in users:
-            # release_param() only accepts tensors as its first argument. If
-            # `user` is a tuple, we should release the param after any of
-            # operator.getitem of that tuple.
+            # release_param() returns its first tensor argument to preserve the
+            # data dependency after the parameter use. If `user` is a tuple, we
+            # should release the param after any operator.getitem of that tuple.
             #
             # Since no torch op takes a tuple as an input, we simply walk
             # through users of `user` and check if there is any call to
             # operator.getitem.
             for secondary_user in user.users:
                 if secondary_user.op == "call_function" and secondary_user.target == _operator.getitem:
-                    add_release(graph_id, graph, secondary_user, pn, ds_id, len(users))
+                    add_release(graph_id, graph, secondary_user, gathered_node, pn, ds_id, len(users))
                     break
             else:
-                add_release(graph_id, graph, user, pn, ds_id, len(users))
+                add_release(graph_id, graph, user, gathered_node, pn, ds_id, len(users))
 
     return move_primals_to_head(graph)
 

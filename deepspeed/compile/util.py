@@ -468,6 +468,11 @@ def is_release_node(n: Node) -> bool:
     return n.target == torch.ops.dc.release_param.default
 
 
+def get_release_ds_id(n: Node) -> int:
+    assert is_release_node(n)
+    return n.args[3]
+
+
 def get_index_by_graph_id(graph_order, target_graph_id):
     for index, (graph_id, _) in enumerate(graph_order):
         if graph_id == target_graph_id:

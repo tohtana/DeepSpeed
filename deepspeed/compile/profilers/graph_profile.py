@@ -20,7 +20,7 @@ except ImportError:
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from ..util import is_comm_op, is_release_node, get_deepcompile_handle
+from ..util import is_comm_op, is_release_node, get_deepcompile_handle, get_release_ds_id
 
 
 def _all_real_if_tensor(args):
@@ -219,11 +219,11 @@ class ProfilingInterpreter(Interpreter):
                 n.meta["alloc_mem"] = int(vals_to_bcast[2].item())
                 n.meta["max_mem"] = int(vals_to_bcast[3].item())
                 n.meta["tensor_size"] = int(vals_to_bcast[4].item())
-                self.cache[cache_key] = (n.meta["device_time"], n.meta["wall_time"], n.meta["alloc_mem"],
-                                         n.meta["max_mem"], n.meta["tensor_size"])
+            self.cache[cache_key] = (n.meta["device_time"], n.meta["wall_time"], n.meta["alloc_mem"],
+                                     n.meta["max_mem"], n.meta["tensor_size"])
 
             if is_release_op:
-                n.meta["alloc_mem"] = -self.allgather_mem.get(args[2], 0)
+                n.meta["alloc_mem"] = -self.allgather_mem.get(get_release_ds_id(n), 0)
 
             if dist.get_rank() == 0 and self.debug_log:
                 print(
