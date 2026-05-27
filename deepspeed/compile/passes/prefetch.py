@@ -34,6 +34,23 @@ def get_ds_id(node: Node):
     return node.args[2]
 
 
+def get_dtype(node: Node):
+    assert node.target == torch.ops.dc.allgather_param.default
+    return node.kwargs.get("dtype", None)
+
+
+def _insert_prefetch_params_fused(new_graph, graph_id, param_nodes_copy, ag_nodes, ds_ids):
+    dtypes = [get_dtype(ag_node) for ag_node in ag_nodes]
+    if any(dtype is not None for dtype in dtypes):
+        ag_names = ", ".join(ag_node.name for ag_node in ag_nodes)
+        assert all(dtype is not None
+                   for dtype in dtypes), (f"mixed explicit/default allgather dtypes in prefetch group: {ag_names}")
+        return new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
+                                       args=(graph_id, param_nodes_copy, ds_ids, dtypes))
+    return new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
+                                   args=(graph_id, param_nodes_copy, ds_ids))
+
+
 def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
                       create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager,
                       bwd: bool) -> GraphModule:
@@ -167,8 +184,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
             param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
 
             ds_ids = [get_ds_id(ag_node) for ag_node in node]
-            new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
-                                    args=(graph_id, param_nodes_copy, ds_ids))
+            _insert_prefetch_params_fused(new_graph, graph_id, param_nodes_copy, node, ds_ids)
     new_graph.lint()
     gm.graph = new_graph
 
