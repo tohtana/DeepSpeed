@@ -93,7 +93,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         values = values[:math.prod(shape)].to(dtype).reshape(-1)
         return values.narrow(0, 0, max(values.numel() - 1, 1)).sum()
 
-    def test_storage_resized_to_zero_after_release_single_use(self):
+    def test_release_keeps_live_view_storage_valid_single_use(self):
         graph_id, ds_id = 9010, 9011
         dc = self._init_dc()
         try:
@@ -103,13 +103,15 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             view, storage = self._gather_view_and_storage(shard, graph_id, ds_id)
             padded_bytes = storage.nbytes()
             self._release(view, graph_id, ds_id, 1)
-            assert storage.nbytes() == 0
+            assert storage.nbytes() == padded_bytes
+            assert torch.allclose(view.sum(), self._expected_view_sum([4097], dtype=view.dtype))
             del view
+            del storage
             self._assert_alloc_returns_to_baseline(before_bytes, padded_bytes)
         finally:
             self._cleanup_dc(dc)
 
-    def test_storage_nonzero_until_final_release_when_multi_use(self):
+    def test_storage_stays_valid_after_final_release_when_multi_use(self):
         graph_id, ds_id = 9020, 9021
         dc = self._init_dc()
         try:
@@ -119,7 +121,8 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             self._release(view, graph_id, ds_id, 2)
             assert storage.nbytes() == before_release_nbytes
             self._release(view, graph_id, ds_id, 2)
-            assert storage.nbytes() == 0
+            assert storage.nbytes() == before_release_nbytes
+            assert torch.allclose(view.sum(), self._expected_view_sum([3], dtype=view.dtype))
         finally:
             self._cleanup_dc(dc)
 
@@ -143,13 +146,15 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         try:
             shard = self._register_param(dc, graph_id, ds_id, [3], dtype=torch.bfloat16)
             view, storage = self._gather_view_and_storage(shard, graph_id, ds_id, dtype=torch.float32)
+            before_release_nbytes = storage.nbytes()
             assert view.dtype == torch.float32
             self._release(view, graph_id, ds_id, 1)
-            assert storage.nbytes() == 0
+            assert storage.nbytes() == before_release_nbytes
+            assert torch.allclose(view.sum(), self._expected_view_sum([3], dtype=view.dtype))
         finally:
             self._cleanup_dc(dc)
 
-    def test_prefetch_params_fused_resizes_each_buffer_independently(self):
+    def test_prefetch_params_fused_releases_each_buffer_independently(self):
         graph_id = 9050
         ds_id_a, ds_id_b = 9051, 9052
         dc = self._init_dc()
@@ -165,10 +170,12 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert storage_a.nbytes() > 0
             assert storage_b.nbytes() > 0
             self._release(view_a, graph_id, ds_id_a, 1)
-            assert storage_a.nbytes() == 0
+            assert storage_a.nbytes() > 0
+            assert torch.allclose(view_a.sum(), self._expected_view_sum([3], dtype=view_a.dtype))
             assert storage_b.nbytes() > 0
             self._release(view_b, graph_id, ds_id_b, 1)
-            assert storage_b.nbytes() == 0
+            assert storage_b.nbytes() > 0
+            assert torch.allclose(view_b.sum(), self._expected_view_sum([5], dtype=view_b.dtype))
         finally:
             self._cleanup_dc(dc)
 
@@ -236,15 +243,17 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         assert release_node.args[1].target == torch.ops.dc.wait_allgather.default
         assert release_node.args[3] == ds_id
 
-    def test_backward_side_gather_release_storage_resized(self):
+    def test_backward_side_gather_release_keeps_live_storage_valid(self):
         graph_id, ds_id = 9070, 9071
         dc = self._init_dc()
         try:
             shard = self._register_param(dc, graph_id, ds_id, [3])
             dc.start_backward(False)
             view, storage = self._gather_view_and_storage(shard, graph_id, ds_id)
+            before_release_nbytes = storage.nbytes()
             self._release(view, graph_id, ds_id, 1)
-            assert storage.nbytes() == 0
+            assert storage.nbytes() == before_release_nbytes
+            assert torch.allclose(view.sum(), self._expected_view_sum([3], dtype=view.dtype))
         finally:
             self._cleanup_dc(dc)
 
@@ -256,14 +265,15 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             dc.register_graph_z3(bwd_graph_id, [ds_id])
             fwd_view, fwd_storage = self._gather_view_and_storage(shard, fwd_graph_id, ds_id)
             self._release(fwd_view, fwd_graph_id, ds_id, 1)
-            assert fwd_storage.nbytes() == 0
+            assert fwd_storage.nbytes() > 0
 
             dc.start_backward(False)
             bwd_view, bwd_storage = self._gather_view_and_storage(shard, bwd_graph_id, ds_id)
             assert bwd_storage.nbytes() > 0
-            assert fwd_storage.nbytes() == 0
+            assert fwd_storage.data_ptr() != bwd_storage.data_ptr()
+            assert torch.allclose(fwd_view.sum(), self._expected_view_sum([3], dtype=fwd_view.dtype))
             self._release(bwd_view, bwd_graph_id, ds_id, 1)
-            assert bwd_storage.nbytes() == 0
+            assert bwd_storage.nbytes() > 0
         finally:
             self._cleanup_dc(dc)
 
@@ -274,14 +284,14 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             shard = self._register_param(dc, graph_id, ds_id, [3])
             first_view, first_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
             self._release(first_view, graph_id, ds_id, 1)
-            assert first_storage.nbytes() == 0
+            assert first_storage.nbytes() > 0
             dc.clear_all_gathered_params()
 
             second_view, second_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
             assert second_storage.nbytes() > 0
-            assert first_storage.nbytes() == 0
+            assert first_storage.data_ptr() != second_storage.data_ptr()
             self._release(second_view, graph_id, ds_id, 1)
-            assert second_storage.nbytes() == 0
+            assert second_storage.nbytes() > 0
         finally:
             self._cleanup_dc(dc)
 
@@ -309,9 +319,10 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             scratch.fill_(17)
             get_accelerator().synchronize()
             assert torch.allclose(result, self._expected_view_sum([4097], dtype=view.dtype))
-            assert storage.nbytes() == 0
+            assert storage.nbytes() == padded_bytes
             del scratch
             del view
+            del storage
             self._assert_alloc_returns_to_baseline(before_bytes, padded_bytes)
         finally:
             self._cleanup_dc(dc)
@@ -332,11 +343,11 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
 
             view, storage = self._gather_view_and_storage(shard, graph_id, ds_id)
             self._release(view, graph_id, ds_id, 1)
-            assert storage.nbytes() == 0
+            assert storage.nbytes() > 0
 
             followup_view, followup_storage = self._gather_view_and_storage(followup_shard, graph_id, followup_ds_id)
             assert followup_storage.nbytes() > 0
             self._release(followup_view, graph_id, followup_ds_id, 1)
-            assert followup_storage.nbytes() == 0
+            assert followup_storage.nbytes() > 0
         finally:
             self._cleanup_dc(dc, started_forward=started_forward)

@@ -159,9 +159,15 @@ def register_custom_ops():
                                   never_reuse_input,
                                   never_reuse_output,
                                   force_free_input,
+                                  force_free_arg_indices=None,
                                   add_to_fallback_set=True):
         if add_to_fallback_set:
             fallbacks.add(kernel)
+
+        if force_free_arg_indices is None:
+            force_free_arg_indices = (0, ) if force_free_input else ()
+        else:
+            force_free_arg_indices = tuple(force_free_arg_indices)
 
         def handler(*args, **kwargs):
 
@@ -195,7 +201,7 @@ def register_custom_ops():
                     return None
 
                 def codegen(self, wrapper):
-                    if not force_free_input:
+                    if not force_free_arg_indices:
                         return super().codegen(wrapper)
 
                     kernel = self.op_overload
@@ -210,13 +216,16 @@ def register_custom_ops():
                     if isinstance(self.layout, Layout):
                         self.codegen_size_asserts(wrapper)
 
-                    var_name = self.get_var_name_for_arg(args[0])
-                    if var_name:
-                        wrapper.writeline(f"{var_name} = None")
+                    for arg_index in force_free_arg_indices:
+                        if arg_index >= len(args):
+                            continue
+                        var_name = self.get_var_name_for_arg(args[arg_index])
+                        if var_name:
+                            wrapper.writeline(f"{var_name} = None")
 
                     self.codegen_unbacked_symbol_defs(wrapper)
 
-            kernel_cls = CustomDCKernel if force_free_input else FallbackKernel
+            kernel_cls = CustomDCKernel if force_free_arg_indices else FallbackKernel
             return pytree.tree_map(wrap_tensors, kernel_cls.create(kernel, *args, **kwargs))
 
         return handler
@@ -224,13 +233,15 @@ def register_custom_ops():
     def register_fallback_no_reuse(op_overload,
                                    never_reuse_input=False,
                                    never_reuse_output=False,
-                                   force_free_input=False):
+                                   force_free_input=False,
+                                   force_free_arg_indices=None):
         add_needs_realized_inputs(op_overload)
         return register_lowering(op_overload, type_promotion_kind=None)(fallback_handler_no_reuse(
             op_overload,
             never_reuse_input=never_reuse_input,
             never_reuse_output=never_reuse_output,
-            force_free_input=force_free_input))
+            force_free_input=force_free_input,
+            force_free_arg_indices=force_free_arg_indices))
 
     # Inductor tries to reuse output buffer when possible. We need to disable this behavior for some custom ops.
     # -> It seems that memory region is still reused in some cases. So we clone the inputs for some ops.
@@ -239,7 +250,8 @@ def register_custom_ops():
     register_fallback_no_reuse(torch.ops.dc.release_param.default, never_reuse_input=True, never_reuse_output=False)
     register_fallback_no_reuse(torch.ops.dc.release_param_with_gathered.default,
                                never_reuse_input=True,
-                               never_reuse_output=False)
+                               never_reuse_output=False,
+                               force_free_arg_indices=(1, ))
     register_fallback_no_reuse(torch.ops.dc.reduce_grad.default,
                                never_reuse_input=True,
                                never_reuse_output=True,
