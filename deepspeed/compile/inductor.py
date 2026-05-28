@@ -201,7 +201,7 @@ def register_custom_ops():
                         return match.group(1)
                     return None
 
-                def should_force_free_arg(self, args):
+                def should_force_free_arg(self, wrapper, args):
                     if not force_free_after_n_users:
                         return True
                     if len(args) < 5:
@@ -236,7 +236,7 @@ def register_custom_ops():
                     if isinstance(self.layout, Layout):
                         self.codegen_size_asserts(wrapper)
 
-                    if self.should_force_free_arg(args):
+                    if self.should_force_free_arg(wrapper, args):
                         for arg_index in force_free_arg_indices:
                             if arg_index >= len(args):
                                 continue
