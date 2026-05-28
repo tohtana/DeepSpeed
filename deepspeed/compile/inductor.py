@@ -160,6 +160,7 @@ def register_custom_ops():
                                   never_reuse_output,
                                   force_free_input,
                                   force_free_arg_indices=None,
+                                  force_free_after_n_users=False,
                                   add_to_fallback_set=True):
         if add_to_fallback_set:
             fallbacks.add(kernel)
@@ -200,6 +201,25 @@ def register_custom_ops():
                         return match.group(1)
                     return None
 
+                def should_force_free_arg(self, args):
+                    if not force_free_after_n_users:
+                        return True
+                    if len(args) < 5:
+                        return True
+                    try:
+                        n_users = int(args[4])
+                    except ValueError:
+                        return False
+
+                    release_counts = getattr(wrapper, "_ds_release_local_free_counts", None)
+                    if release_counts is None:
+                        release_counts = {}
+                        wrapper._ds_release_local_free_counts = release_counts
+
+                    key = (args[2], args[3])
+                    release_counts[key] = release_counts.get(key, 0) + 1
+                    return release_counts[key] >= n_users
+
                 def codegen(self, wrapper):
                     if not force_free_arg_indices:
                         return super().codegen(wrapper)
@@ -216,12 +236,13 @@ def register_custom_ops():
                     if isinstance(self.layout, Layout):
                         self.codegen_size_asserts(wrapper)
 
-                    for arg_index in force_free_arg_indices:
-                        if arg_index >= len(args):
-                            continue
-                        var_name = self.get_var_name_for_arg(args[arg_index])
-                        if var_name:
-                            wrapper.writeline(f"{var_name} = None")
+                    if self.should_force_free_arg(args):
+                        for arg_index in force_free_arg_indices:
+                            if arg_index >= len(args):
+                                continue
+                            var_name = self.get_var_name_for_arg(args[arg_index])
+                            if var_name:
+                                wrapper.writeline(f"{var_name} = None")
 
                     self.codegen_unbacked_symbol_defs(wrapper)
 
@@ -234,14 +255,16 @@ def register_custom_ops():
                                    never_reuse_input=False,
                                    never_reuse_output=False,
                                    force_free_input=False,
-                                   force_free_arg_indices=None):
+                                   force_free_arg_indices=None,
+                                   force_free_after_n_users=False):
         add_needs_realized_inputs(op_overload)
         return register_lowering(op_overload, type_promotion_kind=None)(fallback_handler_no_reuse(
             op_overload,
             never_reuse_input=never_reuse_input,
             never_reuse_output=never_reuse_output,
             force_free_input=force_free_input,
-            force_free_arg_indices=force_free_arg_indices))
+            force_free_arg_indices=force_free_arg_indices,
+            force_free_after_n_users=force_free_after_n_users))
 
     # Inductor tries to reuse output buffer when possible. We need to disable this behavior for some custom ops.
     # -> It seems that memory region is still reused in some cases. So we clone the inputs for some ops.
@@ -254,7 +277,8 @@ def register_custom_ops():
     register_fallback_no_reuse(torch.ops.dc.release_param_with_gathered.default,
                                never_reuse_input=True,
                                never_reuse_output=False,
-                               force_free_arg_indices=(1, ))
+                               force_free_arg_indices=(1, ),
+                               force_free_after_n_users=True)
     register_fallback_no_reuse(torch.ops.dc.reduce_grad.default,
                                never_reuse_input=True,
                                never_reuse_output=True,
