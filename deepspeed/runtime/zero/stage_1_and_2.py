@@ -2133,6 +2133,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if self.overflow:
             see_memory_usage('After overflow before clearing gradients')
             self.zero_grad(set_to_none=True)
+            release_deepcompile_grad_buffers = getattr(self, "_deepcompile_z1_release_grad_buffers", None)
+            if release_deepcompile_grad_buffers is not None:
+                release_deepcompile_grad_buffers()
             if self.cpu_offload:
                 self.reset_cpu_buffers()
             else:
@@ -2201,6 +2204,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
                 self.averaged_gradients[i] = None
                 self.all_grad_tensors[i] = None
+                release_deepcompile_grad_buffers = getattr(self, "_deepcompile_z1_release_grad_buffers", None)
+                if release_deepcompile_grad_buffers is not None:
+                    release_deepcompile_grad_buffers(i)
                 self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
 
                 self.timers(OPTIMIZER_GRADIENTS_TIMER).stop()

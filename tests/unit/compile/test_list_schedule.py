@@ -29,7 +29,7 @@ def _define_dc_ops():
     for schema in (
             "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
             "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
-            "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
+            "release_param(Tensor(a) a, Tensor gathered, int graph_id, int id, int n_users) -> Tensor(a)",
             "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
     ):
         try:
@@ -80,9 +80,9 @@ def _add(graph, lhs, rhs, name, device_time=0):
     return _with_meta(graph.call_function(operator.add, (lhs, rhs), name=name), device_time=device_time)
 
 
-def _release(graph, arg, ds_id, name):
+def _release(graph, arg, gathered, ds_id, name):
     return _with_meta(
-        graph.call_function(torch.ops.dc.release_param.default, (arg, 0, ds_id, 1),
+        graph.call_function(torch.ops.dc.release_param.default, (arg, gathered, 0, ds_id, 1),
                             name=f"release_ds_param_{name}_{ds_id}"))
 
 
@@ -104,14 +104,14 @@ def test_fast_free_schedule_keeps_zero_free_acc_filter():
     safe_ag = _allgather(graph, _add(graph, safe_param, safe_pre_use, "safe_param_dep"), 11, "safe")
     safe_wait = _wait(graph, safe_ag, 11, "safe")
     safe_use = _neg(graph, safe_wait, "safe_use", device_time=100)
-    safe_release = _release(graph, safe_use, 11, "safe")
+    safe_release = _release(graph, safe_use, safe_wait, 11, "safe")
 
     unsafe_ag = _allgather(graph, unsafe_param, 20, "unsafe")
     unsafe_wait = _wait(graph, unsafe_ag, 20, "unsafe")
     unsafe_extra_ag = _allgather(graph, unsafe_extra_param, 21, "unsafe_extra")
     unsafe_extra_wait = _wait(graph, unsafe_extra_ag, 21, "unsafe_extra")
     unsafe_use = _add(graph, unsafe_wait, unsafe_extra_wait, "unsafe_use", device_time=1)
-    unsafe_release = _release(graph, unsafe_use, 20, "unsafe")
+    unsafe_release = _release(graph, unsafe_use, unsafe_wait, 20, "unsafe")
 
     graph.output((safe_release, unsafe_release))
     graph.lint()
@@ -135,14 +135,14 @@ def test_fast_free_schedule_prefers_lower_allgather_pressure_in_zero_free_acc_bu
     high_ag = _allgather(graph, _add(graph, high_param, high_pre_wait, "high_param_dep"), 31, "high")
     high_wait = _wait(graph, high_ag, 31, "high")
     high_use = _neg(graph, high_wait, "high_use", device_time=1)
-    high_release = _release(graph, high_use, 31, "high")
+    high_release = _release(graph, high_use, high_wait, 31, "high")
 
     low_pre_ag = _allgather(graph, low_pre_param, 40, "low_pre", tensor_size=1)
     low_pre_wait = _wait(graph, low_pre_ag, 40, "low_pre")
     low_ag = _allgather(graph, _add(graph, low_param, low_pre_wait, "low_param_dep"), 41, "low")
     low_wait = _wait(graph, low_ag, 41, "low")
     low_use = _neg(graph, low_wait, "low_use", device_time=100)
-    low_release = _release(graph, low_use, 41, "low")
+    low_release = _release(graph, low_use, low_wait, 41, "low")
 
     graph.output((high_release, low_release))
     graph.lint()
@@ -165,14 +165,14 @@ def test_fast_free_schedule_uses_pressure_tiebreaker_in_fallback_bucket():
     high_extra_ag = _allgather(graph, high_extra_param, 51, "fallback_high_extra", tensor_size=10)
     high_extra_wait = _wait(graph, high_extra_ag, 51, "fallback_high_extra")
     high_use = _add(graph, high_wait, high_extra_wait, "fallback_high_use", device_time=1)
-    high_release = _release(graph, high_use, 50, "fallback_high")
+    high_release = _release(graph, high_use, high_wait, 50, "fallback_high")
 
     low_ag = _allgather(graph, low_param, 60, "fallback_low", tensor_size=1)
     low_wait = _wait(graph, low_ag, 60, "fallback_low")
     low_extra_ag = _allgather(graph, low_extra_param, 61, "fallback_low_extra", tensor_size=10)
     low_extra_wait = _wait(graph, low_extra_ag, 61, "fallback_low_extra")
     low_use = _add(graph, low_wait, low_extra_wait, "fallback_low_use", device_time=100)
-    low_release = _release(graph, low_use, 60, "fallback_low")
+    low_release = _release(graph, low_use, low_wait, 60, "fallback_low")
 
     graph.output((high_release, low_release))
     graph.lint()
@@ -189,7 +189,7 @@ def test_fast_free_schedule_keeps_single_allgather_release_order():
     ag = _allgather(graph, param, 70, "single")
     wait = _wait(graph, ag, 70, "single")
     use = _neg(graph, wait, "single_use")
-    release = _release(graph, use, 70, "single")
+    release = _release(graph, use, wait, 70, "single")
 
     graph.output((release, ))
     graph.lint()
