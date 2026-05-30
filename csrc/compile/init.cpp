@@ -98,7 +98,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("register_graph_z2",
           &dc::register_graph_z2,
           "Register graph with a list of ds parameter ids");
-    m.def("register_z3_param", &dc::register_z3_param, "Register a parameter");
+    m.def("register_z3_param",
+          &dc::register_z3_param,
+          "Register a parameter",
+          pybind11::arg("ds_id"),
+          pybind11::arg("ds_shape"),
+          pybind11::arg("ds_tensor"),
+          pybind11::arg("grad_buffer"),
+          pybind11::arg("persistent"),
+          pybind11::arg("expected_grad_dtype") = pybind11::none());
     m.def("register_graph_z3",
           &dc::register_graph_z3,
           "Register graph with a list of ds parameter ids");

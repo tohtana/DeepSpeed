@@ -16,22 +16,25 @@ _DC_LIBRARIES = []
 
 
 def _define_dc_ops():
-    try:
-        torch.ops.dc.allgather_param.default
-        torch.ops.dc.wait_allgather.default
-        torch.ops.dc.release_param.default
-        torch.ops.dc.reduce_grad.default
-        return
-    except AttributeError:
-        pass
+    schemas = {
+        "allgather_param": "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
+        "wait_allgather": "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
+        "release_param": "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
+        "reduce_grad": "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
+    }
+    missing = []
+    for op_name, schema in schemas.items():
+        try:
+            getattr(torch.ops.dc, op_name).default
+        except AttributeError:
+            missing.append(schema)
 
-    lib = torch.library.Library("dc", "DEF")
-    for schema in (
-            "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
-            "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
-            "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
-            "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
-    ):
+    if not missing:
+        return
+
+    kind = "FRAGMENT" if len(missing) < len(schemas) else "DEF"
+    lib = torch.library.Library("dc", kind)
+    for schema in missing:
         try:
             lib.define(schema)
         except RuntimeError as exc:
@@ -190,6 +193,26 @@ def test_fast_free_schedule_keeps_single_allgather_release_order():
     wait = _wait(graph, ag, 70, "single")
     use = _neg(graph, wait, "single_use")
     release = _release(graph, use, 70, "single")
+
+    graph.output((release, ))
+    graph.lint()
+
+    names = _scheduled_names(graph)
+
+    assert names.index(ag.name) < names.index(wait.name)
+    assert names.index(wait.name) < names.index(use.name)
+    assert names.index(use.name) < names.index(release.name)
+
+
+def test_fast_free_schedule_handles_missing_device_time_metadata():
+    graph = Graph()
+
+    param = _placeholder(graph, "missing_time_param")
+    ag = _allgather(graph, param, 80, "missing_time")
+    wait = _wait(graph, ag, 80, "missing_time")
+    use = _neg(graph, wait, "missing_time_use")
+    use.meta.pop("device_time")
+    release = _release(graph, use, 80, "missing_time")
 
     graph.output((release, ))
     graph.lint()

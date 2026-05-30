@@ -54,6 +54,19 @@ def _compute_persistence_budget(all_graph_mem_records: List[List[Tuple[str, int,
     }
 
 
+def _record_allgather_profile(node, ds_id_to_size, ds_id_to_time, ds_id_to_prof_dtime, ds_id_to_prof_wtime):
+    ds_id = node.args[2]
+    tensor_size = node.meta.get("tensor_size")
+    if tensor_size is not None and tensor_size > 0:
+        ds_id_to_size[ds_id] = tensor_size
+
+    device_time = node.meta.get("device_time", 0.0)
+    wall_time = node.meta.get("wall_time", 0.0)
+    ds_id_to_time[ds_id] += device_time
+    ds_id_to_prof_dtime[ds_id] = device_time
+    ds_id_to_prof_wtime[ds_id] = wall_time
+
+
 def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
                      create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager,
                      bwd: bool) -> GraphModule:
@@ -105,21 +118,13 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         profile = profiling_results[param_graph_id]
         for n in profile.fwd_graph.nodes:
             if n.target == torch.ops.dc.allgather_param.default:
-                assert "tensor_size" in n.meta
-                ds_id_to_size[n.args[2]] = n.meta["tensor_size"]
-                assert "device_time" in n.meta
-                ds_id_to_time[n.args[2]] += n.meta["device_time"]
-
-                ds_id_to_prof_dtime[n.args[2]] = n.meta["device_time"]
-                ds_id_to_prof_wtime[n.args[2]] = n.meta["wall_time"]
+                _record_allgather_profile(n, ds_id_to_size, ds_id_to_time, ds_id_to_prof_dtime, ds_id_to_prof_wtime)
 
         if profile.bwd_graph is not None:
             for n in profile.bwd_graph.nodes:
                 if n.target == torch.ops.dc.allgather_param.default:
-                    assert "tensor_size" in n.meta
-                    ds_id_to_size[n.args[2]] = n.meta["tensor_size"]
-                    assert "device_time" in n.meta
-                    ds_id_to_time[n.args[2]] += n.meta["device_time"]
+                    _record_allgather_profile(n, ds_id_to_size, ds_id_to_time, ds_id_to_prof_dtime,
+                                              ds_id_to_prof_wtime)
 
     ds_ids = [ds_id for ds_id in ds_id_to_size if ds_id not in persistent_ds_ids]
     ds_ids.sort(key=lambda ds_id: ds_id_to_time[ds_id] / ds_id_to_size[ds_id], reverse=True)
@@ -146,7 +151,8 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     current_available_mem = vals_to_bcast[1].item()
 
     budget = _compute_persistence_budget(all_graph_mem_records, total_mem, MEM_MARGIN)
-    available_mem = int(current_available_mem * (1 - MEM_MARGIN))
+    current_available_budget = int(current_available_mem * (1 - MEM_MARGIN))
+    available_mem = min(current_available_budget, budget["available_mem"])
 
     ds_id_to_param = {}
     for g_id, g_pm in param_manager.items():
@@ -160,6 +166,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         f"selective_gather target_graph_id={target_graph_id} profiled_mem_lists={budget['profiled_list_count']} "
         f"total_mem={total_mem} usable_mem={budget['usable_mem']} peak_resident_alloc={budget['peak_resident_alloc']} "
         f"transient_peak={budget['transient_peak']} current_available_mem={current_available_mem} "
+        f"current_available_budget={current_available_budget} "
         f"usable_available_mem={available_mem} "
         f"persistent_count={len(persistent_ds_ids)} persistent_bytes={persistent_bytes} "
         f"candidate_count={len(ds_ids)} candidate_bytes={candidate_bytes}")
