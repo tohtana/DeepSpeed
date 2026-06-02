@@ -77,14 +77,32 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     prefetch_ags = []
     prefetch_ag_groups = []
     ag_tensor_size_sum = 0
+
+    def flush_pending_prefetches():
+        nonlocal ag_tensor_size_sum, prefetch_ags
+        for ag_group in prefetch_ag_groups:
+            assert len(ag_group) > 0
+            new_order_rev.append(ag_group)
+            total_ag_tensor_size = sum([tensor_size_dict[ag_node.name] for ag_node in ag_group])
+            ag_tensor_size_sum -= total_ag_tensor_size
+        prefetch_ag_groups.clear()
+        if len(prefetch_ags) > 0:
+            new_order_rev.append(prefetch_ags)
+            ag_tensor_size_sum -= sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
+            prefetch_ags = []
+        assert ag_tensor_size_sum == 0
+
     for i, node in enumerate(order_rev):
         # print_rank_0(
         #     f"Checking node reverse order {node.name} {node.target} ag_tensor_size_sum={ag_tensor_size_sum} max_mem={max_mem}"
         # )
 
         if node.op != "placeholder":
-            assert i < len(order_rev) - 1
             assert node.name in mem_dict
+            if i == len(order_rev) - 1:
+                assert ag_tensor_size_sum == 0
+                new_order_rev.append(node)
+                continue
             next_node = order_rev[i + 1]
             next_alloc_mem, next_peak = mem_dict[next_node.name]
 
@@ -137,17 +155,9 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
         new_order_rev.append(node)
 
-        if (node.op != "placeholder"
-                and node.target != torch.ops.dc.reload_parameter) and order_rev[i + 1].op == "placeholder":
-            for ag_group in prefetch_ag_groups:
-                assert len(ag_group) > 0
-                new_order_rev.append(ag_group)
-                total_ag_tensor_size = sum([tensor_size_dict[ag_node.name] for ag_node in ag_group])
-                ag_tensor_size_sum -= total_ag_tensor_size
-            if len(prefetch_ags) > 0:
-                new_order_rev.append(prefetch_ags)
-                ag_tensor_size_sum -= sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
-            assert ag_tensor_size_sum == 0
+        if (node.op != "placeholder" and node.target != torch.ops.dc.reload_parameter and i < len(order_rev) - 1
+                and order_rev[i + 1].op == "placeholder"):
+            flush_pending_prefetches()
 
         # print_rank_0(
         #     f"node={node} next_alloc_mem={next_alloc_mem} pending_ags={len(prefetch_ags)} ag_tensor_size_sum={ag_tensor_size_sum}"
