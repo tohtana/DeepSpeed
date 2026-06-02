@@ -74,6 +74,17 @@ def _get_mem_usage_out_of_torch():
     return adjust
 
 
+def _should_partition_profile_param(v):
+    if not hasattr(v, "ds_id") or getattr(v, "ds_persist", False):
+        return False
+
+    # During DeepCompile tracing with ZeRO-3 module hooks kept, normal ZeRO
+    # pre-forward hooks may legitimately hold the parameter active until the
+    # module returns. Profiling should not force-partition that Python parameter
+    # while the module-hook lifecycle still owns the release.
+    return not bool(getattr(v, "ds_active_sub_modules", None))
+
+
 # https://pytorch.org/tutorials/intermediate/fx_profiling_tutorial.html
 class ProfilingInterpreter(Interpreter):
 
@@ -199,7 +210,7 @@ class ProfilingInterpreter(Interpreter):
         def partition_param_if_necessary(v):
             if id(v) in partitioned_params:
                 v = partitioned_params[id(v)]
-            if hasattr(v, "ds_id") and not v.ds_persist:
+            if _should_partition_profile_param(v):
                 v.partition(param_list=[v], has_been_updated=False)
             return v
 
