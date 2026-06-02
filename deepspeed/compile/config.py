@@ -57,5 +57,8 @@ class CompileConfig(DeepSpeedConfigModel):
     keep_all_input_tensors: bool = False
     """ Keep real values for all input tensors in InputStorage instead of using dummy values """
 
+    z3_keep_module_hooks: bool = True
+    """ Keep ZeRO-3 module hooks during DeepCompile to protect graph-broken eager regions """
+
     passes: Optional[List[PassName]] = None
     """ Composes different optimizations. """

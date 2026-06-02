@@ -13,6 +13,13 @@ except ImportError:
     # Unsupported torch version
     pass
 
+_z3_module_hooks_kept = False
+
+
+def set_z3_module_hooks_kept(kept: bool):
+    global _z3_module_hooks_kept
+    _z3_module_hooks_kept = kept
+
 
 def wrap_if_ds_param(t):
     if hasattr(t, 'ds_id'):
@@ -31,6 +38,9 @@ def wrap_if_ds_param(t):
 
 def _get_guard_sizes_strides(t):
     if hasattr(t, "ds_id"):
+        if _z3_module_hooks_kept:
+            return t.size(), t.stride()
+
         # ZeRO-3 may temporarily all-gather a parameter during tracing, but the
         # stable module state used by TorchDynamo guards is the released
         # partitioned form, where DeepSpeed resets param.data to empty(0).

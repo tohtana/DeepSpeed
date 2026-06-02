@@ -199,3 +199,23 @@ def test_fast_free_schedule_keeps_single_allgather_release_order():
     assert names.index(ag.name) < names.index(wait.name)
     assert names.index(wait.name) < names.index(use.name)
     assert names.index(use.name) < names.index(release.name)
+
+
+def test_fast_free_schedule_treats_missing_device_time_as_zero():
+    graph = Graph()
+
+    param = _placeholder(graph, "missing_device_time_param")
+    ag = _allgather(graph, param, 80, "missing_device_time")
+    wait = _wait(graph, ag, 80, "missing_device_time")
+    use = _neg(graph, wait, "missing_device_time_use")
+    del use.meta["device_time"]
+    release = _release(graph, use, 80, "missing_device_time")
+
+    graph.output((release, ))
+    graph.lint()
+
+    names = _scheduled_names(graph)
+
+    assert names.index(ag.name) < names.index(wait.name)
+    assert names.index(wait.name) < names.index(use.name)
+    assert names.index(use.name) < names.index(release.name)

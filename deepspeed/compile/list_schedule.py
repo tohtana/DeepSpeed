@@ -181,7 +181,7 @@ def simple_prefetch(graph: Graph, available_mem: int, output_size: int, debug_lo
         for ag_node in runnable:
             ag_scheduled, ag_unscheduled = try_schedule_with_new_allgather(tmp_scheduled, tmp_unscheduled, edges,
                                                                            ag_node)
-            unblock_time = sum(n.meta["device_time"] for n in ag_scheduled[len(tmp_scheduled) + 1:])
+            unblock_time = sum(_node_device_time(n) for n in ag_scheduled[len(tmp_scheduled) + 1:])
             ag_with_unblock_time.append((ag_node, unblock_time, ag_scheduled, ag_unscheduled))
 
         ag_with_unblock_time = sorted(ag_with_unblock_time, key=lambda x: x[1], reverse=True)
@@ -280,6 +280,10 @@ def _fallback_allgather_key(task: AllgatherTask):
     return (task.free_acc_mem, task.n_scheduled_ags, task.allgather_acc_mem, task.free_cost, task.node.name)
 
 
+def _node_device_time(node: Node) -> float:
+    return node.meta.get("device_time", 0.0)
+
+
 def fast_free_schedule(graph: Graph, available_mem: int, output_size: int, debug_log: bool) -> Graph:
     node_to_last_use, user_to_last_uses = get_last_uses(graph)
 
@@ -341,8 +345,8 @@ def fast_free_schedule(graph: Graph, available_mem: int, output_size: int, debug
 
                 diff_required_nodes = get_node_requirements(last_use, scheduled + schedule_until_ag)
 
-                allgather_cost = sum(n.meta["device_time"] for n in schedule_until_ag)
-                free_cost = sum(n.meta["device_time"] for n in diff_required_nodes)
+                allgather_cost = sum(_node_device_time(n) for n in schedule_until_ag)
+                free_cost = sum(_node_device_time(n) for n in diff_required_nodes)
                 allgathered_mem = node.meta["tensor_size"]
                 allgather_acc_mem = sum(n.meta["tensor_size"] for n in schedule_until_ag
                                         if n.target == torch.ops.dc.allgather_param.default)
