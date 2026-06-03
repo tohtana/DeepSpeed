@@ -76,6 +76,15 @@ opt_passes = {}
 fwd_real_inputs = []
 
 
+def _finalize_backward_frame(frame_id: int, consumed_runtime_inputs: bool):
+    if not consumed_runtime_inputs:
+        return
+
+    frames_needing_bwd.discard(frame_id)
+    if len(frames_needing_bwd) == 0:
+        unpatch_compiled_func()
+
+
 def register_compile_pass(name: str, opt_pass_fn):
     opt_passes[name] = opt_pass_fn
 
@@ -342,8 +351,10 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 sample_inputs_with_real_params = param_manager[graph_id].replace_fake_tensors_with_real_params(
                     sample_inputs, gm.graph)
                 bwd_real_inputs = set_example_values_to_symints(sample_inputs_with_real_params)
+                consumed_runtime_inputs = False
             else:
                 bwd_real_inputs = bwd_inputs_stack.pop()
+                consumed_runtime_inputs = True
 
             run_opt_passes(
                 opt_passes=next_passes,
@@ -365,9 +376,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 add_free_activations(graph_id, gm.graph,
                                      get_activation_node_names(gm.graph, param_nodes_bw, non_param_input_names))
 
-            frames_needing_bwd.remove(frame_id)
-            if len(frames_needing_bwd) == 0:
-                unpatch_compiled_func()
+            _finalize_backward_frame(frame_id, consumed_runtime_inputs)
 
             log_rank0(
                 f"Bwd end {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",
