@@ -579,6 +579,12 @@ protected:
     }
 
     // Common helper methods for flushReduceBucket implementations
+    bool hasPendingReduceTasks(at::ScalarType scalar_type) const
+    {
+        auto it = reduce_tasks_.find(scalar_type);
+        return it != reduce_tasks_.end() && !it->second.empty();
+    }
+
     void blockCopyEvents(at::ScalarType scalar_type)
     {
         for (const ReduceTask& t : reduce_tasks_.at(scalar_type)) {

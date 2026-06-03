@@ -250,7 +250,7 @@ public:
 
     void flushReduceBucket(at::ScalarType scalar_type) override
     {
-        if (!hasKey(reduce_tasks_, scalar_type)) { return; }
+        if (!hasPendingReduceTasks(scalar_type)) { return; }
 
         blockCopyEvents(scalar_type);
 
