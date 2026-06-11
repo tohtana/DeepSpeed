@@ -66,6 +66,7 @@ from .data_pipeline.constants import *
 from ..utils.config import get_timers_config
 
 TENSOR_CORE_ALIGN_SIZE = 8
+EXPERT_PARALLEL = "expert_parallel"
 
 ADAGRAD_OPTIMIZER = 'adagrad'
 ADAM_OPTIMIZER = 'adam'
@@ -122,6 +123,14 @@ class DtypeEnum(Enum):
             self._name_,
             ", ".join([repr(v) for v in self._all_values]),
         )
+
+
+def get_expert_parallel_config(param_dict):
+    if EXPERT_PARALLEL in param_dict:
+        from deepspeed.module_inject.auto_ep_config import parse_autoep_config
+        return parse_autoep_config(param_dict[EXPERT_PARALLEL])
+    from deepspeed.module_inject.auto_ep_config import AutoEPConfig
+    return AutoEPConfig()
 
 
 def get_pld_enabled(param_dict):
@@ -681,7 +690,7 @@ class DeepSpeedConfig(object):
                     self.world_size = dist.get_world_size() / config["sequence_parallel_size"]
                 else:
                     self.world_size = dist.get_world_size()
-        except:
+        except Exception:
             self.global_rank = 0
             self.world_size = 1
         logger.info(f"Config mesh_device {mesh_device} world_size = {self.world_size}")
@@ -870,6 +879,7 @@ class DeepSpeedConfig(object):
 
         self.timers_config = get_timers_config(param_dict)
         self.tensor_parallel_config = get_tensor_parallel_config(param_dict)
+        self.expert_parallel_config = get_expert_parallel_config(param_dict)
 
     def _batch_assertion(self):
 

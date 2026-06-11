@@ -15,20 +15,51 @@ tags: training inference
 
 `DS4Sci_EvoformerAttention` is released as part of DeepSpeed >= 0.10.3.
 
-`DS4Sci_EvoformerAttention` is implemented based on [CUTLASS](https://github.com/NVIDIA/cutlass). You need to clone the CUTLASS repository and specify the path to it in the environment variable `CUTLASS_PATH`.
+`DS4Sci_EvoformerAttention` is implemented based on [CUTLASS](https://github.com/NVIDIA/cutlass). DeepSpeed automatically looks for CUTLASS in the [nvidia-cutlass](https://pypi.org/project/nvidia-cutlass/) Python package, Python environment and CMake prefixes, compiler include path environment variables, a `cutlass` checkout next to DeepSpeed or in the current working directory, and common system install prefixes such as `/usr/local`.
 CUTLASS setup detection can be ignored by setting ```CUTLASS_PATH="DS_IGNORE_CUTLASS_DETECTION"```, which is useful if you have a well setup compiler (e.g., compiling in a conda package with cutlass and the cuda compilers installed).
-CUTLASS location can be automatically inferred using pypi's [nvidia-cutlass](https://pypi.org/project/nvidia-cutlass/) package by setting ```CUTLASS_PATH="DS_USE_CUTLASS_PYTHON_BINDINGS"```. Note that this is discouraged as ```nvidia-cutlass``` is not maintained anymore and outdated.
+If automatic detection does not find the intended installation, set `CUTLASS_PATH` to either the CUTLASS checkout root or its `include` directory.
 
-You can always simply clone cutlass and setup ```CUTLASS_PATH```:
+You can always simply clone cutlass next to DeepSpeed:
 ```shell
 git clone https://github.com/NVIDIA/cutlass
-export CUTLASS_PATH=/path/to/cutlass
 ```
 The kernels will be compiled when `DS4Sci_EvoformerAttention` is called for the first time.
 
-`DS4Sci_EvoformerAttention` requires GPUs with compute capability 7.0 or higher (NVIDIA V100 or later GPUs) and the minimal CUDA version is 11.3. It is recommended to use CUDA 11.7 or later for better performance. Besides, the performance of backward kernel on V100 kernel is not as good as that on A100 for now.
-The extension checks both requirements and fails if any is not met. To disable the check, for example for cross-compiling in a system without GPUs, you can set the environment variable ```DS_IGNORE_CUDA_DETECTION=TRUE```
-and the environment value ```DS_EVOFORMER_GPU_ARCH={70|75|80}```, which controls the target GPU (80 being the last supported and meaning NVIDIA Ampere and later).
+`DS4Sci_EvoformerAttention` requires GPUs with compute capability 7.0 or higher
+(NVIDIA V100 or later GPUs) and the minimal CUDA version is 11.3. It is
+recommended to use CUDA 11.7 or later for better performance. Besides, the
+performance of backward kernel on V100 is not as good as on A100 for now.
+
+The extension checks both requirements and fails if any is not met. To disable
+the check (for example cross-compiling in a system without GPUs), set
+`DS_IGNORE_CUDA_DETECTION=TRUE`.
+
+### Multi-Arch Build Behavior
+
+Evoformer now supports mixed-architecture packaging directly via
+`TORCH_CUDA_ARCH_LIST`.
+
+Example:
+
+```shell
+TORCH_CUDA_ARCH_LIST='7.0;8.0' \
+DS_BUILD_OPS=0 DS_BUILD_EVOFORMER_ATTN=1 \
+pip install -e .
+```
+
+- `TORCH_CUDA_ARCH_LIST` controls generated CUDA slices (order-independent).
+- Targets below `sm_70` are pruned for Evoformer because Tensor Cores are
+  required.
+- `DS_EVOFORMER_GPU_ARCH` is **deprecated** and ignored for Evoformer builds.
+  Use `TORCH_CUDA_ARCH_LIST` instead.
+
+Supported dtype matrix by architecture family:
+
+| Arch family | fp16 | bf16 |
+|-------------|------|------|
+| Sm70 (Volta) | Yes | No |
+| Sm75 (Turing) | Yes | No |
+| Sm80+ (Ampere/Ada/Hopper) | Yes | Yes |
 
 ### 3.2 Unit test and benchmark
 

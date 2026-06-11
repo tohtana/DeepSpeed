@@ -173,16 +173,13 @@ class HPU_Accelerator(DeepSpeedAccelerator):
         return supported_dtypes
 
     # Misc
-    def amp(self):
-        return None
-
     def is_available(self):
         return self.hpu.is_available()
 
-    def range_push(self, msg):
+    def range_push(self, msg, domain=None, category=None):
         return
 
-    def range_pop(self):
+    def range_pop(self, domain=None):
         return
 
     def lazy_call(self, callback):

@@ -59,8 +59,10 @@ lnav:
         url: /tutorials/accelerator-abstraction-interface/
       - title: 'Accelerator Setup Guides'
         url: /tutorials/accelerator-setup-guide/
-      - title: 'Automatic Tensor Parallelism'
+      - title: 'Automatic Tensor Parallelism (Inference)'
         url: /tutorials/automatic-tensor-parallelism/
+      - title: 'Automatic Tensor Parallelism (Training)'
+        url: /tutorials/autotp-training/
       - title: 'Autotuning'
         url: /tutorials/autotuning/
       - title: 'BingBertSQuAD Fine-tuning'
@@ -91,7 +93,7 @@ lnav:
         url: /tutorials/lrrt/
       - title: 'Megatron-LM GPT2'
         url: /tutorials/megatron/
-      - title: 'Mixture-of-Experts (MoE)'
+      - title: 'Mixture of Experts (DeepSpeed MoE)'
         url: /tutorials/mixture-of-experts/
       - title: 'MoE for NLG'
         url: /tutorials/mixture-of-experts-nlg/

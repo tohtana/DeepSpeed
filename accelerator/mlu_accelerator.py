@@ -162,19 +162,14 @@ class MLU_Accelerator(DeepSpeedAccelerator):
         return supported_dtypes
 
     # Misc
-    def amp(self):
-        if hasattr(torch.mlu, 'amp'):
-            return torch.mlu.amp
-        return None
-
     def is_available(self):
         return torch.mlu.is_available()
 
-    def range_push(self, msg):
+    def range_push(self, msg, domain=None, category=None):
         if hasattr(torch.mlu.cnpx, 'range_push'):
             return torch.mlu.cnpx.range_push(msg)
 
-    def range_pop(self):
+    def range_pop(self, domain=None):
         if hasattr(torch.mlu.cnpx, 'range_pop'):
             return torch.mlu.cnpx.range_pop()
 

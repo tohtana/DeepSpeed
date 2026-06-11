@@ -8,6 +8,7 @@ from abc import ABC
 
 
 class DeepSpeedAccelerator(ABC):
+    supports_nvtx_domain = False
 
     def __init__(self):
         self._name = None
@@ -179,19 +180,15 @@ class DeepSpeedAccelerator(ABC):
 
     # Misc
     @abc.abstractmethod
-    def amp(self):
-        ...
-
-    @abc.abstractmethod
     def is_available(self):
         ...
 
     @abc.abstractmethod
-    def range_push(self, msg):
+    def range_push(self, msg, domain=None, category=None):
         ...
 
     @abc.abstractmethod
-    def range_pop(self):
+    def range_pop(self, domain=None):
         ...
 
     @abc.abstractmethod
