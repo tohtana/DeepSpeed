@@ -122,12 +122,14 @@ from deepspeed.accelerator import get_accelerator
 
 from deepspeed.runtime.config import DtypeEnum
 
-from deepspeed.compile.util import is_deepcompile_supported, get_deepcompile_handle, deepcompile_backward_prologue
+from deepspeed.compile.util import (is_deepcompile_supported, get_deepcompile_handle, deepcompile_backward_prologue,
+                                    deepcompile_backward_epilogue)
 from deepspeed.compile.backend import register_compile_pass, opt_passes
 from deepspeed.compile.passes import zero3_compile, prefetch, selective_gather, offload_adam_states
 from deepspeed.compile.init_z1 import init_z1
 from deepspeed.compile.init_z3 import init_z3
 from deepspeed.compile.init_sp import init_autosp
+from deepspeed.compile.z3_eager_fallback import deepcompile_z3_forward_context
 
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 
@@ -2449,28 +2451,8 @@ class DeepSpeedEngine(Module):
             # We can't have this in forward prologue as the compiler compiles hooks including the forward prologue.
             self.launch_compile_passes(self.global_steps)
 
-        # When DeepCompile is active the per-module gather/release hooks are
-        # removed and all parameter gathering is handled by compiled graph ops.
-        # However, torch._dynamo may skip frames that contain graph breaks in
-        # loops.  Skipped frames execute eagerly without the compiled ops, so
-        # the ZeROOrderedDict safety-net must be enabled to auto-gather any
-        # parameter accessed in those frames.
-        _dc_z3_eager_fallback = (self.is_deepcompile_active() and self.zero_optimization_partition_weights())
-        if _dc_z3_eager_fallback:
-            for module in self.module.modules():
-                if isinstance(module._parameters, ZeROOrderedDict):
-                    module._parameters._in_forward = True
-
-        with autocast_if_enabled(self):
+        with deepcompile_z3_forward_context(self), autocast_if_enabled(self):
             loss = self.module(*inputs, **kwargs)
-
-        if _dc_z3_eager_fallback:
-            for p in self.module.parameters():
-                if hasattr(p, "ds_status") and p.ds_status == ZeroParamStatus.AVAILABLE and not p.ds_persist:
-                    p.partition()
-            for module in self.module.modules():
-                if isinstance(module._parameters, ZeROOrderedDict):
-                    module._parameters._in_forward = False
 
         # Register output backward hooks
         # preprocess_once_fn is called for preprocessing
@@ -2602,6 +2584,9 @@ class DeepSpeedEngine(Module):
             if not bf16_optimizer:
                 self.optimizer.backward_epilogue()
             self.optimizer.exit_backward()
+
+        if self.is_deepcompile_active():
+            deepcompile_backward_epilogue()
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
         self._stop_timers(self.engine_timers.backward_reduce_timers)
