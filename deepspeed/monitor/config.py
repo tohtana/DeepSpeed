@@ -10,7 +10,10 @@ from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
 
 def get_monitor_config(param_dict):
-    monitor_dict = {key: param_dict.get(key, {}) for key in ("tensorboard", "wandb", "csv_monitor", "comet", "trackio")}
+    monitor_dict = {
+        key: param_dict.get(key, {})
+        for key in ("tensorboard", "wandb", "csv_monitor", "comet", "trackio")
+    }
     return DeepSpeedMonitorConfig(**monitor_dict)
 
 

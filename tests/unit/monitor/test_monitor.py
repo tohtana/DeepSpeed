@@ -8,6 +8,7 @@ from deepspeed.monitor.wandb import WandbMonitor
 from deepspeed.monitor.csv_monitor import csvMonitor
 from deepspeed.monitor.config import DeepSpeedMonitorConfig
 from deepspeed.monitor.comet import CometMonitor
+from deepspeed.monitor.trackio import TrackioMonitor
 
 from unit.common import DistributedTest
 from unittest.mock import Mock, patch
@@ -164,3 +165,41 @@ class TestCometMonitor(DistributedTest):
         assert comet_monitor.enabled == defaults.enabled
         assert comet_monitor.samples_log_interval == defaults.samples_log_interval
         mock_start.assert_not_called()
+
+
+class TestTrackioMonitor(DistributedTest):
+    world_size = 2
+
+    def test_trackio_monitor(self):
+        mock_trackio = Mock()
+
+        config_dict = {"train_batch_size": 2, "trackio": {"enabled": True, "project": "my_project"}}
+        ds_config = DeepSpeedConfig(config_dict)
+
+        with patch.dict("sys.modules", {"trackio": mock_trackio}):
+            trackio_monitor = TrackioMonitor(ds_config.monitor_config.trackio)
+            trackio_monitor.write_events([("loss", 0.123, 7)])
+
+        assert trackio_monitor.enabled is True
+        assert trackio_monitor.project == "my_project"
+
+        if dist.get_rank() == 0:
+            mock_trackio.init.assert_called_once_with(project="my_project")
+            mock_trackio.log.assert_called_once_with({"loss": 0.123}, step=7)
+        else:
+            mock_trackio.init.assert_not_called()
+            mock_trackio.log.assert_not_called()
+
+    def test_empty_trackio(self):
+        mock_trackio = Mock()
+
+        config_dict = {"train_batch_size": 2, "trackio": {}}
+        ds_config = DeepSpeedConfig(config_dict)
+
+        with patch.dict("sys.modules", {"trackio": mock_trackio}):
+            trackio_monitor = TrackioMonitor(ds_config.monitor_config.trackio)
+
+        defaults = DeepSpeedMonitorConfig().trackio
+        assert trackio_monitor.enabled == defaults.enabled
+        assert trackio_monitor.project == defaults.project
+        mock_trackio.init.assert_not_called()

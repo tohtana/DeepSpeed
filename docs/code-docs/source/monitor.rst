@@ -2,8 +2,8 @@ Monitoring
 ==========
 
 Deepspeed’s Monitor module can log training details into a
-Tensorboard-compatible file, to WandB, or to simple CSV files. Below is an
-overview of what DeepSpeed will log automatically.
+Tensorboard-compatible file, to WandB, Trackio, or to simple CSV files. Below is
+an overview of what DeepSpeed will log automatically.
 
 .. csv-table:: Automatically Logged Data
     :header: "Field", "Description", "Condition"
@@ -33,6 +33,11 @@ Comet
 -----
 .. _CometConfig:
 .. autopydantic_model:: deepspeed.monitor.config.CometConfig
+
+Trackio
+-------
+.. _TrackioConfig:
+.. autopydantic_model:: deepspeed.monitor.config.TrackioConfig
 
 CSV Monitor
 -----------

@@ -1639,6 +1639,23 @@ Example of <i>**comet**</i> configuration:
 }
 ```
 
+<i>**trackio**</i>: [dictionary]
+
+| Fields | Value | Default |
+| ------ | ----- | ------- |
+| enabled | Whether logging to [Trackio](https://github.com/huggingface/trackio) is enabled. | `false` |
+| project | Name for the Trackio project. | `deepspeed` |
+
+
+Example of <i>**trackio**</i> configuration:
+
+```json
+"trackio": {
+    "enabled": true,
+    "project": "my_project"
+}
+```
+
 <i>**csv_monitor**</i>: [dictionary]
 
 | Fields | Value                                                                                                                                                                                                                                                                                                        |Default |
