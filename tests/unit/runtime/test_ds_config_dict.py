@@ -9,10 +9,12 @@ import pytest
 import json
 import hjson
 import argparse
+import logging
 import torch
 
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils.logging import logger, set_log_level_from_string
 
 from unit.common import DistributedTest, get_test_path
 from unit.simple_model import SimpleModel, create_config_from_dict, random_dataloader
@@ -154,6 +156,28 @@ def test_get_bfloat16_enabled(bf16_key):
         },
     }
     assert get_bfloat16_config(cfg).enabled == True
+
+
+def test_log_level_defaults_to_current_logger_level():
+    original_level = logger.level
+    original_handler_levels = [handler.level for handler in logger.handlers]
+    try:
+        set_log_level_from_string("debug")
+        cfg = DeepSpeedConfig({"train_batch_size": 1})
+        assert cfg.log_level is None
+        if cfg.log_level is not None:
+            set_log_level_from_string(cfg.log_level)
+        assert logger.level == logging.DEBUG
+        assert all(handler.level == logging.DEBUG for handler in logger.handlers)
+    finally:
+        logger.setLevel(original_level)
+        for handler, level in zip(logger.handlers, original_handler_levels):
+            handler.setLevel(level)
+
+
+def test_log_level_config_value_is_preserved():
+    cfg = DeepSpeedConfig({"train_batch_size": 1, "log_level": "error"})
+    assert cfg.log_level == "error"
 
 
 class TestConfigLoad(DistributedTest):
