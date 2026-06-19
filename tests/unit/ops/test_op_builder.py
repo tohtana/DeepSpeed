@@ -6,6 +6,7 @@
 import os
 import sys
 import subprocess
+import textwrap
 import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -234,6 +235,22 @@ def test_cuda_capability_major_skips_probe_when_context_not_initialized():
     get_device_properties.assert_not_called()
 
 
+def test_cuda_available_without_side_effects_skips_when_context_not_initialized():
+    builder = make_builder()
+    with patch.object(CUDA_API, "is_initialized", return_value=False):
+        with patch.object(CUDA_API, "is_available", side_effect=AssertionError("must not probe CUDA availability")):
+            assert builder.cuda_available_without_side_effects() is False
+
+
+def test_cuda_available_without_side_effects_checks_when_context_initialized():
+    builder = make_builder()
+    with patch.object(CUDA_API, "is_initialized", return_value=True):
+        with patch.object(CUDA_API, "_is_in_bad_fork", return_value=False):
+            with patch.object(CUDA_API, "is_available", return_value=True) as is_available:
+                assert builder.cuda_available_without_side_effects() is True
+    is_available.assert_called_once_with()
+
+
 def test_cuda_capability_major_probes_when_context_already_initialized():
     # When a CUDA context already exists (e.g. at op load time), probing is safe
     # and must report the real compute-capability major.
@@ -271,7 +288,63 @@ def test_import_deepspeed_does_not_initialize_cuda():
         "import torch, deepspeed; "
         "assert not torch.cuda.is_initialized(), "  #ignore-cuda
         "'import deepspeed initialized a CUDA context (issue #7918)'")
-    result = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True, timeout=60)
+    if "ModuleNotFoundError" in result.stderr:
+        pytest.skip("deepspeed/torch not importable in a subprocess in this environment")
+    assert result.returncode == 0, result.stderr
+
+
+def test_import_deepspeed_allows_forked_child_to_initialize_cuda():
+    check = textwrap.dedent("""
+        import multiprocessing as mp
+        import queue
+        import sys
+        import traceback
+
+        import deepspeed  # noqa: F401
+
+        def child_main(result_queue):
+            import torch
+
+            try:
+                torch.cuda.current_device()  #ignore-cuda
+                result_queue.put(("ok", ""))
+            except Exception:
+                result_queue.put(("error", traceback.format_exc()))
+
+        if __name__ == "__main__":
+            ctx = mp.get_context("fork")
+            result_queue = ctx.Queue()
+            process = ctx.Process(target=child_main, args=(result_queue,))
+            process.start()
+            process.join(30)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+                print("forked child timed out", file=sys.stderr)
+                raise SystemExit(2)
+            try:
+                status, payload = result_queue.get(timeout=5)
+            except queue.Empty:
+                print(f"forked child exited without a result; exitcode={process.exitcode}", file=sys.stderr)
+                raise SystemExit(3)
+            if status == "ok" and process.exitcode == 0:
+                raise SystemExit(0)
+            no_cuda_markers = (
+                "Found no NVIDIA driver",
+                "Torch not compiled with CUDA enabled",
+                "CUDA driver version is insufficient",
+                "CUDA-capable device",
+            )
+            if any(marker in payload for marker in no_cuda_markers):
+                print(payload, file=sys.stderr)
+                raise SystemExit(77)
+            print(payload, file=sys.stderr)
+            raise SystemExit(1)
+    """)
+    result = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True, timeout=90)
+    if result.returncode == 77:
+        pytest.skip("CUDA is not available in this subprocess environment")
     if "ModuleNotFoundError" in result.stderr:
         pytest.skip("deepspeed/torch not importable in a subprocess in this environment")
     assert result.returncode == 0, result.stderr

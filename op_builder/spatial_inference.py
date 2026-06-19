@@ -28,9 +28,9 @@ class SpatialInferenceBuilder(CUDAOpBuilder):
 
         cuda_okay = True
         if not os.environ.get("DS_IGNORE_CUDA_DETECTION"):
-            if not self.is_rocm_pytorch() and torch.cuda.is_available():
+            if not self.is_rocm_pytorch() and self.cuda_available_without_side_effects():
                 sys_cuda_major, _ = installed_cuda_version()
-                torch_cuda_major = int(torch.version.cuda.split('.')[0])
+                torch_cuda_major = int(torch.version.cuda.split('.')[0])  #ignore-cuda
                 cuda_capability = self.cuda_capability_major()
                 if cuda_capability is not None and cuda_capability >= 8:
                     if torch_cuda_major < 11 or sys_cuda_major < 11:

@@ -614,6 +614,14 @@ class OpBuilder(ABC):
 
 class CUDAOpBuilder(OpBuilder):
 
+    def cuda_available_without_side_effects(self):
+        """Return whether CUDA is available only when that can be checked safely."""
+        if not torch.cuda.is_initialized():
+            return False
+        if hasattr(torch.cuda, '_is_in_bad_fork') and torch.cuda._is_in_bad_fork():
+            return False
+        return torch.cuda.is_available()
+
     def cuda_capability_major(self):
         """Compute-capability major of CUDA device 0, or ``None`` when it cannot
         be read without side effects.
