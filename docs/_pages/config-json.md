@@ -1553,9 +1553,11 @@ DeepSpeed Data Efficiency Library includes two techniques: curriculum learning a
 **Note:** Logging to WandB requires that the `wandb` package is installed (read more in the [WandB documentation](https://docs.wandb.ai/quickstart)).
 {: .notice--warning}
 **Note:** Logging to Comet requires that the `comet_ml` package is installed (read more in the [Comet documentation](https://www.comet.com/docs/v2/guides/quickstart/#1-install-and-configure-the-comet-ml-sdk)).
+
+**Note:** Logging to Trackio requires that the `trackio` package is installed (read more in the [Trackio documentation](https://github.com/huggingface/trackio)).
 {: .notice--warning}
 
-Deepspeed's Monitor module can log training details into a [Tensorboard](https://www.tensorflow.org/tensorboard)-compatible file, to [WandB](https://wandb.ai/site), to [Comet](https://www.comet.com/site/?utm_source=deepseed&utm_medium=docs&utm_content=docs) or to simple CSV files. Below is an overview of what DeepSpeed will log automatically.
+Deepspeed's Monitor module can log training details into a [Tensorboard](https://www.tensorflow.org/tensorboard)-compatible file, to [WandB](https://wandb.ai/site), to [Comet](https://www.comet.com/site/?utm_source=deepseed&utm_medium=docs&utm_content=docs), to [Trackio](https://github.com/huggingface/trackio), or to simple CSV files. Below is an overview of what DeepSpeed will log automatically.
 
 | Field | Description                                                                                                                                                                                                                                                                                               |Conditions |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----- |
@@ -1636,6 +1638,23 @@ Example of <i>**comet**</i> configuration:
     "experiment_key": "0c4a1c4a90664f2a8084e600b19a9d7",
     "online": false,
     "mode": "get",
+}
+```
+
+<i>**trackio**</i>: [dictionary]
+
+| Fields | Value | Default |
+| ------ | ----- | ------- |
+| enabled | Whether logging to [Trackio](https://github.com/huggingface/trackio) is enabled. | `false` |
+| project | Name for the Trackio project. | `deepspeed` |
+
+
+Example of <i>**trackio**</i> configuration:
+
+```json
+"trackio": {
+    "enabled": true,
+    "project": "my_project"
 }
 ```
 
