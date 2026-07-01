@@ -86,8 +86,15 @@ def unpatch_compiled_func():
     enabled_patched_func = False
 
     global original_grad_fn
-    torch.autograd.Function = original_grad_fn
+    if original_grad_fn is not None:
+        torch.autograd.Function = original_grad_fn
+        original_grad_fn = None
+    clear_backward_inputs()
 
 
 def get_backward_inputs():
     return backward_inputs
+
+
+def clear_backward_inputs():
+    backward_inputs.clear()

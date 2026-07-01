@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import torch
+
 import deepspeed.compile.inductor as inductor
 
 
@@ -139,3 +141,56 @@ def test_torchxla_openxla_shape_passes_through_unchanged(monkeypatch):
     assert result["compiler_calls"] == []
     assert result["partition_calls"] == []
     assert kwargs == original_kwargs
+
+
+def test_deepcompile_z3_inductor_config_patch_disables_persistent_mixed_reductions():
+    config = torch._inductor.config
+    triton_config = config.triton
+    original_persistent = triton_config.persistent_reductions
+    original_mix_order = triton_config.mix_order_reduction
+
+    with inductor.deepcompile_z3_inductor_config_patch(enabled=True):
+        assert triton_config.persistent_reductions is False
+        assert triton_config.mix_order_reduction is False
+
+    assert triton_config.persistent_reductions is original_persistent
+    assert triton_config.mix_order_reduction is original_mix_order
+
+    with inductor.deepcompile_z3_inductor_config_patch(enabled=False):
+        assert triton_config.persistent_reductions is original_persistent
+        assert triton_config.mix_order_reduction is original_mix_order
+
+
+def test_patch_compiler_applies_z3_inductor_config_during_original_compile(monkeypatch):
+    events = []
+
+    class ConfigContext:
+
+        def __init__(self, enabled):
+            self.enabled = enabled
+
+        def __enter__(self):
+            events.append(("enter", self.enabled))
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit", self.enabled))
+
+    monkeypatch.setattr(inductor, "deepcompile_z3_inductor_config_patch", lambda enabled: ConfigContext(enabled))
+
+    class ParamManager:
+        param_names = []
+
+    def original_compiler(gm, inputs):
+        events.append(("compile", tuple(inputs)))
+        return "compiled"
+
+    gm = torch.fx.symbolic_trace(lambda: torch.ones(()))
+    wrapped = inductor.patch_compiler(original_compiler,
+                                      dc_compiler=lambda gm, inputs: gm.graph,
+                                      z3_partition=True,
+                                      graph_id=7,
+                                      graph_param_manager={7: ParamManager()},
+                                      bwd=False)
+
+    assert wrapped(gm, ()) == "compiled"
+    assert events == [("enter", True), ("compile", ()), ("exit", True)]

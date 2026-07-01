@@ -21,6 +21,27 @@ WARMUP = 5
 _MISSING = object()
 
 
+def _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs):
+    """Allow ZeRO-3 partitioned parameters to change between shard and gathered shapes."""
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        try:
+            import torch._dynamo as dynamo
+        except ImportError:
+            return False
+
+    dynamo_config = getattr(dynamo, "config", None)
+    if dynamo_config is None:
+        return False
+
+    changed = False
+    for config_name in ("force_parameter_static_shapes", "force_nn_module_property_static_shapes"):
+        if hasattr(dynamo_config, config_name):
+            setattr(dynamo_config, config_name, False)
+            changed = True
+    return changed
+
+
 def _resolve_expected_grad_dtype(param):
     # Match PyTorch's leaf grad accumulation contract. grad_dtype can be a
     # dtype, or None to allow any incoming gradient dtype:
@@ -106,5 +127,6 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
+    _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
 
     return make_backend(backend, compile_config, compile_kwargs=compile_kwargs)

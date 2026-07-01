@@ -16,6 +16,7 @@ from deepspeed.compile import inductor as inductor_mod
 from deepspeed.compile import list_schedule as schedule_mod
 from deepspeed.compile.passes import prefetch as prefetch_mod
 from deepspeed.compile.passes import selective_gather as selective_gather_mod
+from deepspeed.compile.passes import zero3_compile as zero3_compile_mod
 from deepspeed.compile.profilers import ProfilingResult
 from deepspeed.compile.profilers.graph_profile import _backfill_missing_profile_metadata, is_profile_incomplete
 
@@ -92,13 +93,333 @@ def test_sync_memory_profile_complete_reduces_asymmetric_failure(monkeypatch):
     assert not backend_mod._sync_memory_profile_complete(True)
 
 
-def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1):
-    return _with_meta(
+def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 2000
+
+        def memory_allocated(self):
+            return 50
+
+    def reduce_budget_inputs(tensor, op):
+        if op == zero3_compile_mod.dist.ReduceOp.MIN:
+            tensor[0] = 1000
+        elif op == zero3_compile_mod.dist.ReduceOp.MAX:
+            tensor[0] = 850
+        else:
+            raise AssertionError(f"unexpected reduce op {op}")
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
+
+    graph = Graph()
+    param = _placeholder(graph, "budget_builder_param")
+    ag = _allgather(graph, param, 1, "budget_builder", tensor_size=200)
+    wait = _wait(graph, ag, 1, "budget_builder")
+    op = _neg(graph, wait, "budget_builder_op")
+    op.meta["max_mem"] = 800
+    release = _release(graph, op, 1, "budget_builder")
+    graph.output((release, ))
+    graph.lint()
+    for node in graph.nodes:
+        node.meta.setdefault("max_mem", 0)
+
+    budget = zero3_compile_mod._build_scheduler_budget_from_operator_profile(graph)
+
+    assert budget.source == "profiled_non_gathered_peak_memory"
+    assert budget.total_mem == 1000
+    assert budget.profiled_non_gathered_peak_mem == 850
+    assert budget.safety_margin == 100
+    assert budget.max_gathered_bytes == 50
+
+
+def test_zero3_scheduler_budget_skips_incomplete_operator_profile_metadata():
+    graph = Graph()
+    graph.output(())
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+
+    budget = zero3_compile_mod._build_scheduler_budget_from_operator_profile(graph)
+
+    assert budget is None
+
+
+def test_zero3_scheduler_budget_skips_incomplete_operator_profile(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator",
+                        lambda: SimpleNamespace(current_device=lambda: "cpu", available_memory=lambda: 0))
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+    graph = Graph()
+    graph.output(())
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert budget is None
+    assert disabled_reason == "incomplete_operator_profile"
+
+
+def test_zero3_scheduler_budget_uses_available_memory_when_operator_profile_incomplete(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def available_memory(self):
+            return 500
+
+    def reduce_budget_inputs(tensor, op):
+        assert op == zero3_compile_mod.dist.ReduceOp.MIN
+        if tensor.dtype == torch.int64:
+            tensor[0] = 400
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
+
+    graph = Graph()
+    param = _placeholder(graph, "incomplete_profile_param")
+    ag = _allgather(graph, param, 1, "incomplete_profile", tensor_size=800)
+    wait = _wait(graph, ag, 1, "incomplete_profile")
+    graph.output((wait, ))
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert disabled_reason is None
+    assert budget.source == "available_memory"
+    assert budget.available_mem == 400
+    assert budget.safety_margin == 40
+    assert budget.max_gathered_bytes == 360
+    assert ag.meta["allgather_allocation_bytes"] == 800
+
+
+def test_zero3_scheduler_budget_caps_incomplete_profile_to_single_allgather(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def available_memory(self):
+            return 5000
+
+    def reduce_budget_inputs(tensor, op):
+        assert op == zero3_compile_mod.dist.ReduceOp.MIN
+        if tensor.dtype == torch.int64:
+            tensor[0] = 5000
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
+
+    graph = Graph()
+    lhs = _placeholder(graph, "capped_incomplete_profile_lhs")
+    rhs = _placeholder(graph, "capped_incomplete_profile_rhs")
+    ag1 = _allgather(graph, lhs, 1, "capped_incomplete_profile_lhs", tensor_size=800)
+    ag2 = _allgather(graph, rhs, 2, "capped_incomplete_profile_rhs", tensor_size=600)
+    wait1 = _wait(graph, ag1, 1, "capped_incomplete_profile_lhs")
+    wait2 = _wait(graph, ag2, 2, "capped_incomplete_profile_rhs")
+    use = _add(graph, wait1, wait2, "capped_incomplete_profile_use")
+    graph.output((use, ))
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert disabled_reason is None
+    assert budget.source == "available_memory_single_allgather_cap"
+    assert budget.max_gathered_bytes == 800
+    assert zero3_compile_mod.max_possible_gathered_bytes(graph) == 1400
+
+
+def test_zero3_scheduler_budget_uses_partial_operator_profile_when_incomplete(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1000
+
+        def memory_allocated(self):
+            return 50
+
+        def available_memory(self):
+            return 500
+
+    def reduce_budget_inputs(tensor, op):
+        if tensor.dtype == torch.int32:
+            tensor[0] = 0
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
+
+    graph = Graph()
+    param = _placeholder(graph, "partial_budget_param")
+    ag = _allgather(graph, param, 1, "partial_budget", tensor_size=800)
+    wait = _wait(graph, ag, 1, "partial_budget")
+    op = _neg(graph, wait, "partial_budget_observed_op")
+    op.meta["max_mem"] = 800
+    release = _release(graph, op, 1, "partial_budget")
+    graph.output((release, ))
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert disabled_reason is None
+    assert budget.source == "profiled_non_gathered_peak_memory"
+    assert budget.total_mem == 1000
+    assert budget.profiled_non_gathered_peak_mem == 850
+    assert budget.max_gathered_bytes == 50
+
+
+def test_zero3_scheduler_budget_skips_non_distributed_memory_profile(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: False)
+    graph = Graph()
+    graph.output(())
+    graph.lint()
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert budget is None
+    assert disabled_reason == "non_distributed"
+
+
+def test_zero3_scheduler_budget_skips_when_budget_cannot_constrain(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 2000
+
+        def memory_allocated(self):
+            return 50
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+
+    graph = Graph()
+    param = _placeholder(graph, "nonbinding_budget_param")
+    ag = _allgather(graph, param, 1, "nonbinding_budget", tensor_size=200)
+    wait = _wait(graph, ag, 1, "nonbinding_budget")
+    op = _neg(graph, wait, "nonbinding_budget_op")
+    op.meta["max_mem"] = 800
+    release = _release(graph, op, 1, "nonbinding_budget")
+    graph.output((release, ))
+    graph.lint()
+    for node in graph.nodes:
+        node.meta.setdefault("max_mem", 0)
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
+
+    assert budget is None
+    assert disabled_reason == "budget_not_constraining"
+
+
+def test_profiled_non_gathered_peak_subtracts_live_gathered_residency():
+    graph = Graph()
+    param = _placeholder(graph, "nongathered_peak_param")
+    ag = _allgather(graph, param, 2, "nongathered_peak", tensor_size=200)
+    wait = _wait(graph, ag, 2, "nongathered_peak")
+    release = _release(graph, wait, 2, "nongathered_peak")
+    graph.output((release, ))
+    graph.lint()
+
+    assert schedule_mod.profiled_non_gathered_peak(graph, [(ag.name, 900, 0, 900), (wait.name, 950, 0, 950),
+                                                           (release.name, 920, 0, 920)]) == 750
+
+
+def test_zero3_stamps_padded_allgather_allocation_metadata(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 8)
+    graph = Graph()
+
+    param = _placeholder(graph, "metadata_padded_param")
+    ag = _allgather(graph, param, 3, "metadata_padded", tensor_size=102)
+    wait = _wait(graph, ag, 3, "metadata_padded")
+    release = _release(graph, wait, 3, "metadata_padded")
+    graph.output((release, ))
+    graph.lint()
+
+    zero3_compile_mod._set_allgather_allocation_metadata(graph)
+
+    assert ag.meta["allgather_allocation_bytes"] == 112
+
+
+def test_zero3_stamps_replicated_param_allgather_allocation_metadata():
+    graph = Graph()
+
+    param = _placeholder(graph, "replicated_metadata_param")
+    param.meta["val"] = torch.empty((8, ), dtype=torch.float16)
+    use = _neg(graph, param, "replicated_metadata_use")
+    graph.output((use, ))
+    graph.lint()
+
+    param_manager = SimpleNamespace(params={param.name: SimpleNamespace(dtype=torch.bfloat16, numel=777)},
+                                    ds_ids={param.name: 3})
+
+    zero3_compile_mod.add_gather_and_release(0, graph, param_manager, [param])
+
+    ag_nodes = [node for node in graph.nodes if node.target == torch.ops.dc.allgather_param.default]
+    assert len(ag_nodes) == 1
+    assert ag_nodes[0].meta["allgather_allocation_bytes"] == 1554
+
+
+def test_zero3_scheduler_debug_logs_disabled_budget(monkeypatch, capsys):
+    monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: False)
+    graph = Graph()
+    graph.output(())
+    graph.lint()
+
+    zero3_compile_mod._log_scheduler_result(7,
+                                            bwd=True,
+                                            scheduler_budget=None,
+                                            disabled_reason="missing_or_incomplete_memory_profile",
+                                            graph=graph)
+
+    captured = capsys.readouterr()
+    assert "budget_enabled=False" in captured.out
+    assert "disabled_reason=missing_or_incomplete_memory_profile" in captured.out
+
+
+def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1, allocation_size=None):
+    node = _with_meta(
         graph.call_function(torch.ops.dc.allgather_param.default, (arg, 0, ds_id), {"dtype": torch.float16},
                             name=f"allgather_ds_param_{name}_{ds_id}"),
         tensor_size=tensor_size,
         device_time=device_time,
     )
+    if allocation_size is not None:
+        node.meta["allgather_allocation_bytes"] = allocation_size
+    return node
 
 
 def _wait(graph, arg, ds_id, name):
@@ -115,14 +436,28 @@ def _add(graph, lhs, rhs, name, device_time=0):
     return _with_meta(graph.call_function(operator.add, (lhs, rhs), name=name), device_time=device_time)
 
 
-def _release(graph, arg, ds_id, name):
+def _release(graph, arg, ds_id, name, n_users=1):
     return _with_meta(
-        graph.call_function(torch.ops.dc.release_param.default, (arg, 0, ds_id, 1),
+        graph.call_function(torch.ops.dc.release_param.default, (arg, 0, ds_id, n_users),
                             name=f"release_ds_param_{name}_{ds_id}"))
 
 
-def _scheduled_names(graph):
-    return [node.name for node in schedule_mod.fast_free_schedule(graph, 0, 0, debug_log=True).nodes]
+def _scheduled_graph(graph, scheduler_budget=None):
+    return schedule_mod.fast_free_schedule(
+        graph,
+        0,
+        0,
+        debug_log=True,
+        scheduler_budget=scheduler_budget,
+    )
+
+
+def _scheduled_names(graph, scheduler_budget=None):
+    return [node.name for node in _scheduled_graph(graph, scheduler_budget=scheduler_budget).nodes]
+
+
+def _scheduler_diagnostics(graph):
+    return getattr(graph, schedule_mod.SCHEDULER_BUDGET_DIAGNOSTICS_ATTR)
 
 
 def test_fast_free_schedule_keeps_zero_free_acc_filter():
@@ -215,6 +550,178 @@ def test_fast_free_schedule_uses_pressure_tiebreaker_in_fallback_bucket():
     names = _scheduled_names(graph)
 
     assert names.index(low_ag.name) < names.index(high_ag.name)
+
+
+def test_fast_free_schedule_counts_live_gathered_bytes_when_filtering_candidates():
+    graph = Graph()
+
+    first_param = _placeholder(graph, "budget_first_param")
+    high_param = _placeholder(graph, "budget_high_param")
+    low_param = _placeholder(graph, "budget_low_param")
+
+    first_ag = _allgather(graph, first_param, 80, "budget_first", tensor_size=70)
+    first_wait = _wait(graph, first_ag, 80, "budget_first")
+
+    high_dep = _add(graph, high_param, first_wait, "budget_high_dep")
+    high_ag = _allgather(graph, high_dep, 81, "budget_high", tensor_size=40)
+    high_wait = _wait(graph, high_ag, 81, "budget_high")
+    high_use = _neg(graph, high_wait, "budget_high_use", device_time=1)
+    high_release = _release(graph, high_use, 81, "budget_high")
+
+    low_dep = _add(graph, low_param, first_wait, "budget_low_dep")
+    low_ag = _allgather(graph, low_dep, 82, "budget_low", tensor_size=20)
+    low_wait = _wait(graph, low_ag, 82, "budget_low")
+    low_use = _neg(graph, low_wait, "budget_low_use", device_time=100)
+    low_release = _release(graph, low_use, 82, "budget_low")
+
+    high_low_pair = _add(graph, high_wait, low_wait, "budget_high_low_pair")
+    first_use = _add(graph, first_wait, high_low_pair, "budget_first_use")
+    first_release = _release(graph, first_use, 80, "budget_first")
+
+    graph.output((first_release, high_release, low_release))
+    graph.lint()
+
+    no_budget_names = _scheduled_names(graph)
+    assert no_budget_names.index(high_ag.name) < no_budget_names.index(low_ag.name)
+
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=100, source="test")
+    scheduled_graph = _scheduled_graph(graph, scheduler_budget=budget)
+    names = [node.name for node in scheduled_graph.nodes]
+    diagnostics = _scheduler_diagnostics(scheduled_graph)
+
+    assert names.index(first_ag.name) < names.index(low_ag.name)
+    assert names.index(low_ag.name) < names.index(high_ag.name)
+    assert diagnostics["budget_rejections"] > 0
+    assert any(record["node"] == high_ag.name for record in diagnostics["budget_rejected_candidates"])
+
+
+def test_fast_free_schedule_continues_to_higher_count_candidates_when_lowest_count_exceeds_budget():
+    graph = Graph()
+
+    first_param = _placeholder(graph, "budget_count_first_param")
+    high_param = _placeholder(graph, "budget_count_high_param")
+    low_param = _placeholder(graph, "budget_count_low_param")
+    extra_param = _placeholder(graph, "budget_count_extra_param")
+
+    first_ag = _allgather(graph, first_param, 100, "budget_count_first", tensor_size=70)
+    first_wait = _wait(graph, first_ag, 100, "budget_count_first")
+
+    high_dep = _add(graph, high_param, first_wait, "budget_count_high_dep")
+    high_ag = _allgather(graph, high_dep, 101, "budget_count_high", tensor_size=60)
+    high_wait = _wait(graph, high_ag, 101, "budget_count_high")
+    high_use = _neg(graph, high_wait, "budget_count_high_use")
+    high_release = _release(graph, high_use, 101, "budget_count_high")
+
+    low_dep = _add(graph, low_param, first_wait, "budget_count_low_dep")
+    low_ag = _allgather(graph, low_dep, 102, "budget_count_low", tensor_size=20)
+    low_wait = _wait(graph, low_ag, 102, "budget_count_low")
+    extra_dep = _add(graph, extra_param, low_wait, "budget_count_extra_dep")
+    extra_ag = _allgather(graph, extra_dep, 103, "budget_count_extra", tensor_size=20)
+    extra_wait = _wait(graph, extra_ag, 103, "budget_count_extra")
+    low_use = _add(graph, low_wait, extra_wait, "budget_count_low_use")
+    low_release = _release(graph, low_use, 102, "budget_count_low")
+    extra_release = _release(graph, low_use, 103, "budget_count_extra")
+
+    first_use = _add(graph, first_wait, low_wait, "budget_count_first_use")
+    first_release = _release(graph, first_use, 100, "budget_count_first")
+
+    graph.output((first_release, high_release, low_release, extra_release))
+    graph.lint()
+
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=120, source="test")
+    names = _scheduled_names(graph, scheduler_budget=budget)
+
+    assert names.index(low_ag.name) < names.index(high_ag.name)
+
+
+def test_fast_free_schedule_counts_padded_allgather_allocation_bytes():
+    graph = Graph()
+
+    param = _placeholder(graph, "budget_padded_param")
+    ag = _allgather(graph, param, 110, "budget_padded", tensor_size=102, allocation_size=112)
+    wait = _wait(graph, ag, 110, "budget_padded")
+    use = _neg(graph, wait, "budget_padded_use")
+    release = _release(graph, use, 110, "budget_padded")
+
+    graph.output((release, ))
+    graph.lint()
+
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=105, source="test")
+    scheduled_graph = _scheduled_graph(graph, scheduler_budget=budget)
+    diagnostics = _scheduler_diagnostics(scheduled_graph)
+
+    assert diagnostics["budget_overflows"][0]["candidate_allgather_bytes"] == 112
+    assert diagnostics["budget_overflows"][0]["over_budget_bytes"] == 7
+    assert diagnostics["budget_overflows"][0]["path"] == "until_free"
+
+
+def test_fast_free_schedule_records_diagnostic_when_no_candidate_fits_budget():
+    graph = Graph()
+
+    first_param = _placeholder(graph, "budget_fail_first_param")
+    high_param = _placeholder(graph, "budget_fail_high_param")
+    low_param = _placeholder(graph, "budget_fail_low_param")
+
+    first_ag = _allgather(graph, first_param, 90, "budget_fail_first", tensor_size=80)
+    first_wait = _wait(graph, first_ag, 90, "budget_fail_first")
+
+    high_dep = _add(graph, high_param, first_wait, "budget_fail_high_dep")
+    high_ag = _allgather(graph, high_dep, 91, "budget_fail_high", tensor_size=40)
+    high_wait = _wait(graph, high_ag, 91, "budget_fail_high")
+    high_use = _neg(graph, high_wait, "budget_fail_high_use", device_time=1)
+    high_release = _release(graph, high_use, 91, "budget_fail_high")
+
+    low_dep = _add(graph, low_param, first_wait, "budget_fail_low_dep")
+    low_ag = _allgather(graph, low_dep, 92, "budget_fail_low", tensor_size=30)
+    low_wait = _wait(graph, low_ag, 92, "budget_fail_low")
+    low_use = _neg(graph, low_wait, "budget_fail_low_use", device_time=100)
+    low_release = _release(graph, low_use, 92, "budget_fail_low", n_users=2)
+
+    first_use = _add(graph, first_wait, low_wait, "budget_fail_first_use")
+    first_release = _release(graph, first_use, 90, "budget_fail_first")
+    low_last_release = _release(graph, first_use, 92, "budget_fail_low_last", n_users=2)
+
+    graph.output((first_release, high_release, low_release, low_last_release))
+    graph.lint()
+
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=100, source="test")
+    scheduled_graph = _scheduled_graph(graph, scheduler_budget=budget)
+    names = [node.name for node in scheduled_graph.nodes]
+    diagnostics = _scheduler_diagnostics(scheduled_graph)
+
+    assert names.index(first_ag.name) < names.index(low_ag.name)
+    assert diagnostics["budget_rejections"] > 0
+    assert diagnostics["budget_overflows"][0]["source"] == "test"
+    assert diagnostics["budget_overflows"][0]["max_gathered_bytes"] == 100
+    assert diagnostics["budget_overflows"][0]["over_budget_bytes"] > 0
+
+
+def test_fast_free_schedule_over_budget_fallback_prefers_lower_live_memory():
+    graph = Graph()
+
+    first_param = _placeholder(graph, "budget_debt_first_param")
+    helper_param = _placeholder(graph, "budget_debt_helper_param")
+
+    first_ag = _allgather(graph, first_param, 120, "budget_debt_first", tensor_size=80)
+    first_wait = _wait(graph, first_ag, 120, "budget_debt_first")
+    helper_dep = _add(graph, helper_param, first_wait, "budget_debt_helper_dep")
+    helper_ag = _allgather(graph, helper_dep, 121, "budget_debt_helper", tensor_size=30)
+    helper_wait = _wait(graph, helper_ag, 121, "budget_debt_helper")
+    use = _add(graph, first_wait, helper_wait, "budget_debt_use")
+    first_release = _release(graph, use, 120, "budget_debt_first")
+    helper_release = _release(graph, use, 121, "budget_debt_helper")
+
+    graph.output((first_release, helper_release))
+    graph.lint()
+
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=50, source="test")
+    scheduled_graph = _scheduled_graph(graph, scheduler_budget=budget)
+    diagnostics = _scheduler_diagnostics(scheduled_graph)
+    first_selection = diagnostics["selected"][0]
+
+    assert first_selection["path"] == "until_free"
+    assert first_selection["live_gathered_bytes"] < first_selection["schedule_until_ag_live_mem"]
+    assert diagnostics["budget_overflows"][0]["path"] == "until_free"
 
 
 def test_fast_free_schedule_keeps_single_allgather_release_order():

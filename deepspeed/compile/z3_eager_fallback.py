@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 from contextlib import contextmanager
+import sys
 
 import torch
 
@@ -25,6 +26,15 @@ def record_z3_eager_fallback_param(param):
     return True
 
 
+def is_dynamo_guard_evaluation():
+    frame = sys._getframe()
+    while frame is not None:
+        if frame.f_globals.get("__name__") == "torch._dynamo.guards":
+            return True
+        frame = frame.f_back
+    return False
+
+
 @contextmanager
 def deepcompile_z3_forward_context(engine):
     fallback = getattr(engine, "_deepcompile_z3_eager_fallback", None)
@@ -44,6 +54,8 @@ class DeepCompileZ3EagerFallback:
         self._tracked_params = {}
         self._last_gathered_param_ids = []
         self._last_released_param_ids = []
+        self._last_guard_suppressed_param_ids = []
+        self._last_pre_forward_released_param_ids = []
         self.total_gathered_params = 0
 
     @contextmanager
@@ -53,6 +65,9 @@ class DeepCompileZ3EagerFallback:
         self._depth += 1
         if self._depth == 1:
             self._last_gathered_param_ids = []
+            self._last_guard_suppressed_param_ids = []
+            self._last_pre_forward_released_param_ids = []
+            self.release_available_params_for_next_forward()
             self._enable_forward_fallback()
         _ACTIVE_FALLBACK = self
         try:
@@ -79,6 +94,22 @@ class DeepCompileZ3EagerFallback:
         self._last_gathered_param_ids.append(ds_id)
         self.total_gathered_params += 1
 
+    def record_guard_suppressed_param(self, param):
+        self._last_guard_suppressed_param_ids.append(int(param.ds_id))
+
+    @torch.no_grad()
+    def release_available_params_for_next_forward(self):
+        if self.engine is None:
+            return
+
+        released = []
+        for param in self.engine.module.parameters():
+            if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
+                    and not getattr(param, "ds_persist", False)):
+                param.partition()
+                released.append(int(param.ds_id))
+        self._last_pre_forward_released_param_ids = released
+
     @torch.no_grad()
     def release_gathered_params(self):
         released = []
@@ -95,5 +126,7 @@ class DeepCompileZ3EagerFallback:
             "tracked_param_ids": sorted(self._tracked_params),
             "last_gathered_param_ids": list(self._last_gathered_param_ids),
             "last_released_param_ids": list(self._last_released_param_ids),
+            "last_guard_suppressed_param_ids": list(self._last_guard_suppressed_param_ids),
+            "last_pre_forward_released_param_ids": list(self._last_pre_forward_released_param_ids),
             "total_gathered_params": self.total_gathered_params,
         }

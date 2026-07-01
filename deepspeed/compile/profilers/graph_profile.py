@@ -91,6 +91,13 @@ def _backfill_missing_profile_metadata(graph: Graph, profile_complete: bool = Tr
             node.meta.setdefault(key, default)
 
 
+def _clear_interpreter_env(interpreter: Interpreter):
+    try:
+        interpreter.env.clear()
+    except Exception:
+        pass
+
+
 def _run_warmup_for_profile(call_fn, warmup):
     for _ in range(warmup):
         warmup_out = call_fn()
@@ -177,6 +184,7 @@ class ProfilingInterpreter(Interpreter):
                 try:
                     self.nz3.enable_profiling(False)
                 finally:
+                    _clear_interpreter_env(self)
                     _backfill_missing_profile_metadata(self.graph, profile_complete=profile_complete)
         return return_val
 
@@ -338,7 +346,10 @@ class MemoryProfilingInterpreter(Interpreter):
             try:
                 self.nz3.clear_all_gathered_params()
             finally:
-                self.nz3.enable_profiling(False)
+                try:
+                    self.nz3.enable_profiling(False)
+                finally:
+                    _clear_interpreter_env(self)
 
         return return_val
 
