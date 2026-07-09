@@ -279,12 +279,13 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
                 target_dtype = casted_dtype
 
         param = param_manager.params[pn.name]
-        add_allgather(graph_id,
-                      graph,
-                      pn,
-                      param_manager.ds_ids[pn.name],
-                      target_dtype,
-                      allgather_allocation_bytes=_param_allgather_allocation_bytes(param, target_dtype))
+        allgather_node = add_allgather(graph_id,
+                                       graph,
+                                       pn,
+                                       param_manager.ds_ids[pn.name],
+                                       target_dtype,
+                                       allgather_allocation_bytes=_param_allgather_allocation_bytes(
+                                           param, target_dtype))
         if fuse_typecast:
             users = node_to_uses[typecast_node]
             wait_node = typecast_node.args[0]
@@ -295,6 +296,12 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
             graph.erase_node(typecast_node)
         else:
             users = node_to_uses[pn]
+            if len(users) == 0:
+                output_node = get_output_node(graph)
+                wait_node = next(user for user in allgather_node.users
+                                 if user.target == torch.ops.dc.wait_allgather.default)
+                wait_node.meta["original_output_name"] = pn.name
+                output_node.replace_input_with(pn, wait_node)
 
         ds_id = param_manager.ds_ids[pn.name]
         for user in users:

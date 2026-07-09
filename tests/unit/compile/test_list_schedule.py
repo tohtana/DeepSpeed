@@ -93,6 +93,21 @@ def test_sync_memory_profile_complete_reduces_asymmetric_failure(monkeypatch):
     assert not backend_mod._sync_memory_profile_complete(True)
 
 
+def test_get_last_uses_handles_dead_no_copy_node():
+    graph = Graph()
+    param = _placeholder(graph, "dead_wait_param")
+    wait = _wait(graph, param, 1, "dead_wait")
+    graph.output(())
+    graph.lint()
+
+    node_to_last_use, user_to_last_uses = compile_util.get_last_uses(graph)
+    node_to_uses = compile_util.get_real_uses(graph)
+
+    assert node_to_last_use[param] is wait
+    assert user_to_last_uses[wait] == [param]
+    assert node_to_uses[param] == []
+
+
 def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch):
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
 
@@ -390,6 +405,33 @@ def test_zero3_stamps_replicated_param_allgather_allocation_metadata():
     ag_nodes = [node for node in graph.nodes if node.target == torch.ops.dc.allgather_param.default]
     assert len(ag_nodes) == 1
     assert ag_nodes[0].meta["allgather_allocation_bytes"] == 1554
+
+
+def test_zero3_gathers_output_only_param_for_backward_passthrough():
+    graph = Graph()
+
+    param = _placeholder(graph, "output_only_param")
+    param.meta["val"] = torch.empty((8, ), dtype=torch.float16)
+    graph.output((param, ))
+    graph.lint()
+
+    param_manager = SimpleNamespace(params={param.name: SimpleNamespace(dtype=torch.bfloat16, numel=777)},
+                                    ds_ids={param.name: 3})
+
+    new_graph = zero3_compile_mod.add_gather_and_release(0, graph, param_manager, [param])
+    new_graph.lint()
+
+    ag_nodes = [node for node in new_graph.nodes if node.target == torch.ops.dc.allgather_param.default]
+    wait_nodes = [node for node in new_graph.nodes if node.target == torch.ops.dc.wait_allgather.default]
+    release_nodes = [node for node in new_graph.nodes if node.target == torch.ops.dc.release_param.default]
+    output_node = next(node for node in new_graph.nodes if node.op == "output")
+
+    assert len(ag_nodes) == 1
+    assert len(wait_nodes) == 1
+    assert release_nodes == []
+    assert ag_nodes[0].args[0].name == param.name
+    assert wait_nodes[0].args[0] is ag_nodes[0]
+    assert output_node.args == ((wait_nodes[0], ), )
 
 
 def test_zero3_scheduler_debug_logs_disabled_budget(monkeypatch, capsys):

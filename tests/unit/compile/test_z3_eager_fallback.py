@@ -1,6 +1,8 @@
 # Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
+# DeepSpeed Team
+
 import torch
 from types import FunctionType
 
