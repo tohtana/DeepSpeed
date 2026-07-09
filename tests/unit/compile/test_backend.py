@@ -10,6 +10,7 @@ import torch
 from deepspeed.compile.backend import _get_fw_real_inputs, fwd_real_inputs, set_example_values_to_symints
 from deepspeed.compile import backend as backend_mod
 from deepspeed.compile.inductor import patch_create_aot_dispatcher_function
+from deepspeed.compile.graph_param import DSGraphParamManager
 from deepspeed.compile.input_storage import InputStorage
 from deepspeed.compile.patch_compiled_func import (clear_backward_inputs, get_backward_inputs, patch_compiled_func,
                                                    unpatch_compiled_func)
@@ -43,19 +44,35 @@ def test_forward_real_inputs_fall_back_to_storage_when_local_queue_is_empty():
     assert selected[0].dtype is torch.float32
 
 
-def test_symint_materialization_preserves_fake_parameter_slots():
+def test_symint_materialization_preserves_frozen_zero_parameter_for_manager_consumers():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode() as fake_mode:
-        fake_param = fake_mode.from_tensor(torch.empty((2, 3), dtype=torch.bfloat16))
+        fake_param = fake_mode.from_tensor(
+            torch.nn.Parameter(torch.empty((2, 3), dtype=torch.bfloat16), requires_grad=False))
     fake_param.ds_id = 123
+    fake_param.ds_shape = torch.Size([2, 3])
+    fake_param.ds_persist = False
 
     materialized = set_example_values_to_symints((fake_param, ), [(0, 123, torch.Size([2, 3]))])
+    graph = torch.fx.Graph()
+    param_node = graph.placeholder("frozen_zero_param")
+    graph.output((param_node, ))
+    manager = DSGraphParamManager(graph, materialized, [(0, 123, torch.Size([2, 3]))])
+    managed_param = manager.params[param_node.name].param
+    persistent_ds_ids = {
+        manager.ds_ids[name]
+        for name, graph_param in manager.params.items() if graph_param.param.ds_persist
+    }
 
-    assert isinstance(materialized[0], torch.nn.Parameter)
-    assert materialized[0].shape == torch.Size([2, 3])
-    assert materialized[0].dtype is torch.bfloat16
-    assert materialized[0].ds_id == 123
+    assert isinstance(managed_param, torch.nn.Parameter)
+    assert managed_param.shape == torch.Size([2, 3])
+    assert managed_param.dtype is torch.bfloat16
+    assert not managed_param.requires_grad
+    assert managed_param.ds_id == 123
+    assert managed_param.ds_shape == torch.Size([2, 3])
+    assert managed_param.ds_persist is False
+    assert persistent_ds_ids == set()
 
 
 def test_launch_compile_passes_clears_legacy_input_queues(monkeypatch):

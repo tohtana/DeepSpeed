@@ -738,7 +738,7 @@ def test_fast_free_schedule_records_diagnostic_when_no_candidate_fits_budget():
     assert diagnostics["budget_overflows"][0]["over_budget_bytes"] > 0
 
 
-def test_fast_free_schedule_over_budget_fallback_prefers_lower_live_memory():
+def test_fast_free_schedule_over_budget_fallback_prefers_lower_peak_before_live_memory():
     graph = Graph()
 
     first_param = _placeholder(graph, "budget_debt_first_param")
@@ -761,9 +761,75 @@ def test_fast_free_schedule_over_budget_fallback_prefers_lower_live_memory():
     diagnostics = _scheduler_diagnostics(scheduled_graph)
     first_selection = diagnostics["selected"][0]
 
-    assert first_selection["path"] == "until_free"
-    assert first_selection["live_gathered_bytes"] < first_selection["schedule_until_ag_live_mem"]
-    assert diagnostics["budget_overflows"][0]["path"] == "until_free"
+    assert first_selection["path"] == "until_ag"
+    assert first_selection["schedule_until_ag_peak_mem"] < first_selection["schedule_until_free_peak_mem"]
+    assert first_selection["schedule_until_ag_live_mem"] > first_selection["schedule_until_free_live_mem"]
+    assert diagnostics["budget_overflows"][0]["path"] == "until_ag"
+
+
+def test_over_budget_fallback_prefers_lower_peak_before_ending_residency():
+    graph = Graph()
+    high_peak_node = _placeholder(graph, "high_peak_zero_residency")
+    low_peak_node = _placeholder(graph, "low_peak_nonzero_residency")
+
+    high_peak_task = schedule_mod.AllgatherTask(node=high_peak_node,
+                                                allgather_cost=0,
+                                                free_cost=0,
+                                                allgathered_mem=1000,
+                                                allgather_acc_mem=1000,
+                                                free_acc_mem=0,
+                                                last_use=high_peak_node,
+                                                n_scheduled_ags=1,
+                                                schedule_until_ag=[high_peak_node],
+                                                schedule_until_free=[high_peak_node],
+                                                schedule_until_ag_peak_mem=1000,
+                                                schedule_until_free_peak_mem=1000,
+                                                schedule_until_ag_live_mem=1000,
+                                                schedule_until_free_live_mem=0)
+    low_peak_task = schedule_mod.AllgatherTask(node=low_peak_node,
+                                               allgather_cost=0,
+                                               free_cost=0,
+                                               allgathered_mem=51,
+                                               allgather_acc_mem=51,
+                                               free_acc_mem=0,
+                                               last_use=low_peak_node,
+                                               n_scheduled_ags=1,
+                                               schedule_until_ag=[low_peak_node],
+                                               schedule_until_free=[low_peak_node],
+                                               schedule_until_ag_peak_mem=51,
+                                               schedule_until_free_peak_mem=51,
+                                               schedule_until_ag_live_mem=51,
+                                               schedule_until_free_live_mem=51)
+
+    selected, _ = schedule_mod._select_over_budget_allgather_task([high_peak_task, low_peak_task],
+                                                                  schedule_mod.SchedulerMemoryBudget(
+                                                                      max_gathered_bytes=50, source="test"))
+
+    assert selected is low_peak_task
+
+
+def test_candidate_peak_resets_after_overflow_is_released():
+    graph = Graph()
+    first_param = _placeholder(graph, "historical_overflow_param")
+    next_param = _placeholder(graph, "later_fitting_param")
+    first_ag = _allgather(graph, first_param, 130, "historical_overflow", allocation_size=100)
+    first_release = _release(graph, first_ag, 130, "historical_overflow")
+    next_ag = _allgather(graph, next_param, 131, "later_fitting", allocation_size=40)
+
+    tracker = schedule_mod._GatheredParamTracker({130: 1, 131: 1})
+    tracker.apply(first_ag)
+    tracker.apply(first_release)
+    assert tracker.live_bytes == 0
+    assert tracker.peak_bytes == 100
+
+    candidate_peak, candidate_live = schedule_mod._simulate_path_stats(tracker, [next_ag])
+
+    assert candidate_peak == 40
+    assert candidate_live == 40
+    assert schedule_mod._fits_budget(schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=50, source="test"),
+                                     candidate_peak)
+    assert tracker.live_bytes == 0
+    assert tracker.peak_bytes == 100
 
 
 def test_fast_free_schedule_keeps_single_allgather_release_order():

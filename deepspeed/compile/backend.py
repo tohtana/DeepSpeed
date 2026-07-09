@@ -150,6 +150,9 @@ def evaluate_symint_from_shape_env(sym_int_v):
     return sym_int_v.node.hint
 
 
+_ZERO_PARAMETER_COMPILE_METADATA = ("ds_id", "ds_shape", "ds_persist", "ds_status", "ds_target_dtype")
+
+
 def set_example_values_to_symints(real_inputs, param_indices=None):
     real_inputs_ret = []
 
@@ -183,10 +186,12 @@ def set_example_values_to_symints(real_inputs, param_indices=None):
 
                     # Create Parameter if this input index corresponds to a parameter
                     if i in param_idx_set:
-                        dummy_v = torch.nn.Parameter(dummy_v)
-                        # Copy any additional attributes from the original if they exist
-                        if hasattr(v, 'ds_id'):
-                            dummy_v.ds_id = v.ds_id
+                        dummy_v = torch.nn.Parameter(dummy_v, requires_grad=v.requires_grad)
+                        # Profiling and graph-parameter consumers use these ZeRO
+                        # attributes after symbolic fake inputs are materialized.
+                        for attr in _ZERO_PARAMETER_COMPILE_METADATA:
+                            if hasattr(v, attr):
+                                setattr(dummy_v, attr, getattr(v, attr))
 
                     real_inputs_ret.append(dummy_v)
             else:

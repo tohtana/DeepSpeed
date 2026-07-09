@@ -330,13 +330,14 @@ class _GatheredParamTracker:
         self.live_bytes = live_bytes
         self.peak_bytes = peak_bytes
 
-    def copy(self):
+    def copy(self, *, reset_peak: bool = False):
+        """Copy residency state, optionally starting a candidate-local peak."""
         return _GatheredParamTracker(
             self.release_expected,
             self.live_bytes_by_ds_id,
             self.release_seen_by_ds_id,
             self.live_bytes,
-            self.peak_bytes,
+            self.live_bytes if reset_peak else self.peak_bytes,
         )
 
     def apply(self, node: Node):
@@ -439,8 +440,13 @@ def _simulate_path(tracker: _GatheredParamTracker, nodes: List[Node]):
 
 
 def _simulate_path_stats(tracker: _GatheredParamTracker, nodes: List[Node]):
-    """Return candidate peak and ending residency without mutating the prefix."""
-    candidate_tracker = tracker.copy()
+    """Return this candidate's peak and ending residency without mutating the prefix.
+
+    The committed tracker keeps a cumulative diagnostic peak, but an earlier
+    overflow must not make every later candidate appear over budget after its
+    buffers have been released.
+    """
+    candidate_tracker = tracker.copy(reset_peak=True)
     for node in nodes:
         candidate_tracker.apply(node)
     return candidate_tracker.peak_bytes, candidate_tracker.live_bytes
@@ -545,13 +551,14 @@ def _over_budget_path_options(task: AllgatherTask, scheduler_budget: SchedulerMe
 
 
 def _select_over_budget_allgather_task(runnable_ags: List[AllgatherTask], scheduler_budget: SchedulerMemoryBudget):
-    """Choose a deterministic minimum-residency path when no candidate fits."""
+    """Choose the smallest deterministic peak overage when no candidate fits."""
     options = []
     for task in runnable_ags:
         for path, nodes, peak_bytes, live_bytes in _over_budget_path_options(task, scheduler_budget):
-            options.append((live_bytes, max(0, peak_bytes - scheduler_budget.max_gathered_bytes), peak_bytes,
-                            task.node.name, path, task, nodes))
-    _, _, _, _, _, task, nodes = sorted(options)[0]
+            overage_bytes = max(0, peak_bytes - scheduler_budget.max_gathered_bytes)
+            options.append((overage_bytes, peak_bytes, live_bytes, task.free_acc_mem, task.n_scheduled_ags,
+                            task.allgather_acc_mem, task.free_cost, task.node.name, path, task, nodes))
+    *_, task, nodes = min(options)
     return task, nodes
 
 
@@ -714,9 +721,9 @@ def fast_free_schedule(graph: Graph,
 
         if next_ag is None:
             if scheduler_budget is not None and len(over_budget_ags) > 0:
-                # Failing compilation cannot improve memory pressure.  Commit
-                # the deterministic path with the smallest ending residency
-                # and retain the overflow in diagnostics instead.
+                # Failing compilation cannot improve memory pressure. Commit
+                # the deterministic path with the smallest peak overage and
+                # retain the overflow in diagnostics instead.
                 next_ag, nodes_to_schedule = _select_over_budget_allgather_task(over_budget_ags, scheduler_budget)
             else:
                 raise AssertionError("No runnable allgather nodes")
@@ -755,7 +762,9 @@ def fast_free_schedule(graph: Graph,
             })
         diagnostics["selected"].append(selected_diagnostic)
         if scheduler_budget is not None:
-            if gathered_tracker.peak_bytes > scheduler_budget.max_gathered_bytes:
+            selected_peak_bytes = (next_ag.schedule_until_free_peak_mem if nodes_to_schedule
+                                   is next_ag.schedule_until_free else next_ag.schedule_until_ag_peak_mem)
+            if selected_peak_bytes > scheduler_budget.max_gathered_bytes:
                 diagnostics["budget_overflows"].append(
                     _budget_overflow_diagnostic(scheduler_budget, next_ag, diagnostics["selected"][-1]["path"],
                                                 diagnostics["selected"][-1]["live_gathered_bytes"]))
