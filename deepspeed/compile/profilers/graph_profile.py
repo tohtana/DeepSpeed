@@ -92,6 +92,7 @@ def _backfill_missing_profile_metadata(graph: Graph, profile_complete: bool = Tr
 
 
 def _clear_interpreter_env(interpreter: Interpreter):
+    """Release FX interpreter references so profiling outputs do not remain live."""
     try:
         interpreter.env.clear()
     except Exception:
@@ -328,6 +329,7 @@ class MemoryProfilingInterpreter(Interpreter):
         self.debug_log = debug_log
 
     def run(self, *args) -> Any:
+        """Profile absolute memory and release gathered/interpreter state on every exit."""
         return_val = None
         self.profile_complete = True
         try:

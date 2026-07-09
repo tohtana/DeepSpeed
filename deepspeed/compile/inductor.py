@@ -29,6 +29,7 @@ _DEEP_COMPILE_Z3_INDUCTOR_REDUCTION_CONFIG = {
 
 
 def deepcompile_z3_inductor_config_patch(enabled: bool):
+    """Disable reduction heuristics that create oversized kernels for DeepCompile ZeRO-3 graphs."""
     if not enabled:
         return nullcontext()
 
@@ -71,6 +72,7 @@ def _register_graphsafe_rng_state_no_reuse(register_fallback_no_reuse):
 
 
 def patch_compiler(original_compiler, dc_compiler, z3_partition: bool, graph_id, graph_param_manager, bwd: bool):
+    """Wrap an AOT compiler with DeepCompile rewrites and ZeRO-3 fake-shape repair."""
 
     def wrapped_compiler(gm, fake_inputs):
         mod_graph = dc_compiler(gm, fake_inputs)
@@ -170,11 +172,13 @@ def _patch_deepcompile_aot_kwargs(kwargs: dict, *, graph_id: int, z3_partition: 
 
 def patch_create_aot_dispatcher_function(graph_id: int, z3_partition: bool, make_fw_graph, make_bw_graph, real_inputs,
                                          param_indices, param_manager, frame_id: int, frames_partitioned: Set[int]):
+    """Temporarily install graph-specific AOT compilers and return an idempotent restore callback."""
 
     from torch._dynamo.backends.common import AotAutograd
     import functools
 
-    # Unpatch if a previous DeepCompile compile left the AOT constructor patched.
+    # The constructor patch is process-global.  Recover first if a previous
+    # compile failed before reaching its restoration callback.
     if hasattr(AotAutograd, "__original_init"):
         AotAutograd.__init__ = AotAutograd.__original_init
         delattr(AotAutograd, "__original_init")
@@ -200,6 +204,7 @@ def patch_create_aot_dispatcher_function(graph_id: int, z3_partition: bool, make
     AotAutograd.__init__ = patched_init
 
     def restore_aotautograd():
+        """Restore only this invocation's patch without clobbering a newer owner."""
         if AotAutograd.__init__ is patched_init:
             AotAutograd.__init__ = original_init
         if getattr(AotAutograd, "__original_init", None) is original_init:

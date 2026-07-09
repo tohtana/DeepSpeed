@@ -94,6 +94,7 @@ def init_schedule(schedule):
 
 
 def launch_compile_passes(global_steps: int):
+    """Advance the pass schedule and discard state owned by the previous compile cycle."""
     global next_pass_step, next_passes
 
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
@@ -200,6 +201,7 @@ def set_example_values_to_symints(real_inputs, param_indices=None):
 
 
 def _get_fw_real_inputs(local_real_inputs, input_storage: InputStorage, graph_id: int, debug_log: bool = False):
+    """Resolve real inputs from the one-shot queue, persistent storage, then legacy state."""
     if local_real_inputs:
         return local_real_inputs.popleft()
 
@@ -229,6 +231,7 @@ def run_opt_passes(opt_passes: List[Callable],
                    param_manager,
                    bwd: bool,
                    debug_log=False) -> None:
+    """Apply scheduled graph passes and retain only complete post-pass memory profiles."""
 
     with unset_fake_temporarily():
         get_accelerator().synchronize()
@@ -245,6 +248,8 @@ def run_opt_passes(opt_passes: List[Callable],
             gm.graph.lint()
             gm.recompile()
 
+            # Re-profiling an already incomplete graph would turn synthetic
+            # backfilled metadata into a seemingly valid memory profile.
             if is_profile_incomplete(gm.graph):
                 profile_complete = False
                 mem = []
@@ -318,6 +323,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
             profiling_results[graph_id].param_indices = param_indices
 
         def make_fw_graph(gm, sample_inputs):
+            """Apply forward passes with graph-local real inputs and return the rewritten FX graph."""
             time_start = time.time()
             graph_index = len(graph_order_with_frame_id) - 1
 
@@ -435,6 +441,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 with deepcompile_z3_inductor_config_patch(z3_partition):
                     return torch._inductor.compile(gm, real_inputs)
             finally:
+                # AotAutograd.__init__ is process-global; never leak this
+                # graph-specific compiler wiring into a later compilation.
                 restore_aotautograd()
 
         raise ValueError(f"Unsupported backend {backend}")

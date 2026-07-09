@@ -75,6 +75,7 @@ def _profile_result_incomplete(prof) -> bool:
 def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
                      create_inputs_fn, mem_budget: float, param_manager: DSGraphParamManager,
                      bwd: bool) -> GraphModule:
+    """Persist high-value parameters only on the final backward graph and within measured headroom."""
     target_graph_id = graph_id
 
     if not bwd:
@@ -174,6 +175,8 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     budget = _compute_persistence_budget(all_graph_mem_records, total_mem, MEM_MARGIN)
     profiled_available_mem = budget["available_mem"]
     current_available_headroom = max(0, int(current_available_mem) - int(total_mem * MEM_MARGIN))
+    # The profile models transient peaks, while current allocator state captures
+    # memory retained since profiling.  Persistence must satisfy both views.
     available_mem = min(profiled_available_mem, current_available_headroom)
 
     ds_id_to_param = {}

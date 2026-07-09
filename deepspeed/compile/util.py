@@ -251,6 +251,7 @@ def materialize_fake(v, device=None):
 
 
 def get_last_uses(graph: Graph):
+    """Map values to last consumers while propagating lifetimes through no-copy ops."""
     position = {node: i for i, node in enumerate(graph.nodes)}
 
     node_to_last_use: Dict[Node, Node] = {}
@@ -262,6 +263,8 @@ def get_last_uses(graph: Graph):
         known_last_use = None
 
         if user.target in no_copy_ops and n in node_to_last_use:
+            # A no-copy node can itself be user-less (for example, a graph
+            # output alias).  In that case its own position is the lifetime end.
             last_user = node_to_last_use.get(user, user)
             last_use_position = position[last_user]
 

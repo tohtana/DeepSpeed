@@ -264,6 +264,12 @@ SCHEDULER_BUDGET_DIAGNOSTICS_ATTR = "_deepcompile_scheduler_budget_diagnostics"
 
 @dataclass(frozen=True)
 class SchedulerMemoryBudget:
+    """Rank-consistent allowance for scheduler-managed gathered parameter buffers.
+
+    ``max_gathered_bytes`` is the headroom remaining after any profiled
+    non-gathered peak, output reservation, and safety margin are removed.
+    """
+
     max_gathered_bytes: int
     source: str
     available_mem: int = 0
@@ -274,6 +280,7 @@ class SchedulerMemoryBudget:
 
     @classmethod
     def from_available_memory(cls, available_mem: int, output_size: int):
+        """Build a conservative fallback budget from current free memory."""
         if available_mem is None or available_mem <= 0:
             return None
         output_size = max(0, int(output_size or 0))
@@ -287,6 +294,7 @@ class SchedulerMemoryBudget:
 
     @classmethod
     def from_profiled_non_gathered_peak(cls, total_mem: int, profiled_non_gathered_peak_mem: int, output_size: int):
+        """Reserve profiled non-gather memory before budgeting transient gathers."""
         if total_mem is None or total_mem <= 0 or profiled_non_gathered_peak_mem is None or profiled_non_gathered_peak_mem <= 0:
             return None
         total_mem = int(total_mem)
@@ -304,6 +312,11 @@ class SchedulerMemoryBudget:
 
 
 class _GatheredParamTracker:
+    """Simulate gathered-buffer residency for a committed schedule prefix.
+
+    A gathered buffer remains live until the final release for its ``ds_id``;
+    repeated gathers while it is live only increase the tracked allocation.
+    """
 
     def __init__(self,
                  release_expected: Dict[int, int],
@@ -327,6 +340,7 @@ class _GatheredParamTracker:
         )
 
     def apply(self, node: Node):
+        """Advance residency through one node without treating reduce_grad as a release."""
         if node.target == torch.ops.dc.allgather_param.default:
             ds_id = _get_ds_id(node)
             size = _allgather_allocation_bytes(node)
@@ -369,6 +383,7 @@ def _dtype_element_size(dtype):
 
 
 def allgather_allocation_bytes(tensor_size: int, dtype, world_size: int):
+    """Return the padded allocation size used by a world-size all-gather."""
     element_size = _dtype_element_size(dtype)
     tensor_size = int(tensor_size)
     if tensor_size <= 0 or element_size is None or element_size <= 0 or world_size <= 1:
@@ -385,12 +400,14 @@ def _allgather_allocation_bytes(node: Node):
 
 
 def _allgather_schedule_bytes(node: Node, scheduler_budget: Optional[SchedulerMemoryBudget]):
+    """Use logical bytes for legacy ranking and padded bytes for an enabled memory gate."""
     if scheduler_budget is None:
         return int(node.meta.get("tensor_size", 0))
     return _allgather_allocation_bytes(node)
 
 
 def max_possible_gathered_bytes(graph: Graph):
+    """Upper-bound simultaneous gather residency, counting each ``ds_id`` once."""
     gathered_bytes_by_ds_id = {}
     for node in graph.nodes:
         if node.target != torch.ops.dc.allgather_param.default:
@@ -401,6 +418,7 @@ def max_possible_gathered_bytes(graph: Graph):
 
 
 def _build_release_expected(nodes: List[Node]):
+    """Derive the final-release count for every gathered parameter interval."""
     release_expected = defaultdict(int)
     release_counts = defaultdict(int)
     for node in nodes:
@@ -421,6 +439,7 @@ def _simulate_path(tracker: _GatheredParamTracker, nodes: List[Node]):
 
 
 def _simulate_path_stats(tracker: _GatheredParamTracker, nodes: List[Node]):
+    """Return candidate peak and ending residency without mutating the prefix."""
     candidate_tracker = tracker.copy()
     for node in nodes:
         candidate_tracker.apply(node)
@@ -428,6 +447,7 @@ def _simulate_path_stats(tracker: _GatheredParamTracker, nodes: List[Node]):
 
 
 def _profiled_live_gathered_bytes_by_node(graph: Graph):
+    """Replay source order and record gathered residency across each node boundary."""
     tracker = _GatheredParamTracker(_build_release_expected(list(graph.nodes)))
     live_gathered_bytes = {}
     for node in graph.nodes:
@@ -438,6 +458,7 @@ def _profiled_live_gathered_bytes_by_node(graph: Graph):
 
 
 def profiled_non_gathered_peak(graph: Graph, mem_records):
+    """Remove profiled gather residency from the observed per-node memory peak."""
     live_gathered_bytes = _profiled_live_gathered_bytes_by_node(graph)
     non_gathered_peak = 0
     for name, _, _, peak_mem in mem_records:
@@ -476,6 +497,7 @@ def _fallback_allgather_key(task: AllgatherTask):
 
 
 def _select_allgather_task(runnable_ags: List[AllgatherTask], scheduler_budget: Optional[SchedulerMemoryBudget]):
+    """Select the best fitting release path, then the best fitting gather-only path."""
     ags_with_no_additional_ag = [
         ag for ag in runnable_ags
         if ag.free_acc_mem == 0 and _fits_budget(scheduler_budget, ag.schedule_until_free_peak_mem)
@@ -492,6 +514,7 @@ def _select_allgather_task(runnable_ags: List[AllgatherTask], scheduler_budget: 
 
 
 def _rejected_budget_candidates(runnable_ags: List[AllgatherTask], scheduler_budget: Optional[SchedulerMemoryBudget]):
+    """Describe tasks for which neither scheduler-eligible path fits the budget."""
     if scheduler_budget is None:
         return []
     rejected = []
@@ -522,6 +545,7 @@ def _over_budget_path_options(task: AllgatherTask, scheduler_budget: SchedulerMe
 
 
 def _select_over_budget_allgather_task(runnable_ags: List[AllgatherTask], scheduler_budget: SchedulerMemoryBudget):
+    """Choose a deterministic minimum-residency path when no candidate fits."""
     options = []
     for task in runnable_ags:
         for path, nodes, peak_bytes, live_bytes in _over_budget_path_options(task, scheduler_budget):
@@ -552,6 +576,13 @@ def fast_free_schedule(graph: Graph,
                        debug_log: bool,
                        *,
                        scheduler_budget: Optional[SchedulerMemoryBudget] = None) -> Graph:
+    """Order a ZeRO-3 graph while limiting scheduler-managed gather residency.
+
+    The optional budget is already reduced across ranks by the caller.  With no
+    budget, this preserves the legacy candidate ordering.  With a budget, only
+    candidate simulations that fit are considered until all dependency levels
+    are exhausted; a deterministic least-over-budget path guarantees progress.
+    """
     node_to_last_use, user_to_last_uses = get_last_uses(graph)
     diagnostics = {
         "budget": scheduler_budget,
@@ -583,6 +614,9 @@ def fast_free_schedule(graph: Graph,
     for ag_node in unscheduled_ags:
         last_use = node_to_last_use[ag_node]
         required_nodes = get_node_requirements(last_use, scheduled)
+        # Dependency gather count is the primary scheduling tier.  Searching
+        # higher tiers is allowed only when every candidate in a lower tier is
+        # infeasible under the shared memory budget.
         ag_nodes_in_path[ag_node] = set(n for n in required_nodes if n.target == torch.ops.dc.allgather_param.default)
 
     reduce_nodes = [n for n in unscheduled if n.target == torch.ops.dc.reduce_grad.default]
@@ -644,6 +678,8 @@ def fast_free_schedule(graph: Graph,
                     [n for n in schedule_until_free if n.target == torch.ops.dc.allgather_param.default])
 
                 if scheduler_budget is not None:
+                    # Candidate simulation starts from the residency committed
+                    # by earlier iterations and never mutates that prefix.
                     schedule_until_ag_peak_mem, schedule_until_ag_live_mem = _simulate_path_stats(
                         gathered_tracker, schedule_until_ag)
                     schedule_until_free_peak_mem, schedule_until_free_live_mem = _simulate_path_stats(
@@ -678,12 +714,17 @@ def fast_free_schedule(graph: Graph,
 
         if next_ag is None:
             if scheduler_budget is not None and len(over_budget_ags) > 0:
+                # Failing compilation cannot improve memory pressure.  Commit
+                # the deterministic path with the smallest ending residency
+                # and retain the overflow in diagnostics instead.
                 next_ag, nodes_to_schedule = _select_over_budget_allgather_task(over_budget_ags, scheduler_budget)
             else:
                 raise AssertionError("No runnable allgather nodes")
 
         # print(f" next_ag {next_ag}")
         for n in nodes_to_schedule:
+            # Only the selected path advances the committed residency model;
+            # rejected simulations operated on tracker copies above.
             scheduled.append(n)
             unscheduled.remove(n)
             if gathered_tracker is not None:

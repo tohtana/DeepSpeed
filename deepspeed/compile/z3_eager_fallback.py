@@ -27,6 +27,7 @@ def record_z3_eager_fallback_param(param):
 
 
 def is_dynamo_guard_evaluation():
+    """Return whether the current parameter access originates from Dynamo guard evaluation."""
     frame = sys._getframe()
     while frame is not None:
         if frame.f_globals.get("__name__") == "torch._dynamo.guards":
@@ -47,6 +48,7 @@ def deepcompile_z3_forward_context(engine):
 
 
 class DeepCompileZ3EagerFallback:
+    """Track eager-only ZeRO-3 gathers and restore partitioned state around compiled forwards."""
 
     def __init__(self, engine):
         self.engine = engine
@@ -60,6 +62,7 @@ class DeepCompileZ3EagerFallback:
 
     @contextmanager
     def forward_context(self):
+        """Enable fallback lookup for the outermost forward and restore nested state on exit."""
         global _ACTIVE_FALLBACK
         previous = _ACTIVE_FALLBACK
         self._depth += 1
@@ -95,10 +98,12 @@ class DeepCompileZ3EagerFallback:
         self.total_gathered_params += 1
 
     def record_guard_suppressed_param(self, param):
+        """Record a guard probe that intentionally observed the partitioned parameter."""
         self._last_guard_suppressed_param_ids.append(int(param.ds_id))
 
     @torch.no_grad()
     def release_available_params_for_next_forward(self):
+        """Repartition nonpersistent leftovers before a new forward starts."""
         if self.engine is None:
             return
 

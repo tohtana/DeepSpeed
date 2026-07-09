@@ -28,6 +28,7 @@ SCHEDULER_DEBUG_ENV_LEGACY = "DEEPSPEED_DEEPCOMPILE_SCHEDULER_DEBUG"
 
 
 def _reduce_int(value: int, op):
+    """Reduce an integer scheduling input, or preserve it outside distributed mode."""
     if not dist.is_initialized():
         return int(value)
 
@@ -53,6 +54,7 @@ def _world_size():
 
 
 def _sync_profile_complete(profile_complete: bool):
+    """Require every rank to have a complete profile before using it for scheduling."""
     if not dist.is_initialized():
         return profile_complete
 
@@ -64,6 +66,7 @@ def _sync_profile_complete(profile_complete: bool):
 
 
 def _operator_profile_complete(graph: Graph):
+    """Require both the graph completeness marker and per-node peak metadata."""
     return not is_profile_incomplete(graph) and all("max_mem" in node.meta for node in graph.nodes)
 
 
@@ -78,6 +81,7 @@ def _operator_profile_has_observed_non_gathered_peak(graph: Graph):
 
 
 def _rank_max_operator_profiled_non_gathered_peak(graph: Graph):
+    """Return the worst-rank resident baseline plus the largest non-gather op peak."""
     peak = 0
     for node in graph.nodes:
         if _is_gather_lifetime_node(node):
@@ -87,6 +91,7 @@ def _rank_max_operator_profiled_non_gathered_peak(graph: Graph):
 
 
 def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int = 0):
+    """Build a budget only when every node has trustworthy operator profile data."""
     if not _operator_profile_complete(graph):
         return None
 
@@ -96,6 +101,7 @@ def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int
 
 
 def _build_scheduler_budget_from_partial_operator_profile(graph: Graph, output_size: int = 0):
+    """Build a fallback budget from the observed non-gather portion of a partial profile."""
     if not _operator_profile_has_observed_non_gathered_peak(graph):
         return None
 
@@ -111,6 +117,7 @@ def _max_single_allgather_allocation_bytes(graph: Graph):
 
 
 def _cap_incomplete_profile_budget(graph: Graph, scheduler_budget):
+    """Cap an incomplete-profile budget at the largest single gather allocation."""
     if scheduler_budget is None:
         return None
     max_single_allgather_bytes = _max_single_allgather_allocation_bytes(graph)
@@ -135,6 +142,7 @@ def _print_scheduler_debug(message: str):
 
 
 def _set_allgather_allocation_metadata(graph: Graph):
+    """Stamp padded gather allocation bytes without discarding a more precise estimate."""
     world_size = None
     for node in graph.nodes:
         if node.target == torch.ops.dc.allgather_param.default:
@@ -155,12 +163,16 @@ def _scheduler_budget_disabled_reason(graph: Graph, scheduler_budget):
 
 
 def _scheduler_budget_from_operator_profile(gm: GraphModule):
+    """Derive a rank-consistent budget and explain why a non-constraining gate is disabled."""
     if not dist.is_initialized():
         return None, "non_distributed"
 
     _set_allgather_allocation_metadata(gm.graph)
     operator_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph))
     if not operator_profile_complete:
+        # Partial profiles cannot establish a whole-graph peak.  Cap their
+        # estimate at one maximum-size gather to limit how much residency a
+        # fallback path can accumulate.
         max_gathered_bytes = max_possible_gathered_bytes(gm.graph)
         scheduler_budget = _build_scheduler_budget_from_partial_operator_profile(gm.graph)
         scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
@@ -173,6 +185,8 @@ def _scheduler_budget_from_operator_profile(gm: GraphModule):
         return scheduler_budget, _scheduler_budget_disabled_reason(gm.graph, scheduler_budget)
 
     scheduler_budget = _build_scheduler_budget_from_operator_profile(gm.graph)
+    # A gate larger than every gather combined cannot affect ordering, so keep
+    # legacy behavior and make the disabled state explicit in diagnostics.
     if scheduler_budget is not None and scheduler_budget.max_gathered_bytes >= max_possible_gathered_bytes(gm.graph):
         return None, "budget_not_constraining"
     return scheduler_budget, _scheduler_budget_disabled_reason(gm.graph, scheduler_budget)
@@ -203,6 +217,7 @@ def _dtype_element_size(dtype: torch.dtype):
 
 
 def _param_allgather_allocation_bytes(param, dtype: torch.dtype):
+    """Return the registered parameter size in its target gather dtype."""
     return int(param.numel) * _dtype_element_size(dtype)
 
 
@@ -212,6 +227,7 @@ def add_allgather(graph_id: int,
                   ds_id: int,
                   dtype: torch.dtype,
                   allgather_allocation_bytes: int = None):
+    """Insert gather and wait nodes while preserving the original graph output edge."""
     new_ag_node = add_postprocess(graph,
                                   node,
                                   torch.ops.dc.allgather_param.default,
@@ -261,6 +277,7 @@ def add_reduce(graph_id: int, graph: Graph, grad_node: Node, param_name: str, ds
 
 
 def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nodes: List[Node]) -> Graph:
+    """Insert gather/wait lifetimes and attach releases to ordinary parameter consumers."""
 
     node_to_uses = get_real_uses(graph)
     for pn in param_nodes:
@@ -297,6 +314,9 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
         else:
             users = node_to_uses[pn]
             if len(users) == 0:
+                # Parameters returned directly by the graph have no ordinary
+                # consumer to trigger gathering, so make the waited gather the
+                # output while retaining its original output name.
                 output_node = get_output_node(graph)
                 wait_node = next(user for user in allgather_node.users
                                  if user.target == torch.ops.dc.wait_allgather.default)
@@ -324,6 +344,7 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
 
 def add_gather_and_reduce(graph_id: int, graph: Graph, param_manager, param_nodes_bw: List[Node],
                           param_name_to_grad: Dict[str, Node]) -> Graph:
+    """Add parameter lifetimes and gradient reductions to a backward graph."""
 
     add_gather_and_release(graph_id, graph, param_manager, param_nodes_bw)
 
@@ -342,6 +363,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
                              create_inputs_fn,
                              param_manager,
                              debug_log=False) -> GraphModule:
+    """Profile, budget, and schedule ZeRO-3 parameter lifetimes for a forward graph."""
 
     nz3 = get_deepcompile_handle()
 
@@ -358,6 +380,8 @@ def add_z3_gather_release_fw(gm: GraphModule,
     del profiler
     gc.collect()
     get_accelerator().empty_cache()
+    # Build the shared scheduling budget after the operator profile is complete
+    # but before the scheduler rewrites graph order and Inductor metadata.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm)
 
     rank = dist.get_rank()
@@ -396,6 +420,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
                              create_inputs_fn,
                              param_manager,
                              debug_log=False) -> GraphModule:
+    """Profile, budget, and schedule gathers, releases, and reductions for backward."""
 
     param_nodes_bw, param_name_to_grad = param_manager[graph_id].get_bwd_mapping(gm.graph)
     gm.graph = add_gather_and_reduce(graph_id, gm.graph, param_manager[graph_id], param_nodes_bw, param_name_to_grad)
@@ -409,6 +434,8 @@ def add_z3_gather_release_bw(gm: GraphModule,
     del real_outputs
     gc.collect()
     get_accelerator().empty_cache()
+    # The scheduler consumes only rank-reduced inputs, ensuring every rank emits
+    # collectives in the same order even when allocator state differs locally.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm)
 
     rank = dist.get_rank()

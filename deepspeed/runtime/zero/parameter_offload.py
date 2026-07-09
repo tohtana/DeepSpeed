@@ -66,6 +66,8 @@ class ZeROOrderedDict(OrderedDict):
                 from deepspeed.compile.z3_eager_fallback import get_active_z3_eager_fallback, is_dynamo_guard_evaluation
                 fallback = get_active_z3_eager_fallback()
                 if fallback is not None and is_dynamo_guard_evaluation():
+                    # A guard only inspects parameter identity/metadata.  Gathering here
+                    # would retain a full parameter before the compiled forward begins.
                     fallback.record_guard_suppressed_param(param)
                     return param
                 if fallback is None:
