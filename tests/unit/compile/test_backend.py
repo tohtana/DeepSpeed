@@ -23,6 +23,15 @@ from deepspeed.compile.profilers.graph_profile import _mark_profile_incomplete
 _DC_LIBRARIES = []
 
 
+def test_profiling_result_keeps_existing_positional_field_order():
+    graph = torch.fx.Graph()
+
+    result = ProfilingResult(graph)
+
+    assert result.fwd_graph is graph
+    assert result.process_group is None
+
+
 def _define_dc_ops():
     try:
         torch.ops.dc.allgather_param.default

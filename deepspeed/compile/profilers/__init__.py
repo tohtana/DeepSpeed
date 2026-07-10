@@ -11,7 +11,6 @@ from torch.fx import Graph
 
 @dataclass
 class ProfilingResult:
-    process_group: Any = None
     fwd_graph: Graph = None
     bwd_graph: Graph = None
     needs_backward: bool = False
@@ -24,3 +23,6 @@ class ProfilingResult:
     fwd_tensor_sizes: List[Tuple[str, int]] = field(default_factory=list)  # name, size
     bwd_tensor_sizes: List[Tuple[str, int]] = field(default_factory=list)
     param_indices: List[Tuple[int, int, Tuple[int, ...]]] = field(default_factory=list)  # index, ds_id, ds_shape
+    # Keep newly added fields at the end so positional construction of the
+    # long-standing profiling fields remains backward compatible.
+    process_group: Any = None
