@@ -3,8 +3,10 @@
 
 # DeepSpeed Team
 
+import pytest
 import torch
 
+from deepspeed.compile import backend as backend_mod
 from deepspeed.compile.init_z3 import (_allow_dynamo_dynamic_parameter_shapes_for_z3,
                                        _deactivate_deepcompile_on_backend_failure, _resolve_expected_grad_dtype)
 from deepspeed.runtime.engine import DeepSpeedEngine
@@ -44,10 +46,14 @@ def test_zero3_allows_dynamo_dynamic_parameter_shapes(monkeypatch):
     compile_kwargs = {}
     monkeypatch.setattr(torch, "_dynamo", FakeDynamo)
 
-    assert _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
-    assert "dynamic" not in compile_kwargs
-    assert FakeDynamo.config.force_parameter_static_shapes is False
-    assert FakeDynamo.config.force_nn_module_property_static_shapes is False
+    restore = _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
+    assert restore
+    try:
+        assert "dynamic" not in compile_kwargs
+        assert FakeDynamo.config.force_parameter_static_shapes is False
+        assert FakeDynamo.config.force_nn_module_property_static_shapes is False
+    finally:
+        restore()
 
 
 def test_zero3_preserves_explicit_dynamo_dynamic_setting(monkeypatch):
@@ -62,8 +68,38 @@ def test_zero3_preserves_explicit_dynamo_dynamic_setting(monkeypatch):
     compile_kwargs = {"dynamic": False}
     monkeypatch.setattr(torch, "_dynamo", FakeDynamo)
 
-    assert _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
-    assert compile_kwargs["dynamic"] is False
+    restore = _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
+    assert restore
+    try:
+        assert compile_kwargs["dynamic"] is False
+    finally:
+        restore()
+
+
+@pytest.mark.parametrize("first_owner_to_restore", [0, 1])
+def test_zero3_dynamo_config_restores_after_last_overlapping_owner(monkeypatch, first_owner_to_restore):
+
+    class FakeDynamoConfig:
+        force_parameter_static_shapes = True
+        force_nn_module_property_static_shapes = False
+
+    class FakeDynamo:
+        config = FakeDynamoConfig()
+
+    monkeypatch.setattr(torch, "_dynamo", FakeDynamo)
+    restores = [_allow_dynamo_dynamic_parameter_shapes_for_z3({}), _allow_dynamo_dynamic_parameter_shapes_for_z3({})]
+
+    assert all(restores)
+    assert FakeDynamo.config.force_parameter_static_shapes is False
+    assert FakeDynamo.config.force_nn_module_property_static_shapes is False
+
+    restores[first_owner_to_restore]()
+    assert FakeDynamo.config.force_parameter_static_shapes is False
+    assert FakeDynamo.config.force_nn_module_property_static_shapes is False
+
+    restores[1 - first_owner_to_restore]()
+    assert FakeDynamo.config.force_parameter_static_shapes is True
+    assert FakeDynamo.config.force_nn_module_property_static_shapes is False
 
 
 def test_zero3_compile_failure_deactivation_restores_dynamo_config(monkeypatch):
@@ -86,6 +122,11 @@ def test_zero3_compile_failure_deactivation_restores_dynamo_config(monkeypatch):
             "_create_module_forward_post_hook": lambda self: object(),
         })()
     fake_engine._deepcompile_dynamo_config_restore = restore
+    original_autograd_function = torch.autograd.Function
+    backend_mod.frames_needing_bwd.clear()
+    backend_mod.frames_needing_bwd.add(17)
+    backend_mod.patch_compiled_func()
+    backend_mod.get_backward_inputs().append((torch.ones(1), ))
 
     assert FakeDynamo.config.force_parameter_static_shapes is False
     assert FakeDynamo.config.force_nn_module_property_static_shapes is False
@@ -97,12 +138,19 @@ def test_zero3_compile_failure_deactivation_restores_dynamo_config(monkeypatch):
     fake_engine._set_deepcompile_active = lambda active: DeepSpeedEngine._set_deepcompile_active(fake_engine, active)
 
     try:
-        backend()
-    except RuntimeError as exc:
-        assert str(exc) == "compile failed"
-    else:
-        raise AssertionError("failing backend did not raise")
+        try:
+            backend()
+        except RuntimeError as exc:
+            assert str(exc) == "compile failed"
+        else:
+            raise AssertionError("failing backend did not raise")
 
-    assert FakeDynamo.config.force_parameter_static_shapes is True
-    assert FakeDynamo.config.force_nn_module_property_static_shapes is False
-    assert not hasattr(fake_engine, "_deepcompile_dynamo_config_restore")
+        assert FakeDynamo.config.force_parameter_static_shapes is True
+        assert FakeDynamo.config.force_nn_module_property_static_shapes is False
+        assert not hasattr(fake_engine, "_deepcompile_dynamo_config_restore")
+        assert backend_mod.frames_needing_bwd == set()
+        assert backend_mod.get_backward_inputs() == []
+        assert torch.autograd.Function is original_autograd_function
+    finally:
+        backend_mod.frames_needing_bwd.clear()
+        backend_mod.unpatch_compiled_func()

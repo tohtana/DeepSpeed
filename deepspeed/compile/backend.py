@@ -28,7 +28,7 @@ from .fx import add_free_activations
 from .graph_param import DSGraphParamManager
 from .profilers import ProfilingResult
 from .profilers.graph_profile import MemoryProfilingInterpreter, is_profile_incomplete
-from .patch_compiled_func import patch_compiled_func, unpatch_compiled_func, get_backward_inputs, clear_backward_inputs
+from .patch_compiled_func import patch_compiled_func, unpatch_compiled_func, get_backward_inputs
 from .util import get_input_nodes, get_activation_node_names, get_index_by_graph_id, get_deepcompile_handle, log_rank0, is_backend_inductor
 from .partitioner import get_wrapped_partitioner
 from .inductor import register_custom_ops, patch_create_aot_dispatcher_function, deepcompile_z3_inductor_config_patch
@@ -77,6 +77,28 @@ opt_passes = {}
 fwd_real_inputs = []
 
 
+def cleanup_compiled_backward_state(frame_id=None):
+    """Release process-global compiled-backward state after completion or failure."""
+    if frame_id is None:
+        frames_needing_bwd.clear()
+    else:
+        frames_needing_bwd.discard(frame_id)
+    if len(frames_needing_bwd) == 0:
+        unpatch_compiled_func()
+
+
+def _cleanup_compiled_backward_state_on_error(fn):
+
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            cleanup_compiled_backward_state()
+            raise
+
+    return wrapped
+
+
 def register_compile_pass(name: str, opt_pass_fn):
     opt_passes[name] = opt_pass_fn
 
@@ -107,7 +129,7 @@ def launch_compile_passes(global_steps: int):
         profiling_results.clear()
         param_manager.clear()
         fwd_real_inputs.clear()
-        clear_backward_inputs()
+        cleanup_compiled_backward_state()
         frames_partitioned.clear()
 
 
@@ -346,6 +368,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
             profiling_results[graph_id] = ProfilingResult(process_group=process_group)
             profiling_results[graph_id].param_indices = param_indices
 
+        @_cleanup_compiled_backward_state_on_error
         def make_fw_graph(gm, sample_inputs):
             """Apply forward passes with graph-local real inputs and return the rewritten FX graph."""
             time_start = time.time()
@@ -386,6 +409,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
 
             return gm.graph
 
+        @_cleanup_compiled_backward_state_on_error
         def make_bw_graph(gm, sample_inputs):
             time_start = time.time()
 
@@ -430,9 +454,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
                 add_free_activations(graph_id, gm.graph,
                                      get_activation_node_names(gm.graph, param_nodes_bw, non_param_input_names))
 
-            frames_needing_bwd.remove(frame_id)
-            if len(frames_needing_bwd) == 0:
-                unpatch_compiled_func()
+            cleanup_compiled_backward_state(frame_id)
 
             log_rank0(
                 f"Bwd end {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",

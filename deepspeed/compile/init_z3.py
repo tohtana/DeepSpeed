@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+from threading import Lock
+
 import torch
 
 from deepspeed import comm as dist
@@ -11,7 +13,7 @@ from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToMo
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
 from .passes import zero3_compile, prefetch, selective_gather, offload_parameters
-from .backend import make_backend, launch_compile_passes, init_schedule
+from .backend import cleanup_compiled_backward_state, make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
@@ -19,10 +21,13 @@ from .z3_eager_fallback import DeepCompileZ3EagerFallback
 WARMUP = 5
 
 _MISSING = object()
+_DYNAMO_CONFIG_NAMES = ("force_parameter_static_shapes", "force_nn_module_property_static_shapes")
+_DYNAMO_CONFIG_OWNERS = {}
+_DYNAMO_CONFIG_LOCK = Lock()
 
 
 def _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs):
-    """Allow ZeRO-3 shape changes and return an idempotent config restore callback."""
+    """Acquire process-wide ZeRO-3 Dynamo config ownership and return its release callback."""
     dynamo = getattr(torch, "_dynamo", None)
     if dynamo is None:
         try:
@@ -34,23 +39,34 @@ def _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs):
     if dynamo_config is None:
         return None
 
-    previous_values = {}
-    for config_name in ("force_parameter_static_shapes", "force_nn_module_property_static_shapes"):
-        if hasattr(dynamo_config, config_name):
-            previous_values[config_name] = getattr(dynamo_config, config_name)
+    owner_token = object()
+    config_key = id(dynamo_config)
+    with _DYNAMO_CONFIG_LOCK:
+        state = _DYNAMO_CONFIG_OWNERS.get(config_key)
+        if state is None or state["config"] is not dynamo_config:
+            previous_values = {
+                config_name: getattr(dynamo_config, config_name)
+                for config_name in _DYNAMO_CONFIG_NAMES if hasattr(dynamo_config, config_name)
+            }
+            if not previous_values:
+                return None
+            state = {"config": dynamo_config, "previous_values": previous_values, "owner_tokens": set()}
+            _DYNAMO_CONFIG_OWNERS[config_key] = state
+        state["owner_tokens"].add(owner_token)
+        for config_name in state["previous_values"]:
             setattr(dynamo_config, config_name, False)
-    if not previous_values:
-        return None
-
-    restored = False
 
     def restore():
-        nonlocal restored
-        if restored:
-            return
-        for config_name, previous_value in previous_values.items():
-            setattr(dynamo_config, config_name, previous_value)
-        restored = True
+        with _DYNAMO_CONFIG_LOCK:
+            state = _DYNAMO_CONFIG_OWNERS.get(config_key)
+            if state is None or state["config"] is not dynamo_config or owner_token not in state["owner_tokens"]:
+                return
+            state["owner_tokens"].remove(owner_token)
+            if state["owner_tokens"]:
+                return
+            for config_name, previous_value in state["previous_values"].items():
+                setattr(dynamo_config, config_name, previous_value)
+            del _DYNAMO_CONFIG_OWNERS[config_key]
 
     return restore
 
@@ -61,6 +77,7 @@ def _deactivate_deepcompile_on_backend_failure(engine, backend_fn):
         try:
             return backend_fn(*args, **kwargs)
         except Exception:
+            cleanup_compiled_backward_state()
             engine._set_deepcompile_active(False)
             raise
 
