@@ -66,8 +66,9 @@ def _sync_profile_complete(profile_complete: bool):
 
 
 def _operator_profile_complete(graph: Graph):
-    """Require both the graph completeness marker and per-node peak metadata."""
-    return not is_profile_incomplete(graph) and all("max_mem" in node.meta for node in graph.nodes)
+    """Require the graph marker plus per-node allocation and peak deltas."""
+    return not is_profile_incomplete(graph) and all("alloc_mem" in node.meta and "max_mem" in node.meta
+                                                    for node in graph.nodes)
 
 
 def _is_gather_lifetime_node(node: Node):
@@ -76,18 +77,25 @@ def _is_gather_lifetime_node(node: Node):
 
 
 def _operator_profile_has_observed_non_gathered_peak(graph: Graph):
-    return any(not _is_gather_lifetime_node(node) and int(node.meta.get("max_mem", 0) or 0) > 0
+    return any(not _is_gather_lifetime_node(node) and (
+        int(node.meta.get("max_mem", 0) or 0) > 0 or int(node.meta.get("alloc_mem", 0) or 0) != 0)
                for node in graph.nodes)
 
 
 def _rank_max_operator_profiled_non_gathered_peak(graph: Graph):
-    """Return the worst-rank resident baseline plus the largest non-gather op peak."""
-    peak = 0
+    """Reconstruct the worst-rank absolute non-gathered peak from operator deltas."""
+    baseline = int(get_accelerator().memory_allocated())
+    live_non_gathered = 0
+    peak = baseline
     for node in graph.nodes:
         if _is_gather_lifetime_node(node):
             continue
-        peak = max(peak, int(node.meta.get("max_mem", 0) or 0))
-    return _reduce_int(int(get_accelerator().memory_allocated()) + peak, dist.ReduceOp.MAX)
+        # Profiling resets peak statistics before every node, so max_mem is
+        # transient growth above that node's starting residency.  Accumulate
+        # alloc_mem to retain live activations produced by preceding nodes.
+        peak = max(peak, baseline + live_non_gathered + int(node.meta.get("max_mem", 0) or 0))
+        live_non_gathered += int(node.meta.get("alloc_mem", 0) or 0)
+    return _reduce_int(max(0, peak), dist.ReduceOp.MAX)
 
 
 def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int = 0):
@@ -101,10 +109,7 @@ def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int
 
 
 def _build_scheduler_budget_from_partial_operator_profile(graph: Graph, output_size: int = 0):
-    """Build a fallback budget from the observed non-gather portion of a partial profile."""
-    if not _operator_profile_has_observed_non_gathered_peak(graph):
-        return None
-
+    """Build a fallback budget after ranks agree that some partial data exists."""
     return SchedulerMemoryBudget.from_profiled_non_gathered_peak(_rank_min_total_memory(),
                                                                  _rank_max_operator_profiled_non_gathered_peak(graph),
                                                                  output_size)
@@ -172,12 +177,17 @@ def _scheduler_budget_from_operator_profile(gm: GraphModule):
     if not operator_profile_complete:
         # Partial profiles cannot establish a whole-graph peak.  Cap their
         # estimate at one maximum-size gather to limit how much residency a
-        # fallback path can accumulate.
+        # fallback path can accumulate.  Synchronize whether any rank observed
+        # useful partial data before entering the collective budget builder so
+        # every rank executes the same reduction sequence.
         max_gathered_bytes = max_possible_gathered_bytes(gm.graph)
-        scheduler_budget = _build_scheduler_budget_from_partial_operator_profile(gm.graph)
-        scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
-        if scheduler_budget is not None and scheduler_budget.max_gathered_bytes < max_gathered_bytes:
-            return scheduler_budget, None
+        partial_profile_observed = bool(
+            _reduce_int(int(_operator_profile_has_observed_non_gathered_peak(gm.graph)), dist.ReduceOp.MAX))
+        if partial_profile_observed:
+            scheduler_budget = _build_scheduler_budget_from_partial_operator_profile(gm.graph)
+            scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
+            if scheduler_budget is not None and scheduler_budget.max_gathered_bytes < max_gathered_bytes:
+                return scheduler_budget, None
         scheduler_budget = SchedulerMemoryBudget.from_available_memory(_rank_min_available_memory(), 0)
         scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
         if scheduler_budget is not None and scheduler_budget.max_gathered_bytes >= max_gathered_bytes:
