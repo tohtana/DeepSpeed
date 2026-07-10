@@ -438,24 +438,15 @@ def _simulate_path_stats(tracker: _GatheredParamTracker, nodes: List[Node]):
     return candidate_tracker.peak_bytes, candidate_tracker.live_bytes
 
 
-def _profiled_live_gathered_bytes_by_node(graph: Graph):
-    """Replay source order and record gathered residency across each node boundary."""
-    tracker = _GatheredParamTracker(_build_release_expected(list(graph.nodes)))
-    live_gathered_bytes = {}
-    for node in graph.nodes:
-        before_node = tracker.live_bytes
-        tracker.apply(node)
-        live_gathered_bytes[node.name] = max(before_node, tracker.live_bytes)
-    return live_gathered_bytes
-
-
 def profiled_non_gathered_peak(graph: Graph, mem_records):
-    """Remove profiled gather residency from the observed per-node memory peak."""
-    live_gathered_bytes = _profiled_live_gathered_bytes_by_node(graph)
-    non_gathered_peak = 0
-    for name, _, _, peak_mem in mem_records:
-        non_gathered_peak = max(non_gathered_peak, int(peak_mem) - live_gathered_bytes.get(name, 0))
-    return max(0, non_gathered_peak)
+    """Return a conservative peak for scheduler-budget headroom.
+
+    Operator profiling invalidates gathered parameters between nodes, so a
+    source-order residency replay is not guaranteed to be present in each
+    recorded peak.  Keep the observed peak intact rather than subtracting
+    hypothetical gathered residency and risking an unsafe budget.
+    """
+    return max((int(peak_mem) for _, _, _, peak_mem in mem_records), default=0)
 
 
 def _fits_budget(scheduler_budget: Optional[SchedulerMemoryBudget], peak_bytes: int):

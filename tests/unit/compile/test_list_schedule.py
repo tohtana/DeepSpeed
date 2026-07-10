@@ -466,7 +466,7 @@ def test_zero3_scheduler_budget_skips_when_budget_cannot_constrain(monkeypatch):
     assert disabled_reason == "budget_not_constraining"
 
 
-def test_profiled_non_gathered_peak_subtracts_live_gathered_residency():
+def test_profiled_non_gathered_peak_conservatively_keeps_observed_peak():
     graph = Graph()
     param = _placeholder(graph, "nongathered_peak_param")
     ag = _allgather(graph, param, 2, "nongathered_peak", tensor_size=200)
@@ -476,7 +476,26 @@ def test_profiled_non_gathered_peak_subtracts_live_gathered_residency():
     graph.lint()
 
     assert schedule_mod.profiled_non_gathered_peak(graph, [(ag.name, 900, 0, 900), (wait.name, 950, 0, 950),
-                                                           (release.name, 920, 0, 920)]) == 750
+                                                           (release.name, 920, 0, 920)]) == 950
+
+
+def test_profiled_non_gathered_peak_does_not_subtract_nonresident_upfront_gathers():
+    graph = Graph()
+    first_param = _placeholder(graph, "first_upfront_param")
+    second_param = _placeholder(graph, "second_upfront_param")
+    first_ag = _allgather(graph, first_param, 20, "first_upfront", tensor_size=200)
+    second_ag = _allgather(graph, second_param, 21, "second_upfront", tensor_size=300)
+    activation = _neg(graph, second_ag, "activation_heavy_node")
+    first_release = _release(graph, activation, 20, "first_upfront")
+    second_release = _release(graph, first_release, 21, "second_upfront")
+    graph.output((second_release, ))
+    graph.lint()
+
+    # Operator profiling invalidates gathered buffers between nodes, so the
+    # activation peak is not guaranteed to include either upfront gather.  The
+    # scheduler budget must not subtract hypothetical source-order residency.
+    mem_records = [(first_ag.name, 200, 0, 200), (second_ag.name, 300, 0, 300), (activation.name, 1000, 0, 1000)]
+    assert schedule_mod.profiled_non_gathered_peak(graph, mem_records) == 1000
 
 
 def test_zero3_stamps_padded_allgather_allocation_metadata(monkeypatch):
@@ -656,6 +675,92 @@ def test_zero3_scheduler_collectives_stay_with_each_data_parallel_group(monkeypa
     first_group_b = collective_groups.index(group_b)
     assert all(group is group_a for group in collective_groups[:first_group_b])
     assert all(group is group_b for group in collective_groups[first_group_b:])
+
+
+def test_prefetch_and_selective_gather_collectives_stay_with_data_parallel_group(monkeypatch):
+    try:
+        torch.ops.dc.reload_parameter.default
+    except AttributeError:
+        library = torch.library.Library("dc", "FRAGMENT")
+        library.define("reload_parameter(Tensor a, int graph_id, int id) -> ()")
+        _DC_LIBRARIES.append(library)
+
+    group_a = object()
+    group_b = object()
+    collective_groups = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 2000
+
+        def available_memory(self):
+            return 1800
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    def all_reduce(tensor, op, group=None):
+        assert group in (group_a, group_b)
+        collective_groups.append(group)
+
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", FakeAccelerator)
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 0.0)
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", lambda _: None)
+    monkeypatch.setattr(selective_gather_mod, "get_accelerator", FakeAccelerator)
+    monkeypatch.setattr(selective_gather_mod, "get_deepcompile_handle",
+                        lambda: SimpleNamespace(set_persistent=lambda _: None))
+    monkeypatch.setattr(selective_gather_mod, "print_rank_0", lambda _: None)
+
+    def run_passes(group, graph_id):
+        graph = Graph()
+        value = _placeholder(graph, f"group_{graph_id}_input")
+        result = _neg(graph, value, f"group_{graph_id}_result")
+        graph.output((result, ))
+        graph.lint()
+        mem = [(node.name, 0, 0, 0) for node in graph.nodes]
+        timing = [(node.name, 0.0, 0.0) for node in graph.nodes]
+        tensor_sizes = [(node.name, 0) for node in graph.nodes]
+        profile = ProfilingResult(fwd_graph=graph,
+                                  bwd_graph=graph,
+                                  needs_backward=True,
+                                  fwd_mem=mem,
+                                  bwd_mem=mem,
+                                  fwd_time=timing,
+                                  bwd_time=timing,
+                                  fwd_tensor_sizes=tensor_sizes,
+                                  bwd_tensor_sizes=tensor_sizes,
+                                  process_group=group)
+        profiling_results = {graph_id: profile}
+        gm = GraphModule(torch.nn.Module(), graph)
+        prefetch_mod.schedule_prefetch(gm,
+                                       graph_id=graph_id,
+                                       graph_order=[(graph_id, True)],
+                                       profiling_results=profiling_results,
+                                       create_inputs_fn=lambda: (),
+                                       mem_budget=0,
+                                       param_manager={},
+                                       bwd=False)
+        selective_gather_mod.selective_gather(gm,
+                                              graph_id=graph_id,
+                                              graph_order=[(graph_id, True)],
+                                              profiling_results=profiling_results,
+                                              create_inputs_fn=lambda: (),
+                                              mem_budget=0,
+                                              param_manager={},
+                                              bwd=True)
+
+    run_passes(group_a, 0)
+    run_passes(group_b, 1)
+
+    assert collective_groups == [group_a, group_a, group_b, group_b]
 
 
 def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1, allocation_size=None):
