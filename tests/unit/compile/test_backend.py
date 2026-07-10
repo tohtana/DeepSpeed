@@ -67,6 +67,27 @@ def test_forward_real_inputs_fall_back_to_storage_when_local_queue_is_empty():
     assert selected[0].dtype is torch.float32
 
 
+def test_stored_zero_parameter_recovers_original_instance_bound_protocol():
+    real_param = torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    real_param.ds_id = 123
+    real_param.ds_shape = torch.Size([3])
+    real_param.ds_persist = False
+    real_param.all_gather = MethodType(lambda self, param_list: None, real_param)
+    real_param.partition = MethodType(lambda self, param_list, has_been_updated: None, real_param)
+    storage = InputStorage()
+    storage.put((real_param, ))
+
+    stored_inputs = storage.get()
+    materialized = set_example_values_to_symints(stored_inputs, [(0, 123, torch.Size([3]))],
+                                                 real_zero_params={123: real_param})
+
+    assert stored_inputs[0] is not real_param
+    assert not hasattr(stored_inputs[0], "ds_id")
+    assert materialized[0] is real_param
+    assert materialized[0].all_gather.__self__ is real_param
+    assert materialized[0].partition.__self__ is real_param
+
+
 def test_symint_materialization_preserves_frozen_zero_parameter_for_profiling_consumers(monkeypatch):
     from torch._subclasses.fake_tensor import FakeTensorMode
 

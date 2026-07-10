@@ -165,6 +165,13 @@ def set_example_values_to_symints(real_inputs, param_indices=None, real_zero_par
 
     for i, v in enumerate(real_inputs):
         if isinstance(v, torch.Tensor):
+            real_zero_param = real_zero_params.get(param_ds_ids.get(i))
+            if i in param_idx_set and real_zero_param is not None:
+                # Stored and fake profiling inputs both discard instance-bound
+                # ZeRO methods, so recover the original before materialization.
+                real_inputs_ret.append(real_zero_param)
+                continue
+
             if is_fake(v):
                 shape = []
                 for fs in v.shape:
@@ -179,13 +186,6 @@ def set_example_values_to_symints(real_inputs, param_indices=None, real_zero_par
                     else:
                         stride.append(fs)
                 with unset_fake_temporarily():
-                    real_zero_param = real_zero_params.get(param_ds_ids.get(i))
-                    if i in param_idx_set and real_zero_param is not None:
-                        # Profiling needs the instance-bound ZeRO protocol, not
-                        # only metadata copied onto a synthetic Parameter.
-                        real_inputs_ret.append(real_zero_param)
-                        continue
-
                     dummy_v = torch.empty_strided(shape,
                                                   stride,
                                                   dtype=v.dtype,
