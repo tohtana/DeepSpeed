@@ -105,7 +105,7 @@ def test_deepcompile_fallback_releases_leftover_gathered_params_before_forward()
     assert fallback.stats()["last_pre_forward_released_param_ids"] == [11]
 
 
-def test_deepcompile_forward_preserves_user_gathered_parameters_context():
+def test_deepcompile_forward_preserves_fallback_param_adopted_by_user_gathered_context():
     module, param = _zero_module_with_param()
     param.ds_persist = False
     partition_calls = []
@@ -137,11 +137,17 @@ def test_deepcompile_forward_preserves_user_gathered_parameters_context():
             return True
 
     engine = FakeEngine()
+    param.ds_status = ZeroParamStatus.AVAILABLE
+    engine._deepcompile_z3_eager_fallback.record_gathered_param(param)
+    assert engine._deepcompile_z3_eager_fallback.stats()["tracked_param_ids"] == [7]
 
     with GatheredParameters([param]):
         assert param.ds_status == ZeroParamStatus.AVAILABLE
+        assert engine._deepcompile_z3_eager_fallback.stats()["tracked_param_ids"] == []
+        assert engine._deepcompile_z3_eager_fallback.stats()["last_user_adopted_param_ids"] == [7]
         with deepcompile_z3_forward_context(engine):
             assert param.ds_status == ZeroParamStatus.AVAILABLE
         assert param.ds_status == ZeroParamStatus.AVAILABLE
 
     assert partition_calls == [7]
+    assert engine._deepcompile_z3_eager_fallback.stats()["last_user_adopted_param_ids"] == [7]

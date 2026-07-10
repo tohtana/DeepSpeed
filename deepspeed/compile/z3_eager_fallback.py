@@ -12,6 +12,7 @@ from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict, ensure_zer
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 _ACTIVE_FALLBACK = None
+_FALLBACK_OWNER_ATTR = "_deepcompile_z3_eager_fallback_owner"
 
 
 def get_active_z3_eager_fallback():
@@ -58,6 +59,7 @@ class DeepCompileZ3EagerFallback:
         self._last_released_param_ids = []
         self._last_guard_suppressed_param_ids = []
         self._last_pre_forward_released_param_ids = []
+        self._last_user_adopted_param_ids = []
         self.total_gathered_params = 0
 
     @contextmanager
@@ -93,9 +95,25 @@ class DeepCompileZ3EagerFallback:
 
     def record_gathered_param(self, param):
         ds_id = int(param.ds_id)
+        previous_owner = getattr(param, _FALLBACK_OWNER_ATTR, None)
+        if previous_owner is not None and previous_owner is not self:
+            previous_owner._drop_tracked_param(ds_id, param)
         self._tracked_params[ds_id] = param
+        setattr(param, _FALLBACK_OWNER_ATTR, self)
         self._last_gathered_param_ids.append(ds_id)
         self.total_gathered_params += 1
+
+    def _drop_tracked_param(self, ds_id, param):
+        if self._tracked_params.get(ds_id) is param:
+            self._tracked_params.pop(ds_id)
+        if getattr(param, _FALLBACK_OWNER_ATTR, None) is self:
+            delattr(param, _FALLBACK_OWNER_ATTR)
+
+    def transfer_gathered_param_to_user(self, param):
+        """Transfer a gathered parameter to an explicit user context."""
+        ds_id = int(param.ds_id)
+        self._drop_tracked_param(ds_id, param)
+        self._last_user_adopted_param_ids.append(ds_id)
 
     def record_guard_suppressed_param(self, param):
         """Record a guard probe that intentionally observed the partitioned parameter."""
@@ -110,7 +128,7 @@ class DeepCompileZ3EagerFallback:
                     and not getattr(param, "ds_persist", False)):
                 param.partition()
                 released.append(ds_id)
-        self._tracked_params.clear()
+            self._drop_tracked_param(ds_id, param)
         self._last_pre_forward_released_param_ids = released
 
     @torch.no_grad()
@@ -121,7 +139,7 @@ class DeepCompileZ3EagerFallback:
                     and not getattr(param, "ds_persist", False)):
                 param.partition()
                 released.append(ds_id)
-        self._tracked_params.clear()
+            self._drop_tracked_param(ds_id, param)
         self._last_released_param_ids = released
 
     def stats(self):
@@ -131,5 +149,6 @@ class DeepCompileZ3EagerFallback:
             "last_released_param_ids": list(self._last_released_param_ids),
             "last_guard_suppressed_param_ids": list(self._last_guard_suppressed_param_ids),
             "last_pre_forward_released_param_ids": list(self._last_pre_forward_released_param_ids),
+            "last_user_adopted_param_ids": list(self._last_user_adopted_param_ids),
             "total_gathered_params": self.total_gathered_params,
         }
