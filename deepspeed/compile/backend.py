@@ -153,13 +153,15 @@ def evaluate_symint_from_shape_env(sym_int_v):
 _ZERO_PARAMETER_COMPILE_METADATA = ("ds_id", "ds_shape", "ds_persist", "ds_status", "ds_target_dtype")
 
 
-def set_example_values_to_symints(real_inputs, param_indices=None):
+def set_example_values_to_symints(real_inputs, param_indices=None, real_zero_params=None):
     real_inputs_ret = []
 
     # Create a set of parameter indices for quick lookup
     param_idx_set = set()
     if param_indices is not None:
         param_idx_set = {i for i, _, _ in param_indices}
+    param_ds_ids = {i: ds_id for i, ds_id, _ in (param_indices or [])}
+    real_zero_params = real_zero_params or {}
 
     for i, v in enumerate(real_inputs):
         if isinstance(v, torch.Tensor):
@@ -177,6 +179,13 @@ def set_example_values_to_symints(real_inputs, param_indices=None):
                     else:
                         stride.append(fs)
                 with unset_fake_temporarily():
+                    real_zero_param = real_zero_params.get(param_ds_ids.get(i))
+                    if i in param_idx_set and real_zero_param is not None:
+                        # Profiling needs the instance-bound ZeRO protocol, not
+                        # only metadata copied onto a synthetic Parameter.
+                        real_inputs_ret.append(real_zero_param)
+                        continue
+
                     dummy_v = torch.empty_strided(shape,
                                                   stride,
                                                   dtype=v.dtype,
@@ -303,11 +312,17 @@ def make_backend(backend, compile_config, compile_kwargs={}):
         if z3_partition:
             param_indices = [(i, input_val.ds_id, input_val.ds_shape) for i, input_val in enumerate(real_inputs)
                              if isinstance(input_val, torch.nn.Parameter)]
+            real_zero_params = {
+                input_val.ds_id: input_val
+                for input_val in real_inputs if isinstance(input_val, torch.nn.Parameter)
+                and hasattr(input_val, "all_gather") and hasattr(input_val, "partition")
+            }
         else:
             assert all(hasattr(v, "param_id") for v in real_inputs
                        if isinstance(v, torch.nn.Parameter)), "All param inputs should have param_id"
             param_indices = [(i, input_val.param_id, input_val.shape) for i, input_val in enumerate(real_inputs)
                              if isinstance(input_val, torch.nn.Parameter)]
+            real_zero_params = {}
 
         global fwd_real_inputs
 
@@ -342,7 +357,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 frames_needing_bwd.add(frame_id)
 
             real_inputs = _get_fw_real_inputs(local_fwd_real_inputs, input_storage, graph_id, debug_log=debug_log)
-            real_inputs = set_example_values_to_symints(real_inputs, param_indices)
+            real_inputs = set_example_values_to_symints(real_inputs, param_indices, real_zero_params=real_zero_params)
 
             param_manager[graph_id] = DSGraphParamManager(gm.graph, real_inputs, param_indices)
 

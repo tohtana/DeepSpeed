@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 from collections import deque
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -15,7 +17,28 @@ from deepspeed.compile.input_storage import InputStorage
 from deepspeed.compile.patch_compiled_func import (clear_backward_inputs, get_backward_inputs, patch_compiled_func,
                                                    unpatch_compiled_func)
 from deepspeed.compile.profilers import ProfilingResult
+from deepspeed.compile.profilers import graph_profile as graph_profile_mod
 from deepspeed.compile.profilers.graph_profile import _mark_profile_incomplete
+
+_DC_LIBRARIES = []
+
+
+def _define_dc_ops():
+    lib = torch.library.Library("dc", "FRAGMENT")
+    for schema in (
+            "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
+            "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
+            "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
+            "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
+            "free_tensors(Tensor[] tensors) -> ()",
+            "end_backward(Tensor[] tensors, int graph_id, bool release_reduce_buckets = True) -> ()",
+    ):
+        try:
+            lib.define(schema)
+        except RuntimeError as exc:
+            if "already been registered" not in str(exc):
+                raise
+    _DC_LIBRARIES.append(lib)
 
 
 def test_forward_real_inputs_prefer_closure_queue_over_global_queue():
@@ -44,20 +67,38 @@ def test_forward_real_inputs_fall_back_to_storage_when_local_queue_is_empty():
     assert selected[0].dtype is torch.float32
 
 
-def test_symint_materialization_preserves_frozen_zero_parameter_for_manager_consumers():
+def test_symint_materialization_preserves_frozen_zero_parameter_for_profiling_consumers(monkeypatch):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    _define_dc_ops()
+    calls = []
+    real_param = torch.nn.Parameter(torch.empty((2, 3), dtype=torch.bfloat16), requires_grad=False)
+    real_param.ds_id = 123
+    real_param.ds_shape = torch.Size([2, 3])
+    real_param.ds_persist = False
+
+    def all_gather(self, param_list):
+        calls.append(("all_gather", param_list))
+
+    def partition(self, param_list, has_been_updated):
+        calls.append(("partition", param_list, has_been_updated))
+
+    real_param.all_gather = MethodType(all_gather, real_param)
+    real_param.partition = MethodType(partition, real_param)
+
     with FakeTensorMode() as fake_mode:
-        fake_param = fake_mode.from_tensor(
-            torch.nn.Parameter(torch.empty((2, 3), dtype=torch.bfloat16), requires_grad=False))
+        fake_param = fake_mode.from_tensor(real_param)
     fake_param.ds_id = 123
     fake_param.ds_shape = torch.Size([2, 3])
     fake_param.ds_persist = False
 
-    materialized = set_example_values_to_symints((fake_param, ), [(0, 123, torch.Size([2, 3]))])
+    materialized = set_example_values_to_symints((fake_param, ), [(0, 123, torch.Size([2, 3]))],
+                                                 real_zero_params={123: real_param})
+    assert materialized[0] is real_param
     graph = torch.fx.Graph()
     param_node = graph.placeholder("frozen_zero_param")
-    graph.output((param_node, ))
+    neg_node = graph.call_function(torch.neg, (param_node, ))
+    graph.output((neg_node, ))
     manager = DSGraphParamManager(graph, materialized, [(0, 123, torch.Size([2, 3]))])
     managed_param = manager.params[param_node.name].param
     persistent_ds_ids = {
@@ -73,6 +114,60 @@ def test_symint_materialization_preserves_frozen_zero_parameter_for_manager_cons
     assert managed_param.ds_shape == torch.Size([2, 3])
     assert managed_param.ds_persist is False
     assert persistent_ds_ids == set()
+
+    class FakeEvent:
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, other):
+            return 0.0
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def random(self):
+            return SimpleNamespace(fork_rng=lambda devices: nullcontext())
+
+        def Event(self, enable_timing):
+            return FakeEvent()
+
+        def reset_peak_memory_stats(self):
+            pass
+
+        def memory_allocated(self):
+            return 100
+
+        def max_memory_allocated(self):
+            return 100
+
+        def synchronize(self):
+            pass
+
+    class FakeDeepCompileHandle:
+
+        def enable_profiling(self, enabled):
+            pass
+
+        def clear_all_gathered_params(self):
+            pass
+
+    monkeypatch.setattr(graph_profile_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(graph_profile_mod, "get_deepcompile_handle", lambda: FakeDeepCompileHandle())
+    monkeypatch.setattr(graph_profile_mod, "_get_mem_usage_out_of_torch", lambda: 0)
+    monkeypatch.setattr(graph_profile_mod, "is_comm_op", lambda node: False)
+    monkeypatch.setattr(graph_profile_mod, "is_release_node", lambda node: False)
+    monkeypatch.setattr(graph_profile_mod.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(graph_profile_mod.dist, "get_rank", lambda: 0)
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    profiler = graph_profile_mod.ProfilingInterpreter(gm, iteration=1, warmup=0)
+    profiler.run(*materialized)
+
+    assert not graph_profile_mod.is_profile_incomplete(graph)
+    assert [call[0] for call in calls] == ["all_gather", "partition"]
 
 
 def test_launch_compile_passes_clears_legacy_input_queues(monkeypatch):

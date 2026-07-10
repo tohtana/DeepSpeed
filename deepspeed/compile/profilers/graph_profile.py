@@ -60,6 +60,8 @@ _PROFILE_META_DEFAULTS = {
     "tensor_size": 0,
     "alloc_mem": 0,
     "max_mem": 0,
+    "profile_mem_start": 0,
+    "profile_mem_peak": 0,
 }
 _PROFILE_INCOMPLETE_ATTR = "_deepcompile_profile_incomplete"
 _PROFILE_INCOMPLETE_META_KEY = "deepcompile_profile_incomplete"
@@ -138,6 +140,20 @@ def _get_mem_usage_out_of_torch():
     return adjust
 
 
+def _absolute_profile_memory(mem_usage_out_of_torch):
+    """Read absolute allocator residency and peak with external memory included once."""
+    return (int(get_accelerator().memory_allocated()) + int(mem_usage_out_of_torch),
+            int(get_accelerator().max_memory_allocated()) + int(mem_usage_out_of_torch))
+
+
+def _rank_max_profile_memory(start_mem, peak_mem, device, distributed):
+    """Return per-field worst-rank absolute memory without averaging rank asymmetry."""
+    values = torch.tensor([int(start_mem), int(peak_mem)], device=device, dtype=torch.int64)
+    if distributed:
+        dist.all_reduce(values, dist.ReduceOp.MAX)
+    return int(values[0].item()), int(values[1].item())
+
+
 # https://pytorch.org/tutorials/intermediate/fx_profiling_tutorial.html
 class ProfilingInterpreter(Interpreter):
 
@@ -192,12 +208,20 @@ class ProfilingInterpreter(Interpreter):
     def run_node(self, n: torch.fx.Node) -> Any:
 
         if n.op in {"placeholder", "output"}:
+            get_accelerator().reset_peak_memory_stats()
+            profile_mem_start, _ = _absolute_profile_memory(self.mem_usage_out_of_torch)
+            ret = super().run_node(n)
+            _, profile_mem_peak = _absolute_profile_memory(self.mem_usage_out_of_torch)
+            profile_mem_start, profile_mem_peak = _rank_max_profile_memory(profile_mem_start, profile_mem_peak,
+                                                                           self.device, self.distributed)
             n.meta["device_time"] = 0.0
             n.meta["wall_time"] = 0.0
             n.meta["alloc_mem"] = 0
             n.meta["max_mem"] = 0
             n.meta["tensor_size"] = _node_size(n)
-            return super().run_node(n)
+            n.meta["profile_mem_start"] = profile_mem_start
+            n.meta["profile_mem_peak"] = profile_mem_peak
+            return ret
 
         args, kwargs = self.fetch_args_kwargs_from_env(n)
         assert isinstance(args, tuple)
@@ -245,6 +269,7 @@ class ProfilingInterpreter(Interpreter):
         get_accelerator().reset_peak_memory_stats()
         alloc_mem_start = get_accelerator().memory_allocated()
         max_mem_start = get_accelerator().max_memory_allocated()
+        profile_mem_start, _ = _absolute_profile_memory(self.mem_usage_out_of_torch)
 
         def run_target():
             return getattr(self, n.op)(n.target, args, kwargs)
@@ -266,6 +291,11 @@ class ProfilingInterpreter(Interpreter):
 
         alloc_mem = get_accelerator().memory_allocated() - alloc_mem_start + self.mem_usage_out_of_torch
         max_memory = get_accelerator().max_memory_allocated() - max_mem_start + self.mem_usage_out_of_torch
+        _, profile_mem_peak = _absolute_profile_memory(self.mem_usage_out_of_torch)
+        profile_mem_start, profile_mem_peak = _rank_max_profile_memory(profile_mem_start, profile_mem_peak,
+                                                                       self.device, self.distributed)
+        n.meta["profile_mem_start"] = profile_mem_start
+        n.meta["profile_mem_peak"] = profile_mem_peak
         tensor_size = _node_size(out)
 
         def partition_param_if_necessary(v):
@@ -336,6 +366,7 @@ class MemoryProfilingInterpreter(Interpreter):
             assert _all_real_if_tensor(args), "Inputs must be real tensors"
             self.nz3.enable_profiling(True)
             self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
+            self.last_alloc = int(get_accelerator().memory_allocated()) + int(self.mem_usage_out_of_torch)
 
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):
@@ -357,6 +388,7 @@ class MemoryProfilingInterpreter(Interpreter):
 
     def run_node(self, n: torch.fx.Node) -> Any:
         get_accelerator().reset_peak_memory_stats()
+        profile_mem_start, _ = _absolute_profile_memory(self.mem_usage_out_of_torch)
 
         if n.op in {"placeholder", "output"}:
             ret = super().run_node(n)
@@ -368,12 +400,15 @@ class MemoryProfilingInterpreter(Interpreter):
 
             del args, kwargs
 
-        current_alloc = get_accelerator().memory_allocated() + self.mem_usage_out_of_torch
-        max_alloc = get_accelerator().max_memory_allocated() + self.mem_usage_out_of_torch
-        vals_to_bcast = torch.tensor([current_alloc, max_alloc], device=self.device, dtype=torch.int64)
-        dist.all_reduce(vals_to_bcast, dist.ReduceOp.MAX)
-        current_alloc = vals_to_bcast[0].item()
-        max_alloc = vals_to_bcast[1].item()
+        current_alloc, max_alloc = _absolute_profile_memory(self.mem_usage_out_of_torch)
+        absolute_record = torch.tensor([profile_mem_start, current_alloc, max_alloc],
+                                       device=self.device,
+                                       dtype=torch.int64)
+        if dist.is_initialized():
+            dist.all_reduce(absolute_record, dist.ReduceOp.MAX)
+        profile_mem_start, current_alloc, max_alloc = (int(value.item()) for value in absolute_record)
+        n.meta["profile_mem_start"] = profile_mem_start
+        n.meta["profile_mem_peak"] = max_alloc
 
         self.mem_record.append((n.name, current_alloc, current_alloc - self.last_alloc, max_alloc))
 

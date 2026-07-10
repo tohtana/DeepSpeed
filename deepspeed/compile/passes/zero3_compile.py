@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import gc
+import hashlib
 import os
 from dataclasses import replace
 from typing import List, Dict, Tuple
@@ -17,7 +18,7 @@ from ..fx import (add_postprocess, _make_node_meta, get_output_node, move_primal
                   replace_reduce_outputs_with_none, should_release_reduce_buckets)
 from ..profilers.graph_profile import ProfilingInterpreter, is_profile_incomplete
 from ..list_schedule import (SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, SchedulerMemoryBudget, allgather_allocation_bytes,
-                             fast_free_schedule, max_possible_gathered_bytes)
+                             fast_free_schedule, max_possible_gathered_bytes, profiled_non_gathered_peak)
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
@@ -66,9 +67,9 @@ def _sync_profile_complete(profile_complete: bool):
 
 
 def _operator_profile_complete(graph: Graph):
-    """Require the graph marker plus per-node allocation and peak deltas."""
-    return not is_profile_incomplete(graph) and all("alloc_mem" in node.meta and "max_mem" in node.meta
-                                                    for node in graph.nodes)
+    """Require the graph marker plus per-node absolute start and peak memory."""
+    return not is_profile_incomplete(graph) and all(
+        "profile_mem_start" in node.meta and "profile_mem_peak" in node.meta for node in graph.nodes)
 
 
 def _is_gather_lifetime_node(node: Node):
@@ -78,24 +79,15 @@ def _is_gather_lifetime_node(node: Node):
 
 def _operator_profile_has_observed_non_gathered_peak(graph: Graph):
     return any(not _is_gather_lifetime_node(node) and (
-        int(node.meta.get("max_mem", 0) or 0) > 0 or int(node.meta.get("alloc_mem", 0) or 0) != 0)
+        int(node.meta.get("profile_mem_peak", 0) or 0) > 0 or int(node.meta.get("profile_mem_start", 0) or 0) > 0)
                for node in graph.nodes)
 
 
 def _rank_max_operator_profiled_non_gathered_peak(graph: Graph):
-    """Reconstruct the worst-rank absolute non-gathered peak from operator deltas."""
-    baseline = int(get_accelerator().memory_allocated())
-    live_non_gathered = 0
-    peak = baseline
-    for node in graph.nodes:
-        if _is_gather_lifetime_node(node):
-            continue
-        # Profiling resets peak statistics before every node, so max_mem is
-        # transient growth above that node's starting residency.  Accumulate
-        # alloc_mem to retain live activations produced by preceding nodes.
-        peak = max(peak, baseline + live_non_gathered + int(node.meta.get("max_mem", 0) or 0))
-        live_non_gathered += int(node.meta.get("alloc_mem", 0) or 0)
-    return _reduce_int(max(0, peak), dist.ReduceOp.MAX)
+    """Return the worst absolute peak after removing profiled gather residency."""
+    records = [(node.name, int(node.meta.get("profile_mem_start", 0)
+                               or 0), 0, int(node.meta.get("profile_mem_peak", 0) or 0)) for node in graph.nodes]
+    return _reduce_int(profiled_non_gathered_peak(graph, records), dist.ReduceOp.MAX)
 
 
 def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int = 0):
@@ -144,6 +136,51 @@ def _print_scheduler_debug(message: str):
         return
     if not dist.is_initialized() or dist.get_rank() == 0:
         print(message, flush=True)
+
+
+def _stable_schedule_target(target):
+    if isinstance(target, str):
+        return target
+    module = getattr(target, "__module__", None)
+    qualname = getattr(target, "__qualname__", None) or getattr(target, "__name__", None)
+    if module and qualname:
+        return f"{module}.{qualname}"
+    return f"{type(target).__module__}.{type(target).__qualname__}"
+
+
+def _final_schedule_fingerprint(graph: Graph):
+    """Hash stable node order and dependencies without process-local graph identifiers."""
+    entries = []
+    for node in graph.nodes:
+        inputs = ",".join(input_node.name for input_node in node.all_input_nodes)
+        entries.append(f"{node.op}|{node.name}|{_stable_schedule_target(node.target)}|{inputs}")
+    digest = hashlib.sha256("\n".join(entries).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)
+
+
+def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool):
+    """In scheduler debug mode, fail every rank when final graph order diverges."""
+    if not _scheduler_debug_enabled():
+        return None
+
+    fingerprint = _final_schedule_fingerprint(graph)
+    if not dist.is_initialized():
+        _print_scheduler_debug(
+            f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}")
+        return fingerprint
+
+    device = torch.device(get_accelerator().current_device())
+    min_fingerprint = torch.tensor([fingerprint], device=device, dtype=torch.int64)
+    max_fingerprint = min_fingerprint.clone()
+    dist.all_reduce(min_fingerprint, dist.ReduceOp.MIN)
+    dist.all_reduce(max_fingerprint, dist.ReduceOp.MAX)
+    if min_fingerprint.item() != max_fingerprint.item():
+        raise RuntimeError(
+            f"DeepCompile ZeRO-3 final schedule fingerprint mismatch for graph_id={graph_id} bwd={bwd}: "
+            f"min={min_fingerprint.item()} max={max_fingerprint.item()}")
+    _print_scheduler_debug(
+        f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}")
+    return fingerprint
 
 
 def _set_allgather_allocation_metadata(graph: Graph):
@@ -416,6 +453,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
                           scheduler_budget=scheduler_budget,
                           disabled_reason=disabled_reason,
                           graph=gm.graph)
+    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=False)
 
     if rank == 0 and debug_log:
         print(f"Fwd after scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
@@ -467,6 +505,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
 
     add_end_backward(gm.graph, graph_id, should_release_reduce_buckets(graph_order, graph_id))
     replace_reduce_outputs_with_none(gm.graph)
+    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=True)
 
     return gm
 

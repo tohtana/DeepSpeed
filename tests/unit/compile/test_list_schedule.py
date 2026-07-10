@@ -18,6 +18,7 @@ from deepspeed.compile.passes import prefetch as prefetch_mod
 from deepspeed.compile.passes import selective_gather as selective_gather_mod
 from deepspeed.compile.passes import zero3_compile as zero3_compile_mod
 from deepspeed.compile.profilers import ProfilingResult
+from deepspeed.compile.profilers import graph_profile as graph_profile_mod
 from deepspeed.compile.profilers.graph_profile import _backfill_missing_profile_metadata, is_profile_incomplete
 
 _DC_LIBRARIES = []
@@ -60,6 +61,8 @@ def stub_deepcompile_ops(monkeypatch):
 def _with_meta(node, tensor_size=0, device_time=0):
     node.meta["tensor_size"] = tensor_size
     node.meta["alloc_mem"] = 0
+    node.meta["profile_mem_start"] = 0
+    node.meta["profile_mem_peak"] = 0
     if device_time is not None:
         node.meta["device_time"] = device_time
     return node
@@ -139,13 +142,15 @@ def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch)
     ag = _allgather(graph, param, 1, "budget_builder", tensor_size=200)
     wait = _wait(graph, ag, 1, "budget_builder")
     op = _neg(graph, wait, "budget_builder_op")
-    op.meta["max_mem"] = 800
+    op.meta.update(max_mem=800, profile_mem_start=250, profile_mem_peak=1050)
     release = _release(graph, op, 1, "budget_builder")
     graph.output((release, ))
     graph.lint()
     for node in graph.nodes:
         node.meta.setdefault("alloc_mem", 0)
         node.meta.setdefault("max_mem", 0)
+        node.meta.setdefault("profile_mem_start", 0)
+        node.meta.setdefault("profile_mem_peak", 0)
 
     budget = zero3_compile_mod._build_scheduler_budget_from_operator_profile(graph)
 
@@ -163,17 +168,57 @@ def test_zero3_scheduler_budget_reconstructs_live_activations_before_transient_p
     graph = Graph()
     value = _placeholder(graph, "absolute_peak_input")
     activation = _neg(graph, value, "absolute_peak_activation")
-    activation.meta.update(alloc_mem=300, max_mem=300)
+    activation.meta.update(alloc_mem=300, max_mem=300, profile_mem_start=100, profile_mem_peak=400)
     transient = _neg(graph, activation, "absolute_peak_transient")
-    transient.meta.update(alloc_mem=50, max_mem=200)
+    transient.meta.update(alloc_mem=50, max_mem=200, profile_mem_start=400, profile_mem_peak=600)
     graph.output((transient, ))
     graph.lint()
 
     peak = zero3_compile_mod._rank_max_operator_profiled_non_gathered_peak(graph)
 
-    # The second node starts with the first node's 300-byte live activation,
-    # then reaches a further 200-byte transient peak above the 100-byte base.
+    # The absolute record retains the first node's live activation while the
+    # second node reaches a further transient peak.
     assert peak == 600
+
+
+def test_zero3_scheduler_budget_uses_absolute_peaks_after_inter_node_reclamation(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: False)
+
+    graph = Graph()
+    value = _placeholder(graph, "reclaimed_peak_input")
+    first = _neg(graph, value, "reclaimed_first")
+    first.meta.update(alloc_mem=400, max_mem=400, profile_mem_start=100, profile_mem_peak=500)
+    second = _neg(graph, first, "reclaimed_second")
+    second.meta.update(alloc_mem=-300, max_mem=250, profile_mem_start=200, profile_mem_peak=450)
+    graph.output((second, ))
+    graph.lint()
+
+    peak = zero3_compile_mod._rank_max_operator_profiled_non_gathered_peak(graph)
+
+    assert peak == 500
+
+
+def test_absolute_profile_memory_adds_external_once_and_max_reduces_asymmetric_ranks(monkeypatch):
+
+    class FakeAccelerator:
+
+        def memory_allocated(self):
+            return 100
+
+        def max_memory_allocated(self):
+            return 140
+
+    monkeypatch.setattr(graph_profile_mod, "get_accelerator", lambda: FakeAccelerator())
+
+    assert graph_profile_mod._absolute_profile_memory(50) == (150, 190)
+
+    def reduce_to_worst_rank(values, op):
+        assert op == graph_profile_mod.dist.ReduceOp.MAX
+        values[0] = 175
+        values[1] = 410
+
+    monkeypatch.setattr(graph_profile_mod.dist, "all_reduce", reduce_to_worst_rank)
+    assert graph_profile_mod._rank_max_profile_memory(150, 190, torch.device("cpu"), distributed=True) == (175, 410)
 
 
 def test_zero3_scheduler_partial_profile_uses_identical_collectives_on_asymmetric_ranks(monkeypatch):
@@ -203,7 +248,7 @@ def test_zero3_scheduler_partial_profile_uses_identical_collectives_on_asymmetri
         wait = _wait(graph, ag, 1, f"asymmetric_{observed}")
         op = _neg(graph, wait, f"asymmetric_op_{observed}")
         if observed:
-            op.meta.update(alloc_mem=300, max_mem=500)
+            op.meta.update(alloc_mem=300, max_mem=500, profile_mem_start=850, profile_mem_peak=1300)
         release = _release(graph, op, 1, f"asymmetric_{observed}")
         graph.output((release, ))
         graph.lint()
@@ -381,7 +426,7 @@ def test_zero3_scheduler_budget_uses_partial_operator_profile_when_incomplete(mo
     ag = _allgather(graph, param, 1, "partial_budget", tensor_size=800)
     wait = _wait(graph, ag, 1, "partial_budget")
     op = _neg(graph, wait, "partial_budget_observed_op")
-    op.meta["max_mem"] = 800
+    op.meta.update(max_mem=800, profile_mem_start=850, profile_mem_peak=1650)
     release = _release(graph, op, 1, "partial_budget")
     graph.output((release, ))
     graph.lint()
@@ -433,13 +478,15 @@ def test_zero3_scheduler_budget_skips_when_budget_cannot_constrain(monkeypatch):
     ag = _allgather(graph, param, 1, "nonbinding_budget", tensor_size=200)
     wait = _wait(graph, ag, 1, "nonbinding_budget")
     op = _neg(graph, wait, "nonbinding_budget_op")
-    op.meta["max_mem"] = 800
+    op.meta.update(max_mem=800, profile_mem_start=250, profile_mem_peak=1050)
     release = _release(graph, op, 1, "nonbinding_budget")
     graph.output((release, ))
     graph.lint()
     for node in graph.nodes:
         node.meta.setdefault("alloc_mem", 0)
         node.meta.setdefault("max_mem", 0)
+        node.meta.setdefault("profile_mem_start", 0)
+        node.meta.setdefault("profile_mem_peak", 0)
     gm = GraphModule(torch.nn.Module(), graph)
 
     budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
@@ -540,6 +587,47 @@ def test_zero3_scheduler_debug_logs_disabled_budget(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "budget_enabled=False" in captured.out
     assert "disabled_reason=missing_or_incomplete_memory_profile" in captured.out
+
+
+def test_zero3_final_schedule_fingerprint_detects_rank_mismatch(monkeypatch):
+    monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: SimpleNamespace(current_device=lambda: "cpu"))
+
+    def reduce_mismatched_fingerprints(value, op):
+        value[0] = 1 if op == zero3_compile_mod.dist.ReduceOp.MIN else 2
+
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_mismatched_fingerprints)
+    graph = Graph()
+    graph.output(())
+
+    with pytest.raises(RuntimeError, match="final schedule fingerprint mismatch"):
+        zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=7, bwd=False)
+
+
+def test_zero3_final_schedule_fingerprint_is_safe_without_distributed(monkeypatch, capsys):
+    monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce",
+                        lambda *args, **kwargs: pytest.fail("non-distributed debug must not use a collective"))
+    graph = Graph()
+    graph.output(())
+
+    fingerprint = zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=8, bwd=True)
+
+    assert fingerprint == zero3_compile_mod._final_schedule_fingerprint(graph)
+    assert "final_schedule_fingerprint" in capsys.readouterr().out
+
+
+def test_zero3_final_schedule_fingerprint_is_absent_when_debug_is_disabled(monkeypatch):
+    monkeypatch.delenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, raising=False)
+    monkeypatch.delenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV_LEGACY, raising=False)
+    monkeypatch.setattr(zero3_compile_mod, "_final_schedule_fingerprint",
+                        lambda graph: pytest.fail("non-debug scheduling must not compute a fingerprint"))
+    graph = Graph()
+    graph.output(())
+
+    assert zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=9, bwd=False) is None
 
 
 def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1, allocation_size=None):
