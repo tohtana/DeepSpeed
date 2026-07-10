@@ -87,13 +87,30 @@ def cleanup_compiled_backward_state(frame_id=None):
         unpatch_compiled_func()
 
 
-def _cleanup_compiled_backward_state_on_error(fn):
+def _cleanup_compiled_backward_state_on_error(frame_id):
 
-    def wrapped(*args, **kwargs):
+    def decorator(fn):
+
+        def wrapped(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                cleanup_compiled_backward_state(frame_id)
+                raise
+
+        return wrapped
+
+    return decorator
+
+
+def _cleanup_compiled_backward_backend_state_on_error(fn):
+
+    def wrapped(gm, *args, **kwargs):
+        frame_id = gm.meta["dynamo_compile_id"].frame_id
         try:
-            return fn(*args, **kwargs)
+            return fn(gm, *args, **kwargs)
         except Exception:
-            cleanup_compiled_backward_state()
+            cleanup_compiled_backward_state(frame_id)
             raise
 
     return wrapped
@@ -290,7 +307,9 @@ def run_opt_passes(opt_passes: List[Callable],
 
             # Re-profiling an already incomplete graph would turn synthetic
             # backfilled metadata into a seemingly valid memory profile.
-            if is_profile_incomplete(gm.graph):
+            operator_profile_complete = _sync_memory_profile_complete(not is_profile_incomplete(gm.graph),
+                                                                      process_group)
+            if not operator_profile_complete:
                 profile_complete = False
                 mem = []
             else:
@@ -320,6 +339,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
     debug_log = compile_config.debug_log
     free_activation = compile_config.free_activation and not is_backend_inductor(backend)
 
+    @_cleanup_compiled_backward_backend_state_on_error
     def backend_fn(gm: GraphModule, real_inputs):
         graph_id = id(gm.graph)
 
@@ -368,7 +388,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
             profiling_results[graph_id] = ProfilingResult(process_group=process_group)
             profiling_results[graph_id].param_indices = param_indices
 
-        @_cleanup_compiled_backward_state_on_error
+        @_cleanup_compiled_backward_state_on_error(frame_id)
         def make_fw_graph(gm, sample_inputs):
             """Apply forward passes with graph-local real inputs and return the rewritten FX graph."""
             time_start = time.time()
@@ -409,7 +429,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
 
             return gm.graph
 
-        @_cleanup_compiled_backward_state_on_error
+        @_cleanup_compiled_backward_state_on_error(frame_id)
         def make_bw_graph(gm, sample_inputs):
             time_start = time.time()
 

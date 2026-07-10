@@ -13,7 +13,7 @@ from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToMo
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
 from .passes import zero3_compile, prefetch, selective_gather, offload_parameters
-from .backend import cleanup_compiled_backward_state, make_backend, launch_compile_passes, init_schedule
+from .backend import make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
@@ -77,7 +77,6 @@ def _deactivate_deepcompile_on_backend_failure(engine, backend_fn):
         try:
             return backend_fn(*args, **kwargs)
         except Exception:
-            cleanup_compiled_backward_state()
             engine._set_deepcompile_active(False)
             raise
 

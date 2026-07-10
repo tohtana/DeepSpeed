@@ -7,6 +7,7 @@ from collections import deque
 from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 
 from deepspeed.compile.backend import _get_fw_real_inputs, fwd_real_inputs, set_example_values_to_symints
@@ -291,3 +292,59 @@ def test_run_opt_passes_skips_memory_profile_for_incomplete_graph(monkeypatch):
 
     assert profiling_results[7].fwd_mem == []
     assert profiling_results[7].fwd_mem_complete is False
+
+
+def test_run_opt_passes_skips_memory_profile_when_another_rank_is_incomplete(monkeypatch):
+    gm = torch.fx.symbolic_trace(lambda x: x + 1)
+    profiling_results = {7: ProfilingResult()}
+
+    class UnexpectedMemoryProfiler:
+
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("all ranks must skip profiling when any rank has an incomplete operator profile")
+
+    def complete_profile_pass(gm, *args, **kwargs):
+        return gm
+
+    monkeypatch.setattr(backend_mod, "MemoryProfilingInterpreter", UnexpectedMemoryProfiler)
+    monkeypatch.setattr(backend_mod, "_sync_memory_profile_complete", lambda complete, process_group=None: False)
+    monkeypatch.setattr(backend_mod, "log_rank0", lambda *args, **kwargs: None)
+
+    backend_mod.run_opt_passes(opt_passes=[complete_profile_pass],
+                               gm=gm,
+                               graph_id=7,
+                               graph_order=[],
+                               profiling_results=profiling_results,
+                               create_inputs_fn=lambda: (torch.ones(1), ),
+                               mem_budget=0.0,
+                               param_manager={},
+                               bwd=False)
+
+    assert profiling_results[7].fwd_mem == []
+    assert profiling_results[7].fwd_mem_complete is False
+
+
+def test_backend_failure_cleanup_preserves_other_pending_frames():
+    original_autograd_function = torch.autograd.Function
+    backend_mod.frames_needing_bwd.clear()
+    backend_mod.frames_needing_bwd.update((17, 18))
+    backend_mod.patch_compiled_func()
+    backend_mod.get_backward_inputs().append((torch.ones(1), ))
+    gm = torch.fx.symbolic_trace(lambda x: x + 1)
+    gm.meta["dynamo_compile_id"] = SimpleNamespace(frame_id=17)
+
+    def failing_backend(gm):
+        raise RuntimeError("compile failed")
+
+    backend = backend_mod._cleanup_compiled_backward_backend_state_on_error(failing_backend)
+
+    try:
+        with pytest.raises(RuntimeError, match="compile failed"):
+            backend(gm)
+
+        assert backend_mod.frames_needing_bwd == {18}
+        assert len(backend_mod.get_backward_inputs()) == 1
+        assert torch.autograd.Function is not original_autograd_function
+    finally:
+        backend_mod.frames_needing_bwd.clear()
+        backend_mod.unpatch_compiled_func()
