@@ -336,7 +336,7 @@ def test_backend_failure_cleanup_preserves_other_pending_frames():
     def failing_backend(gm):
         raise RuntimeError("compile failed")
 
-    backend = backend_mod._cleanup_compiled_backward_backend_state_on_error(failing_backend)
+    backend = backend_mod._cleanup_compiled_backward_backend_state_on_error()(failing_backend)
 
     try:
         with pytest.raises(RuntimeError, match="compile failed"):

@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+from functools import partial
 from threading import Lock
 
 import torch
@@ -164,7 +165,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
             if move_opt_states in passes or move_opt_states_sync in passes:
                 init_offload_opt_states(optimizer, dc)
 
-    engine.launch_compile_passes = launch_compile_passes
+    engine._deepcompile_owned_frames = set()
+    engine.launch_compile_passes = partial(launch_compile_passes, owned_frames=engine._deepcompile_owned_frames)
 
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
@@ -180,7 +182,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         backend_fn = make_backend(backend,
                                   compile_config,
                                   compile_kwargs=compile_kwargs,
-                                  process_group=engine.data_parallel_group)
+                                  process_group=engine.data_parallel_group,
+                                  owned_frames=engine._deepcompile_owned_frames)
     except Exception:
         if restore_dynamo_config is not None:
             restore_dynamo_config()

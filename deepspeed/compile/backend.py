@@ -77,17 +77,23 @@ opt_passes = {}
 fwd_real_inputs = []
 
 
-def cleanup_compiled_backward_state(frame_id=None):
+def cleanup_compiled_backward_state(frame_id=None, owned_frames=None):
     """Release process-global compiled-backward state after completion or failure."""
     if frame_id is None:
-        frames_needing_bwd.clear()
+        if owned_frames is None:
+            frames_needing_bwd.clear()
+        else:
+            frames_needing_bwd.difference_update(owned_frames)
+            owned_frames.clear()
     else:
         frames_needing_bwd.discard(frame_id)
+        if owned_frames is not None:
+            owned_frames.discard(frame_id)
     if len(frames_needing_bwd) == 0:
         unpatch_compiled_func()
 
 
-def _cleanup_compiled_backward_state_on_error(frame_id):
+def _cleanup_compiled_backward_state_on_error(frame_id, owned_frames=None):
 
     def decorator(fn):
 
@@ -95,7 +101,7 @@ def _cleanup_compiled_backward_state_on_error(frame_id):
             try:
                 return fn(*args, **kwargs)
             except Exception:
-                cleanup_compiled_backward_state(frame_id)
+                cleanup_compiled_backward_state(frame_id, owned_frames)
                 raise
 
         return wrapped
@@ -103,17 +109,21 @@ def _cleanup_compiled_backward_state_on_error(frame_id):
     return decorator
 
 
-def _cleanup_compiled_backward_backend_state_on_error(fn):
+def _cleanup_compiled_backward_backend_state_on_error(owned_frames=None):
 
-    def wrapped(gm, *args, **kwargs):
-        frame_id = gm.meta["dynamo_compile_id"].frame_id
-        try:
-            return fn(gm, *args, **kwargs)
-        except Exception:
-            cleanup_compiled_backward_state(frame_id)
-            raise
+    def decorator(fn):
 
-    return wrapped
+        def wrapped(gm, *args, **kwargs):
+            frame_id = gm.meta["dynamo_compile_id"].frame_id
+            try:
+                return fn(gm, *args, **kwargs)
+            except Exception:
+                cleanup_compiled_backward_state(frame_id, owned_frames)
+                raise
+
+        return wrapped
+
+    return decorator
 
 
 def register_compile_pass(name: str, opt_pass_fn):
@@ -132,7 +142,7 @@ def init_schedule(schedule):
     remaining_schedule = deque(schedule)
 
 
-def launch_compile_passes(global_steps: int):
+def launch_compile_passes(global_steps: int, owned_frames=None):
     """Advance the pass schedule and discard state owned by the previous compile cycle."""
     global next_pass_step, next_passes
 
@@ -146,7 +156,7 @@ def launch_compile_passes(global_steps: int):
         profiling_results.clear()
         param_manager.clear()
         fwd_real_inputs.clear()
-        cleanup_compiled_backward_state()
+        cleanup_compiled_backward_state(owned_frames=owned_frames)
         frames_partitioned.clear()
 
 
@@ -331,7 +341,7 @@ def run_opt_passes(opt_passes: List[Callable],
             get_accelerator().empty_cache()
 
 
-def make_backend(backend, compile_config, compile_kwargs={}, process_group=None):
+def make_backend(backend, compile_config, compile_kwargs={}, process_group=None, owned_frames=None):
 
     register_custom_ops()
 
@@ -339,7 +349,10 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
     debug_log = compile_config.debug_log
     free_activation = compile_config.free_activation and not is_backend_inductor(backend)
 
-    @_cleanup_compiled_backward_backend_state_on_error
+    if owned_frames is None:
+        owned_frames = set()
+
+    @_cleanup_compiled_backward_backend_state_on_error(owned_frames)
     def backend_fn(gm: GraphModule, real_inputs):
         graph_id = id(gm.graph)
 
@@ -388,7 +401,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
             profiling_results[graph_id] = ProfilingResult(process_group=process_group)
             profiling_results[graph_id].param_indices = param_indices
 
-        @_cleanup_compiled_backward_state_on_error(frame_id)
+        @_cleanup_compiled_backward_state_on_error(frame_id, owned_frames)
         def make_fw_graph(gm, sample_inputs):
             """Apply forward passes with graph-local real inputs and return the rewritten FX graph."""
             time_start = time.time()
@@ -402,6 +415,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
                 if len(frames_needing_bwd) == 0:
                     patch_compiled_func()
                 frames_needing_bwd.add(frame_id)
+                owned_frames.add(frame_id)
 
             real_inputs = _get_fw_real_inputs(local_fwd_real_inputs, input_storage, graph_id, debug_log=debug_log)
             real_inputs = set_example_values_to_symints(real_inputs, param_indices, real_zero_params=real_zero_params)
@@ -429,7 +443,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
 
             return gm.graph
 
-        @_cleanup_compiled_backward_state_on_error(frame_id)
+        @_cleanup_compiled_backward_state_on_error(frame_id, owned_frames)
         def make_bw_graph(gm, sample_inputs):
             time_start = time.time()
 
@@ -474,7 +488,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, process_group=None)
                 add_free_activations(graph_id, gm.graph,
                                      get_activation_node_names(gm.graph, param_nodes_bw, non_param_input_names))
 
-            cleanup_compiled_backward_state(frame_id)
+            cleanup_compiled_backward_state(frame_id, owned_frames)
 
             log_rank0(
                 f"Bwd end {graph_index} graph_id={graph_id} alloc_mem={get_accelerator().memory_allocated()} graph={gm.graph}",
