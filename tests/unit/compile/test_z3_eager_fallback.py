@@ -7,8 +7,9 @@ import torch
 from types import FunctionType
 
 from deepspeed.compile import z3_eager_fallback
-from deepspeed.compile.z3_eager_fallback import DeepCompileZ3EagerFallback
+from deepspeed.compile.z3_eager_fallback import DeepCompileZ3EagerFallback, deepcompile_z3_forward_context
 from deepspeed.runtime.zero import parameter_offload
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
@@ -96,8 +97,51 @@ def test_deepcompile_fallback_releases_leftover_gathered_params_before_forward()
 
     param.partition = partition
     fallback = DeepCompileZ3EagerFallback(FakeEngine())
+    fallback.record_gathered_param(param)
 
     fallback.release_available_params_for_next_forward()
 
     assert partition_calls == [11]
     assert fallback.stats()["last_pre_forward_released_param_ids"] == [11]
+
+
+def test_deepcompile_forward_preserves_user_gathered_parameters_context():
+    module, param = _zero_module_with_param()
+    param.ds_persist = False
+    partition_calls = []
+
+    def all_gather(param_list):
+        assert param_list == [param]
+        param.ds_status = ZeroParamStatus.AVAILABLE
+
+    def partition(param_list=None, has_been_updated=False):
+        if param_list is not None:
+            assert param_list == [param]
+            assert has_been_updated is False
+        partition_calls.append(param.ds_id)
+        param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
+    param.all_gather = all_gather
+    param.partition = partition
+
+    class FakeEngine:
+
+        def __init__(self):
+            self.module = module
+            self._deepcompile_z3_eager_fallback = DeepCompileZ3EagerFallback(self)
+
+        def is_deepcompile_active(self):
+            return True
+
+        def zero_optimization_partition_weights(self):
+            return True
+
+    engine = FakeEngine()
+
+    with GatheredParameters([param]):
+        assert param.ds_status == ZeroParamStatus.AVAILABLE
+        with deepcompile_z3_forward_context(engine):
+            assert param.ds_status == ZeroParamStatus.AVAILABLE
+        assert param.ds_status == ZeroParamStatus.AVAILABLE
+
+    assert partition_calls == [7]

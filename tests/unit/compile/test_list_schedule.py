@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import operator
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -219,6 +220,68 @@ def test_absolute_profile_memory_adds_external_once_and_max_reduces_asymmetric_r
 
     monkeypatch.setattr(graph_profile_mod.dist, "all_reduce", reduce_to_worst_rank)
     assert graph_profile_mod._rank_max_profile_memory(150, 190, torch.device("cpu"), distributed=True) == (175, 410)
+
+
+def test_external_memory_profile_maps_nvml_device_and_excludes_reserved_allocator_bytes(monkeypatch):
+    nvml_device_ids = []
+    fake_nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlDeviceGetHandleByIndex=lambda device_id: nvml_device_ids.append(device_id) or "handle",
+        nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(used=1000))
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return 0
+
+        def _get_nvml_gpu_id(self, device_id):
+            assert device_id == 0
+            return 5
+
+        def memory_allocated(self):
+            return 400
+
+        def memory_reserved(self):
+            return 600
+
+    monkeypatch.setattr(graph_profile_mod, "get_accelerator", lambda: FakeAccelerator())
+
+    assert graph_profile_mod._get_mem_usage_out_of_torch() == 400
+    assert nvml_device_ids == [5]
+
+
+def test_external_memory_profile_does_not_count_reserved_to_allocated_reuse_twice(monkeypatch):
+    fake_nvml = SimpleNamespace(nvmlInit=lambda: None,
+                                nvmlDeviceGetHandleByIndex=lambda device_id: "handle",
+                                nvmlDeviceGetMemoryInfo=lambda handle: SimpleNamespace(used=1000))
+    monkeypatch.setitem(sys.modules, "pynvml", fake_nvml)
+
+    class FakeAccelerator:
+        allocated = 400
+
+        def current_device(self):
+            return 0
+
+        def memory_allocated(self):
+            return self.allocated
+
+        def max_memory_allocated(self):
+            return self.allocated
+
+        def memory_reserved(self):
+            return 800
+
+    accelerator = FakeAccelerator()
+    monkeypatch.setattr(graph_profile_mod, "get_accelerator", lambda: accelerator)
+
+    external_mem = graph_profile_mod._get_mem_usage_out_of_torch()
+    first_absolute, _ = graph_profile_mod._absolute_profile_memory(external_mem)
+    accelerator.allocated = 700
+    second_absolute, _ = graph_profile_mod._absolute_profile_memory(external_mem)
+
+    assert external_mem == 200
+    assert (first_absolute, second_absolute) == (600, 900)
 
 
 def test_zero3_scheduler_partial_profile_uses_identical_collectives_on_asymmetric_ranks(monkeypatch):

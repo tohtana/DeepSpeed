@@ -103,16 +103,14 @@ class DeepCompileZ3EagerFallback:
 
     @torch.no_grad()
     def release_available_params_for_next_forward(self):
-        """Repartition nonpersistent leftovers before a new forward starts."""
-        if self.engine is None:
-            return
-
+        """Repartition only leftovers gathered by this fallback instance."""
         released = []
-        for param in self.engine.module.parameters():
+        for ds_id, param in list(self._tracked_params.items()):
             if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
                     and not getattr(param, "ds_persist", False)):
                 param.partition()
-                released.append(int(param.ds_id))
+                released.append(ds_id)
+        self._tracked_params.clear()
         self._last_pre_forward_released_param_ids = released
 
     @torch.no_grad()

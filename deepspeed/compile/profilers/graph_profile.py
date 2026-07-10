@@ -127,12 +127,17 @@ def _get_mem_usage_out_of_torch():
         import pynvml
         pynvml.nvmlInit()
 
-        current_dev_id = get_accelerator().current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(current_dev_id)
+        accelerator = get_accelerator()
+        current_dev_id = accelerator.current_device()
+        map_nvml_device = getattr(accelerator, "_get_nvml_gpu_id", None)
+        nvml_dev_id = map_nvml_device(current_dev_id) if callable(map_nvml_device) else current_dev_id
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_dev_id)
         info = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
-        torch_alloc = get_accelerator().memory_allocated()
-        adjust = info.used - torch_alloc
+        # NVML includes PyTorch's cached allocator reservation.  Subtract the
+        # whole reservation so later reuse is counted only as live allocation.
+        torch_reserved = accelerator.memory_reserved()
+        adjust = max(0, int(info.used) - int(torch_reserved or 0))
     except Exception:
         # pynvml not available
         pass
