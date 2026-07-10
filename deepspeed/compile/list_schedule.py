@@ -279,20 +279,6 @@ class SchedulerMemoryBudget:
     profiled_non_gathered_peak_mem: int = 0
 
     @classmethod
-    def from_available_memory(cls, available_mem: int, output_size: int):
-        """Build a conservative fallback budget from current free memory."""
-        if available_mem is None or available_mem <= 0:
-            return None
-        output_size = max(0, int(output_size or 0))
-        safety_margin = int(available_mem * SCHEDULER_MEMORY_MARGIN)
-        max_gathered_bytes = max(0, int(available_mem) - output_size - safety_margin)
-        return cls(max_gathered_bytes=max_gathered_bytes,
-                   source="available_memory",
-                   available_mem=int(available_mem),
-                   output_size=output_size,
-                   safety_margin=safety_margin)
-
-    @classmethod
     def from_profiled_non_gathered_peak(cls, total_mem: int, profiled_non_gathered_peak_mem: int, output_size: int):
         """Reserve profiled non-gather memory before budgeting transient gathers."""
         if total_mem is None or total_mem <= 0 or profiled_non_gathered_peak_mem is None or profiled_non_gathered_peak_mem <= 0:
@@ -384,7 +370,7 @@ def _dtype_element_size(dtype):
 
 
 def allgather_allocation_bytes(tensor_size: int, dtype, world_size: int):
-    """Return the padded allocation size used by a world-size all-gather."""
+    """Return the padded allocation size used by a process-group all-gather."""
     element_size = _dtype_element_size(dtype)
     tensor_size = int(tensor_size)
     if tensor_size <= 0 or element_size is None or element_size <= 0 or world_size <= 1:

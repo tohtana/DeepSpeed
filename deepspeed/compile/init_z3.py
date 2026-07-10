@@ -22,24 +22,49 @@ _MISSING = object()
 
 
 def _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs):
-    """Allow ZeRO-3 partitioned parameters to change between shard and gathered shapes."""
+    """Allow ZeRO-3 shape changes and return an idempotent config restore callback."""
     dynamo = getattr(torch, "_dynamo", None)
     if dynamo is None:
         try:
             import torch._dynamo as dynamo
         except ImportError:
-            return False
+            return None
 
     dynamo_config = getattr(dynamo, "config", None)
     if dynamo_config is None:
-        return False
+        return None
 
-    changed = False
+    previous_values = {}
     for config_name in ("force_parameter_static_shapes", "force_nn_module_property_static_shapes"):
         if hasattr(dynamo_config, config_name):
+            previous_values[config_name] = getattr(dynamo_config, config_name)
             setattr(dynamo_config, config_name, False)
-            changed = True
-    return changed
+    if not previous_values:
+        return None
+
+    restored = False
+
+    def restore():
+        nonlocal restored
+        if restored:
+            return
+        for config_name, previous_value in previous_values.items():
+            setattr(dynamo_config, config_name, previous_value)
+        restored = True
+
+    return restore
+
+
+def _deactivate_deepcompile_on_backend_failure(engine, backend_fn):
+
+    def backend_with_failure_cleanup(*args, **kwargs):
+        try:
+            return backend_fn(*args, **kwargs)
+        except Exception:
+            engine._set_deepcompile_active(False)
+            raise
+
+    return backend_with_failure_cleanup
 
 
 def _resolve_expected_grad_dtype(param):
@@ -127,6 +152,22 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
-    _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
+    previous_restore = getattr(engine, "_deepcompile_dynamo_config_restore", None)
+    if previous_restore is not None:
+        previous_restore()
+        del engine._deepcompile_dynamo_config_restore
+    restore_dynamo_config = _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
+    if restore_dynamo_config is not None:
+        engine._deepcompile_dynamo_config_restore = restore_dynamo_config
 
-    return make_backend(backend, compile_config, compile_kwargs=compile_kwargs)
+    try:
+        backend_fn = make_backend(backend,
+                                  compile_config,
+                                  compile_kwargs=compile_kwargs,
+                                  process_group=engine.data_parallel_group)
+    except Exception:
+        if restore_dynamo_config is not None:
+            restore_dynamo_config()
+            del engine._deepcompile_dynamo_config_restore
+        raise
+    return _deactivate_deepcompile_on_backend_failure(engine, backend_fn)

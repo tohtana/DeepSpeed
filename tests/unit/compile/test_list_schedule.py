@@ -88,14 +88,16 @@ def test_sync_memory_profile_complete_noops_without_distributed(monkeypatch):
 def test_sync_memory_profile_complete_reduces_asymmetric_failure(monkeypatch):
     monkeypatch.setattr(backend_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(backend_mod, "get_accelerator", lambda: SimpleNamespace(current_device=lambda: "cpu"))
+    process_group = object()
 
-    def mark_any_rank_failed(tensor, op):
+    def mark_any_rank_failed(tensor, op, group=None):
         assert op == backend_mod.dist.ReduceOp.MIN
+        assert group is process_group
         tensor[0] = 0
 
     monkeypatch.setattr(backend_mod.dist, "all_reduce", mark_any_rank_failed)
 
-    assert not backend_mod._sync_memory_profile_complete(True)
+    assert not backend_mod._sync_memory_profile_complete(True, process_group)
 
 
 def test_get_last_uses_handles_dead_no_copy_node():
@@ -284,7 +286,7 @@ def test_external_memory_profile_does_not_count_reserved_to_allocated_reuse_twic
     assert (first_absolute, second_absolute) == (600, 900)
 
 
-def test_zero3_scheduler_partial_profile_uses_identical_collectives_on_asymmetric_ranks(monkeypatch):
+def test_zero3_scheduler_incomplete_profile_uses_identical_collective_on_asymmetric_ranks(monkeypatch):
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 2)
 
@@ -325,28 +327,18 @@ def test_zero3_scheduler_partial_profile_uses_identical_collectives_on_asymmetri
 
         def reduce_asymmetric_rank(tensor, op):
             calls.append((op, tensor.dtype))
-            if op == zero3_compile_mod.dist.ReduceOp.MIN and tensor.dtype == torch.int32:
-                tensor[0] = 0
-            elif op == zero3_compile_mod.dist.ReduceOp.MAX and len(calls) == 2:
-                tensor[0] = 1
-            elif op == zero3_compile_mod.dist.ReduceOp.MIN:
-                tensor[0] = 1000
-            elif op == zero3_compile_mod.dist.ReduceOp.MAX:
-                tensor[0] = 850
+            tensor[0] = 0
 
         monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_asymmetric_rank)
         budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(make_graph(observed))
-        assert disabled_reason is None
+        assert budget is None
+        assert disabled_reason == "incomplete_operator_profile"
         sequences.append(calls)
         budgets.append(budget)
 
     assert sequences[0] == sequences[1]
-    assert sequences[0] == [(zero3_compile_mod.dist.ReduceOp.MIN, torch.int32),
-                            (zero3_compile_mod.dist.ReduceOp.MAX, torch.int64),
-                            (zero3_compile_mod.dist.ReduceOp.MIN, torch.int64),
-                            (zero3_compile_mod.dist.ReduceOp.MAX, torch.int64)]
-    assert [budget.profiled_non_gathered_peak_mem for budget in budgets] == [850, 850]
-    assert [budget.max_gathered_bytes for budget in budgets] == [50, 50]
+    assert sequences[0] == [(zero3_compile_mod.dist.ReduceOp.MIN, torch.int32)]
+    assert budgets == [None, None]
 
 
 def test_zero3_scheduler_budget_skips_incomplete_operator_profile_metadata():
@@ -377,89 +369,7 @@ def test_zero3_scheduler_budget_skips_incomplete_operator_profile(monkeypatch):
     assert disabled_reason == "incomplete_operator_profile"
 
 
-def test_zero3_scheduler_budget_uses_available_memory_when_operator_profile_incomplete(monkeypatch):
-    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
-
-    class FakeAccelerator:
-
-        def current_device(self):
-            return "cpu"
-
-        def available_memory(self):
-            return 500
-
-    def reduce_budget_inputs(tensor, op):
-        if op == zero3_compile_mod.dist.ReduceOp.MAX:
-            assert tensor.item() == 0
-        elif tensor.dtype == torch.int64:
-            tensor[0] = 400
-
-    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
-    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
-
-    graph = Graph()
-    param = _placeholder(graph, "incomplete_profile_param")
-    ag = _allgather(graph, param, 1, "incomplete_profile", tensor_size=800)
-    wait = _wait(graph, ag, 1, "incomplete_profile")
-    graph.output((wait, ))
-    graph.lint()
-    _backfill_missing_profile_metadata(graph, profile_complete=False)
-    gm = GraphModule(torch.nn.Module(), graph)
-
-    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
-
-    assert disabled_reason is None
-    assert budget.source == "available_memory"
-    assert budget.available_mem == 400
-    assert budget.safety_margin == 40
-    assert budget.max_gathered_bytes == 360
-    assert ag.meta["allgather_allocation_bytes"] == 800
-
-
-def test_zero3_scheduler_budget_caps_incomplete_profile_to_single_allgather(monkeypatch):
-    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
-
-    class FakeAccelerator:
-
-        def current_device(self):
-            return "cpu"
-
-        def available_memory(self):
-            return 5000
-
-    def reduce_budget_inputs(tensor, op):
-        if op == zero3_compile_mod.dist.ReduceOp.MAX:
-            assert tensor.item() == 0
-        elif tensor.dtype == torch.int64:
-            tensor[0] = 5000
-
-    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
-    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_budget_inputs)
-
-    graph = Graph()
-    lhs = _placeholder(graph, "capped_incomplete_profile_lhs")
-    rhs = _placeholder(graph, "capped_incomplete_profile_rhs")
-    ag1 = _allgather(graph, lhs, 1, "capped_incomplete_profile_lhs", tensor_size=800)
-    ag2 = _allgather(graph, rhs, 2, "capped_incomplete_profile_rhs", tensor_size=600)
-    wait1 = _wait(graph, ag1, 1, "capped_incomplete_profile_lhs")
-    wait2 = _wait(graph, ag2, 2, "capped_incomplete_profile_rhs")
-    use = _add(graph, wait1, wait2, "capped_incomplete_profile_use")
-    graph.output((use, ))
-    graph.lint()
-    _backfill_missing_profile_metadata(graph, profile_complete=False)
-    gm = GraphModule(torch.nn.Module(), graph)
-
-    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
-
-    assert disabled_reason is None
-    assert budget.source == "available_memory_single_allgather_cap"
-    assert budget.max_gathered_bytes == 800
-    assert zero3_compile_mod.max_possible_gathered_bytes(graph) == 1400
-
-
-def test_zero3_scheduler_budget_uses_partial_operator_profile_when_incomplete(monkeypatch):
+def test_zero3_scheduler_budget_disables_incomplete_profile_with_unprofiled_high_memory_suffix(monkeypatch):
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
 
@@ -490,19 +400,17 @@ def test_zero3_scheduler_budget_uses_partial_operator_profile_when_incomplete(mo
     wait = _wait(graph, ag, 1, "partial_budget")
     op = _neg(graph, wait, "partial_budget_observed_op")
     op.meta.update(max_mem=800, profile_mem_start=850, profile_mem_peak=1650)
+    unprofiled_suffix = _neg(graph, op, "partial_budget_unprofiled_high_memory_suffix")
     release = _release(graph, op, 1, "partial_budget")
-    graph.output((release, ))
+    graph.output((release, unprofiled_suffix))
     graph.lint()
     _backfill_missing_profile_metadata(graph, profile_complete=False)
     gm = GraphModule(torch.nn.Module(), graph)
 
     budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
 
-    assert disabled_reason is None
-    assert budget.source == "profiled_non_gathered_peak_memory"
-    assert budget.total_mem == 1000
-    assert budget.profiled_non_gathered_peak_mem == 850
-    assert budget.max_gathered_bytes == 50
+    assert budget is None
+    assert disabled_reason == "incomplete_operator_profile"
 
 
 def test_zero3_scheduler_budget_skips_non_distributed_memory_profile(monkeypatch):
@@ -691,6 +599,63 @@ def test_zero3_final_schedule_fingerprint_is_absent_when_debug_is_disabled(monke
     graph.output(())
 
     assert zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=9, bwd=False) is None
+
+
+def test_zero3_scheduler_collectives_stay_with_each_data_parallel_group(monkeypatch):
+    monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator",
+                        lambda: SimpleNamespace(current_device=lambda: "cpu", total_memory=lambda: 2000))
+    group_a = object()
+    group_b = object()
+    group_sizes = {group_a: 2, group_b: 8}
+    collective_groups = []
+
+    def get_world_size(group=None):
+        assert group in group_sizes
+        return group_sizes[group]
+
+    def all_reduce(tensor, op, group=None):
+        assert group in group_sizes
+        collective_groups.append(group)
+
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", get_world_size)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", all_reduce)
+    monkeypatch.setattr(graph_profile_mod.dist, "all_reduce", all_reduce)
+
+    def make_group_graph(name):
+        graph = Graph()
+        param = _placeholder(graph, f"{name}_param")
+        ag = _allgather(graph, param, 1, name, tensor_size=102)
+        wait = _wait(graph, ag, 1, name)
+        op = _neg(graph, wait, f"{name}_op")
+        release = _release(graph, op, 1, name)
+        graph.output((release, ))
+        graph.lint()
+        for node in graph.nodes:
+            node.meta.setdefault("alloc_mem", 0)
+            node.meta.setdefault("max_mem", 0)
+            node.meta.setdefault("profile_mem_start", 100)
+            node.meta.setdefault("profile_mem_peak", 1000)
+        return GraphModule(torch.nn.Module(), graph), ag
+
+    gm_a, ag_a = make_group_graph("group_a")
+    gm_b, ag_b = make_group_graph("group_b_with_different_graph")
+
+    zero3_compile_mod._scheduler_budget_from_operator_profile(gm_a, process_group=group_a)
+    zero3_compile_mod._validate_final_schedule_fingerprint(gm_a.graph, graph_id=10, bwd=False, process_group=group_a)
+    graph_profile_mod._rank_max_profile_memory(100, 200, torch.device("cpu"), distributed=True, process_group=group_a)
+    zero3_compile_mod._scheduler_budget_from_operator_profile(gm_b, process_group=group_b)
+    zero3_compile_mod._validate_final_schedule_fingerprint(gm_b.graph, graph_id=11, bwd=True, process_group=group_b)
+    graph_profile_mod._rank_max_profile_memory(300, 400, torch.device("cpu"), distributed=True, process_group=group_b)
+
+    assert ag_a.meta["allgather_allocation_bytes"] == 104
+    assert ag_b.meta["allgather_allocation_bytes"] == 112
+    assert collective_groups
+    first_group_b = collective_groups.index(group_b)
+    assert all(group is group_a for group in collective_groups[:first_group_b])
+    assert all(group is group_b for group in collective_groups[first_group_b:])
 
 
 def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1, allocation_size=None):

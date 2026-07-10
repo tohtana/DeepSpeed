@@ -134,12 +134,15 @@ def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results
         profiling_results[graph_id].fwd_mem_complete = mem_complete
 
 
-def _sync_memory_profile_complete(profile_complete: bool) -> bool:
+def _sync_memory_profile_complete(profile_complete: bool, process_group=None) -> bool:
     if not dist.is_initialized():
         return profile_complete
 
     complete = torch.tensor([1 if profile_complete else 0], device=torch.device(get_accelerator().current_device()))
-    dist.all_reduce(complete, dist.ReduceOp.MIN)
+    if process_group is None:
+        dist.all_reduce(complete, dist.ReduceOp.MIN)
+    else:
+        dist.all_reduce(complete, dist.ReduceOp.MIN, group=process_group)
     return bool(complete.item())
 
 
@@ -244,7 +247,8 @@ def run_opt_passes(opt_passes: List[Callable],
                    mem_budget: float,
                    param_manager,
                    bwd: bool,
-                   debug_log=False) -> None:
+                   debug_log=False,
+                   process_group=None) -> None:
     """Apply scheduled graph passes and retain only complete post-pass memory profiles."""
 
     with unset_fake_temporarily():
@@ -268,9 +272,9 @@ def run_opt_passes(opt_passes: List[Callable],
                 profile_complete = False
                 mem = []
             else:
-                mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log)
+                mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log, process_group=process_group)
                 mem_prof.run(*create_inputs_fn())
-                profile_complete = _sync_memory_profile_complete(mem_prof.profile_complete)
+                profile_complete = _sync_memory_profile_complete(mem_prof.profile_complete, process_group)
                 if profile_complete:
                     mem = [(name, current_alloc, delta, peak)
                            for name, current_alloc, delta, peak in mem_prof.mem_record]
@@ -286,7 +290,7 @@ def run_opt_passes(opt_passes: List[Callable],
             get_accelerator().empty_cache()
 
 
-def make_backend(backend, compile_config, compile_kwargs={}):
+def make_backend(backend, compile_config, compile_kwargs={}, process_group=None):
 
     register_custom_ops()
 
@@ -339,7 +343,7 @@ def make_backend(backend, compile_config, compile_kwargs={}):
 
         global profiling_results
         if graph_id not in profiling_results:
-            profiling_results[graph_id] = ProfilingResult()
+            profiling_results[graph_id] = ProfilingResult(process_group=process_group)
             profiling_results[graph_id].param_indices = param_indices
 
         def make_fw_graph(gm, sample_inputs):
@@ -372,7 +376,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 mem_budget=.0,  # unused
                 param_manager=param_manager,
                 bwd=False,
-                debug_log=debug_log)
+                debug_log=debug_log,
+                process_group=process_group)
 
             opt_pass_times.append(("fwd", graph_index, graph_id, time.time() - time_start))
 
@@ -414,7 +419,8 @@ def make_backend(backend, compile_config, compile_kwargs={}):
                 mem_budget=.0,  # unused
                 param_manager=param_manager,
                 bwd=True,
-                debug_log=debug_log)
+                debug_log=debug_log,
+                process_group=process_group)
 
             # assert graph_id in param_manager, f"Graph {graph_id} not found in param_manager"
 

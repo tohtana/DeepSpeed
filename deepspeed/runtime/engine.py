@@ -5215,6 +5215,12 @@ class DeepSpeedEngine(Module):
 
     def _set_deepcompile_active(self, active: bool) -> None:
         """Toggle DeepCompile runtime state and manage forward hooks accordingly."""
+        if not active:
+            restore_dynamo_config = getattr(self, "_deepcompile_dynamo_config_restore", None)
+            if restore_dynamo_config is not None:
+                restore_dynamo_config()
+                del self._deepcompile_dynamo_config_restore
+
         if self._deepcompile_active == active:
             return
 

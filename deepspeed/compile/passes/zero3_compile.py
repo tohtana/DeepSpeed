@@ -6,7 +6,6 @@
 import gc
 import hashlib
 import os
-from dataclasses import replace
 from typing import List, Dict, Tuple
 import _operator
 
@@ -28,7 +27,19 @@ SCHEDULER_DEBUG_ENV = "DEEPSPEED_COMPILE_SCHEDULER_BUDGET_DEBUG"
 SCHEDULER_DEBUG_ENV_LEGACY = "DEEPSPEED_DEEPCOMPILE_SCHEDULER_DEBUG"
 
 
-def _reduce_int(value: int, op):
+def _all_reduce(tensor, op, process_group=None):
+    if process_group is None:
+        return dist.all_reduce(tensor, op)
+    return dist.all_reduce(tensor, op, group=process_group)
+
+
+def _get_rank(process_group=None):
+    if process_group is None:
+        return dist.get_rank()
+    return dist.get_rank(group=process_group)
+
+
+def _reduce_int(value: int, op, process_group=None):
     """Reduce an integer scheduling input, or preserve it outside distributed mode."""
     if not dist.is_initialized():
         return int(value)
@@ -36,25 +47,23 @@ def _reduce_int(value: int, op):
     value_tensor = torch.tensor([int(value)],
                                 device=torch.device(get_accelerator().current_device()),
                                 dtype=torch.int64)
-    dist.all_reduce(value_tensor, op)
+    _all_reduce(value_tensor, op, process_group)
     return int(value_tensor.item())
 
 
-def _rank_min_total_memory():
-    return _reduce_int(get_accelerator().total_memory(), dist.ReduceOp.MIN)
+def _rank_min_total_memory(process_group=None):
+    return _reduce_int(get_accelerator().total_memory(), dist.ReduceOp.MIN, process_group)
 
 
-def _rank_min_available_memory():
-    return _reduce_int(get_accelerator().available_memory(), dist.ReduceOp.MIN)
-
-
-def _world_size():
+def _world_size(process_group=None):
     if dist.is_initialized():
-        return dist.get_world_size()
+        if process_group is None:
+            return dist.get_world_size()
+        return dist.get_world_size(group=process_group)
     return 1
 
 
-def _sync_profile_complete(profile_complete: bool):
+def _sync_profile_complete(profile_complete: bool, process_group=None):
     """Require every rank to have a complete profile before using it for scheduling."""
     if not dist.is_initialized():
         return profile_complete
@@ -62,7 +71,7 @@ def _sync_profile_complete(profile_complete: bool):
     complete = torch.tensor([1 if profile_complete else 0],
                             device=torch.device(get_accelerator().current_device()),
                             dtype=torch.int)
-    dist.all_reduce(complete, dist.ReduceOp.MIN)
+    _all_reduce(complete, dist.ReduceOp.MIN, process_group)
     return bool(complete.item())
 
 
@@ -72,57 +81,21 @@ def _operator_profile_complete(graph: Graph):
         "profile_mem_start" in node.meta and "profile_mem_peak" in node.meta for node in graph.nodes)
 
 
-def _is_gather_lifetime_node(node: Node):
-    return node.target in (torch.ops.dc.allgather_param.default, torch.ops.dc.wait_allgather.default,
-                           torch.ops.dc.release_param.default, torch.ops.dc.reduce_grad.default)
-
-
-def _operator_profile_has_observed_non_gathered_peak(graph: Graph):
-    return any(not _is_gather_lifetime_node(node) and (
-        int(node.meta.get("profile_mem_peak", 0) or 0) > 0 or int(node.meta.get("profile_mem_start", 0) or 0) > 0)
-               for node in graph.nodes)
-
-
-def _rank_max_operator_profiled_non_gathered_peak(graph: Graph):
+def _rank_max_operator_profiled_non_gathered_peak(graph: Graph, process_group=None):
     """Return the worst absolute peak after removing profiled gather residency."""
     records = [(node.name, int(node.meta.get("profile_mem_start", 0)
                                or 0), 0, int(node.meta.get("profile_mem_peak", 0) or 0)) for node in graph.nodes]
-    return _reduce_int(profiled_non_gathered_peak(graph, records), dist.ReduceOp.MAX)
+    return _reduce_int(profiled_non_gathered_peak(graph, records), dist.ReduceOp.MAX, process_group)
 
 
-def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int = 0):
+def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int = 0, process_group=None):
     """Build a budget only when every node has trustworthy operator profile data."""
     if not _operator_profile_complete(graph):
         return None
 
-    return SchedulerMemoryBudget.from_profiled_non_gathered_peak(_rank_min_total_memory(),
-                                                                 _rank_max_operator_profiled_non_gathered_peak(graph),
-                                                                 output_size)
-
-
-def _build_scheduler_budget_from_partial_operator_profile(graph: Graph, output_size: int = 0):
-    """Build a fallback budget after ranks agree that some partial data exists."""
-    return SchedulerMemoryBudget.from_profiled_non_gathered_peak(_rank_min_total_memory(),
-                                                                 _rank_max_operator_profiled_non_gathered_peak(graph),
-                                                                 output_size)
-
-
-def _max_single_allgather_allocation_bytes(graph: Graph):
-    return max((int(node.meta.get("allgather_allocation_bytes", node.meta.get("tensor_size", 0)) or 0)
-                for node in graph.nodes if node.target == torch.ops.dc.allgather_param.default),
-               default=0)
-
-
-def _cap_incomplete_profile_budget(graph: Graph, scheduler_budget):
-    """Cap an incomplete-profile budget at the largest single gather allocation."""
-    if scheduler_budget is None:
-        return None
-    max_single_allgather_bytes = _max_single_allgather_allocation_bytes(graph)
-    if max_single_allgather_bytes <= 0 or scheduler_budget.max_gathered_bytes <= max_single_allgather_bytes:
-        return scheduler_budget
-    return replace(scheduler_budget,
-                   max_gathered_bytes=max_single_allgather_bytes,
-                   source=f"{scheduler_budget.source}_single_allgather_cap")
+    return SchedulerMemoryBudget.from_profiled_non_gathered_peak(
+        _rank_min_total_memory(process_group), _rank_max_operator_profiled_non_gathered_peak(graph, process_group),
+        output_size)
 
 
 def _scheduler_debug_enabled():
@@ -131,10 +104,10 @@ def _scheduler_debug_enabled():
         for env_name in (SCHEDULER_DEBUG_ENV, SCHEDULER_DEBUG_ENV_LEGACY))
 
 
-def _print_scheduler_debug(message: str):
+def _print_scheduler_debug(message: str, process_group=None):
     if not _scheduler_debug_enabled():
         return
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if not dist.is_initialized() or _get_rank(process_group) == 0:
         print(message, flush=True)
 
 
@@ -158,7 +131,7 @@ def _final_schedule_fingerprint(graph: Graph):
     return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)
 
 
-def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool):
+def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool, process_group=None):
     """In scheduler debug mode, fail every rank when final graph order diverges."""
     if not _scheduler_debug_enabled():
         return None
@@ -166,30 +139,32 @@ def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool)
     fingerprint = _final_schedule_fingerprint(graph)
     if not dist.is_initialized():
         _print_scheduler_debug(
-            f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}")
+            f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}",
+            process_group)
         return fingerprint
 
     device = torch.device(get_accelerator().current_device())
     min_fingerprint = torch.tensor([fingerprint], device=device, dtype=torch.int64)
     max_fingerprint = min_fingerprint.clone()
-    dist.all_reduce(min_fingerprint, dist.ReduceOp.MIN)
-    dist.all_reduce(max_fingerprint, dist.ReduceOp.MAX)
+    _all_reduce(min_fingerprint, dist.ReduceOp.MIN, process_group)
+    _all_reduce(max_fingerprint, dist.ReduceOp.MAX, process_group)
     if min_fingerprint.item() != max_fingerprint.item():
         raise RuntimeError(
             f"DeepCompile ZeRO-3 final schedule fingerprint mismatch for graph_id={graph_id} bwd={bwd}: "
             f"min={min_fingerprint.item()} max={max_fingerprint.item()}")
     _print_scheduler_debug(
-        f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}")
+        f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}",
+        process_group)
     return fingerprint
 
 
-def _set_allgather_allocation_metadata(graph: Graph):
+def _set_allgather_allocation_metadata(graph: Graph, process_group=None):
     """Stamp padded gather allocation bytes without discarding a more precise estimate."""
     world_size = None
     for node in graph.nodes:
         if node.target == torch.ops.dc.allgather_param.default:
             if world_size is None:
-                world_size = _world_size()
+                world_size = _world_size(process_group)
             dtype = node.kwargs.get("dtype") if isinstance(node.kwargs, dict) else None
             profiled_bytes = allgather_allocation_bytes(node.meta.get("tensor_size", 0), dtype, world_size)
             node.meta["allgather_allocation_bytes"] = max(int(node.meta.get("allgather_allocation_bytes", 0) or 0),
@@ -204,34 +179,19 @@ def _scheduler_budget_disabled_reason(graph: Graph, scheduler_budget):
     return "invalid_profiled_non_gathered_peak"
 
 
-def _scheduler_budget_from_operator_profile(gm: GraphModule):
+def _scheduler_budget_from_operator_profile(gm: GraphModule, process_group=None):
     """Derive a rank-consistent budget and explain why a non-constraining gate is disabled."""
     if not dist.is_initialized():
         return None, "non_distributed"
 
-    _set_allgather_allocation_metadata(gm.graph)
-    operator_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph))
+    _set_allgather_allocation_metadata(gm.graph, process_group)
+    operator_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph), process_group)
     if not operator_profile_complete:
-        # Partial profiles cannot establish a whole-graph peak.  Cap their
-        # estimate at one maximum-size gather to limit how much residency a
-        # fallback path can accumulate.  Synchronize whether any rank observed
-        # useful partial data before entering the collective budget builder so
-        # every rank executes the same reduction sequence.
-        max_gathered_bytes = max_possible_gathered_bytes(gm.graph)
-        partial_profile_observed = bool(
-            _reduce_int(int(_operator_profile_has_observed_non_gathered_peak(gm.graph)), dist.ReduceOp.MAX))
-        if partial_profile_observed:
-            scheduler_budget = _build_scheduler_budget_from_partial_operator_profile(gm.graph)
-            scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
-            if scheduler_budget is not None and scheduler_budget.max_gathered_bytes < max_gathered_bytes:
-                return scheduler_budget, None
-        scheduler_budget = SchedulerMemoryBudget.from_available_memory(_rank_min_available_memory(), 0)
-        scheduler_budget = _cap_incomplete_profile_budget(gm.graph, scheduler_budget)
-        if scheduler_budget is not None and scheduler_budget.max_gathered_bytes >= max_gathered_bytes:
-            return None, "incomplete_operator_profile_budget_not_constraining"
-        return scheduler_budget, _scheduler_budget_disabled_reason(gm.graph, scheduler_budget)
+        # An unvisited suffix can exceed every observed partial peak, so no
+        # absolute headroom estimate is safe until every rank completes.
+        return None, "incomplete_operator_profile"
 
-    scheduler_budget = _build_scheduler_budget_from_operator_profile(gm.graph)
+    scheduler_budget = _build_scheduler_budget_from_operator_profile(gm.graph, process_group=process_group)
     # A gate larger than every gather combined cannot affect ordering, so keep
     # legacy behavior and make the disabled state explicit in diagnostics.
     if scheduler_budget is not None and scheduler_budget.max_gathered_bytes >= max_possible_gathered_bytes(gm.graph):
@@ -239,14 +199,20 @@ def _scheduler_budget_from_operator_profile(gm: GraphModule):
     return scheduler_budget, _scheduler_budget_disabled_reason(gm.graph, scheduler_budget)
 
 
-def _log_scheduler_result(graph_id: int, bwd: bool, scheduler_budget, disabled_reason, graph: Graph):
+def _log_scheduler_result(graph_id: int,
+                          bwd: bool,
+                          scheduler_budget,
+                          disabled_reason,
+                          graph: Graph,
+                          process_group=None):
     diagnostics = getattr(graph, SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, {})
     selected = diagnostics.get("selected", [])
     max_live_gathered_bytes = max((entry.get("peak_gathered_bytes", 0) for entry in selected), default=0)
     if scheduler_budget is None:
-        _print_scheduler_debug(f"DeepCompile ZeRO-3 scheduler graph_id={graph_id} bwd={bwd} budget_enabled=False "
-                               f"disabled_reason={disabled_reason} selected_count={len(selected)} "
-                               f"max_live_gathered_bytes={max_live_gathered_bytes}")
+        _print_scheduler_debug(
+            f"DeepCompile ZeRO-3 scheduler graph_id={graph_id} bwd={bwd} budget_enabled=False "
+            f"disabled_reason={disabled_reason} selected_count={len(selected)} "
+            f"max_live_gathered_bytes={max_live_gathered_bytes}", process_group)
         return
 
     _print_scheduler_debug(
@@ -256,7 +222,7 @@ def _log_scheduler_result(graph_id: int, bwd: bool, scheduler_budget, disabled_r
         f"profiled_non_gathered_peak_mem={scheduler_budget.profiled_non_gathered_peak_mem} "
         f"budget_rejections={diagnostics.get('budget_rejections', 0)} "
         f"over_budget_fallbacks={len(diagnostics.get('budget_overflows', []))} "
-        f"max_live_gathered_bytes={max_live_gathered_bytes}")
+        f"max_live_gathered_bytes={max_live_gathered_bytes}", process_group)
 
 
 def _dtype_element_size(dtype: torch.dtype):
@@ -416,22 +382,23 @@ def add_z3_gather_release_fw(gm: GraphModule,
 
     real_inputs = create_inputs_fn()
     param_indices = profiling_results[graph_id].param_indices
+    process_group = getattr(profiling_results[graph_id], "process_group", None)
 
     gm.graph = add_gather_and_release(graph_id, gm.graph, param_manager[graph_id],
                                       get_param_nodes(gm.graph, param_indices))
 
     nz3.register_graph_z3(graph_id, [v[1] for v in param_indices])  # Need this before profiling
 
-    profiler = ProfilingInterpreter(gm, debug_log=debug_log)
+    profiler = ProfilingInterpreter(gm, debug_log=debug_log, process_group=process_group)
     profiler.run(*real_inputs)
     del profiler
     gc.collect()
     get_accelerator().empty_cache()
     # Build the shared scheduling budget after the operator profile is complete
     # but before the scheduler rewrites graph order and Inductor metadata.
-    scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm)
+    scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
 
-    rank = dist.get_rank()
+    rank = _get_rank(process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
     if rank == 0 and debug_log:
         print(f"Fwd before scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
@@ -452,8 +419,9 @@ def add_z3_gather_release_fw(gm: GraphModule,
                           bwd=False,
                           scheduler_budget=scheduler_budget,
                           disabled_reason=disabled_reason,
-                          graph=gm.graph)
-    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=False)
+                          graph=gm.graph,
+                          process_group=process_group)
+    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=False, process_group=process_group)
 
     if rank == 0 and debug_log:
         print(f"Fwd after scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
@@ -475,18 +443,19 @@ def add_z3_gather_release_bw(gm: GraphModule,
 
     input_nodes = get_input_nodes(gm.graph)
     real_inputs = create_inputs_fn()
+    process_group = getattr(profiling_results[graph_id], "process_group", None)
     assert len(input_nodes) == len(real_inputs), f"Expected {len(real_inputs)} inputs, got {len(input_nodes)}"
 
-    real_outputs = ProfilingInterpreter(gm, debug_log=debug_log).run(*real_inputs)
+    real_outputs = ProfilingInterpreter(gm, debug_log=debug_log, process_group=process_group).run(*real_inputs)
 
     del real_outputs
     gc.collect()
     get_accelerator().empty_cache()
-    # The scheduler consumes only rank-reduced inputs, ensuring every rank emits
-    # collectives in the same order even when allocator state differs locally.
-    scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm)
+    # The scheduler consumes only DP-group-reduced inputs, ensuring every group
+    # rank emits collectives in the same order even when allocator state differs.
+    scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
 
-    rank = dist.get_rank()
+    rank = _get_rank(process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
     if rank == 0 and debug_log:
         print(f"Bwd before scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
@@ -501,11 +470,12 @@ def add_z3_gather_release_bw(gm: GraphModule,
                           bwd=True,
                           scheduler_budget=scheduler_budget,
                           disabled_reason=disabled_reason,
-                          graph=gm.graph)
+                          graph=gm.graph,
+                          process_group=process_group)
 
     add_end_backward(gm.graph, graph_id, should_release_reduce_buckets(graph_order, graph_id))
     replace_reduce_outputs_with_none(gm.graph)
-    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=True)
+    _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=True, process_group=process_group)
 
     return gm
 

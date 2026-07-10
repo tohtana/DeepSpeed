@@ -3,7 +3,7 @@
 
 # DeepSpeed Team
 
-from typing import List, Tuple
+from typing import Any, List, Tuple
 from dataclasses import dataclass, field
 
 from torch.fx import Graph
@@ -11,6 +11,7 @@ from torch.fx import Graph
 
 @dataclass
 class ProfilingResult:
+    process_group: Any = None
     fwd_graph: Graph = None
     bwd_graph: Graph = None
     needs_backward: bool = False

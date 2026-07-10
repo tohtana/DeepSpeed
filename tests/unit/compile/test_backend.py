@@ -24,6 +24,15 @@ _DC_LIBRARIES = []
 
 
 def _define_dc_ops():
+    try:
+        torch.ops.dc.allgather_param.default
+        torch.ops.dc.wait_allgather.default
+        torch.ops.dc.release_param.default
+        torch.ops.dc.reduce_grad.default
+        return
+    except AttributeError:
+        pass
+
     lib = torch.library.Library("dc", "FRAGMENT")
     for schema in (
             "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
