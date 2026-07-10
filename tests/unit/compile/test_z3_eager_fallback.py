@@ -105,6 +105,17 @@ def test_deepcompile_fallback_releases_leftover_gathered_params_before_forward()
     assert fallback.stats()["last_pre_forward_released_param_ids"] == [11]
 
 
+def test_user_adopted_param_diagnostic_deduplicates_repeated_transfers():
+    module, param = _zero_module_with_param()
+    fallback = DeepCompileZ3EagerFallback(engine=None)
+
+    for _ in range(3):
+        fallback.record_gathered_param(param)
+        fallback.transfer_gathered_param_to_user(param)
+
+    assert fallback.stats()["last_user_adopted_param_ids"] == [7]
+
+
 def test_deepcompile_forward_preserves_fallback_param_adopted_by_user_gathered_context():
     module, param = _zero_module_with_param()
     param.ds_persist = False

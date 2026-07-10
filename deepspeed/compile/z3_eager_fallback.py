@@ -60,6 +60,7 @@ class DeepCompileZ3EagerFallback:
         self._last_guard_suppressed_param_ids = []
         self._last_pre_forward_released_param_ids = []
         self._last_user_adopted_param_ids = []
+        self._user_adopted_param_ids = set()
         self.total_gathered_params = 0
 
     @contextmanager
@@ -113,7 +114,9 @@ class DeepCompileZ3EagerFallback:
         """Transfer a gathered parameter to an explicit user context."""
         ds_id = int(param.ds_id)
         self._drop_tracked_param(ds_id, param)
-        self._last_user_adopted_param_ids.append(ds_id)
+        if ds_id not in self._user_adopted_param_ids:
+            self._user_adopted_param_ids.add(ds_id)
+            self._last_user_adopted_param_ids.append(ds_id)
 
     def record_guard_suppressed_param(self, param):
         """Record a guard probe that intentionally observed the partitioned parameter."""

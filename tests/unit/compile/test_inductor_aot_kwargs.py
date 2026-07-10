@@ -143,22 +143,63 @@ def test_torchxla_openxla_shape_passes_through_unchanged(monkeypatch):
     assert kwargs == original_kwargs
 
 
-def test_deepcompile_z3_inductor_config_patch_disables_persistent_mixed_reductions():
+def test_deepcompile_z3_inductor_config_patch_disables_available_reduction_heuristics():
     config = torch._inductor.config
     triton_config = config.triton
-    original_persistent = triton_config.persistent_reductions
-    original_mix_order = triton_config.mix_order_reduction
+    original_values = {
+        config_name: getattr(triton_config,
+                             config_name.split(".", 1)[1])
+        for config_name in inductor._DEEP_COMPILE_Z3_INDUCTOR_REDUCTION_CONFIG
+        if hasattr(triton_config,
+                   config_name.split(".", 1)[1])
+    }
+    assert original_values
 
     with inductor.deepcompile_z3_inductor_config_patch(enabled=True):
-        assert triton_config.persistent_reductions is False
-        assert triton_config.mix_order_reduction is False
+        for config_name in original_values:
+            assert getattr(triton_config, config_name.split(".", 1)[1]) is False
 
-    assert triton_config.persistent_reductions is original_persistent
-    assert triton_config.mix_order_reduction is original_mix_order
+    for config_name, original_value in original_values.items():
+        assert getattr(triton_config, config_name.split(".", 1)[1]) is original_value
 
     with inductor.deepcompile_z3_inductor_config_patch(enabled=False):
-        assert triton_config.persistent_reductions is original_persistent
-        assert triton_config.mix_order_reduction is original_mix_order
+        for config_name, original_value in original_values.items():
+            assert getattr(triton_config, config_name.split(".", 1)[1]) is original_value
+
+
+def test_deepcompile_z3_inductor_config_patch_skips_unavailable_reduction_heuristics(monkeypatch):
+
+    class FakeTritonConfig:
+        persistent_reductions = True
+
+    class FakePatch:
+
+        def __init__(self, overrides):
+            self.overrides = overrides
+
+        def __enter__(self):
+            assert self.overrides == {"triton.persistent_reductions": False}
+            FakeTritonConfig.persistent_reductions = False
+
+        def __exit__(self, exc_type, exc, tb):
+            FakeTritonConfig.persistent_reductions = True
+
+    class FakeConfig:
+        triton = FakeTritonConfig()
+
+        @staticmethod
+        def patch(overrides):
+            return FakePatch(overrides)
+
+    class FakeInductor:
+        config = FakeConfig()
+
+    monkeypatch.setattr(torch, "_inductor", FakeInductor())
+
+    with inductor.deepcompile_z3_inductor_config_patch(enabled=True):
+        assert FakeTritonConfig.persistent_reductions is False
+
+    assert FakeTritonConfig.persistent_reductions is True
 
 
 def test_patch_compiler_applies_z3_inductor_config_during_original_compile(monkeypatch):
