@@ -62,6 +62,19 @@ class DeepSpeedHybridEngine(DeepSpeedEngine):
         self.is_lora_fused = False
         self.workspace = WorkspaceOp()
 
+    def _get_forward_delegate(self, module):
+        if self.Z3_enabled:
+            parameter_offload = getattr(self.optimizer, "parameter_offload", self.optimizer)
+            return parameter_offload._get_forward_delegate(module)
+        return module.forward
+
+    def _set_forward_delegate(self, module, forward):
+        if self.Z3_enabled:
+            parameter_offload = getattr(self.optimizer, "parameter_offload", self.optimizer)
+            parameter_offload._set_forward_delegate(module, forward)
+        else:
+            module.forward = forward
+
     def convert_to_linear_transposed(self, model):
 
         def _replace_linear_layer(r_module, parent_type=None, prev_type=None):
@@ -278,7 +291,7 @@ class DeepSpeedHybridEngine(DeepSpeedEngine):
                     self._inference_containers.append(self.inference_policies[child.__class__][0](
                         child, self.inference_policies[child.__class__][-1], layer_id))
                     self._orig_modules.append(child)
-                    self._orig_fwds.append(child.forward)
+                    self._orig_fwds.append(self._get_forward_delegate(child))
 
                     self.layer_params.append(self._inference_containers[layer_id].get_all_params())
 
@@ -298,7 +311,7 @@ class DeepSpeedHybridEngine(DeepSpeedEngine):
                         self._other_layers.append(self.inference_policies[child.__class__][0](
                             weight=child.weight, bias=child.bias if hasattr(child, 'bias') else None))
                     self._orig_modules_others.append(child)
-                    self._orig_fwds_others.append(child.forward)
+                    self._orig_fwds_others.append(self._get_forward_delegate(child))
             else:
                 self.create_inference_containers(child, layer_id=layer_id)
 
@@ -405,15 +418,15 @@ class DeepSpeedHybridEngine(DeepSpeedEngine):
             for i, (orig_module, inference_container) in enumerate(zip(self._orig_modules,
                                                                        self._inference_containers)):
                 if self.Z3_enabled and not self.gather_all_layers:
-                    orig_module.forward = self._zero3_forward(i)
+                    self._set_forward_delegate(orig_module, self._zero3_forward(i))
                 else:
-                    orig_module.forward = inference_container.module.forward
+                    self._set_forward_delegate(orig_module, inference_container.module.forward)
 
                 inference_container.transform_for_inference()
 
             if not self.Z3_enabled or self.gather_all_layers:
                 for orig_module, inference_layer in zip(self._orig_modules_others, self._other_layers):
-                    orig_module.forward = inference_layer.forward
+                    self._set_forward_delegate(orig_module, inference_layer.forward)
         if self.Z3_enabled:
             gc.collect()
             get_accelerator().empty_cache()
@@ -425,9 +438,9 @@ class DeepSpeedHybridEngine(DeepSpeedEngine):
             for inference_container, orig_module, orig_fwd in zip(self._inference_containers, self._orig_modules,
                                                                   self._orig_fwds):
                 inference_container.transform_for_training()
-                orig_module.forward = orig_fwd
+                self._set_forward_delegate(orig_module, orig_fwd)
             for orig_module, orig_fwd in zip(self._orig_modules_others, self._orig_fwds_others):
-                orig_module.forward = orig_fwd
+                self._set_forward_delegate(orig_module, orig_fwd)
         super().train(mode)
         if mode:
             self._training_start_time = time.time()

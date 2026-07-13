@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import functools
+
 import pytest
 import torch
 import deepspeed.comm as dist
@@ -12,6 +14,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from unit.common import DistributedTest, preferred_dtype, allclose_on_all_ranks
 from unit.simple_model import SimpleModel, random_dataloader
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.parameter_offload import FWD_MODULE_STACK
+from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.utils import safe_get_full_grad
 
 
@@ -84,6 +88,90 @@ def collect_gradients_safe(model):
                 clean_name = name.replace('module.', '')
                 grads[clean_name] = grad.detach().clone().cpu()
     return grads
+
+
+def assert_zero3_balanced_residency(model_engine, frozen_module=None, allow_external_residency=False):
+    """Assert graph-task cleanup left no transient ZeRO-3 parameter lifetime behind."""
+    nonpersistent_params = [param for param in model_engine.module.parameters() if not param.ds_persist]
+    releasable_params = [param for param in nonpersistent_params if not param.is_external_param]
+    resident_numel = sum(param.ds_numel for param in nonpersistent_params
+                         if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
+    coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+    available_numel = coordinator._PartitionedParameterCoordinator__n_available_params
+    parameter_offload = model_engine.optimizer.parameter_offload
+
+    assert not coordinator._PartitionedParameterCoordinator__params_fetched_by_graph
+    assert not coordinator._PartitionedParameterCoordinator__active_sub_modules_fetched_by_graph
+    assert not coordinator._PartitionedParameterCoordinator__graph_cleanup_callbacks
+    assert not coordinator._PartitionedParameterCoordinator__inflight_param_registry
+    assert all(not param.ds_active_sub_modules for param in releasable_params)
+    assert available_numel >= 0
+    assert available_numel == resident_numel
+    if allow_external_residency:
+        assert all(param.is_external_param for param in nonpersistent_params
+                   if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
+    else:
+        assert resident_numel == 0
+    assert not parameter_offload._DeepSpeedZeRoOffload__fwd_modules_by_graph
+    assert not parameter_offload._DeepSpeedZeRoOffload__fwd_module_cleanup_callbacks
+    assert FWD_MODULE_STACK == [model_engine.module]
+    if frozen_module is not None:
+        assert all(param.ds_status == ZeroParamStatus.NOT_AVAILABLE for param in frozen_module.parameters())
+
+
+def observe_zero3_graph_cleanup(model_engine):
+    """Record graph cleanup boundaries while delegating to the real coordinator method."""
+    coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+    original = coordinator.release_unreleased_params
+    observations = []
+
+    def observed(graph_task_id=None):
+        tracked = coordinator._PartitionedParameterCoordinator__params_fetched_by_graph
+        owners = coordinator._PartitionedParameterCoordinator__active_sub_modules_fetched_by_graph
+        inflight = coordinator._PartitionedParameterCoordinator__inflight_param_registry
+        params_before = {task_id: set(params) for task_id, params in tracked.items()}
+        owners_before = {
+            task_id: {
+                param: set(module_ids)
+                for param, module_ids in graph_owners.items()
+            }
+            for task_id, graph_owners in owners.items()
+        }
+        inflight_before = {param.ds_id for param in inflight}
+
+        original(graph_task_id)
+
+        params_after = {task_id: set(params) for task_id, params in tracked.items()}
+        completed_params = params_before.get(graph_task_id, set())
+        protected_params = set().union(*params_after.values()) if params_after else set()
+        overlapping_graph_tasks = {
+            task_id
+            for task_id, params in params_before.items() if task_id != graph_task_id and params & completed_params
+        }
+        protected_owner_ids = {
+            module_id
+            for graph_owners in owners.values()
+            for param, module_ids in graph_owners.items() if param in completed_params for module_id in module_ids
+        }
+        completed_owner_ids = {
+            module_id
+            for module_ids in owners_before.get(graph_task_id, {}).values()
+            for module_id in module_ids
+        }
+        observations.append({
+            "graph_task_id": graph_task_id,
+            "inflight_before": inflight_before,
+            "inflight_after": {param.ds_id
+                               for param in inflight},
+            "overlapping_graph_tasks": overlapping_graph_tasks,
+            "protected_param_ids": {param.ds_id
+                                    for param in completed_params & protected_params},
+            "completed_owner_ids": completed_owner_ids,
+            "protected_owner_ids": protected_owner_ids,
+        })
+
+    coordinator.release_unreleased_params = observed
+    return observations
 
 
 def initialize_distributed():
@@ -1434,6 +1522,22 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
         model_engine.destroy()
 
 
+class FrozenParamCheckpointedBlock(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(hidden_dim)
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.norm.weight.requires_grad_(False)
+        self.norm.bias.requires_grad_(False)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.linear1(x)
+        x = torch.nn.functional.relu(x)
+        return x
+
+
 class FrozenParamCheckpointedModel(torch.nn.Module):
     """Checkpointed model with a frozen parameter inside the checkpointed block.
 
@@ -1446,27 +1550,87 @@ class FrozenParamCheckpointedModel(torch.nn.Module):
     def __init__(self, hidden_dim, use_reentrant=False):
         super().__init__()
         self.use_reentrant = use_reentrant
-        self.norm = torch.nn.LayerNorm(hidden_dim)
-        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        # Freeze the norm: this is the parameter that tripped the recompute metadata check.
-        self.norm.weight.requires_grad_(False)
-        self.norm.bias.requires_grad_(False)
+        self.block = FrozenParamCheckpointedBlock(hidden_dim)
+        self.block2 = FrozenParamCheckpointedBlock(hidden_dim)
+        self.recompute_graph_task_ids = []
 
-    def _checkpointed_block(self, x):
-        x = self.norm(x)
-        x = self.linear1(x)
-        x = torch.nn.functional.relu(x)
-        return x
+    def _checkpointed_block(self, block, x):
+        if hasattr(torch._C, "_current_graph_task_id"):
+            graph_task_id = torch._C._current_graph_task_id()
+            if graph_task_id != -1:
+                self.recompute_graph_task_ids.append(graph_task_id)
+        return block(x)
 
     def forward(self, x):
         if self.training:
             from torch.utils.checkpoint import checkpoint
-            x = checkpoint(self._checkpointed_block, x, use_reentrant=self.use_reentrant)
+            x = checkpoint(self._checkpointed_block, self.block, x, use_reentrant=self.use_reentrant)
+            x = checkpoint(self._checkpointed_block, self.block2, x, use_reentrant=self.use_reentrant)
         else:
-            x = self._checkpointed_block(x)
-        x = self.linear2(x)
+            x = self._checkpointed_block(self.block, x)
+            x = self._checkpointed_block(self.block2, x)
         return x
+
+
+class ForcedInflightGather(torch.autograd.Function):
+    """Start a real ZeRO all-gather during backward without waiting on it."""
+
+    target_param = None
+
+    @staticmethod
+    def forward(ctx, x, coordinator):
+        ctx.param = ForcedInflightGather.target_param
+        ctx.coordinator = coordinator
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        assert ctx.param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+        ctx.coordinator._PartitionedParameterCoordinator__all_gather_params({ctx.param}, forward=False)
+        return grad_output, None
+
+
+class InflightGatherModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.param_holder = torch.nn.Module()
+        self.param_holder.prefetched = torch.nn.Parameter(torch.zeros(hidden_dim), requires_grad=False)
+        # Do not read this parameter through a module during forward: ZeRO correctly
+        # treats such a read as external access and gathers it. The custom autograd
+        # function needs an unavailable target to start a backward-only fetch.
+        ForcedInflightGather.target_param = self.param_holder.prefetched
+        self.coordinator = None
+
+    def forward(self, x):
+        return ForcedInflightGather.apply(x, self.coordinator) * self.scale
+
+
+class ExternalReturningCheckpointBlock(torch.nn.Linear):
+
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim, hidden_dim)
+        self.recompute_parent_ids = []
+
+    def forward(self, x):
+        if hasattr(torch._C, "_current_graph_task_id") and torch._C._current_graph_task_id() != -1:
+            self.recompute_parent_ids.append(FWD_MODULE_STACK[-2].ds_id)
+        return super().forward(x), self.bias
+
+
+class MixedCheckpointExternalParamModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.reentrant = ExternalReturningCheckpointBlock(hidden_dim)
+        self.non_reentrant = FrozenParamCheckpointedBlock(hidden_dim)
+
+    def forward(self, x):
+        from torch.utils.checkpoint import checkpoint
+        x, bias = checkpoint(self.reentrant, x, use_reentrant=True)
+        x = checkpoint(self.non_reentrant, x, use_reentrant=False)
+        return x + bias
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
@@ -1500,6 +1664,7 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
         config = get_config_dict(zero_stage)
         trainable_params = [p for p in model_ds.parameters() if p.requires_grad]
         model_engine, _, _, _ = deepspeed.initialize(config=config, model=model_ds, model_parameters=trainable_params)
+        cleanup_observations = observe_zero3_graph_cleanup(model_engine) if zero_stage == 3 else []
 
         torch.manual_seed(123)
         x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
@@ -1514,6 +1679,15 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
         x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         output_ds = model_engine(x_ds)
         output_ds.backward(torch.ones_like(output_ds))
+        assert model_engine.module.recompute_graph_task_ids
+        if zero_stage == 3:
+            assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
+            if use_reentrant:
+                # The inner graph callback must leave shared params and exact owners
+                # protected until the outer graph reaches its own completion callback.
+                assert any(observation["overlapping_graph_tasks"] and observation["protected_param_ids"]
+                           and observation["completed_owner_ids"] & observation["protected_owner_ids"]
+                           for observation in cleanup_observations)
         get_accelerator().synchronize()
         dist.barrier()
         ds_grads = collect_gradients_safe(model_engine)
@@ -1524,3 +1698,144 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
 
         model_engine.step()
         model_engine.destroy()
+
+
+@pytest.mark.parametrize("backward_mode", ["engine", "torch"])
+class TestZero3NoGradCheckpointRelease(DistributedTest):
+    """ZeRO-3 releases checkpoint recompute parameters at each backward boundary."""
+
+    world_size = 2
+
+    def test_no_grad_input_gradient_accumulation(self, backward_mode):
+        hidden_dim = 8
+        batch_size = 2
+        gradient_accumulation_steps = 2
+        device, rank, dtype = initialize_distributed()
+
+        torch.manual_seed(42)
+        model_ddp = FrozenParamCheckpointedModel(hidden_dim=hidden_dim, use_reentrant=False)
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+
+        torch.manual_seed(42)
+        model_ds = FrozenParamCheckpointedModel(hidden_dim=hidden_dim, use_reentrant=False)
+        config = get_config_dict(3, gradient_accumulation_steps=gradient_accumulation_steps)
+        trainable_params = [param for param in model_ds.parameters() if param.requires_grad]
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model_ds, model_parameters=trainable_params)
+
+        optimizer_ddp = torch.optim.Adam((param for param in model_ddp.parameters() if param.requires_grad), lr=1e-3)
+        for microbatch in range(gradient_accumulation_steps):
+            torch.manual_seed(123 + microbatch)
+            x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+            (model_ddp(x_ddp).sum() / gradient_accumulation_steps).backward()
+
+            torch.manual_seed(123 + microbatch)
+            x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+            loss_ds = model_engine(x_ds).sum()
+            if backward_mode == "engine":
+                model_engine.backward(loss_ds)
+            else:
+                model_engine.scale(loss_ds).backward()
+            assert model_engine.module.recompute_graph_task_ids
+            assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
+
+        get_accelerator().synchronize()
+        dist.barrier()
+        compare_gradients(collect_ddp_gradients(model_ddp), collect_gradients_safe(model_engine),
+                          "no-grad-input frozen-param checkpointing")
+
+        optimizer_ddp.step()
+        model_engine.step()
+        assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
+        model_engine.destroy()
+
+
+@pytest.mark.parametrize("backward_mode", ["engine", "torch"])
+class TestZero3InflightGraphCleanup(DistributedTest):
+    """Graph completion waits and releases a real unfinished ZeRO all-gather."""
+
+    world_size = 2
+
+    def test_inflight_gather_cleanup(self, backward_mode):
+        hidden_dim = 8
+        device, _, dtype = initialize_distributed()
+
+        model = InflightGatherModel(hidden_dim)
+        config = get_config_dict(3)
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=[model.scale])
+        model_engine.module.coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+        cleanup_observations = observe_zero3_graph_cleanup(model_engine)
+
+        x = torch.randn(2, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+        loss = model_engine(x).sum()
+        if backward_mode == "engine":
+            model_engine.backward(loss)
+        else:
+            model_engine.scale(loss).backward()
+
+        assert any(observation["inflight_before"] and not observation["inflight_after"]
+                   for observation in cleanup_observations)
+        assert_zero3_balanced_residency(model_engine, model_engine.module)
+        model_engine.destroy()
+
+
+@pytest.mark.parametrize("force_py20_fallback", [False, True])
+class TestZero3CheckpointForwardExceptionCleanup(DistributedTest):
+    """A stopped recompute unwinds before a later recompute returns an external param."""
+
+    world_size = 2
+
+    def test_mixed_checkpoint_external_param_owner(self, force_py20_fallback):
+        import deepspeed.runtime.zero.parameter_offload as parameter_offload
+
+        hidden_dim = 8
+        device, _, dtype = initialize_distributed()
+        actual_always_call_support = parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED
+        if force_py20_fallback:
+            parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED = False
+
+        model_engine = None
+        try:
+            model = MixedCheckpointExternalParamModel(hidden_dim)
+            config = get_config_dict(3)
+            trainable_params = [param for param in model.parameters() if param.requires_grad]
+            model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=trainable_params)
+
+            if force_py20_fallback:
+                from deepspeed.runtime.zero import unwrap_model_for_generation
+                wrapper_count = len(model_engine.optimizer.parameter_offload.forward_wrappers)
+                assert wrapper_count == len(list(model_engine.module.modules()))
+
+                wrapped_forward = model_engine.module.non_reentrant.forward
+
+                @functools.wraps(wrapped_forward)
+                def user_decorated_forward(*args, **kwargs):
+                    return wrapped_forward(*args, **kwargs)
+
+                model_engine.module.non_reentrant.forward = user_decorated_forward
+                with pytest.raises(RuntimeError, match="wrapped forward or module call was rebound"):
+                    with unwrap_model_for_generation(model_engine):
+                        pass
+                assert len(model_engine.optimizer.parameter_offload.forward_wrappers) == wrapper_count
+                model_engine.module.non_reentrant.forward = wrapped_forward
+
+                with unwrap_model_for_generation(model_engine):
+                    assert not model_engine.optimizer.parameter_offload.forward_wrappers
+                assert len(model_engine.optimizer.parameter_offload.forward_wrappers) == wrapper_count
+
+            x = torch.randn(2, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+            model_engine.backward(model_engine(x).sum())
+
+            root_id = model_engine.module.ds_id
+            external = model_engine.module.reentrant.bias
+            assert model_engine.module.reentrant.recompute_parent_ids
+            assert all(parent_id == root_id for parent_id in model_engine.module.reentrant.recompute_parent_ids)
+            assert id(external) in model_engine.module._external_params
+            assert id(external) not in model_engine.module.non_reentrant._external_params
+            assert_zero3_balanced_residency(model_engine,
+                                            model_engine.module.non_reentrant.norm,
+                                            allow_external_residency=True)
+        finally:
+            if model_engine is not None:
+                model_engine.destroy()
+            parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED = actual_always_call_support

@@ -101,22 +101,28 @@ def unwrap_model_for_generation(model):
         elif model.optimizer is not None:
             optimizer_offload = model.optimizer
 
+        optimizer_offload._check_forward_wrappers_removable()
         for hook in optimizer_offload.forward_hooks:
             hook.remove()
         for hook in optimizer_offload.backward_hooks:
             hook.remove()
+        if optimizer_offload.fwd_pre_hook is not None:
+            optimizer_offload.fwd_pre_hook.remove()
+            optimizer_offload.fwd_pre_hook = None
 
         optimizer_offload.forward_hooks = []
         optimizer_offload.backward_hooks = []
+        optimizer_offload._remove_forward_wrappers()
 
-        yield model
-
-        # Adds the optimizer hooks from a DeepSpeed ZeRO-3 model.
-        if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
-            optimizer_offload = model.optimizer.parameter_offload
-        elif model.optimizer is not None:
-            optimizer_offload = model.optimizer
-        optimizer_offload._register_deepspeed_module(optimizer_offload.module)
+        try:
+            yield model
+        finally:
+            # Adds the optimizer hooks from a DeepSpeed ZeRO-3 model even when generation raises.
+            if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
+                optimizer_offload = model.optimizer.parameter_offload
+            elif model.optimizer is not None:
+                optimizer_offload = model.optimizer
+            optimizer_offload._register_deepspeed_module_hooks()
     return
 
 

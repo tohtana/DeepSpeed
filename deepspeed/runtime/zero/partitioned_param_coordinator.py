@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import collections
 from collections import UserDict
 import threading
-from typing import Deque, Set
+from typing import Deque, Dict, Optional, Set
 
 from deepspeed import comm as dist
 from deepspeed.utils import z3_leaf_module
@@ -24,6 +24,13 @@ from deepspeed.runtime.compiler import is_compiling
 import logging
 
 ENABLE_PROFILER = False
+
+
+def current_graph_task_id() -> int:
+    """Return the active autograd graph task, or -1 when the private Torch API is unavailable."""
+    if not hasattr(torch._C, "_current_graph_task_id"):
+        return -1
+    return torch._C._current_graph_task_id()
 
 
 def debug_rank0(message: str) -> None:
@@ -147,6 +154,17 @@ class PartitionedParameterCoordinator:
         self.__ongoing_fetch_leaf_module_events = collections.defaultdict(threading.Event)
         self.__leaf_module_lock = threading.Lock()
 
+        # A module whose input does not require gradients may not run its post-backward
+        # release hook. Checkpoint early-stop can also bypass a recompute post-forward
+        # hook. Track parameter ownership per autograd graph task so each graph-completion
+        # callback reconciles only the lifetime it observed. This matters for reentrant
+        # checkpointing, where an inner graph can finish while its outer graph is active.
+        self.__params_fetched_by_graph: Dict[int, Set[Parameter]] = collections.defaultdict(set)
+        self.__active_sub_modules_fetched_by_graph: Dict[int, Dict[Parameter, Set[int]]] = collections.defaultdict(
+            lambda: collections.defaultdict(set))
+        self.__graph_cleanup_callbacks = set()
+        self.__backward_fetch_lock = threading.Lock()
+
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
     and passing trace results into constructor. This way all the code in here can
@@ -241,6 +259,8 @@ class PartitionedParameterCoordinator:
         if is_compiling():
             return
 
+        if current_graph_task_id() == -1:
+            self.release_unreleased_params()
         self._clean_inflight_param_registry()
 
         if not self.is_complete_trace():  # not self.trace_complete:
@@ -369,9 +389,12 @@ class PartitionedParameterCoordinator:
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)
         fast_fetch = self.fast_sharding_for_leaf_module and is_leaf
+        in_backward = not forward or current_graph_task_id() != -1
         # wait for parameters in the immediately needed submodule to become available
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
+            if in_backward:
+                self.__track_graph_task_lifetime({param}, current_submodule.ds_id)
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
@@ -470,7 +493,7 @@ class PartitionedParameterCoordinator:
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def release_sub_module(self, submodule: Module, forward=False) -> None:
+    def release_sub_module(self, submodule: Module, forward=False, defer_release=False) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
         #print_rank_0(f"release_sub_module {'fwd' if forward else 'bwd'}: {debug_module2name_id(submodule)}", force=False)
@@ -482,14 +505,16 @@ class PartitionedParameterCoordinator:
             # wait for the computation to finish and launch as early as possible.
             empty_buffer = torch.empty(1, device=torch.device(get_accelerator().current_device_name()))
 
-        # A non-reentrant checkpoint recompute re-fires this forward hook inside backward
-        # (torch._C._current_graph_task_id() != -1). Partitioning a frozen param here shrinks the
-        # tensor torch saved for the recompute and trips its metadata check. See #4332.
-        in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
+        # A non-reentrant checkpoint recompute re-fires this forward hook inside backward.
+        # Partitioning a frozen param here shrinks the tensor torch saved for the
+        # recompute and trips its metadata check. An early-stop exception also means
+        # trainable parameters can still have backward consumers, so the exception-safe
+        # post hook unwinds ownership now but defers storage release to graph completion.
+        in_checkpoint_recompute = forward and current_graph_task_id() != -1
 
         for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
             param.ds_active_sub_modules.discard(submodule.ds_id)
-            if in_checkpoint_recompute and not param.requires_grad:
+            if in_checkpoint_recompute and (defer_release or not param.requires_grad):
                 continue
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param, free_data)
@@ -502,6 +527,11 @@ class PartitionedParameterCoordinator:
     @torch.no_grad()
     def release_and_reset_all(self, module: Module) -> None:
         """release all module parameters"""
+        with self.__backward_fetch_lock:
+            self.__params_fetched_by_graph.clear()
+            self.__active_sub_modules_fetched_by_graph.clear()
+            self.__graph_cleanup_callbacks.clear()
+
         for param in iter_params(module, recurse=True):
             if param in self.__inflight_param_registry:
                 self.__inflight_param_registry.pop(param).wait()
@@ -514,6 +544,69 @@ class PartitionedParameterCoordinator:
         for param in iter_params(module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
                 raise RuntimeError(f"{param.ds_summary()} expected to be released")
+
+    @compiler.disable
+    @torch.no_grad()
+    def release_unreleased_params(self, graph_task_id: Optional[int] = None) -> None:
+        """Release transient parameters whose hooks did not finish their graph-task lifetime."""
+        with self.__backward_fetch_lock:
+            graph_task_ids = (list(self.__params_fetched_by_graph) if graph_task_id is None else [graph_task_id])
+            params = set()
+            active_sub_modules = collections.defaultdict(set)
+            for completed_graph_task_id in graph_task_ids:
+                params.update(self.__params_fetched_by_graph.pop(completed_graph_task_id, set()))
+                for param, sub_module_ids in self.__active_sub_modules_fetched_by_graph.pop(
+                        completed_graph_task_id, {}).items():
+                    active_sub_modules[param].update(sub_module_ids)
+                self.__graph_cleanup_callbacks.discard(completed_graph_task_id)
+
+            # A parameter can participate in nested graph tasks. Do not remove an owner or
+            # partition the tensor while any still-active graph task is tracking it.
+            protected_params = set().union(*self.__params_fetched_by_graph.values()) \
+                if self.__params_fetched_by_graph else set()
+            protected_active_sub_modules = collections.defaultdict(set)
+            for graph_active_sub_modules in self.__active_sub_modules_fetched_by_graph.values():
+                for param, sub_module_ids in graph_active_sub_modules.items():
+                    protected_active_sub_modules[param].update(sub_module_ids)
+
+        for param, sub_module_ids in active_sub_modules.items():
+            param.ds_active_sub_modules.difference_update(sub_module_ids - protected_active_sub_modules[param])
+
+        for param in params:
+            if param in protected_params:
+                continue
+            if param in self.__inflight_param_registry:
+                self.__inflight_param_registry.pop(param).wait()
+            if not param.ds_persist and not param.is_external_param:
+                self.__release_param(param)
+
+    def __track_graph_task_lifetime(self, params: Set[Parameter], sub_module_id: Optional[int] = None) -> None:
+        """Track params and exact owners acquired by the currently executing autograd graph task."""
+        graph_task_id = current_graph_task_id()
+        if graph_task_id == -1:
+            return
+
+        with self.__backward_fetch_lock:
+            self.__params_fetched_by_graph[graph_task_id].update(params)
+            if sub_module_id is not None:
+                for param in params:
+                    self.__active_sub_modules_fetched_by_graph[graph_task_id][param].add(sub_module_id)
+            if graph_task_id in self.__graph_cleanup_callbacks:
+                return
+
+            engine = getattr(torch.autograd.Variable, "_execution_engine", None)
+            if engine is None or not hasattr(engine, "queue_callback"):
+                return
+            self.__graph_cleanup_callbacks.add(graph_task_id)
+
+            def release_graph_task_lifetime():
+                self.release_unreleased_params(graph_task_id)
+
+            try:
+                engine.queue_callback(release_graph_task_lifetime)
+            except Exception:
+                self.__graph_cleanup_callbacks.discard(graph_task_id)
+                raise
 
     @instrument_w_nvtx
     def __all_gather_params(self, params: Set[Parameter], forward: bool) -> None:
@@ -538,6 +631,9 @@ class PartitionedParameterCoordinator:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 partitioned_params.append(param)
                 all_gather_numel += param.ds_numel
+
+        if partitioned_params:
+            self.__track_graph_task_lifetime(set(partitioned_params))
 
         if partitioned_params:
             self.__n_available_params += all_gather_numel

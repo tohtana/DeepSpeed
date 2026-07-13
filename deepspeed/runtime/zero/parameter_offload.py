@@ -3,20 +3,112 @@
 
 # DeepSpeed Team
 
+import functools
+import inspect
 import sys
 import torch
-from collections import OrderedDict
+from collections import defaultdict, OrderedDict
+import threading
 from deepspeed.utils import z3_leaf_module, set_z3_leaf_module
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.runtime.zero.utils import apply_to_tensors_only, is_zero_param
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.partition_parameters import *
-from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator, InflightParamRegistry, iter_params
+from deepspeed.runtime.zero.partitioned_param_coordinator import (PartitionedParameterCoordinator,
+                                                                  InflightParamRegistry, current_graph_task_id,
+                                                                  iter_params)
+import deepspeed.runtime.compiler as compiler
 from deepspeed.accelerator import get_accelerator
 from deepspeed import utils
 
 FWD_MODULE_STACK = list()
+FORWARD_HOOK_ALWAYS_CALL_SUPPORTED = "always_call" in inspect.signature(
+    torch.nn.Module.register_forward_hook).parameters
+_MODULE_CALL_IMPL_CODE = inspect.unwrap(torch.nn.Module._call_impl).__code__
+_MISSING_CLASS_CALL = object()
+_MODULE_CALL_GUARD_LOCK = threading.RLock()
+_MODULE_CALL_GUARD_CLASSES = {}
+
+
+def _module_forward_call_token(module):
+    """Return the active ``Module._call_impl`` frame id for one invocation."""
+
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code is _MODULE_CALL_IMPL_CODE and frame.f_locals.get("self") is module:
+            return id(frame)
+        frame = frame.f_back
+    raise RuntimeError(f"ZeRO-3 could not identify the active forward invocation for {module.__class__.__name__}")
+
+
+def _install_module_call_guard(module, guard):
+    """Intercept ``module(...)`` on versions where ``__call__`` bypasses instance ``_call_impl``.
+
+    PyTorch 2.0 binds ``Module.__call__`` directly to the class implementation, so
+    replacing ``module._call_impl`` does not cover exceptions raised by hooks. Patch
+    each concrete module class once and dispatch only registered instances through
+    their ZeRO guard. This preserves the concrete class identity and the class's
+    original ``__call__`` implementation for guarded and unguarded instances.
+    """
+
+    module_class = type(module)
+    with _MODULE_CALL_GUARD_LOCK:
+        class_state = _MODULE_CALL_GUARD_CLASSES.get(module_class)
+        if class_state is None:
+            original_owned_call = module_class.__dict__.get("__call__", _MISSING_CLASS_CALL)
+            original_call = getattr(module_class, "__call__")
+            class_state = {
+                "original_owned_call": original_owned_call,
+                "original_call": original_call,
+                "guards": {},
+            }
+
+            @functools.wraps(original_call)
+            def guarded_module_call(called_module, *args, **kwargs):
+                registered_guard = class_state["guards"].get(id(called_module))
+                if registered_guard is None or registered_guard[0] is not called_module:
+                    return original_call(called_module, *args, **kwargs)
+                return registered_guard[1](original_call, called_module, *args, **kwargs)
+
+            class_state["wrapper"] = guarded_module_call
+            try:
+                module_class.__call__ = guarded_module_call
+            except (AttributeError, TypeError) as error:
+                raise RuntimeError(
+                    f"ZeRO-3 cannot install its PyTorch 2.0 module-call guard for {module_class.__name__}") from error
+            _MODULE_CALL_GUARD_CLASSES[module_class] = class_state
+
+        if id(module) in class_state["guards"]:
+            raise RuntimeError(f"ZeRO-3 module-call guard is already installed for {module_class.__name__}")
+        class_state["guards"][id(module)] = (module, guard)
+        return class_state
+
+
+def _module_call_guard_is_current(module, guard, class_state):
+    module_class = type(module)
+    registered_guard = class_state["guards"].get(id(module))
+    return (module_class.__dict__.get("__call__") is class_state["wrapper"] and registered_guard is not None
+            and registered_guard[0] is module and registered_guard[1] is guard)
+
+
+def _remove_module_call_guard(module, guard, class_state):
+    """Remove one instance guard and restore its class when the last guard leaves."""
+
+    module_class = type(module)
+    with _MODULE_CALL_GUARD_LOCK:
+        if not _module_call_guard_is_current(module, guard, class_state):
+            raise RuntimeError(
+                f"ZeRO-3 cannot safely remove its module-call guard after rebinding: {module_class.__name__}")
+        del class_state["guards"][id(module)]
+        if class_state["guards"]:
+            return
+
+        if class_state["original_owned_call"] is _MISSING_CLASS_CALL:
+            delattr(module_class, "__call__")
+        else:
+            module_class.__call__ = class_state["original_owned_call"]
+        del _MODULE_CALL_GUARD_CLASSES[module_class]
 
 
 #for each tensor in outputs run the forward_function and register backward_function as hook
@@ -62,7 +154,7 @@ class ZeROOrderedDict(OrderedDict):
             return param
 
         if hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if self._parent_module._parameters._in_forward and not torch.compiler.is_compiling():
+            if self._parent_module._parameters._in_forward and not compiler.is_compiling():
                 from deepspeed.compile.z3_eager_fallback import get_active_z3_eager_fallback
                 fallback = get_active_z3_eager_fallback()
                 if fallback is None:
@@ -206,6 +298,13 @@ class DeepSpeedZeRoOffload(object):
 
         self.forward_hooks = []
         self.backward_hooks = []
+        self.forward_wrappers = []
+        self.forward_call_wrappers = []
+        self.forward_wrapper_states = {}
+        self.fwd_pre_hook = None
+        self.__fwd_modules_by_graph = defaultdict(list)
+        self.__fwd_module_cleanup_callbacks = set()
+        self.__fwd_module_stack_lock = threading.Lock()
 
         self.setup_zero_stage3_hooks()
         print_rank_0(
@@ -260,30 +359,91 @@ class DeepSpeedZeRoOffload(object):
         num_forward_hooks = len(self.forward_hooks)
         num_backward_hooks = len(self.backward_hooks)
 
+        self._check_forward_wrappers_removable()
         for hook in self.forward_hooks:
             hook.remove()
 
         for hook in self.backward_hooks:
             hook.remove()
 
-        self.fwd_pre_hook.remove()
+        if self.fwd_pre_hook is not None:
+            self.fwd_pre_hook.remove()
+            self.fwd_pre_hook = None
+
+        self._remove_forward_wrappers()
 
         print_rank_0(f'Deleted module hooks: forward = {num_forward_hooks}, backward = {num_backward_hooks}',
                      force=False)
 
+    def _remove_forward_wrappers(self):
+        """Restore forwards and module calls wrapped for PyTorch 2.0 hook pairing."""
+
+        self._check_forward_wrappers_removable()
+        for module, _, state in reversed(self.forward_wrappers):
+            module.forward = state["forward"]
+        for module, guard, state in reversed(self.forward_call_wrappers):
+            _remove_module_call_guard(module, guard, state)
+        self.forward_wrappers.clear()
+        self.forward_call_wrappers.clear()
+        self.forward_wrapper_states.clear()
+
+    def _check_forward_wrappers_removable(self):
+        """Fail before hook mutation if another framework rebound a wrapped forward."""
+
+        rebound_modules = [module for module, wrapper, _ in self.forward_wrappers if module.forward is not wrapper]
+        rebound_modules.extend(module for module, guard, state in self.forward_call_wrappers
+                               if not _module_call_guard_is_current(module, guard, state))
+        if rebound_modules:
+            names = ", ".join(module.__class__.__name__ for module in rebound_modules)
+            raise RuntimeError("ZeRO-3 cannot safely remove its forward exception wrappers because a wrapped forward "
+                               f"or module call was rebound after initialization: {names}")
+
+    def _get_forward_delegate(self, module):
+        """Return the logical forward owned by an optional ZeRO exception wrapper."""
+
+        wrapper_state = self.forward_wrapper_states.get(module)
+        if wrapper_state is None:
+            return module.forward
+
+        wrapper, state = wrapper_state
+        if module.forward is not wrapper:
+            raise RuntimeError("ZeRO-3 cannot update a forward exception wrapper because module.forward was rebound "
+                               f"after initialization: {module.__class__.__name__}")
+        return state["forward"]
+
+    def _set_forward_delegate(self, module, forward):
+        """Update the logical forward without replacing ZeRO's outer exception wrapper."""
+
+        wrapper_state = self.forward_wrapper_states.get(module)
+        if wrapper_state is None:
+            module.forward = forward
+            return
+
+        wrapper, state = wrapper_state
+        if module.forward is not wrapper:
+            raise RuntimeError("ZeRO-3 cannot update a forward exception wrapper because module.forward was rebound "
+                               f"after initialization: {module.__class__.__name__}")
+        state["forward"] = forward
+
+    @instrument_w_nvtx
+    def _start_of_forward_hook(self, module, *args):
+        if current_graph_task_id() == -1:
+            self._release_unfinished_forward_modules()
+        self.get_param_coordinator().reset_step()
+
+    def _register_deepspeed_module_hooks(self):
+        """Register ZeRO hooks with the root reset ordered before root fetch."""
+
+        if self.fwd_pre_hook is not None:
+            self.fwd_pre_hook.remove()
+        self._register_deepspeed_module(self.module)
+        # Both hooks prepend on PyTorch 2.1+, so registering reset last makes it
+        # run first. The PyTorch 2.0 fallback appends fetch and has the same order.
+        self.fwd_pre_hook = self.module.register_forward_pre_hook(self._start_of_forward_hook, prepend=True)
+
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
-
-        #reset step if in inference mode
-        @instrument_w_nvtx
-        def _start_of_forward_hook(module, *args):
-
-            self.get_param_coordinator().reset_step()
-
-        self.fwd_pre_hook = self.module.register_forward_pre_hook(_start_of_forward_hook)
-
-        #likely one of them should be enough but just to be safe
-        self._register_deepspeed_module(self.module)
+        self._register_deepspeed_module_hooks()
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -329,15 +489,74 @@ class DeepSpeedZeRoOffload(object):
                 count[0] = count[0] + 1
                 self._register_deepspeed_module(child, count=count)
 
-        @torch.compiler.disable
+        always_call_supported = FORWARD_HOOK_ALWAYS_CALL_SUPPORTED
+        active_forward_invocations = threading.local()
+        active_fallback_calls = threading.local()
+
+        def _invocation_entries():
+            if not hasattr(active_forward_invocations, "entries"):
+                active_forward_invocations.entries = []
+            return active_forward_invocations.entries
+
+        def _fallback_call_tokens():
+            if not hasattr(active_fallback_calls, "tokens"):
+                active_fallback_calls.tokens = []
+            return active_fallback_calls.tokens
+
+        def _forward_call_token():
+            if always_call_supported:
+                return _module_forward_call_token(module)
+            call_states = _fallback_call_tokens()
+            if not call_states:
+                raise RuntimeError(
+                    f"ZeRO-3 could not identify the active fallback forward invocation for {module.__class__.__name__}"
+                )
+            return call_states[-1]["token"]
+
+        @compiler.disable
         def _pre_forward_module_hook(module, *args):
+            entry = {"token": _forward_call_token(), "acquired": False, "exception_state": sys.exc_info()}
+            _invocation_entries().append(entry)
+            see_memory_usage(f"Before sub module function {module.__class__.__name__}", force=False)
+
+            global FWD_MODULE_STACK
+            FWD_MODULE_STACK.append(module)
+            entry["acquired"] = True
+            if not always_call_supported:
+                _fallback_call_tokens()[-1]["zero_pre_acquired"] = True
+            self._track_forward_module(module)
+
             self.pre_sub_module_forward_function(module)
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
 
+            exception_state = sys.exc_info()
+            token = _forward_call_token()
+            entries = _invocation_entries()
+            entry = None
+            for index in range(len(entries) - 1, -1, -1):
+                if entries[index]["token"] == token:
+                    entry = entries.pop(index)
+                    break
+
+            # A global or earlier pre-hook can fail before ZeRO's pre-hook runs,
+            # while PyTorch still runs local always_call post-hooks. Only unwind
+            # invocations for which ZeRO actually pushed the module stack entry.
+            if entry is None or not entry["acquired"]:
+                return
+
+            # ``sys.exc_info`` can already be populated when a model is invoked
+            # from an outer except block. Only classify this call as failed when
+            # PyTorch is handling a different exception state than ZeRO observed
+            # on entry.
+            forward_failed = any(current is not previous
+                                 for current, previous in zip(exception_state, entry["exception_state"]))
+
+            defer_release = output is None and current_graph_task_id() != -1
             global FWD_MODULE_STACK
             FWD_MODULE_STACK.pop()
+            self._finish_forward_module(module)
             if output is None:
                 output = []
             elif not isinstance(output, (list, tuple)):
@@ -374,7 +593,17 @@ class DeepSpeedZeRoOffload(object):
 
                     actual_external_param.all_gather()
 
-            self.post_sub_module_forward_function(module)
+            self.post_sub_module_forward_function(module, defer_release=defer_release)
+
+            # A partial root forward can prefetch parameters owned by modules whose
+            # hooks never ran. The next reset assumes no such residency and resets
+            # its counter to zero, so fully reconcile an ordinary failed forward
+            # before a caller can catch the exception and retry. Recompute failures
+            # stay scoped to their graph-task cleanup instead.
+            if forward_failed and module is self.module and current_graph_task_id() == -1:
+                self.partition_all_parameters()
+                if not always_call_supported:
+                    _fallback_call_tokens()[-1]["root_reconciled"] = True
 
         def _bwd_hook_unexpected_inputs_msg(value):
             return f"A module has unknown inputs or outputs type ({type(value)}) and the tensors embedded in it cannot be detected. " \
@@ -407,7 +636,7 @@ class DeepSpeedZeRoOffload(object):
             return _apply_forward_and_backward_to_tensors_only(module, _run_before_forward_function,
                                                                _run_after_backward_hook, inputs)
 
-        @torch.compiler.disable
+        @compiler.disable
         def _post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
@@ -416,10 +645,67 @@ class DeepSpeedZeRoOffload(object):
                                          warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
 
         # Pre forward hook
-        self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))
+        self.forward_hooks.append(
+            module.register_forward_pre_hook(_pre_forward_module_hook, prepend=FORWARD_HOOK_ALWAYS_CALL_SUPPORTED))
 
-        # Post forward hook
-        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
+        # Non-reentrant checkpoint recompute stops by raising an internal exception
+        # once all needed tensors have been recreated. PyTorch 2.1+ can run the paired
+        # post hook on that path. On the supported PyTorch 2.0 floor, wrap forward so
+        # the same hook runs before another recomputation can observe a stale parent.
+        if always_call_supported:
+            self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook, always_call=True))
+        else:
+            self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
+            forward_state = {"forward": module.forward}
+
+            @functools.wraps(forward_state["forward"])
+            def exception_safe_forward(*args, **kwargs):
+                try:
+                    return forward_state["forward"](*args, **kwargs)
+                except Exception:
+                    try:
+                        _post_forward_module_hook(module, args, None)
+                    except Exception as hook_error:
+                        utils.logger.warning(f"ZeRO-3 failed to unwind a forward exception: {hook_error}")
+                    raise
+
+            module.forward = exception_safe_forward
+            self.forward_wrappers.append((module, exception_safe_forward, forward_state))
+            self.forward_wrapper_states[module] = (exception_safe_forward, forward_state)
+
+            # ``module.forward`` begins only after every pre-hook has run. Guard the
+            # whole class-dispatched module call as well, so this also works on
+            # PyTorch 2.0 where ``Module.__call__`` bypasses instance ``_call_impl``.
+            def exception_safe_module_call(original_call, called_module, *args, **kwargs):
+                call_state = {
+                    "token": object(),
+                    "zero_pre_acquired": False,
+                    "root_reconciled": False,
+                }
+                call_states = _fallback_call_tokens()
+                call_states.append(call_state)
+                try:
+                    return original_call(called_module, *args, **kwargs)
+                except Exception:
+                    try:
+                        _post_forward_module_hook(module, args, None)
+                    except Exception as hook_error:
+                        utils.logger.warning(f"ZeRO-3 failed to unwind a module-call exception: {hook_error}")
+                    if (call_state["zero_pre_acquired"] and not call_state["root_reconciled"] and module is self.module
+                            and current_graph_task_id() == -1):
+                        try:
+                            self.partition_all_parameters()
+                            call_state["root_reconciled"] = True
+                        except Exception as hook_error:
+                            utils.logger.warning(f"ZeRO-3 failed to reconcile a root forward exception: {hook_error}")
+                    raise
+                finally:
+                    if call_states[-1] is not call_state:
+                        raise RuntimeError("ZeRO-3 fallback module-call tokens were unbalanced")
+                    call_states.pop()
+
+            call_guard_state = _install_module_call_guard(module, exception_safe_module_call)
+            self.forward_call_wrappers.append((module, exception_safe_module_call, call_guard_state))
 
         # Pre backward hook
         if not hasattr(module, "pre_bwd_fn"):
@@ -501,11 +787,6 @@ class DeepSpeedZeRoOffload(object):
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)
-
-        global FWD_MODULE_STACK
-        FWD_MODULE_STACK.append(sub_module)
-
         param_coordinator = self.get_param_coordinator()
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
@@ -519,8 +800,64 @@ class DeepSpeedZeRoOffload(object):
 
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__} after fetch", force=False)
 
+    def _track_forward_module(self, sub_module):
+        """Arrange to unwind forward-stack entries skipped by checkpoint early-stop."""
+        graph_task_id = current_graph_task_id()
+        if graph_task_id == -1:
+            return
+
+        with self.__fwd_module_stack_lock:
+            self.__fwd_modules_by_graph[graph_task_id].append(sub_module)
+            if graph_task_id in self.__fwd_module_cleanup_callbacks:
+                return
+
+            engine = getattr(torch.autograd.Variable, "_execution_engine", None)
+            if engine is None or not hasattr(engine, "queue_callback"):
+                return
+            self.__fwd_module_cleanup_callbacks.add(graph_task_id)
+
+            def release_forward_modules():
+                self._release_unfinished_forward_modules(graph_task_id)
+
+            try:
+                engine.queue_callback(release_forward_modules)
+            except Exception:
+                self.__fwd_module_cleanup_callbacks.discard(graph_task_id)
+                raise
+
+    def _finish_forward_module(self, sub_module):
+        """Remove a normally completed module from graph-task fallback tracking."""
+        graph_task_id = current_graph_task_id()
+        if graph_task_id == -1:
+            return
+
+        with self.__fwd_module_stack_lock:
+            graph_modules = self.__fwd_modules_by_graph.get(graph_task_id, [])
+            for index in range(len(graph_modules) - 1, -1, -1):
+                if graph_modules[index] is sub_module:
+                    del graph_modules[index]
+                    break
+
+    def _release_unfinished_forward_modules(self, graph_task_id=None):
+        """Remove only stack entries left by forward exceptions in completed graphs."""
+        with self.__fwd_module_stack_lock:
+            graph_task_ids = list(self.__fwd_modules_by_graph) if graph_task_id is None else [graph_task_id]
+            unfinished_modules = []
+            for completed_graph_task_id in graph_task_ids:
+                unfinished_modules.extend(self.__fwd_modules_by_graph.pop(completed_graph_task_id, []))
+                self.__fwd_module_cleanup_callbacks.discard(completed_graph_task_id)
+
+        global FWD_MODULE_STACK
+        for sub_module in reversed(unfinished_modules):
+            # The first entry is the engine root sentinel. Remove the rightmost
+            # matching invocation so nested/reentrant uses of one module stay paired.
+            for index in range(len(FWD_MODULE_STACK) - 1, 0, -1):
+                if FWD_MODULE_STACK[index] is sub_module:
+                    del FWD_MODULE_STACK[index]
+                    break
+
     @torch.no_grad()
-    def post_sub_module_forward_function(self, sub_module):
+    def post_sub_module_forward_function(self, sub_module, defer_release=False):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.ds_id} before release",
             force=False)
@@ -531,7 +868,7 @@ class DeepSpeedZeRoOffload(object):
                 param.data = param.data.t() if len(param.ds_shape) != 1 else param.data
 
         param_coordinator = self.get_param_coordinator()
-        param_coordinator.release_sub_module(sub_module, forward=True)
+        param_coordinator.release_sub_module(sub_module, forward=True, defer_release=defer_release)
 
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.ds_id} after release",
