@@ -3,6 +3,11 @@
 
 # DeepSpeed Team
 
+import subprocess
+import sys
+import textwrap
+import types
+
 import torch
 from torch._utils import _flatten_dense_tensors
 import deepspeed.comm as dist
@@ -14,6 +19,66 @@ import deepspeed.utils.groups as groups
 from deepspeed.accelerator import get_accelerator
 
 from unit.common import DistributedTest
+
+
+def test_deepspeed_import_without_transformers():
+    script = textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        class BlockTransformers(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "transformers" or fullname.startswith("transformers."):
+                    raise ModuleNotFoundError("No module named 'transformers'")
+                return None
+
+        sys.meta_path.insert(0, BlockTransformers())
+
+        import deepspeed
+        import deepspeed.runtime.utils
+    """)
+
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def _install_fake_transformers_cache(monkeypatch):
+
+    class Cache:
+        pass
+
+    class DynamicCache(Cache):
+        pass
+
+    class SinkCache(Cache):
+        pass
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.__path__ = []
+    fake_cache_utils = types.ModuleType("transformers.cache_utils")
+    fake_cache_utils.Cache = Cache
+    fake_cache_utils.DynamicCache = DynamicCache
+    fake_cache_utils.SinkCache = SinkCache
+    fake_transformers.cache_utils = fake_cache_utils
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "transformers.cache_utils", fake_cache_utils)
+    return Cache, DynamicCache, SinkCache
+
+
+def test_is_transformers_cache_uses_common_base(monkeypatch):
+    _, DynamicCache, SinkCache = _install_fake_transformers_cache(monkeypatch)
+
+    assert ds_utils.is_transformers_cache(DynamicCache())
+    assert ds_utils.is_transformers_cache(SinkCache())
+    assert not ds_utils.is_transformers_cache(object())
+
+
+@pytest.mark.parametrize("container", [list, lambda values: {"cache": values[0]}])
+def test_compare_tensors_skips_only_matching_cache_types(monkeypatch, container):
+    _, DynamicCache, SinkCache = _install_fake_transformers_cache(monkeypatch)
+
+    assert ds_utils.compare_tensors_in_structures(container([DynamicCache()]), container([DynamicCache()]))
+    assert not ds_utils.compare_tensors_in_structures(container([DynamicCache()]), container([SinkCache()]))
 
 
 def test_call_to_str():
