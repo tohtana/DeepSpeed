@@ -25,6 +25,8 @@ class FakeParam:
 
     def __init__(self):
         self.ds_active_sub_modules = set()
+        self.ds_persist = False
+        self.is_external_param = False
 
 
 class CountingRegistry(dict):
@@ -96,3 +98,34 @@ def test_clean_root_reset_skips_graph_cleanup_lock_but_sweeps_inflight_registry(
 
     assert lock.acquisitions == 0
     assert registry.items_calls == 1
+
+
+def test_nested_graph_cleanup_preserves_shared_param_and_owner_until_last_lease():
+    coordinator = _bare_coordinator()
+    coordinator._PartitionedParameterCoordinator__graph_cleanup_lock = CountingLock()
+    coordinator._PartitionedParameterCoordinator__inflight_param_registry = {}
+    released = []
+    coordinator._PartitionedParameterCoordinator__release_param = released.append
+
+    param = FakeParam()
+    owner = 42
+    lease_type = coordinator._PartitionedParameterCoordinator__GraphTaskLease
+    for graph_task_id in (17, 23):
+        coordinator._PartitionedParameterCoordinator__graph_task_leases[graph_task_id] = lease_type(
+            callback_queued=True)
+        coordinator._PartitionedParameterCoordinator__track_graph_task_lifetime(graph_task_id, {param}, owner)
+
+    coordinator.release_unreleased_params(17)
+
+    assert not released
+    assert param.ds_active_sub_modules == {owner}
+    assert coordinator._PartitionedParameterCoordinator__param_graph_ref_counts[param] == 1
+    assert coordinator._PartitionedParameterCoordinator__owner_graph_ref_counts[(param, owner)] == 1
+
+    coordinator.release_unreleased_params(23)
+
+    assert released == [param]
+    assert not param.ds_active_sub_modules
+    assert not coordinator._PartitionedParameterCoordinator__graph_task_leases
+    assert not coordinator._PartitionedParameterCoordinator__param_graph_ref_counts
+    assert not coordinator._PartitionedParameterCoordinator__owner_graph_ref_counts
