@@ -104,6 +104,7 @@ jobs:
       DEFAULT_TRANSFORMERS_VERSION: '4.50.0'
       DEFAULT_TRANSFORMERS_REF: 'main'
       CUTLASS_PATH: /opt/cutlass
+      CIFAR10_DATASET_PATH: ${{ github.workspace }}/.cache/cifar10
       # Disable reuse_dist_env to prevent pool worker cleanup hangs in full test runs
       DS_DISABLE_REUSE_DIST_ENV: '1'
 
@@ -118,6 +119,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Restore CIFAR-10 dataset
+        id: cifar10_cache_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CIFAR10_DATASET_PATH }}
+          key: cifar10-python-v1-${{ runner.os }}
 
       - name: Resolve dependency inputs
         env:
@@ -236,6 +244,26 @@ jobs:
             torchvision=="$TORCHVISION_INSTALL_VERSION" \
             torchaudio=="$TORCHAUDIO_INSTALL_VERSION" \
             --index-url "$PYTORCH_INDEX_URL"
+
+      - name: Warm and verify CIFAR-10 dataset
+        run: |
+          python - <<'PY'
+          import os
+          from torchvision.datasets import CIFAR10
+
+          root = os.environ["CIFAR10_DATASET_PATH"]
+          CIFAR10(root=root, train=True, download=True)
+          offline = CIFAR10(root=root, train=True, download=False)
+          assert len(offline) == 50_000, len(offline)
+          print(f"Verified {len(offline)} CIFAR-10 training examples at {root}")
+          PY
+
+      - name: Save CIFAR-10 dataset
+        if: steps.cifar10_cache_restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CIFAR10_DATASET_PATH }}
+          key: ${{ steps.cifar10_cache_restore.outputs.cache-primary-key }}
 
       - name: Install Transformers
         run: |
