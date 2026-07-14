@@ -5452,13 +5452,18 @@ class DeepSpeedEngine(Module):
 
         if schedule is not None:
 
+            # Keep callable identity instead of hashing/equality-merging registered callable
+            # objects. Custom pass callables may be unhashable or compare equal without being the
+            # same registered pass.
+            fn_to_names = [(fn, name) for name, fn in opt_passes.items()]
+            validate_schedule(schedule, fn_to_names)
+
             def passes_name_to_fn(passes):
                 for p in passes:
                     assert callable(p) or p in opt_passes, f"Unknown pass {p}"
                 return [p if callable(p) else opt_passes[p] for p in passes]
 
             schedule = [(step, passes_name_to_fn(passes)) for step, passes in schedule]
-            validate_schedule(schedule, {fn: name for name, fn in opt_passes.items()})
 
         assert backend in ['inductor', 'eager'], f"Backend {backend} is not supported for DeepCompile."
 
