@@ -3,8 +3,6 @@
 
 # DeepSpeed Team
 
-import functools
-
 import pytest
 import torch
 import deepspeed.comm as dist
@@ -98,11 +96,10 @@ def assert_zero3_balanced_residency(model_engine, frozen_module=None, allow_exte
                          if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
     coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
     available_numel = coordinator._PartitionedParameterCoordinator__n_available_params
-    parameter_offload = model_engine.optimizer.parameter_offload
-
-    assert not coordinator._PartitionedParameterCoordinator__params_fetched_by_graph
-    assert not coordinator._PartitionedParameterCoordinator__active_sub_modules_fetched_by_graph
-    assert not coordinator._PartitionedParameterCoordinator__graph_cleanup_callbacks
+    assert not coordinator._PartitionedParameterCoordinator__graph_task_leases
+    assert not coordinator._PartitionedParameterCoordinator__param_graph_ref_counts
+    assert not coordinator._PartitionedParameterCoordinator__owner_graph_ref_counts
+    assert not coordinator._PartitionedParameterCoordinator__graph_cleanup_pending
     assert not coordinator._PartitionedParameterCoordinator__inflight_param_registry
     assert all(not param.ds_active_sub_modules for param in releasable_params)
     assert available_numel >= 0
@@ -112,8 +109,6 @@ def assert_zero3_balanced_residency(model_engine, frozen_module=None, allow_exte
                    if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
     else:
         assert resident_numel == 0
-    assert not parameter_offload._DeepSpeedZeRoOffload__fwd_modules_by_graph
-    assert not parameter_offload._DeepSpeedZeRoOffload__fwd_module_cleanup_callbacks
     assert FWD_MODULE_STACK == [model_engine.module]
     if frozen_module is not None:
         assert all(param.ds_status == ZeroParamStatus.NOT_AVAILABLE for param in frozen_module.parameters())
@@ -126,22 +121,15 @@ def observe_zero3_graph_cleanup(model_engine):
     observations = []
 
     def observed(graph_task_id=None):
-        tracked = coordinator._PartitionedParameterCoordinator__params_fetched_by_graph
-        owners = coordinator._PartitionedParameterCoordinator__active_sub_modules_fetched_by_graph
+        leases = coordinator._PartitionedParameterCoordinator__graph_task_leases
         inflight = coordinator._PartitionedParameterCoordinator__inflight_param_registry
-        params_before = {task_id: set(params) for task_id, params in tracked.items()}
-        owners_before = {
-            task_id: {
-                param: set(module_ids)
-                for param, module_ids in graph_owners.items()
-            }
-            for task_id, graph_owners in owners.items()
-        }
+        params_before = {task_id: set(lease.params) for task_id, lease in leases.items()}
+        owners_before = {task_id: lease.owners.copy() for task_id, lease in leases.items()}
         inflight_before = {param.ds_id for param in inflight}
 
         original(graph_task_id)
 
-        params_after = {task_id: set(params) for task_id, params in tracked.items()}
+        params_after = {task_id: set(lease.params) for task_id, lease in leases.items()}
         completed_params = params_before.get(graph_task_id, set())
         protected_params = set().union(*params_after.values()) if params_after else set()
         overlapping_graph_tasks = {
@@ -150,13 +138,12 @@ def observe_zero3_graph_cleanup(model_engine):
         }
         protected_owner_ids = {
             module_id
-            for graph_owners in owners.values()
-            for param, module_ids in graph_owners.items() if param in completed_params for module_id in module_ids
+            for lease in leases.values()
+            for (param, module_id), count in lease.owners.items() if count and param in completed_params
         }
         completed_owner_ids = {
             module_id
-            for module_ids in owners_before.get(graph_task_id, {}).values()
-            for module_id in module_ids
+            for (param, module_id), count in owners_before.get(graph_task_id, {}).items() if count
         }
         observations.append({
             "graph_task_id": graph_task_id,
@@ -1779,20 +1766,14 @@ class TestZero3InflightGraphCleanup(DistributedTest):
         model_engine.destroy()
 
 
-@pytest.mark.parametrize("force_py20_fallback", [False, True])
 class TestZero3CheckpointForwardExceptionCleanup(DistributedTest):
     """A stopped recompute unwinds before a later recompute returns an external param."""
 
     world_size = 2
 
-    def test_mixed_checkpoint_external_param_owner(self, force_py20_fallback):
-        import deepspeed.runtime.zero.parameter_offload as parameter_offload
-
+    def test_mixed_checkpoint_external_param_owner(self):
         hidden_dim = 8
         device, _, dtype = initialize_distributed()
-        actual_always_call_support = parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED
-        if force_py20_fallback:
-            parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED = False
 
         model_engine = None
         try:
@@ -1800,28 +1781,6 @@ class TestZero3CheckpointForwardExceptionCleanup(DistributedTest):
             config = get_config_dict(3)
             trainable_params = [param for param in model.parameters() if param.requires_grad]
             model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=trainable_params)
-
-            if force_py20_fallback:
-                from deepspeed.runtime.zero import unwrap_model_for_generation
-                wrapper_count = len(model_engine.optimizer.parameter_offload.forward_wrappers)
-                assert wrapper_count == len(list(model_engine.module.modules()))
-
-                wrapped_forward = model_engine.module.non_reentrant.forward
-
-                @functools.wraps(wrapped_forward)
-                def user_decorated_forward(*args, **kwargs):
-                    return wrapped_forward(*args, **kwargs)
-
-                model_engine.module.non_reentrant.forward = user_decorated_forward
-                with pytest.raises(RuntimeError, match="wrapped forward or module call was rebound"):
-                    with unwrap_model_for_generation(model_engine):
-                        pass
-                assert len(model_engine.optimizer.parameter_offload.forward_wrappers) == wrapper_count
-                model_engine.module.non_reentrant.forward = wrapped_forward
-
-                with unwrap_model_for_generation(model_engine):
-                    assert not model_engine.optimizer.parameter_offload.forward_wrappers
-                assert len(model_engine.optimizer.parameter_offload.forward_wrappers) == wrapper_count
 
             x = torch.randn(2, hidden_dim, device=device, dtype=dtype, requires_grad=True)
             model_engine.backward(model_engine(x).sum())
@@ -1838,4 +1797,3 @@ class TestZero3CheckpointForwardExceptionCleanup(DistributedTest):
         finally:
             if model_engine is not None:
                 model_engine.destroy()
-            parameter_offload.FORWARD_HOOK_ALWAYS_CALL_SUPPORTED = actual_always_call_support

@@ -3,7 +3,7 @@
 
 # DeepSpeed Team
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import collections
 from collections import UserDict
 import threading
@@ -84,6 +84,12 @@ class PartitionedParameterCoordinator:
         param: Parameter
         step_id_last_used_at: int
 
+    @dataclass
+    class __GraphTaskLease:
+        params: Set[Parameter] = field(default_factory=set)
+        owners: collections.Counter = field(default_factory=collections.Counter)
+        callback_queued: bool = False
+
     def __init__(
         self,
         prefetch_bucket_sz: int,
@@ -154,16 +160,15 @@ class PartitionedParameterCoordinator:
         self.__ongoing_fetch_leaf_module_events = collections.defaultdict(threading.Event)
         self.__leaf_module_lock = threading.Lock()
 
-        # A module whose input does not require gradients may not run its post-backward
-        # release hook. Checkpoint early-stop can also bypass a recompute post-forward
-        # hook. Track parameter ownership per autograd graph task so each graph-completion
-        # callback reconciles only the lifetime it observed. This matters for reentrant
-        # checkpointing, where an inner graph can finish while its outer graph is active.
-        self.__params_fetched_by_graph: Dict[int, Set[Parameter]] = collections.defaultdict(set)
-        self.__active_sub_modules_fetched_by_graph: Dict[int, Dict[Parameter, Set[int]]] = collections.defaultdict(
-            lambda: collections.defaultdict(set))
-        self.__graph_cleanup_callbacks = set()
-        self.__backward_fetch_lock = threading.Lock()
+        # Graph-task leases bound parameters whose normal module hooks can be skipped
+        # by a no-grad input or checkpoint early-stop. Refcounts let nested/reentrant
+        # tasks protect shared parameters and owners without rebuilding a union of all
+        # live graph state at cleanup.
+        self.__graph_task_leases: Dict[int, __class__.__GraphTaskLease] = {}
+        self.__param_graph_ref_counts = collections.Counter()
+        self.__owner_graph_ref_counts = collections.Counter()
+        self.__graph_cleanup_lock = threading.Lock()
+        self.__graph_cleanup_pending = False
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -259,7 +264,9 @@ class PartitionedParameterCoordinator:
         if is_compiling():
             return
 
-        if current_graph_task_id() == -1:
+        # Ordinary root forwards should not acquire the graph-cleanup lock. The
+        # separate in-flight registry sweep remains an unconditional safety net.
+        if self.__graph_cleanup_pending and current_graph_task_id() == -1:
             self.release_unreleased_params()
         self._clean_inflight_param_registry()
 
@@ -321,6 +328,8 @@ class PartitionedParameterCoordinator:
         2. kick off fetch for next few parameters we will need later (prefetch)
         3. block on parameters in immediately required sub module
         """
+        graph_task_id = current_graph_task_id()
+
         # For leaf modules during backward pass, autograd may trigger hooks from multiple
         # threads concurrently (e.g., when a module returns multiple tensors). We need to
         # serialize access to prevent race conditions in parameter state management.
@@ -345,7 +354,7 @@ class PartitionedParameterCoordinator:
                 return
 
         try:
-            self._fetch_sub_module_impl(current_submodule, forward, is_leaf)
+            self._fetch_sub_module_impl(current_submodule, forward, is_leaf, graph_task_id)
         finally:
             if needs_sync:
                 # Signal that we're done fetching this leaf module and remove the event
@@ -354,7 +363,8 @@ class PartitionedParameterCoordinator:
                     if event is not None:
                         event.set()
 
-    def _fetch_sub_module_impl(self, current_submodule: Module, forward: bool, is_leaf: bool) -> None:
+    def _fetch_sub_module_impl(self, current_submodule: Module, forward: bool, is_leaf: bool,
+                               graph_task_id: int) -> None:
         """Implementation of fetch_sub_module, separated for thread synchronization."""
         if logger.isEnabledFor(logging.DEBUG):
             debug_rank0(
@@ -366,6 +376,12 @@ class PartitionedParameterCoordinator:
                 }))
 
         params_to_fetch = set(iter_params(current_submodule, recurse=is_leaf))
+        if graph_task_id != -1:
+            self.__track_graph_task_lifetime(graph_task_id, params_to_fetch, current_submodule.ds_id)
+        else:
+            for param in params_to_fetch:
+                param.ds_active_sub_modules.add(current_submodule.ds_id)
+
         fetch_numel = sum(
             [p.partition_numel() for p in params_to_fetch if p.ds_status == ZeroParamStatus.NOT_AVAILABLE])
 
@@ -382,19 +398,15 @@ class PartitionedParameterCoordinator:
             if logger.isEnabledFor(logging.DEBUG):
                 for param in params_to_fetch:
                     debug_rank0(f"-fetch: {param.ds_summary()}")
-            self.__all_gather_params(params_to_fetch, forward)
+            self.__all_gather_params(params_to_fetch, forward, graph_task_id=graph_task_id, already_tracked=True)
             self.__profiler.stop_event(event_name, fetch_numel)
 
         wait_numel = 0
         wait_event_name = __class__.FORWARD_FETCH_WAIT if forward else __class__.BACKWARD_FETCH_WAIT
         self.__profiler.start_event(wait_event_name)
         fast_fetch = self.fast_sharding_for_leaf_module and is_leaf
-        in_backward = not forward or current_graph_task_id() != -1
         # wait for parameters in the immediately needed submodule to become available
         for param in params_to_fetch:
-            param.ds_active_sub_modules.add(current_submodule.ds_id)
-            if in_backward:
-                self.__track_graph_task_lifetime({param}, current_submodule.ds_id)
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
             if param in self.__inflight_param_registry:
@@ -483,7 +495,12 @@ class PartitionedParameterCoordinator:
                     if logger.isEnabledFor(logging.DEBUG):
                         for param in params_to_prefetch:
                             debug_rank0(f"-prefetch: {param.ds_summary()}")
-                    self.__all_gather_params(params_to_prefetch, forward)
+                    if graph_task_id != -1:
+                        self.__track_graph_task_lifetime(graph_task_id, params_to_prefetch)
+                    self.__all_gather_params(params_to_prefetch,
+                                             forward,
+                                             graph_task_id=graph_task_id,
+                                             already_tracked=True)
                     self.__profiler.stop_event(event_name, numel_prefetching)
 
                 if self.__prefetch_nvme:
@@ -497,8 +514,9 @@ class PartitionedParameterCoordinator:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
         #print_rank_0(f"release_sub_module {'fwd' if forward else 'bwd'}: {debug_module2name_id(submodule)}", force=False)
+        params = set(iter_params(submodule, recurse=z3_leaf_module(submodule)))
         params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
-            p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+            p.ds_id for p in params))
 
         free_data = not z3_leaf_module(submodule) or not self.fast_sharding_for_leaf_module
         if not free_data:
@@ -510,11 +528,19 @@ class PartitionedParameterCoordinator:
         # recompute and trips its metadata check. An early-stop exception also means
         # trainable parameters can still have backward consumers, so the exception-safe
         # post hook unwinds ownership now but defers storage release to graph completion.
-        in_checkpoint_recompute = forward and current_graph_task_id() != -1
+        graph_task_id = current_graph_task_id()
+        in_checkpoint_recompute = forward and graph_task_id != -1
+        if graph_task_id == -1:
+            for param in params:
+                param.ds_active_sub_modules.discard(submodule.ds_id)
+            protected_params = set()
+        else:
+            protected_params = self.__finish_graph_task_submodule(graph_task_id, params, submodule.ds_id)
 
-        for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
-            param.ds_active_sub_modules.discard(submodule.ds_id)
+        for param in params:
             if in_checkpoint_recompute and (defer_release or not param.requires_grad):
+                continue
+            if param in protected_params:
                 continue
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param, free_data)
@@ -527,10 +553,11 @@ class PartitionedParameterCoordinator:
     @torch.no_grad()
     def release_and_reset_all(self, module: Module) -> None:
         """release all module parameters"""
-        with self.__backward_fetch_lock:
-            self.__params_fetched_by_graph.clear()
-            self.__active_sub_modules_fetched_by_graph.clear()
-            self.__graph_cleanup_callbacks.clear()
+        with self.__graph_cleanup_lock:
+            self.__graph_task_leases.clear()
+            self.__param_graph_ref_counts.clear()
+            self.__owner_graph_ref_counts.clear()
+            self.__graph_cleanup_pending = False
 
         for param in iter_params(module, recurse=True):
             if param in self.__inflight_param_registry:
@@ -549,67 +576,128 @@ class PartitionedParameterCoordinator:
     @torch.no_grad()
     def release_unreleased_params(self, graph_task_id: Optional[int] = None) -> None:
         """Release transient parameters whose hooks did not finish their graph-task lifetime."""
-        with self.__backward_fetch_lock:
-            graph_task_ids = (list(self.__params_fetched_by_graph) if graph_task_id is None else [graph_task_id])
-            params = set()
-            active_sub_modules = collections.defaultdict(set)
+        if not self.__graph_cleanup_pending:
+            return
+
+        with self.__graph_cleanup_lock:
+            graph_task_ids = (list(self.__graph_task_leases) if graph_task_id is None else [graph_task_id])
+            params_to_release = set()
             for completed_graph_task_id in graph_task_ids:
-                params.update(self.__params_fetched_by_graph.pop(completed_graph_task_id, set()))
-                for param, sub_module_ids in self.__active_sub_modules_fetched_by_graph.pop(
-                        completed_graph_task_id, {}).items():
-                    active_sub_modules[param].update(sub_module_ids)
-                self.__graph_cleanup_callbacks.discard(completed_graph_task_id)
+                lease = self.__graph_task_leases.pop(completed_graph_task_id, None)
+                if lease is None:
+                    continue
 
-            # A parameter can participate in nested graph tasks. Do not remove an owner or
-            # partition the tensor while any still-active graph task is tracking it.
-            protected_params = set().union(*self.__params_fetched_by_graph.values()) \
-                if self.__params_fetched_by_graph else set()
-            protected_active_sub_modules = collections.defaultdict(set)
-            for graph_active_sub_modules in self.__active_sub_modules_fetched_by_graph.values():
-                for param, sub_module_ids in graph_active_sub_modules.items():
-                    protected_active_sub_modules[param].update(sub_module_ids)
+                for (param, sub_module_id), count in lease.owners.items():
+                    owner = (param, sub_module_id)
+                    self.__owner_graph_ref_counts[owner] -= count
+                    if self.__owner_graph_ref_counts[owner] == 0:
+                        del self.__owner_graph_ref_counts[owner]
+                        param.ds_active_sub_modules.discard(sub_module_id)
 
-        for param, sub_module_ids in active_sub_modules.items():
-            param.ds_active_sub_modules.difference_update(sub_module_ids - protected_active_sub_modules[param])
+                for param in lease.params:
+                    self.__param_graph_ref_counts[param] -= 1
+                    if self.__param_graph_ref_counts[param] == 0:
+                        del self.__param_graph_ref_counts[param]
+                        params_to_release.add(param)
 
-        for param in params:
-            if param in protected_params:
-                continue
+            self.__graph_cleanup_pending = bool(self.__graph_task_leases)
+
+        # CUDA waits, allocator work, partitioning, NVMe activity, and collectives
+        # must remain outside the graph-lifetime lock.
+        for param in params_to_release:
             if param in self.__inflight_param_registry:
                 self.__inflight_param_registry.pop(param).wait()
             if not param.ds_persist and not param.is_external_param:
                 self.__release_param(param)
 
-    def __track_graph_task_lifetime(self, params: Set[Parameter], sub_module_id: Optional[int] = None) -> None:
-        """Track params and exact owners acquired by the currently executing autograd graph task."""
-        graph_task_id = current_graph_task_id()
-        if graph_task_id == -1:
+    def __track_graph_task_lifetime(self,
+                                    graph_task_id: int,
+                                    params: Set[Parameter],
+                                    sub_module_id: Optional[int] = None) -> None:
+        """Acquire one batched parameter/owner lease for an autograd graph task."""
+        if graph_task_id == -1 or not params:
             return
 
-        with self.__backward_fetch_lock:
-            self.__params_fetched_by_graph[graph_task_id].update(params)
+        queue_callback = False
+        with self.__graph_cleanup_lock:
+            lease = self.__graph_task_leases.get(graph_task_id)
+            if lease is None:
+                lease = __class__.__GraphTaskLease()
+                self.__graph_task_leases[graph_task_id] = lease
+
+            new_params = params - lease.params
+            lease.params.update(new_params)
+            self.__param_graph_ref_counts.update(new_params)
+
             if sub_module_id is not None:
                 for param in params:
-                    self.__active_sub_modules_fetched_by_graph[graph_task_id][param].add(sub_module_id)
-            if graph_task_id in self.__graph_cleanup_callbacks:
-                return
+                    owner = (param, sub_module_id)
+                    lease.owners[owner] += 1
+                    self.__owner_graph_ref_counts[owner] += 1
+                    param.ds_active_sub_modules.add(sub_module_id)
 
-            engine = getattr(torch.autograd.Variable, "_execution_engine", None)
-            if engine is None or not hasattr(engine, "queue_callback"):
-                return
-            self.__graph_cleanup_callbacks.add(graph_task_id)
+            if not lease.callback_queued:
+                lease.callback_queued = True
+                queue_callback = True
+            self.__graph_cleanup_pending = True
 
-            def release_graph_task_lifetime():
-                self.release_unreleased_params(graph_task_id)
+        if not queue_callback:
+            return
 
-            try:
-                engine.queue_callback(release_graph_task_lifetime)
-            except Exception:
-                self.__graph_cleanup_callbacks.discard(graph_task_id)
-                raise
+        engine = getattr(torch.autograd.Variable, "_execution_engine", None)
+        if engine is None or not hasattr(engine, "queue_callback"):
+            with self.__graph_cleanup_lock:
+                lease.callback_queued = False
+            raise RuntimeError("ZeRO-3 requires autograd graph completion callbacks")
+
+        def release_graph_task_lifetime():
+            self.release_unreleased_params(graph_task_id)
+
+        try:
+            engine.queue_callback(release_graph_task_lifetime)
+        except Exception:
+            with self.__graph_cleanup_lock:
+                lease = self.__graph_task_leases.get(graph_task_id)
+                if lease is not None:
+                    lease.callback_queued = False
+            raise
+
+    def __finish_graph_task_submodule(self, graph_task_id: int, params: Set[Parameter],
+                                      sub_module_id: int) -> Set[Parameter]:
+        """Release one owner acquisition and return params leased by another live graph."""
+        with self.__graph_cleanup_lock:
+            lease = self.__graph_task_leases.get(graph_task_id)
+            for param in params:
+                owner = (param, sub_module_id)
+                if lease is None or lease.owners[owner] == 0:
+                    param.ds_active_sub_modules.discard(sub_module_id)
+                    continue
+
+                lease.owners[owner] -= 1
+                if lease.owners[owner] == 0:
+                    del lease.owners[owner]
+                self.__owner_graph_ref_counts[owner] -= 1
+                if self.__owner_graph_ref_counts[owner] == 0:
+                    del self.__owner_graph_ref_counts[owner]
+                    param.ds_active_sub_modules.discard(sub_module_id)
+
+            return {
+                param
+                for param in params
+                if self.__param_graph_ref_counts[param] > (1 if lease is not None and param in lease.params else 0)
+            }
 
     @instrument_w_nvtx
-    def __all_gather_params(self, params: Set[Parameter], forward: bool) -> None:
+    def __all_gather_params(self,
+                            params: Set[Parameter],
+                            forward: bool,
+                            graph_task_id: Optional[int] = None,
+                            already_tracked: bool = False) -> None:
+        if not already_tracked:
+            if graph_task_id is None:
+                graph_task_id = current_graph_task_id()
+            self.__track_graph_task_lifetime(graph_task_id, params)
+
         quantized_params = []
         nonquantized_params = []
         for param in params:
@@ -631,9 +719,6 @@ class PartitionedParameterCoordinator:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 partitioned_params.append(param)
                 all_gather_numel += param.ds_numel
-
-        if partitioned_params:
-            self.__track_graph_task_lifetime(set(partitioned_params))
 
         if partitioned_params:
             self.__n_available_params += all_gather_numel

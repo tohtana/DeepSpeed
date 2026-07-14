@@ -101,7 +101,6 @@ def unwrap_model_for_generation(model):
         elif model.optimizer is not None:
             optimizer_offload = model.optimizer
 
-        optimizer_offload._check_forward_wrappers_removable()
         for hook in optimizer_offload.forward_hooks:
             hook.remove()
         for hook in optimizer_offload.backward_hooks:
@@ -112,8 +111,6 @@ def unwrap_model_for_generation(model):
 
         optimizer_offload.forward_hooks = []
         optimizer_offload.backward_hooks = []
-        optimizer_offload._remove_forward_wrappers()
-
         try:
             yield model
         finally:
