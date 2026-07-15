@@ -129,11 +129,13 @@ def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch)
         def memory_allocated(self):
             return 50
 
+    max_reductions = iter((850, 200))
+
     def reduce_budget_inputs(tensor, op):
         if op == zero3_compile_mod.dist.ReduceOp.MIN:
             tensor[0] = 1000
         elif op == zero3_compile_mod.dist.ReduceOp.MAX:
-            tensor[0] = 850
+            tensor[0] = next(max_reductions)
         else:
             raise AssertionError(f"unexpected reduce op {op}")
 
@@ -157,11 +159,71 @@ def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch)
 
     budget = zero3_compile_mod._build_scheduler_budget_from_operator_profile(graph)
 
-    assert budget.source == "profiled_non_gathered_peak_memory"
+    assert budget.source == "profiled_non_gathered_peak_memory_clamped_to_minimum_gather_residency"
     assert budget.total_mem == 1000
     assert budget.profiled_non_gathered_peak_mem == 850
     assert budget.safety_margin == 100
-    assert budget.max_gathered_bytes == 50
+    assert budget.available_mem == 50
+    assert budget.max_gathered_bytes == 200
+
+
+def test_profiled_scheduler_budget_clamps_impossible_step7_shape_to_largest_single_gather():
+    budget = schedule_mod.SchedulerMemoryBudget.from_profiled_non_gathered_peak(
+        total_mem=85017493504,
+        profiled_non_gathered_peak_mem=75524405760,
+        output_size=0,
+    )
+
+    clamped = budget.clamped_to_minimum_gather_residency(1555824640)
+
+    assert budget.max_gathered_bytes == 991338394
+    assert clamped.max_gathered_bytes == 1555824640
+    assert clamped.available_mem == 991338394
+    assert clamped.profiled_non_gathered_peak_mem == 75524405760
+    assert clamped.source == "profiled_non_gathered_peak_memory_clamped_to_minimum_gather_residency"
+
+
+def test_zero3_scheduler_complete_profile_clamps_to_largest_single_gather(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1000
+
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: FakeAccelerator())
+
+    graph = Graph()
+    first_param = _placeholder(graph, "profile_floor_first_param")
+    second_param = _placeholder(graph, "profile_floor_second_param")
+    first_ag = _allgather(graph, first_param, 1, "profile_floor_first", tensor_size=800, allocation_size=800)
+    first_wait = _wait(graph, first_ag, 1, "profile_floor_first")
+    second_ag = _allgather(graph, second_param, 2, "profile_floor_second", tensor_size=800, allocation_size=800)
+    second_wait = _wait(graph, second_ag, 2, "profile_floor_second")
+    op = _add(graph, first_wait, second_wait, "profile_floor_op")
+    op.meta.update(max_mem=800, profile_mem_start=850, profile_mem_peak=850)
+    first_release = _release(graph, op, 1, "profile_floor_first")
+    second_release = _release(graph, first_release, 2, "profile_floor_second")
+    graph.output((second_release, ))
+    graph.lint()
+    for node in graph.nodes:
+        node.meta.setdefault("alloc_mem", 0)
+        node.meta.setdefault("max_mem", 0)
+        node.meta.setdefault("profile_mem_start", 0)
+        node.meta.setdefault("profile_mem_peak", 0)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(
+        GraphModule(torch.nn.Module(), graph))
+
+    assert budget.max_gathered_bytes == 800
+    assert budget.available_mem == 50
+    assert budget.source == "profiled_non_gathered_peak_memory_clamped_to_minimum_gather_residency"
+    assert disabled_reason is None
 
 
 def test_zero3_scheduler_budget_reconstructs_live_activations_before_transient_peak(monkeypatch):
@@ -327,18 +389,23 @@ def test_zero3_scheduler_incomplete_profile_uses_identical_collective_on_asymmet
 
         def reduce_asymmetric_rank(tensor, op):
             calls.append((op, tensor.dtype))
-            tensor[0] = 0
+            if op == zero3_compile_mod.dist.ReduceOp.MIN:
+                tensor[0] = 0
+            elif op != zero3_compile_mod.dist.ReduceOp.MAX:
+                raise AssertionError(f"unexpected reduce op {op}")
 
         monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", reduce_asymmetric_rank)
         budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(make_graph(observed))
-        assert budget is None
-        assert disabled_reason == "incomplete_operator_profile"
+        assert budget.source == "incomplete_profile_minimum_gather_residency"
+        assert budget.max_gathered_bytes == 800
+        assert disabled_reason is None
         sequences.append(calls)
         budgets.append(budget)
 
     assert sequences[0] == sequences[1]
-    assert sequences[0] == [(zero3_compile_mod.dist.ReduceOp.MIN, torch.int32)]
-    assert budgets == [None, None]
+    assert sequences[0] == [(zero3_compile_mod.dist.ReduceOp.MIN, torch.int32),
+                            (zero3_compile_mod.dist.ReduceOp.MAX, torch.int64)]
+    assert [budget.max_gathered_bytes for budget in budgets] == [800, 800]
 
 
 def test_zero3_scheduler_budget_skips_incomplete_operator_profile_metadata():
@@ -366,10 +433,10 @@ def test_zero3_scheduler_budget_skips_incomplete_operator_profile(monkeypatch):
     budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
 
     assert budget is None
-    assert disabled_reason == "incomplete_operator_profile"
+    assert disabled_reason == "incomplete_operator_profile_without_gather"
 
 
-def test_zero3_scheduler_budget_disables_incomplete_profile_with_unprofiled_high_memory_suffix(monkeypatch):
+def test_zero3_scheduler_budget_caps_gathers_without_estimating_unprofiled_high_memory_suffix(monkeypatch):
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda: 1)
 
@@ -409,8 +476,42 @@ def test_zero3_scheduler_budget_disables_incomplete_profile_with_unprofiled_high
 
     budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(gm)
 
-    assert budget is None
-    assert disabled_reason == "incomplete_operator_profile"
+    assert budget.source == "incomplete_profile_minimum_gather_residency"
+    assert budget.max_gathered_bytes == 800
+    assert budget.available_mem == 0
+    assert budget.profiled_non_gathered_peak_mem == 0
+    assert disabled_reason is None
+
+
+def test_minimum_gather_residency_budget_uses_largest_padded_gather_and_no_memory_estimate(monkeypatch):
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(zero3_compile_mod.dist, "get_world_size", lambda group=None: 4)
+    monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: SimpleNamespace(current_device=lambda: "cpu"))
+
+    def preserve_max(tensor, op, group=None):
+        assert op in (zero3_compile_mod.dist.ReduceOp.MIN, zero3_compile_mod.dist.ReduceOp.MAX)
+
+    monkeypatch.setattr(zero3_compile_mod.dist, "all_reduce", preserve_max)
+
+    graph = Graph()
+    small_param = _placeholder(graph, "minimum_residency_small_param")
+    large_param = _placeholder(graph, "minimum_residency_large_param")
+    small_ag = _allgather(graph, small_param, 1, "minimum_residency_small", tensor_size=10)
+    large_ag = _allgather(graph, large_param, 2, "minimum_residency_large", tensor_size=18)
+    graph.output((small_ag, large_ag))
+    graph.lint()
+    _backfill_missing_profile_metadata(graph, profile_complete=False)
+
+    budget, disabled_reason = zero3_compile_mod._scheduler_budget_from_operator_profile(
+        GraphModule(torch.nn.Module(), graph))
+
+    assert small_ag.meta["allgather_allocation_bytes"] == 16
+    assert large_ag.meta["allgather_allocation_bytes"] == 24
+    assert budget.max_gathered_bytes == 24
+    assert budget.source == "incomplete_profile_minimum_gather_residency"
+    assert budget.available_mem == 0
+    assert budget.total_mem == 0
+    assert disabled_reason is None
 
 
 def test_zero3_scheduler_budget_skips_non_distributed_memory_profile(monkeypatch):
@@ -577,6 +678,34 @@ def test_zero3_scheduler_debug_logs_disabled_budget(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "budget_enabled=False" in captured.out
     assert "disabled_reason=missing_or_incomplete_memory_profile" in captured.out
+
+
+def test_zero3_scheduler_debug_logs_smallest_rejected_candidate_peak(monkeypatch, capsys):
+    monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
+    monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: False)
+    graph = Graph()
+    graph.output(())
+    graph.lint()
+    setattr(
+        graph,
+        schedule_mod.SCHEDULER_BUDGET_DIAGNOSTICS_ATTR,
+        {
+            "selected": [],
+            "budget_rejections": 2,
+            "budget_rejected_candidates": [{
+                "over_budget_bytes": 64
+            }, {
+                "over_budget_bytes": 32
+            }],
+            "budget_overflows": [],
+        },
+    )
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=1024, source="test")
+
+    zero3_compile_mod._log_scheduler_result(7, bwd=True, scheduler_budget=budget, disabled_reason=None, graph=graph)
+
+    captured = capsys.readouterr()
+    assert "minimum_rejected_candidate_peak_bytes=1056" in captured.out
 
 
 def test_zero3_final_schedule_fingerprint_detects_rank_mismatch(monkeypatch):

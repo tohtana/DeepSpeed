@@ -21,6 +21,8 @@ from ..list_schedule import (SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, SchedulerMemoryB
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils.allocator_telemetry import enabled as allocator_telemetry_enabled
+from deepspeed.utils.allocator_telemetry import record_empty_cache, record_scheduler_decision
 
 NAME = "zero3_compile"
 SCHEDULER_DEBUG_ENV = "DEEPSPEED_COMPILE_SCHEDULER_BUDGET_DEBUG"
@@ -93,9 +95,22 @@ def _build_scheduler_budget_from_operator_profile(graph: Graph, output_size: int
     if not _operator_profile_complete(graph):
         return None
 
-    return SchedulerMemoryBudget.from_profiled_non_gathered_peak(
+    scheduler_budget = SchedulerMemoryBudget.from_profiled_non_gathered_peak(
         _rank_min_total_memory(process_group), _rank_max_operator_profiled_non_gathered_peak(graph, process_group),
         output_size)
+    minimum_budget = _minimum_gather_residency_budget(graph, process_group)
+    if scheduler_budget is not None and minimum_budget is not None:
+        scheduler_budget = scheduler_budget.clamped_to_minimum_gather_residency(minimum_budget.max_gathered_bytes)
+    return scheduler_budget
+
+
+def _minimum_gather_residency_budget(graph: Graph, process_group=None):
+    """Build a rank-consistent gather-only cap without inferring memory headroom."""
+    local_max_single_gather = max((int(node.meta.get("allgather_allocation_bytes", 0) or 0)
+                                   for node in graph.nodes if node.target == torch.ops.dc.allgather_param.default),
+                                  default=0)
+    max_single_gather = _reduce_int(local_max_single_gather, dist.ReduceOp.MAX, process_group)
+    return SchedulerMemoryBudget.minimum_gather_residency(max_single_gather)
 
 
 def _scheduler_debug_enabled():
@@ -187,9 +202,15 @@ def _scheduler_budget_from_operator_profile(gm: GraphModule, process_group=None)
     _set_allgather_allocation_metadata(gm.graph, process_group)
     operator_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph), process_group)
     if not operator_profile_complete:
-        # An unvisited suffix can exceed every observed partial peak, so no
-        # absolute headroom estimate is safe until every rank completes.
-        return None, "incomplete_operator_profile"
+        # An unvisited suffix can exceed every observed partial peak, so do
+        # not infer whole-graph headroom from partial data or allocator state.
+        # Still constrain scheduler-controlled gathered-parameter residency to
+        # one largest-gather-sized cap so incomplete profiling cannot silently
+        # restore unconstrained gather overlap.
+        scheduler_budget = _minimum_gather_residency_budget(gm.graph, process_group)
+        if scheduler_budget is None:
+            return None, "incomplete_operator_profile_without_gather"
+        return scheduler_budget, None
 
     scheduler_budget = _build_scheduler_budget_from_operator_profile(gm.graph, process_group=process_group)
     # A gate larger than every gather combined cannot affect ordering, so keep
@@ -208,6 +229,23 @@ def _log_scheduler_result(graph_id: int,
     diagnostics = getattr(graph, SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, {})
     selected = diagnostics.get("selected", [])
     max_live_gathered_bytes = max((entry.get("peak_gathered_bytes", 0) for entry in selected), default=0)
+    rejected_candidates = diagnostics.get("budget_rejected_candidates", [])
+    minimum_rejected_candidate_peak_bytes = None
+    if (scheduler_budget is not None and rejected_candidates
+            and (_scheduler_debug_enabled() or allocator_telemetry_enabled())):
+        minimum_rejected_candidate_peak_bytes = min(
+            scheduler_budget.max_gathered_bytes + entry.get("over_budget_bytes", 0) for entry in rejected_candidates)
+    record_scheduler_decision(
+        graph_id=graph_id,
+        backward=bwd,
+        budget_source=scheduler_budget.source if scheduler_budget is not None else None,
+        disabled_reason=disabled_reason,
+        max_gathered_bytes=scheduler_budget.max_gathered_bytes if scheduler_budget is not None else None,
+        max_live_gathered_bytes=max_live_gathered_bytes,
+        budget_rejections=diagnostics.get("budget_rejections", 0),
+        over_budget_fallbacks=len(diagnostics.get("budget_overflows", [])),
+        minimum_rejected_candidate_peak_bytes=minimum_rejected_candidate_peak_bytes,
+    )
     if scheduler_budget is None:
         _print_scheduler_debug(
             f"DeepCompile ZeRO-3 scheduler graph_id={graph_id} bwd={bwd} budget_enabled=False "
@@ -221,6 +259,7 @@ def _log_scheduler_result(graph_id: int,
         f"safety_margin={scheduler_budget.safety_margin} "
         f"profiled_non_gathered_peak_mem={scheduler_budget.profiled_non_gathered_peak_mem} "
         f"budget_rejections={diagnostics.get('budget_rejections', 0)} "
+        f"minimum_rejected_candidate_peak_bytes={minimum_rejected_candidate_peak_bytes} "
         f"over_budget_fallbacks={len(diagnostics.get('budget_overflows', []))} "
         f"max_live_gathered_bytes={max_live_gathered_bytes}", process_group)
 
@@ -393,7 +432,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
     profiler.run(*real_inputs)
     del profiler
     gc.collect()
-    get_accelerator().empty_cache()
+    record_empty_cache("zero3-compile.forward-post-profile", get_accelerator().empty_cache)
     # Build the shared scheduling budget after the operator profile is complete
     # but before the scheduler rewrites graph order and Inductor metadata.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
@@ -450,7 +489,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
 
     del real_outputs
     gc.collect()
-    get_accelerator().empty_cache()
+    record_empty_cache("zero3-compile.backward-post-profile", get_accelerator().empty_cache)
     # The scheduler consumes only DP-group-reduced inputs, ensuring every group
     # rank emits collectives in the same order even when allocator state differs.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)

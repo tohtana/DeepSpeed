@@ -6,7 +6,7 @@
 from collections import defaultdict
 from typing import List, Dict, Optional
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch.fx import Graph, Node
@@ -267,7 +267,8 @@ class SchedulerMemoryBudget:
     """Rank-consistent allowance for scheduler-managed gathered parameter buffers.
 
     ``max_gathered_bytes`` is the headroom remaining after any profiled
-    non-gathered peak, output reservation, and safety margin are removed.
+    non-gathered peak, output reservation, and safety margin are removed, or
+    an explicit gather-residency cap when no complete memory profile exists.
     """
 
     max_gathered_bytes: int
@@ -277,6 +278,34 @@ class SchedulerMemoryBudget:
     safety_margin: int = 0
     total_mem: int = 0
     profiled_non_gathered_peak_mem: int = 0
+
+    @classmethod
+    def minimum_gather_residency(cls, max_single_allgather_bytes: int):
+        """Limit an incomplete-profile schedule to one largest-gather-sized residency.
+
+        This is not an estimate of available memory or of an unobserved
+        non-gather peak. It only constrains the memory the scheduler controls:
+        simultaneously resident gathered parameter buffers.
+        """
+        max_single_allgather_bytes = int(max_single_allgather_bytes or 0)
+        if max_single_allgather_bytes <= 0:
+            return None
+        return cls(max_gathered_bytes=max_single_allgather_bytes, source="incomplete_profile_minimum_gather_residency")
+
+    def clamped_to_minimum_gather_residency(self, max_single_allgather_bytes: int):
+        """Keep an enabled budget large enough for one unavoidable gather.
+
+        A smaller budget cannot be satisfied by any schedule and forces the
+        scheduler into its over-budget fallback. This floor changes only the
+        gathered residency controlled by the scheduler; it does not revise the
+        profiled non-gather memory estimate.
+        """
+        max_single_allgather_bytes = int(max_single_allgather_bytes or 0)
+        if max_single_allgather_bytes <= self.max_gathered_bytes:
+            return self
+        return replace(self,
+                       max_gathered_bytes=max_single_allgather_bytes,
+                       source=f"{self.source}_clamped_to_minimum_gather_residency")
 
     @classmethod
     def from_profiled_non_gathered_peak(cls, total_mem: int, profiled_non_gathered_peak_mem: int, output_size: int):

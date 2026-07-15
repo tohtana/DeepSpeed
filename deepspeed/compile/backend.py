@@ -23,6 +23,7 @@ except ImportError:
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils.allocator_telemetry import record_empty_cache
 
 from .fx import add_free_activations
 from .graph_param import DSGraphParamManager
@@ -303,7 +304,7 @@ def run_opt_passes(opt_passes: List[Callable],
     with unset_fake_temporarily():
         get_accelerator().synchronize()
         gc.collect()
-        get_accelerator().empty_cache()
+        record_empty_cache("backend.pre-opt-passes", get_accelerator().empty_cache)
 
     for i, opt_pass_fn in enumerate(opt_passes):
         log_rank0(f"Running opt pass {i} for graph {graph_id}. bwd={bwd}", enable=debug_log)
@@ -338,7 +339,7 @@ def run_opt_passes(opt_passes: List[Callable],
         with unset_fake_temporarily():
             get_accelerator().synchronize()
             gc.collect()
-            get_accelerator().empty_cache()
+            record_empty_cache("backend.post-profile", get_accelerator().empty_cache)
 
 
 def make_backend(backend, compile_config, compile_kwargs={}, process_group=None, owned_frames=None):

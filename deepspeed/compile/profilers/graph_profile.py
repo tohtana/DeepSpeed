@@ -401,6 +401,7 @@ class MemoryProfilingInterpreter(Interpreter):
         except Exception as e:
             self.profile_complete = False
             self.mem_record.clear()
+            _backfill_missing_profile_metadata(self.graph, profile_complete=False)
             print(f"MemoryProfiling error {e}")
         finally:
             try:

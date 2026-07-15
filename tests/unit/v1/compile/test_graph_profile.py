@@ -167,6 +167,7 @@ def test_memory_profiling_interpreter_clears_gathered_params_after_failure(monke
     assert interpreter.run() is None
     assert not interpreter.profile_complete
     assert interpreter.mem_record == []
+    assert graph_profile.is_profile_incomplete(interpreter.graph)
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
 
 

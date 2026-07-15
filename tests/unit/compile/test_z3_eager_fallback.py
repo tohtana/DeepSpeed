@@ -105,6 +105,39 @@ def test_deepcompile_fallback_releases_leftover_gathered_params_before_forward()
     assert fallback.stats()["last_pre_forward_released_param_ids"] == [11]
 
 
+def test_consecutive_deepcompile_forwards_release_unowned_available_params():
+    module, param = _zero_module_with_param()
+    param.ds_persist = False
+    partition_calls = []
+
+    def partition():
+        partition_calls.append(param.ds_id)
+        param.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
+    param.partition = partition
+
+    class FakeEngine:
+
+        def __init__(self):
+            self.module = module
+            self._deepcompile_z3_eager_fallback = DeepCompileZ3EagerFallback(self)
+
+        def is_deepcompile_active(self):
+            return True
+
+        def zero_optimization_partition_weights(self):
+            return True
+
+    engine = FakeEngine()
+    for _ in range(2):
+        # Direct compiler/profiler gathers do not pass through the eager fallback.
+        param.ds_status = ZeroParamStatus.AVAILABLE
+        with deepcompile_z3_forward_context(engine):
+            assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+
+    assert partition_calls == [7, 7]
+
+
 def test_user_adopted_param_diagnostic_deduplicates_repeated_transfers():
     module, param = _zero_module_with_param()
     fallback = DeepCompileZ3EagerFallback(engine=None)

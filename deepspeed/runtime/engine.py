@@ -132,6 +132,7 @@ from ..git_version_info import version
 
 from deepspeed.profiling.flops_profiler.profiler import FlopsProfiler
 from deepspeed.utils.logging import print_json_dist, print_configuration, set_log_level_from_string
+from deepspeed.utils.allocator_telemetry import record_empty_cache
 
 from deepspeed.accelerator import get_accelerator
 
@@ -5105,7 +5106,7 @@ class DeepSpeedEngine(Module):
         if hasattr(self.optimizer, 'empty_partition_cache'):
             self.optimizer.empty_partition_cache()
             gc.collect()
-            get_accelerator().empty_cache()
+            record_empty_cache("engine.empty-partition-cache", get_accelerator().empty_cache)
 
     def get_autosp_backend(self, compile_kwargs):
         if self.compile_autosp() and self.zero_optimization_stage() not in [

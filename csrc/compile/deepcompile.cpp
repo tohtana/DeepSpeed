@@ -4,6 +4,7 @@
 // DeepSpeed Team
 
 #include "deepcompile.h"
+#include "z3.h"
 
 #define USE_C10D_NCCL
 
@@ -84,6 +85,7 @@ void reset()
 void cleanup()
 {
     reset();
+    reset_z3_gather_buffer_pool();
 
     ncclCommDestroy(nccl_comm);
     process_group = nullptr;

@@ -9,7 +9,7 @@ import sys
 import torch
 
 from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict, ensure_zero_ordered_dict
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+from deepspeed.runtime.zero.partition_parameters import _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, ZeroParamStatus
 
 _ACTIVE_FALLBACK = None
 _FALLBACK_OWNER_ATTR = "_deepcompile_z3_eager_fallback_owner"
@@ -124,13 +124,17 @@ class DeepCompileZ3EagerFallback:
 
     @torch.no_grad()
     def release_available_params_for_next_forward(self):
-        """Repartition only leftovers gathered by this fallback instance."""
+        """Restore the partitioned parameter state expected by Dynamo guards."""
         released = []
+        if self.engine is not None:
+            for param in self.engine.module.parameters():
+                if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
+                        and not getattr(param, "ds_persist", False)
+                        and not getattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
+                    param.partition()
+                    released.append(int(param.ds_id))
+
         for ds_id, param in list(self._tracked_params.items()):
-            if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
-                    and not getattr(param, "ds_persist", False)):
-                param.partition()
-                released.append(ds_id)
             self._drop_tracked_param(ds_id, param)
         self._last_pre_forward_released_param_ids = released
 
