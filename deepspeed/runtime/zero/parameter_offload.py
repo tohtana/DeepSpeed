@@ -6,17 +6,36 @@
 import sys
 import torch
 from collections import OrderedDict
+import threading
+from torch.autograd.graph import _get_grad_fn_or_grad_acc, register_multi_grad_hook
+from torch.utils._pytree import tree_flatten
 from deepspeed.utils import z3_leaf_module, set_z3_leaf_module
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.runtime.zero.utils import apply_to_tensors_only, is_zero_param
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.partition_parameters import *
-from deepspeed.runtime.zero.partitioned_param_coordinator import PartitionedParameterCoordinator, InflightParamRegistry, iter_params
+from deepspeed.runtime.zero.partitioned_param_coordinator import (PartitionedParameterCoordinator,
+                                                                  InflightParamRegistry, current_graph_task_id,
+                                                                  iter_params)
 from deepspeed.accelerator import get_accelerator
 from deepspeed import utils
 
 FWD_MODULE_STACK = list()
+
+
+class _FrozenForwardBoundary:
+    """One frozen-module activation boundary awaiting its last consumer."""
+
+    __slots__ = ("active", "callback", "deferred_releases", "grad_nodes", "handle", "pending_boundaries")
+
+    def __init__(self, pending_boundaries, grad_nodes=()):
+        self.active = True
+        self.callback = None
+        self.deferred_releases = []
+        self.grad_nodes = grad_nodes
+        self.handle = None
+        self.pending_boundaries = pending_boundaries
 
 
 #for each tensor in outputs run the forward_function and register backward_function as hook
@@ -143,6 +162,10 @@ class DeepSpeedZeRoOffload(object):
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
 
         self.module = module
+        self._has_frozen_params = any(not param.requires_grad for param in module.parameters())
+        if self._has_frozen_params:
+            self._frozen_boundary_lock = threading.Lock()
+            self._frozen_boundaries = set()
         self.timers = timers
         self.zenflow = zenflow
         self.dtype = list(module.parameters())[0].dtype
@@ -203,9 +226,11 @@ class DeepSpeedZeRoOffload(object):
             fast_sharding_for_leaf_module=self.fast_sharding_for_leaf_module,
             log_trace_cache_warnings=self.log_trace_cache_warnings,
         )
+        self._backward_hook_state_manager = None
 
         self.forward_hooks = []
         self.backward_hooks = []
+        self.fwd_pre_hook = None
 
         self.setup_zero_stage3_hooks()
         print_rank_0(
@@ -219,6 +244,8 @@ class DeepSpeedZeRoOffload(object):
         """Partitioning Parameters that were not partitioned usually if parameters
         of modules whose input parameters do not require grad computation do not
         trigger post call and will therefore will remain unpartitioned"""
+        if self._has_frozen_params:
+            self._clear_frozen_boundaries()
         self.get_param_coordinator().release_and_reset_all(self.module)
         for param in iter_params(self.module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
@@ -226,6 +253,153 @@ class DeepSpeedZeRoOffload(object):
 
     def get_param_coordinator(self):
         return self.param_coordinator
+
+    def set_backward_hook_state_manager(self, manager):
+        """Reuse the optimizer's one outer-GraphTask completion callback."""
+        self._backward_hook_state_manager = manager
+
+    @property
+    def has_frozen_params(self):
+        return self._has_frozen_params
+
+    def _begin_outer_backward(self):
+        manager = self._backward_hook_state_manager
+        if manager is None:
+            return
+
+        graph_task_id = current_graph_task_id()
+        if (not manager.post_backward_callback_queued
+                or manager.post_backward_callback_graph_task_id != graph_task_id):
+            raise RuntimeError("ZeRO-3 root backward did not register the outer GraphTask callback")
+        self.get_param_coordinator().begin_outer_backward(graph_task_id)
+
+    def release_outer_backward(self):
+        """Run from BackwardHookStateManager's existing completion callback."""
+        manager = self._backward_hook_state_manager
+        if manager is None or manager.post_backward_callback_graph_task_id is None:
+            return
+        self.get_param_coordinator().release_outer_backward(manager.post_backward_callback_graph_task_id)
+        self._clear_frozen_boundaries()
+
+    def _new_frozen_boundary(self, input_tensors, pending_boundaries):
+        """Register last-consumer timing on one frozen invocation's activation inputs."""
+        with torch.enable_grad():
+            grad_nodes = tuple(_get_grad_fn_or_grad_acc(tensor) for tensor in input_tensors)
+        boundary = _FrozenForwardBoundary(pending_boundaries, grad_nodes)
+
+        def finish_boundary(unused_grads):
+            deferred_releases = None
+            hook_handle = None
+            with self._frozen_boundary_lock:
+                if not boundary.active:
+                    return
+                boundary.active = False
+                self._frozen_boundaries.discard(boundary)
+                if pending_boundaries is not None and boundary in pending_boundaries:
+                    pending_boundaries.remove(boundary)
+                deferred_releases = boundary.deferred_releases
+                boundary.deferred_releases = []
+                hook_handle = boundary.handle
+                boundary.handle = None
+            try:
+                for deferred_release in deferred_releases:
+                    self.get_param_coordinator().finish_deferred_release(deferred_release)
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+
+        boundary.callback = finish_boundary
+        hook_handle = None
+        try:
+            if input_tensors:
+                hook_handle = register_multi_grad_hook(input_tensors, finish_boundary)
+                boundary.handle = hook_handle
+            with self._frozen_boundary_lock:
+                if pending_boundaries is not None:
+                    pending_boundaries.append(boundary)
+                self._frozen_boundaries.add(boundary)
+        except Exception:
+            if hook_handle is not None:
+                hook_handle.remove()
+            raise
+        return boundary
+
+    def _register_frozen_boundary(self, input_tensors, pending_boundaries):
+        """Record an ordinary-forward activation boundary for checkpoint replay."""
+        self._new_frozen_boundary(input_tensors, pending_boundaries)
+
+    def _bind_frozen_boundary(self,
+                              input_tensors,
+                              pending_boundaries,
+                              fallback_boundary_pools=(),
+                              protect_all_params=False):
+        """Bind replay to its activation last-consumer in the active GraphTask."""
+        coordinator = self.get_param_coordinator()
+        deferred_release = (coordinator.begin_deferred_release(
+            protect_all_params=True) if protect_all_params else coordinator.begin_deferred_release())
+        boundaries = []
+        try:
+            # Select every live invocation whose activation node will execute
+            # in the current GraphTask. This covers ordinary
+            # non-reentrant boundaries as well as a non-reentrant checkpoint
+            # created by a parent reentrant replay, while skipping later unused
+            # calls without an autograd graph scan. Repeated uses share the same
+            # parameters, so the last executable callback is their true local
+            # parameter-consumer boundary.
+            boundary_pools = (() if pending_boundaries is None else
+                              (pending_boundaries, )) + tuple(fallback_boundary_pools)
+            with self._frozen_boundary_lock:
+                for boundary_pool in boundary_pools:
+                    for candidate in reversed(boundary_pool):
+                        if (candidate.active and candidate.grad_nodes
+                                and any(torch._C._will_engine_execute_node(node) for node in candidate.grad_nodes)):
+                            boundaries.append(candidate)
+                    if boundaries:
+                        break
+
+            if not boundaries:
+                # Reentrant replay forward still runs in the outer GraphTask;
+                # checkpoint starts its nested GraphTask only after recompute.
+                # With no executable ordinary boundary, the replay inputs are
+                # therefore the valid local boundary. Empty inputs fall back to
+                # the outer completion callback.
+                # Keep this boundary in the module-local invocation list: a
+                # nested non-reentrant recompute may execute later in the
+                # boundary's child GraphTask and must bind to the same hook.
+                boundaries = [self._new_frozen_boundary(input_tensors, pending_boundaries)]
+
+            coordinator.set_deferred_release_boundary_count(deferred_release, len(boundaries))
+            with self._frozen_boundary_lock:
+                if any(not boundary.active for boundary in boundaries):
+                    raise RuntimeError("ZeRO-3 frozen replay boundary completed before binding")
+                for boundary in boundaries:
+                    boundary.deferred_releases.append(deferred_release)
+        except Exception:
+            with self._frozen_boundary_lock:
+                for boundary in boundaries:
+                    if deferred_release in boundary.deferred_releases:
+                        boundary.deferred_releases.remove(deferred_release)
+            coordinator.cancel_deferred_release(deferred_release)
+            raise
+        return deferred_release
+
+    def _clear_frozen_boundaries(self):
+        hook_handles = []
+        with self._frozen_boundary_lock:
+            boundaries = self._frozen_boundaries
+            self._frozen_boundaries = set()
+            for boundary in boundaries:
+                if not boundary.active:
+                    continue
+                boundary.active = False
+                boundary.deferred_releases = []
+                if boundary.handle is not None:
+                    hook_handles.append(boundary.handle)
+                    boundary.handle = None
+                if boundary.pending_boundaries is not None:
+                    boundary.pending_boundaries.clear()
+        for hook_handle in hook_handles:
+            hook_handle.remove()
 
     def empty_partition_cache(self):
         self.partition_all_parameters()
@@ -266,24 +440,38 @@ class DeepSpeedZeRoOffload(object):
         for hook in self.backward_hooks:
             hook.remove()
 
-        self.fwd_pre_hook.remove()
+        if self._has_frozen_params:
+            self._clear_frozen_boundaries()
+
+        if self.fwd_pre_hook is not None:
+            self.fwd_pre_hook.remove()
+            self.fwd_pre_hook = None
 
         print_rank_0(f'Deleted module hooks: forward = {num_forward_hooks}, backward = {num_backward_hooks}',
                      force=False)
 
+    @instrument_w_nvtx
+    def _start_of_forward_hook(self, module, *args):
+        self.get_param_coordinator().reset_step()
+
+    @instrument_w_nvtx
+    def _start_of_frozen_forward_hook(self, module, *args):
+        self._clear_frozen_boundaries()
+        self.get_param_coordinator().reset_step()
+
+    def _register_deepspeed_module_hooks(self):
+        """Register ZeRO hooks with the root reset ordered before root fetch."""
+
+        if self.fwd_pre_hook is not None:
+            self.fwd_pre_hook.remove()
+        self._register_deepspeed_module(self.module)
+        # Both hooks prepend, so registering reset last makes it run first.
+        start_of_forward_hook = self._start_of_frozen_forward_hook if self._has_frozen_params else self._start_of_forward_hook
+        self.fwd_pre_hook = self.module.register_forward_pre_hook(start_of_forward_hook, prepend=True)
+
     def setup_zero_stage3_hooks(self):
         self.hierarchy = 0
-
-        #reset step if in inference mode
-        @instrument_w_nvtx
-        def _start_of_forward_hook(module, *args):
-
-            self.get_param_coordinator().reset_step()
-
-        self.fwd_pre_hook = self.module.register_forward_pre_hook(_start_of_forward_hook)
-
-        #likely one of them should be enough but just to be safe
-        self._register_deepspeed_module(self.module)
+        self._register_deepspeed_module_hooks()
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -329,14 +517,111 @@ class DeepSpeedZeRoOffload(object):
                 count[0] = count[0] + 1
                 self._register_deepspeed_module(child, count=count)
 
-        @torch.compiler.disable
-        def _pre_forward_module_hook(module, *args):
-            self.pre_sub_module_forward_function(module)
+        active_forward_invocations = threading.local()
+        module_has_frozen_params = any(not param.requires_grad
+                                       for param in iter_params(module, recurse=z3_leaf_module(module)))
+        module_contains_frozen_params = self._has_frozen_params and any(not param.requires_grad
+                                                                        for param in module.parameters())
+        pending_forward_boundaries = [] if module_contains_frozen_params else None
+        if module_contains_frozen_params:
+            module._ds_frozen_forward_boundaries = pending_forward_boundaries
+
+        def _invocation_depth():
+            return getattr(active_forward_invocations, "depth", 0)
+
+        def _root_forward_is_active():
+            global FWD_MODULE_STACK
+            return len(FWD_MODULE_STACK) > 1 and FWD_MODULE_STACK[1] is self.module
+
+        def _push_deferred_release(deferred_release):
+            stack = getattr(active_forward_invocations, "deferred_releases", None)
+            if stack is None:
+                stack = []
+                active_forward_invocations.deferred_releases = stack
+            stack.append(deferred_release)
+
+        def _set_deferred_release(deferred_release):
+            stack = getattr(active_forward_invocations, "deferred_releases", None)
+            if not stack or stack[-1] is not None:
+                raise RuntimeError("ZeRO-3 frozen forward invocation has no deferred-release slot")
+            stack[-1] = deferred_release
+
+        def _pop_deferred_release():
+            stack = getattr(active_forward_invocations, "deferred_releases", None)
+            if not stack:
+                return None
+            return stack.pop()
+
+        if module_has_frozen_params:
+
+            def release_after_forward(module):
+                self.post_sub_module_forward_function(module, deferred_release=_pop_deferred_release())
+
+        else:
+            release_after_forward = self.post_sub_module_forward_function
+
+        if module_has_frozen_params:
+
+            @torch.compiler.disable
+            def _pre_forward_module_hook(module, *args):
+                see_memory_usage(f"Before sub module function {module.__class__.__name__}", force=False)
+
+                global FWD_MODULE_STACK
+                FWD_MODULE_STACK.append(module)
+                active_forward_invocations.depth = _invocation_depth() + 1
+                _push_deferred_release(None)
+
+                self.pre_sub_module_forward_function(module)
+
+        else:
+
+            @torch.compiler.disable
+            def _pre_forward_module_hook(module, *args):
+                see_memory_usage(f"Before sub module function {module.__class__.__name__}", force=False)
+
+                global FWD_MODULE_STACK
+                FWD_MODULE_STACK.append(module)
+                active_forward_invocations.depth = _invocation_depth() + 1
+
+                self.pre_sub_module_forward_function(module)
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
 
+            # A global or earlier pre-hook can fail before ZeRO's pre-hook runs,
+            # while PyTorch still runs local always-call post-hooks.
+            depth = _invocation_depth()
+            if depth == 0:
+                return
+            active_forward_invocations.depth = depth - 1
+
             global FWD_MODULE_STACK
+            if not FWD_MODULE_STACK or FWD_MODULE_STACK[-1] is not module:
+                raise RuntimeError(f"ZeRO-3 forward module stack is unbalanced at {module.__class__.__name__}")
+            early_stop_deferred_release = None
+            if (output is None and self._has_frozen_params and not module_has_frozen_params
+                    and self.get_param_coordinator().has_active_outer_backward()):
+                boundary_pools = []
+                seen_boundary_pools = set()
+                for enclosing_module in reversed(FWD_MODULE_STACK[:-1]):
+                    boundary_pool = getattr(enclosing_module, "_ds_frozen_forward_boundaries", None)
+                    if boundary_pool is not None and id(boundary_pool) not in seen_boundary_pools:
+                        boundary_pools.append(boundary_pool)
+                        seen_boundary_pools.add(id(boundary_pool))
+                input_tensors = tuple(obj for obj in tree_flatten(input)[0]
+                                      if torch.is_tensor(obj) and obj.requires_grad)
+                try:
+                    early_stop_deferred_release = self._bind_frozen_boundary(input_tensors,
+                                                                             None,
+                                                                             boundary_pools,
+                                                                             protect_all_params=True)
+                except Exception:
+                    # PyTorch suppresses an always-call hook exception while
+                    # propagating checkpoint's internal early-stop exception.
+                    # Preserve correctness by retaining this exact invocation
+                    # for the already-armed root callback instead.
+                    early_stop_deferred_release = self.get_param_coordinator().begin_deferred_release(
+                        protect_all_params=True)
             FWD_MODULE_STACK.pop()
             if output is None:
                 output = []
@@ -374,18 +659,36 @@ class DeepSpeedZeRoOffload(object):
 
                     actual_external_param.all_gather()
 
-            self.post_sub_module_forward_function(module)
+            if early_stop_deferred_release is None:
+                release_after_forward(module)
+            else:
+                self.post_sub_module_forward_function(module, deferred_release=early_stop_deferred_release)
 
         def _bwd_hook_unexpected_inputs_msg(value):
             return f"A module has unknown inputs or outputs type ({type(value)}) and the tensors embedded in it cannot be detected. " \
                 "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and " \
                 "output tensors and therefore may not get triggered properly."
 
-        def _pre_backward_module_hook(module, inputs, output):
+        if self._has_frozen_params:
 
-            return apply_to_tensors_only(module.pre_bwd_fn.apply,
-                                         output,
-                                         warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+            def _pre_backward_module_hook(module, inputs, output):
+                needs_root_fallback = not any(
+                    torch.is_tensor(obj) and obj.requires_grad for obj in tree_flatten(inputs)[0])
+
+                def apply_frozen_pre_backward(output):
+                    return module.frozen_pre_bwd_fn.apply(output, needs_root_fallback)
+
+                return apply_to_tensors_only(apply_frozen_pre_backward,
+                                             output,
+                                             warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+
+        else:
+
+            def _pre_backward_module_hook(module, inputs, output):
+
+                return apply_to_tensors_only(module.pre_bwd_fn.apply,
+                                             output,
+                                             warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
 
         #This is an alternate to doing _post_backward_module_hook
         #it uses tensor.register_hook instead of using torch.autograd.Function
@@ -407,33 +710,133 @@ class DeepSpeedZeRoOffload(object):
             return _apply_forward_and_backward_to_tensors_only(module, _run_before_forward_function,
                                                                _run_after_backward_hook, inputs)
 
-        @torch.compiler.disable
-        def _post_backward_module_hook(module, inputs):
-            module.ds_grads_remaining = 0
+        if module_has_frozen_params:
 
-            return apply_to_tensors_only(module.post_bwd_fn.apply,
-                                         inputs,
-                                         warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+            @torch.compiler.disable
+            def _post_backward_module_hook(module, inputs, kwargs):
+                module.ds_grads_remaining = 0
+                deferred_release = None
+                coordinator = self.get_param_coordinator()
+                input_tensors = tuple(obj for obj in tree_flatten((inputs, kwargs))[0]
+                                      if torch.is_tensor(obj) and obj.requires_grad)
+                if coordinator.has_active_outer_backward():
+                    deferred_release = self._bind_frozen_boundary(input_tensors, pending_forward_boundaries)
+                elif not _root_forward_is_active():
+                    raise RuntimeError("ZeRO-3 frozen checkpoint replay requires backward from the engine output")
+                else:
+                    self._register_frozen_boundary(input_tensors, pending_forward_boundaries)
+                _set_deferred_release(deferred_release)
+
+                inputs = apply_to_tensors_only(module.post_bwd_fn.apply,
+                                               inputs,
+                                               warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+                return inputs, kwargs
+
+        elif module_contains_frozen_params:
+
+            @torch.compiler.disable
+            def _post_backward_module_hook(module, inputs):
+                module.ds_grads_remaining = 0
+                coordinator = self.get_param_coordinator()
+                if not coordinator.has_active_outer_backward():
+                    if not _root_forward_is_active():
+                        raise RuntimeError("ZeRO-3 frozen checkpoint replay requires backward from the engine output")
+                    input_tensors = tuple(obj for obj in tree_flatten(inputs)[0]
+                                          if torch.is_tensor(obj) and obj.requires_grad)
+                    self._register_frozen_boundary(input_tensors, pending_forward_boundaries)
+
+                return apply_to_tensors_only(module.post_bwd_fn.apply,
+                                             inputs,
+                                             warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
+
+        else:
+
+            @torch.compiler.disable
+            def _post_backward_module_hook(module, inputs):
+                module.ds_grads_remaining = 0
+
+                return apply_to_tensors_only(module.post_bwd_fn.apply,
+                                             inputs,
+                                             warning_msg_fn=_bwd_hook_unexpected_inputs_msg)
 
         # Pre forward hook
         self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))
 
-        # Post forward hook
-        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
+        # Non-reentrant checkpoint early-stop raises an internal exception. Native
+        # always-call hooks unwind the module stack immediately, before a later
+        # reentrant recompute in the same outer backward observes its parent.
+        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook, always_call=True))
 
         # Pre backward hook
-        if not hasattr(module, "pre_bwd_fn"):
+        if self._has_frozen_params and not hasattr(module, "frozen_pre_bwd_fn"):
 
-            @instrument_w_nvtx
-            def _run_before_backward_function(sub_module):
-                # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
-                # before doing backwards, so each backward will need a pre-fetch - using reference
-                # counting to support this scenario
-                #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
-                if sub_module.applied_pre_backward_ref_cnt > 0:
-                    self.pre_sub_module_backward_function(sub_module)
-                    sub_module.applied_pre_backward_ref_cnt -= 1
-                #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
+            if module is self.module:
+
+                @instrument_w_nvtx
+                def _run_before_backward_function(sub_module, needs_root_fallback):
+                    self._begin_outer_backward()
+                    if sub_module.applied_pre_backward_ref_cnt > 0:
+                        self.pre_sub_module_backward_function(sub_module)
+                        if needs_root_fallback:
+                            self.get_param_coordinator().defer_missing_post_backward(sub_module)
+                        sub_module.applied_pre_backward_ref_cnt -= 1
+
+            else:
+
+                @instrument_w_nvtx
+                def _run_before_backward_function(sub_module, needs_root_fallback):
+                    if sub_module.applied_pre_backward_ref_cnt > 0:
+                        self.pre_sub_module_backward_function(sub_module)
+                        if needs_root_fallback:
+                            self.get_param_coordinator().defer_missing_post_backward(sub_module)
+                        sub_module.applied_pre_backward_ref_cnt -= 1
+
+            class FrozenPreBackwardFunctionForModule(torch.autograd.Function):
+
+                @staticmethod
+                def forward(outputs, needs_root_fallback):
+                    return outputs.detach()
+
+                @staticmethod
+                def setup_context(ctx, inputs, output):
+                    _, needs_root_fallback = inputs
+                    ctx.module = module
+                    ctx.needs_root_fallback = needs_root_fallback
+                    ctx.pre_backward_function = _run_before_backward_function
+                    if not hasattr(ctx.module, "applied_pre_backward_ref_cnt"):
+                        ctx.module.applied_pre_backward_ref_cnt = 0
+                    ctx.module.applied_pre_backward_ref_cnt += 1
+
+                @staticmethod
+                def backward(ctx, *args):
+                    ctx.pre_backward_function(ctx.module, ctx.needs_root_fallback)
+                    return args + (None, )
+
+            module.frozen_pre_bwd_fn = FrozenPreBackwardFunctionForModule
+
+        elif not self._has_frozen_params and not hasattr(module, "pre_bwd_fn"):
+
+            if module is self.module and self._has_frozen_params:
+
+                @instrument_w_nvtx
+                def _run_before_backward_function(sub_module):
+                    self._begin_outer_backward()
+                    if sub_module.applied_pre_backward_ref_cnt > 0:
+                        self.pre_sub_module_backward_function(sub_module)
+                        sub_module.applied_pre_backward_ref_cnt -= 1
+
+            else:
+
+                @instrument_w_nvtx
+                def _run_before_backward_function(sub_module):
+                    # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
+                    # before doing backwards, so each backward will need a pre-fetch - using reference
+                    # counting to support this scenario
+                    #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+                    if sub_module.applied_pre_backward_ref_cnt > 0:
+                        self.pre_sub_module_backward_function(sub_module)
+                        sub_module.applied_pre_backward_ref_cnt -= 1
+                    #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
 
             class PreBackwardFunctionForModule(torch.autograd.Function):
 
@@ -497,15 +900,13 @@ class DeepSpeedZeRoOffload(object):
 
             module.post_bwd_fn = PostBackwardFunctionModule
 
-        self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
+        if module_has_frozen_params:
+            self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook, with_kwargs=True))
+        else:
+            self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
-        see_memory_usage(f"Before sub module function {sub_module.__class__.__name__}", force=False)
-
-        global FWD_MODULE_STACK
-        FWD_MODULE_STACK.append(sub_module)
-
         param_coordinator = self.get_param_coordinator()
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
@@ -520,7 +921,7 @@ class DeepSpeedZeRoOffload(object):
         see_memory_usage(f"Before sub module function {sub_module.__class__.__name__} after fetch", force=False)
 
     @torch.no_grad()
-    def post_sub_module_forward_function(self, sub_module):
+    def post_sub_module_forward_function(self, sub_module, deferred_release=None):
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__} {sub_module.ds_id} before release",
             force=False)
@@ -531,7 +932,7 @@ class DeepSpeedZeRoOffload(object):
                 param.data = param.data.t() if len(param.ds_shape) != 1 else param.data
 
         param_coordinator = self.get_param_coordinator()
-        param_coordinator.release_sub_module(sub_module, forward=True)
+        param_coordinator.release_sub_module(sub_module, forward=True, deferred_release=deferred_release)
 
         see_memory_usage(
             f"After sub module function {sub_module.__class__.__name__}  {sub_module.ds_id} after release",

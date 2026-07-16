@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import collections
 from collections import UserDict
 import threading
-from typing import Deque, Set
+from typing import Deque, Optional, Set
 
 from deepspeed import comm as dist
 from deepspeed.utils import z3_leaf_module
@@ -24,6 +24,11 @@ from deepspeed.runtime.compiler import is_compiling
 import logging
 
 ENABLE_PROFILER = False
+
+
+def current_graph_task_id() -> int:
+    """Return the active autograd graph task, or -1 outside backward."""
+    return torch._C._current_graph_task_id()
 
 
 def debug_rank0(message: str) -> None:
@@ -76,6 +81,21 @@ class PartitionedParameterCoordinator:
     class __ParamInTrace:
         param: Parameter
         step_id_last_used_at: int
+
+    class __DeferredRelease:
+        """One frozen checkpoint-recompute invocation and its exact forward boundary."""
+
+        __slots__ = ("epoch_id", "params", "free_data", "active", "pending_boundaries", "submodule_id",
+                     "protect_all_params")
+
+        def __init__(self, epoch_id: int, protect_all_params: bool = False):
+            self.epoch_id = epoch_id
+            self.params = None
+            self.free_data = True
+            self.active = True
+            self.pending_boundaries = None
+            self.submodule_id = None
+            self.protect_all_params = protect_all_params
 
     def __init__(
         self,
@@ -146,6 +166,12 @@ class PartitionedParameterCoordinator:
         # This is only needed during backward pass; forward pass is single-threaded.
         self.__ongoing_fetch_leaf_module_events = collections.defaultdict(threading.Event)
         self.__leaf_module_lock = threading.Lock()
+
+        # Frozen checkpoint invocations receive unique owners only after an actual
+        # release is deferred. The set and lock remain lazy on the ordinary path.
+        self.__outer_backward_graph_task_id: Optional[int] = None
+        self.__deferred_releases: Optional[Set[__class__.__DeferredRelease]] = None
+        self.__deferred_release_lock = None
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -241,6 +267,10 @@ class PartitionedParameterCoordinator:
         if is_compiling():
             return
 
+        # A GraphTask callback may be skipped when backward terminates with an
+        # exception. A new root forward is the existing reset safety boundary.
+        if self.__outer_backward_graph_task_id is not None:
+            self.release_outer_backward(self.__outer_backward_graph_task_id)
         self._clean_inflight_param_registry()
 
         if not self.is_complete_trace():  # not self.trace_complete:
@@ -470,31 +500,58 @@ class PartitionedParameterCoordinator:
 
     @instrument_w_nvtx
     @torch.no_grad()
-    def release_sub_module(self, submodule: Module, forward=False) -> None:
+    def release_sub_module(self, submodule: Module, forward=False, deferred_release=None) -> None:
         """release the parameters of a sub module, assuming they meet conditions to
         be released."""
         #print_rank_0(f"release_sub_module {'fwd' if forward else 'bwd'}: {debug_module2name_id(submodule)}", force=False)
+        if deferred_release is None:
+            params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else
+                                 set(p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+
+            free_data = not z3_leaf_module(submodule) or not self.fast_sharding_for_leaf_module
+            if not free_data:
+                # wait for the computation to finish and launch as early as possible.
+                empty_buffer = torch.empty(1, device=torch.device(get_accelerator().current_device_name()))
+
+            for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
+                param.ds_active_sub_modules.discard(submodule.ds_id)
+                if param.ds_id in params_to_release and not param.is_external_param:
+                    self.__release_param(param, free_data)
+                if not free_data:
+                    if param.ds_id in params_to_release and not param.is_external_param:
+                        # empty buffer ensures that all computations are complete
+                        param.data = empty_buffer
+            return
+
+        params = tuple(iter_params(submodule, recurse=z3_leaf_module(submodule)))
         params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
-            p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+            p.ds_id for p in params))
 
         free_data = not z3_leaf_module(submodule) or not self.fast_sharding_for_leaf_module
         if not free_data:
             # wait for the computation to finish and launch as early as possible.
             empty_buffer = torch.empty(1, device=torch.device(get_accelerator().current_device_name()))
 
-        # A non-reentrant checkpoint recompute re-fires this forward hook inside backward
-        # (torch._C._current_graph_task_id() != -1). Partitioning a frozen param here shrinks the
-        # tensor torch saved for the recompute and trips its metadata check. See #4332.
-        in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
+        # The direct multi-grad hook on this recompute invocation's inputs is its
+        # local last-consumer boundary. Only the exact frozen invocation receives
+        # a unique owner; empty-input and early-stop records remain for root fallback.
+        deferred_params = {
+            param
+            for param in params if (deferred_release.protect_all_params or not param.requires_grad)
+            and param.ds_id in params_to_release and not param.is_external_param
+        }
+        self.__attach_deferred_release(deferred_release, deferred_params, free_data, submodule.ds_id)
 
-        for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
+        for param in params:
             param.ds_active_sub_modules.discard(submodule.ds_id)
-            if in_checkpoint_recompute and not param.requires_grad:
+
+        for param in params:
+            if param in deferred_params:
                 continue
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param, free_data)
             if not free_data:
-                if param.ds_id in params_to_release and not param.is_external_param:
+                if param.ds_id in params_to_release and not param.is_external_param and param not in deferred_params:
                     # empty buffer ensures that all computations are complete
                     param.data = empty_buffer
 
@@ -502,6 +559,9 @@ class PartitionedParameterCoordinator:
     @torch.no_grad()
     def release_and_reset_all(self, module: Module) -> None:
         """release all module parameters"""
+        if self.__outer_backward_graph_task_id is not None:
+            self.release_outer_backward(self.__outer_backward_graph_task_id)
+
         for param in iter_params(module, recurse=True):
             if param in self.__inflight_param_registry:
                 self.__inflight_param_registry.pop(param).wait()
@@ -514,6 +574,185 @@ class PartitionedParameterCoordinator:
         for param in iter_params(module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
                 raise RuntimeError(f"{param.ds_summary()} expected to be released")
+
+    def begin_outer_backward(self, graph_task_id: int) -> None:
+        """Arm the outer GraphTask before execution descends into child modules."""
+        if graph_task_id == -1:
+            raise RuntimeError("ZeRO-3 cannot arm deferred release outside backward")
+
+        # Same-engine concurrent backward is outside the existing ZeRO hook-state
+        # contract. Root arming itself takes no frozen slow-path lock.
+        active_graph_task_id = self.__outer_backward_graph_task_id
+        if active_graph_task_id is None:
+            self.__outer_backward_graph_task_id = graph_task_id
+        elif active_graph_task_id != graph_task_id:
+            raise RuntimeError("ZeRO-3 does not support overlapping backward calls on one engine")
+
+    def has_active_outer_backward(self) -> bool:
+        return self.__outer_backward_graph_task_id is not None
+
+    def __get_deferred_release_lock(self):
+        lock = self.__deferred_release_lock
+        if lock is None:
+            lock = threading.Lock()
+            self.__deferred_release_lock = lock
+        return lock
+
+    def begin_deferred_release(self, protect_all_params: bool = False):
+        """Create one frozen invocation record under the armed outer backward."""
+        epoch_id = self.__outer_backward_graph_task_id
+        if epoch_id is None:
+            raise RuntimeError("ZeRO-3 checkpoint replay ran without a root backward epoch")
+
+        deferred_release = __class__.__DeferredRelease(epoch_id, protect_all_params)
+        with self.__get_deferred_release_lock():
+            if self.__outer_backward_graph_task_id != epoch_id:
+                raise RuntimeError("ZeRO-3 backward epoch changed during checkpoint replay")
+            if self.__deferred_releases is None:
+                self.__deferred_releases = set()
+            self.__deferred_releases.add(deferred_release)
+        return deferred_release
+
+    def cancel_deferred_release(self, deferred_release) -> None:
+        """Unpublish an invocation whose forward-boundary binding failed."""
+        with self.__get_deferred_release_lock():
+            if not deferred_release.active:
+                return
+            deferred_release.active = False
+            if self.__deferred_releases is not None:
+                self.__deferred_releases.discard(deferred_release)
+                if not self.__deferred_releases:
+                    self.__deferred_releases = None
+
+    @instrument_w_nvtx
+    @torch.no_grad()
+    def defer_missing_post_backward(self, submodule: Module) -> None:
+        """Transfer one executed no-grad invocation to the outer root fallback."""
+        deferred_release = self.begin_deferred_release()
+        params = tuple(iter_params(submodule, recurse=z3_leaf_module(submodule)))
+        params_to_protect = {param for param in params if not param.ds_persist and not param.is_external_param}
+        free_data = not z3_leaf_module(submodule) or not self.fast_sharding_for_leaf_module
+        try:
+            self.__attach_deferred_release(deferred_release, params_to_protect, free_data, submodule.ds_id)
+        except Exception:
+            self.cancel_deferred_release(deferred_release)
+            raise
+
+        # The unique record now replaces this invocation's module owner. This
+        # mirrors the missing post-backward Function without changing fetch.
+        for param in params:
+            param.ds_active_sub_modules.discard(submodule.ds_id)
+
+    def set_deferred_release_boundary_count(self, deferred_release, count: int) -> None:
+        """Set the exact executable activation boundaries protecting one invocation."""
+        if count < 1:
+            raise RuntimeError("ZeRO-3 deferred release requires an activation boundary")
+        with self.__get_deferred_release_lock():
+            if not deferred_release.active or deferred_release.epoch_id != self.__outer_backward_graph_task_id:
+                raise RuntimeError("ZeRO-3 deferred release does not belong to the active backward")
+            if deferred_release.pending_boundaries is not None:
+                raise RuntimeError("ZeRO-3 deferred release boundaries were set more than once")
+            deferred_release.pending_boundaries = count
+
+    def __attach_deferred_release(self, deferred_release, params: Set[Parameter], free_data: bool,
+                                  submodule_id: int) -> None:
+        """Promote only the otherwise-releasable frozen subset to unique ownership."""
+        with self.__get_deferred_release_lock():
+            if (not deferred_release.active or deferred_release.epoch_id != self.__outer_backward_graph_task_id):
+                raise RuntimeError("ZeRO-3 deferred release does not belong to the active backward")
+            if deferred_release.params is not None:
+                raise RuntimeError("ZeRO-3 deferred release was attached more than once")
+
+            if not params:
+                deferred_release.active = False
+                if self.__deferred_releases is not None:
+                    self.__deferred_releases.discard(deferred_release)
+                    if not self.__deferred_releases:
+                        self.__deferred_releases = None
+            else:
+                deferred_release.params = set(params)
+                deferred_release.free_data = free_data
+                deferred_release.submodule_id = submodule_id
+                for param in deferred_release.params:
+                    param.ds_active_sub_modules.add(deferred_release)
+
+    def finish_deferred_release(self, deferred_release) -> None:
+        """Retire one invocation from its direct multi-grad input callback."""
+        params_to_release = None
+        free_data = True
+        with self.__get_deferred_release_lock():
+            if not deferred_release.active:
+                return
+            if deferred_release.pending_boundaries is None:
+                raise RuntimeError("ZeRO-3 deferred release completed before boundary binding")
+            deferred_release.pending_boundaries -= 1
+            if deferred_release.pending_boundaries > 0:
+                return
+            if deferred_release.params is None:
+                raise RuntimeError("ZeRO-3 deferred release completed before forward unwind")
+
+            deferred_release.active = False
+            params_to_release = deferred_release.params
+            free_data = deferred_release.free_data
+            if self.__deferred_releases is not None:
+                self.__deferred_releases.discard(deferred_release)
+                if not self.__deferred_releases:
+                    self.__deferred_releases = None
+            for param in params_to_release:
+                param.ds_active_sub_modules.discard(deferred_release)
+
+        for param in params_to_release:
+            self.__release_param(param, free_data)
+
+    @compiler.disable
+    @torch.no_grad()
+    def release_outer_backward(self, graph_task_id: int) -> None:
+        """Release only invocation records missed by the local input boundary."""
+        active_graph_task_id = self.__outer_backward_graph_task_id
+        if active_graph_task_id is None:
+            return
+        if active_graph_task_id != graph_task_id:
+            raise RuntimeError("ZeRO-3 outer backward callback does not match the armed epoch")
+
+        # A frozen backward with no residual record reaches neither the lock nor
+        # parameter/accounting work. Fully-trainable models never arm this state.
+        if self.__deferred_releases is None:
+            self.__outer_backward_graph_task_id = None
+            return
+
+        params_to_release = set()
+        free_data_by_param = {}
+        with self.__get_deferred_release_lock():
+            active_graph_task_id = self.__outer_backward_graph_task_id
+            if active_graph_task_id is None:
+                return
+            if active_graph_task_id != graph_task_id:
+                raise RuntimeError("ZeRO-3 outer backward callback does not match the armed epoch")
+
+            deferred_releases = self.__deferred_releases or set()
+            self.__outer_backward_graph_task_id = None
+            self.__deferred_releases = None
+            for deferred_release in deferred_releases:
+                if not deferred_release.active:
+                    continue
+                deferred_release.active = False
+                if deferred_release.params is None:
+                    continue
+                for param in deferred_release.params:
+                    param.ds_active_sub_modules.discard(deferred_release)
+                    # A no-grad module input has no post-backward Function to
+                    # retire the owner acquired by its backward fetch. At
+                    # outer GraphTask completion every invocation in this
+                    # backward is finished, so complete only this record's
+                    # originating module release. Other module owners remain.
+                    param.ds_active_sub_modules.discard(deferred_release.submodule_id)
+                    params_to_release.add(param)
+                    free_data_by_param[param] = free_data_by_param.get(param, True) and deferred_release.free_data
+
+        # Partitioning, allocator work, and any offload side effects remain
+        # outside the slow-path lock. Ordinary module owners are never removed.
+        for param in params_to_release:
+            self.__release_param(param, free_data_by_param[param])
 
     @instrument_w_nvtx
     def __all_gather_params(self, params: Set[Parameter], forward: bool) -> None:

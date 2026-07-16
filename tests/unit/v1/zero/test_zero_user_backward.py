@@ -12,6 +12,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from unit.common import DistributedTest, preferred_dtype, allclose_on_all_ranks
 from unit.simple_model import SimpleModel, random_dataloader
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.parameter_offload import FWD_MODULE_STACK
+from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.utils import safe_get_full_grad
 
 
@@ -84,6 +86,122 @@ def collect_gradients_safe(model):
                 clean_name = name.replace('module.', '')
                 grads[clean_name] = grad.detach().clone().cpu()
     return grads
+
+
+def assert_zero3_balanced_residency(model_engine, frozen_module=None, allow_external_residency=False):
+    """Assert graph-task cleanup left no transient ZeRO-3 parameter lifetime behind."""
+    nonpersistent_params = [param for param in model_engine.module.parameters() if not param.ds_persist]
+    releasable_params = [param for param in nonpersistent_params if not param.is_external_param]
+    resident_numel = sum(param.ds_numel for param in nonpersistent_params
+                         if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
+    coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+    available_numel = coordinator._PartitionedParameterCoordinator__n_available_params
+    assert coordinator._PartitionedParameterCoordinator__outer_backward_graph_task_id is None
+    assert coordinator._PartitionedParameterCoordinator__deferred_releases is None
+    assert not coordinator._PartitionedParameterCoordinator__inflight_param_registry
+    releasable_param_ids = {id(param) for param in releasable_params}
+    active_owner_details = {
+        name: {
+            "ds_id":
+            param.ds_id,
+            "requires_grad":
+            param.requires_grad,
+            "status":
+            str(param.ds_status),
+            "owners":
+            tuple(
+                sorted(
+                    str(owner) if isinstance(owner, int
+                                             ) else f"{type(owner).__name__}(epoch={getattr(owner, 'epoch_id', None)})"
+                    for owner in param.ds_active_sub_modules)),
+        }
+        for name, param in model_engine.module.named_parameters()
+        if id(param) in releasable_param_ids and param.ds_active_sub_modules
+    }
+    assert not active_owner_details, active_owner_details
+    assert available_numel >= 0
+    assert available_numel == resident_numel
+    if allow_external_residency:
+        assert all(param.is_external_param for param in nonpersistent_params
+                   if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
+    else:
+        assert resident_numel == 0
+    assert FWD_MODULE_STACK == [model_engine.module]
+    if frozen_module is not None:
+        assert all(param.ds_status == ZeroParamStatus.NOT_AVAILABLE for param in frozen_module.parameters())
+
+
+def observe_zero3_deferred_release_boundaries(model_engine):
+    """Record exact deferred-record transitions without changing coordinator behavior."""
+    coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+    original_begin = coordinator.begin_deferred_release
+    original_attach = coordinator._PartitionedParameterCoordinator__attach_deferred_release
+    original_cancel = coordinator.cancel_deferred_release
+    original_finish = coordinator.finish_deferred_release
+    original_root = coordinator.release_outer_backward
+    events = []
+
+    def snapshot(deferred_release=None):
+        pending = coordinator._PartitionedParameterCoordinator__deferred_releases or ()
+        return {
+            "pending_count":
+            len(pending),
+            "attached_pending_count":
+            sum(record.active and record.params is not None for record in pending),
+            "outer_graph_task_id":
+            coordinator._PartitionedParameterCoordinator__outer_backward_graph_task_id,
+            "record_id":
+            id(deferred_release) if deferred_release is not None else None,
+            "record_active":
+            deferred_release.active if deferred_release is not None else None,
+            "record_attached":
+            deferred_release.params is not None if deferred_release is not None else None,
+            "record_param_ids":
+            tuple(sorted(param.ds_id
+                         for param in (deferred_release.params or ()))) if deferred_release is not None else (),
+        }
+
+    def observed_begin(protect_all_params=False):
+        deferred_release = original_begin(protect_all_params=protect_all_params)
+        events.append({"kind": "begin", "protect_all_params": protect_all_params, **snapshot(deferred_release)})
+        return deferred_release
+
+    def observed_attach(deferred_release, params, free_data, submodule_id):
+        requested_param_ids = tuple(sorted(param.ds_id for param in params))
+        original_attach(deferred_release, params, free_data, submodule_id)
+        events.append({
+            "kind": "attach",
+            "requested_param_ids": requested_param_ids,
+            "submodule_id": submodule_id,
+            **snapshot(deferred_release),
+        })
+
+    def observed_cancel(deferred_release):
+        before = snapshot(deferred_release)
+        original_cancel(deferred_release)
+        events.append({"kind": "cancel", "before": before, "after": snapshot(deferred_release)})
+
+    def observed_finish(deferred_release):
+        before = snapshot(deferred_release)
+        original_finish(deferred_release)
+        events.append({"kind": "local", "before": before, "after": snapshot(deferred_release)})
+
+    def observed_root(graph_task_id):
+        before = snapshot()
+        original_root(graph_task_id)
+        events.append({
+            "kind": "root",
+            "graph_task_id": graph_task_id,
+            "before": before,
+            "after": snapshot(),
+        })
+
+    coordinator.begin_deferred_release = observed_begin
+    coordinator._PartitionedParameterCoordinator__attach_deferred_release = observed_attach
+    coordinator.cancel_deferred_release = observed_cancel
+    coordinator.finish_deferred_release = observed_finish
+    coordinator.release_outer_backward = observed_root
+    return events
 
 
 def initialize_distributed():
@@ -1434,6 +1552,22 @@ class TestZeroUserBackwardWithCheckpointing(DistributedTest):
         model_engine.destroy()
 
 
+class FrozenParamCheckpointedBlock(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(hidden_dim)
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.norm.weight.requires_grad_(False)
+        self.norm.bias.requires_grad_(False)
+
+    def forward(self, x):
+        x = self.norm(x)
+        x = self.linear1(x)
+        x = torch.nn.functional.relu(x)
+        return x
+
+
 class FrozenParamCheckpointedModel(torch.nn.Module):
     """Checkpointed model with a frozen parameter inside the checkpointed block.
 
@@ -1446,27 +1580,52 @@ class FrozenParamCheckpointedModel(torch.nn.Module):
     def __init__(self, hidden_dim, use_reentrant=False):
         super().__init__()
         self.use_reentrant = use_reentrant
-        self.norm = torch.nn.LayerNorm(hidden_dim)
-        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        # Freeze the norm: this is the parameter that tripped the recompute metadata check.
-        self.norm.weight.requires_grad_(False)
-        self.norm.bias.requires_grad_(False)
+        self.block = FrozenParamCheckpointedBlock(hidden_dim)
+        self.block2 = FrozenParamCheckpointedBlock(hidden_dim)
+        self.recompute_graph_task_ids = []
 
-    def _checkpointed_block(self, x):
-        x = self.norm(x)
-        x = self.linear1(x)
-        x = torch.nn.functional.relu(x)
-        return x
+    def _checkpointed_block(self, block, x):
+        if hasattr(torch._C, "_current_graph_task_id"):
+            graph_task_id = torch._C._current_graph_task_id()
+            if graph_task_id != -1:
+                self.recompute_graph_task_ids.append(graph_task_id)
+        return block(x)
 
     def forward(self, x):
         if self.training:
             from torch.utils.checkpoint import checkpoint
-            x = checkpoint(self._checkpointed_block, x, use_reentrant=self.use_reentrant)
+            x = checkpoint(self._checkpointed_block, self.block, x, use_reentrant=self.use_reentrant)
+            x = checkpoint(self._checkpointed_block, self.block2, x, use_reentrant=self.use_reentrant)
         else:
-            x = self._checkpointed_block(x)
-        x = self.linear2(x)
+            x = self._checkpointed_block(self.block, x)
+            x = self._checkpointed_block(self.block2, x)
         return x
+
+
+class ExternalReturningCheckpointBlock(torch.nn.Linear):
+
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim, hidden_dim)
+        self.recompute_parent_ids = []
+
+    def forward(self, x):
+        if hasattr(torch._C, "_current_graph_task_id") and torch._C._current_graph_task_id() != -1:
+            self.recompute_parent_ids.append(FWD_MODULE_STACK[-2].ds_id)
+        return super().forward(x), self.bias
+
+
+class MixedCheckpointExternalParamModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.reentrant = ExternalReturningCheckpointBlock(hidden_dim)
+        self.non_reentrant = FrozenParamCheckpointedBlock(hidden_dim)
+
+    def forward(self, x):
+        from torch.utils.checkpoint import checkpoint
+        x, bias = checkpoint(self.reentrant, x, use_reentrant=True)
+        x = checkpoint(self.non_reentrant, x, use_reentrant=False)
+        return x + bias
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2, 3])
@@ -1500,7 +1659,7 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
         config = get_config_dict(zero_stage)
         trainable_params = [p for p in model_ds.parameters() if p.requires_grad]
         model_engine, _, _, _ = deepspeed.initialize(config=config, model=model_ds, model_parameters=trainable_params)
-
+        deferred_events = observe_zero3_deferred_release_boundaries(model_engine) if zero_stage == 3 else []
         torch.manual_seed(123)
         x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         output_ddp = model_ddp(x_ddp)
@@ -1514,6 +1673,17 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
         x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype, requires_grad=True)
         output_ds = model_engine(x_ds)
         output_ds.backward(torch.ones_like(output_ds))
+        assert model_engine.module.recompute_graph_task_ids
+        if zero_stage == 3:
+            event_kinds = [event["kind"] for event in deferred_events]
+            root_pending_counts = [
+                event["before"]["attached_pending_count"] for event in deferred_events if event["kind"] == "root"
+            ]
+            assert "local" in event_kinds, \
+                f"missing local deferred release: events={deferred_events}, root_pending_counts={root_pending_counts}"
+            assert event_kinds[-1] == "root"
+            assert deferred_events[-1]["after"]["pending_count"] == 0
+            assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
         get_accelerator().synchronize()
         dist.barrier()
         ds_grads = collect_gradients_safe(model_engine)
@@ -1524,3 +1694,104 @@ class TestZeroUserBackwardFrozenParamCheckpointing(DistributedTest):
 
         model_engine.step()
         model_engine.destroy()
+
+
+@pytest.mark.parametrize("backward_mode", ["engine", "torch"])
+class TestZero3NoGradCheckpointRelease(DistributedTest):
+    """ZeRO-3 releases checkpoint recompute parameters at each backward boundary."""
+
+    world_size = 2
+
+    def test_no_grad_input_gradient_accumulation(self, backward_mode):
+        hidden_dim = 8
+        batch_size = 2
+        gradient_accumulation_steps = 2
+        device, rank, dtype = initialize_distributed()
+
+        torch.manual_seed(42)
+        model_ddp = FrozenParamCheckpointedModel(hidden_dim=hidden_dim, use_reentrant=False)
+        model_ddp = model_ddp.to(device=device, dtype=dtype)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+
+        torch.manual_seed(42)
+        model_ds = FrozenParamCheckpointedModel(hidden_dim=hidden_dim, use_reentrant=False)
+        config = get_config_dict(3, gradient_accumulation_steps=gradient_accumulation_steps)
+        trainable_params = [param for param in model_ds.parameters() if param.requires_grad]
+        model_engine, _, _, _ = deepspeed.initialize(config=config, model=model_ds, model_parameters=trainable_params)
+        deferred_events = observe_zero3_deferred_release_boundaries(model_engine)
+
+        optimizer_ddp = torch.optim.Adam((param for param in model_ddp.parameters() if param.requires_grad), lr=1e-3)
+        deferred_event_start = 0
+        for microbatch in range(gradient_accumulation_steps):
+            coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+            assert coordinator._PartitionedParameterCoordinator__outer_backward_graph_task_id is None
+            assert coordinator._PartitionedParameterCoordinator__deferred_releases is None
+
+            torch.manual_seed(123 + microbatch)
+            x_ddp = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+            loss_ddp = model_ddp(x_ddp).sum()
+            (loss_ddp / gradient_accumulation_steps).backward()
+
+            torch.manual_seed(123 + microbatch)
+            x_ds = torch.randn(batch_size, hidden_dim, device=device, dtype=dtype)
+            loss_ds = model_engine(x_ds).sum()
+            allclose_on_all_ranks(loss_ddp.detach(),
+                                  loss_ds.detach(),
+                                  assert_message=f"Loss differs at no-grad microbatch {microbatch}")
+            if backward_mode == "engine":
+                model_engine.backward(loss_ds)
+            else:
+                model_engine.scale(loss_ds).backward()
+            assert model_engine.module.recompute_graph_task_ids
+            microbatch_events = deferred_events[deferred_event_start:]
+            deferred_event_start = len(deferred_events)
+            root_events = [event for event in microbatch_events if event["kind"] == "root"]
+            assert len(root_events) == 1, f"unexpected root events: {microbatch_events}"
+            root_event = root_events[0]
+            assert root_event["before"]["attached_pending_count"] >= 1, microbatch_events
+            assert root_event["after"]["pending_count"] == 0, microbatch_events
+            assert root_event["after"]["outer_graph_task_id"] is None, microbatch_events
+            assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
+
+        get_accelerator().synchronize()
+        dist.barrier()
+        compare_gradients(collect_ddp_gradients(model_ddp), collect_gradients_safe(model_engine),
+                          "no-grad-input frozen-param checkpointing")
+
+        optimizer_ddp.step()
+        model_engine.step()
+        assert_zero3_balanced_residency(model_engine, model_engine.module.block.norm)
+        model_engine.destroy()
+
+
+class TestZero3CheckpointForwardExceptionCleanup(DistributedTest):
+    """A stopped recompute unwinds before a later recompute returns an external param."""
+
+    world_size = 2
+
+    def test_mixed_checkpoint_external_param_owner(self):
+        hidden_dim = 8
+        device, _, dtype = initialize_distributed()
+
+        model_engine = None
+        try:
+            model = MixedCheckpointExternalParamModel(hidden_dim)
+            config = get_config_dict(3)
+            trainable_params = [param for param in model.parameters() if param.requires_grad]
+            model_engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=trainable_params)
+
+            x = torch.randn(2, hidden_dim, device=device, dtype=dtype, requires_grad=True)
+            model_engine.backward(model_engine(x).sum())
+
+            root_id = model_engine.module.ds_id
+            external = model_engine.module.reentrant.bias
+            assert model_engine.module.reentrant.recompute_parent_ids
+            assert all(parent_id == root_id for parent_id in model_engine.module.reentrant.recompute_parent_ids)
+            assert id(external) in model_engine.module._external_params
+            assert id(external) not in model_engine.module.non_reentrant._external_params
+            assert_zero3_balanced_residency(model_engine,
+                                            model_engine.module.non_reentrant.norm,
+                                            allow_external_residency=True)
+        finally:
+            if model_engine is not None:
+                model_engine.destroy()

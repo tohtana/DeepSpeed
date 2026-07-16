@@ -105,18 +105,21 @@ def unwrap_model_for_generation(model):
             hook.remove()
         for hook in optimizer_offload.backward_hooks:
             hook.remove()
+        if optimizer_offload.fwd_pre_hook is not None:
+            optimizer_offload.fwd_pre_hook.remove()
+            optimizer_offload.fwd_pre_hook = None
 
         optimizer_offload.forward_hooks = []
         optimizer_offload.backward_hooks = []
-
-        yield model
-
-        # Adds the optimizer hooks from a DeepSpeed ZeRO-3 model.
-        if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
-            optimizer_offload = model.optimizer.parameter_offload
-        elif model.optimizer is not None:
-            optimizer_offload = model.optimizer
-        optimizer_offload._register_deepspeed_module(optimizer_offload.module)
+        try:
+            yield model
+        finally:
+            # Adds the optimizer hooks from a DeepSpeed ZeRO-3 model even when generation raises.
+            if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
+                optimizer_offload = model.optimizer.parameter_offload
+            elif model.optimizer is not None:
+                optimizer_offload = model.optimizer
+            optimizer_offload._register_deepspeed_module_hooks()
     return
 
 
@@ -286,6 +289,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             zero_module_granularity_threshold=zero_module_granularity_threshold,
             log_trace_cache_warnings=log_trace_cache_warnings,
         )
+        if self.parameter_offload.has_frozen_params:
+            self.parameter_offload.set_backward_hook_state_manager(self._backward_hook_state)
+            self.register_grad_acc_post_hook(self.parameter_offload.release_outer_backward)
 
         self.persistent_parameters = self.parameter_offload.persistent_parameters
         self._configure_offloading(offload_optimizer_config, offload_param_config)

@@ -7,10 +7,25 @@ import torch
 
 import deepspeed
 from deepspeed.runtime.zero import unwrap_model_for_generation
+from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.accelerator import get_accelerator
 
 from unit.common import DistributedTest, preferred_dtype
 from unit.simple_model import SimpleModel
+
+
+class RootParameterModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.root_weight = torch.nn.Parameter(torch.eye(hidden_dim))
+        self.linear = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
+
+    def forward(self, x, y):
+        x = x @ self.root_weight
+        return self.cross_entropy_loss(self.linear(x), y)
+
 
 config = {
     "train_batch_size": 2,
@@ -91,3 +106,65 @@ class TestUnwrapModelTraceInvalidate(DistributedTest):
         loss = engine(x, y)
         engine.backward(loss)
         engine.step()
+
+
+class TestUnwrapModelRootHookOrder(DistributedTest):
+    world_size = 2
+
+    def test(self):
+        engine = None
+        original_reset_step = None
+        original_pre_forward = None
+        try:
+            hidden_dim = 8
+            model = RootParameterModel(hidden_dim)
+            engine, _, _, _ = deepspeed.initialize(args=None, model=model, config=config)
+            offload = engine.optimizer.parameter_offload
+            coordinator = offload.get_param_coordinator()
+
+            x = torch.randn(2, hidden_dim, device=engine.device, dtype=preferred_dtype())
+            y = torch.empty(2, dtype=torch.long, device=engine.device).random_(hidden_dim)
+
+            loss = engine(x, y)
+            engine.backward(loss)
+            engine.step()
+
+            with unwrap_model_for_generation(engine):
+                pass
+
+            events = []
+            original_reset_step = coordinator.reset_step
+            original_pre_forward = offload.pre_sub_module_forward_function
+
+            def observed_reset_step():
+                events.append("reset")
+                return original_reset_step()
+
+            def observed_pre_forward(sub_module):
+                if sub_module is engine.module:
+                    events.append("root_fetch")
+                return original_pre_forward(sub_module)
+
+            coordinator.reset_step = observed_reset_step
+            offload.pre_sub_module_forward_function = observed_pre_forward
+
+            for _ in range(3):
+                events.clear()
+                loss = engine(x, y)
+                assert events[:2] == ["reset", "root_fetch"]
+                assert torch.isfinite(loss.detach())
+                engine.backward(loss)
+                engine.step()
+
+                nonpersistent_params = [param for param in engine.module.parameters() if not param.ds_persist]
+                resident_numel = sum(param.ds_numel for param in nonpersistent_params
+                                     if param.ds_status != ZeroParamStatus.NOT_AVAILABLE)
+                available_numel = coordinator._PartitionedParameterCoordinator__n_available_params
+                assert available_numel == resident_numel
+        finally:
+            if engine is not None:
+                if original_reset_step is not None:
+                    engine.optimizer.parameter_offload.get_param_coordinator().reset_step = original_reset_step
+                if original_pre_forward is not None:
+                    engine.optimizer.parameter_offload.pre_sub_module_forward_function = original_pre_forward
+                engine.destroy()
