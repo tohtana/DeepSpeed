@@ -279,11 +279,10 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
 
     partition_stream_chunk_size: int = Field(pp_int(0), ge=0, alias="stage3_partition_stream_chunk_size")
     """
-    Partition parameters with more than this many elements by streaming their flattened data through
-    fixed-size chunks of this size, instead of materializing the full parameter on a single device during
-    ``zero.Init``. This bounds the peak device memory used while partitioning to roughly the chunk size,
-    which is required when a single (e.g. fused MoE-expert) parameter is too large to fit on one device.
-    ``0`` (default) disables streaming and uses the standard broadcast-then-partition path. Used by ZeRO3.
+    Partition off-accelerator parameters with more than this many elements by streaming their flattened
+    data through fixed-size chunks of this size. This bounds accelerator staging memory during partitioning
+    to roughly the chunk size. Parameters already on the accelerator use the standard path because their
+    full allocation has already occurred. ``0`` (default) disables streaming. Used by ZeRO3.
     """
 
     stage3_gather_fp16_weights_on_model_save: bool = Field(False,

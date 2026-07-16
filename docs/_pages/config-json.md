@@ -578,7 +578,7 @@ Enabling and configuring ZeRO memory optimizations
 
 | Description                                                                                                                                                                                                                                                                                               | Default |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| Partition parameters with more than this many elements by streaming their flattened data through fixed-size chunks of this size, bounding peak device memory during `zero.Init` instead of materializing the full parameter on one device. Needed when a single (e.g. fused MoE-expert) parameter is too large to fit on one device. `0` disables streaming. | `0`     |
+| Partition off-accelerator parameters with more than this many elements by streaming their flattened data through fixed-size chunks of this size. This bounds accelerator staging memory during partitioning to roughly the chunk size. Parameters already on the accelerator use the standard path because their full allocation has already occurred. `0` disables streaming. | `0`     |
 
 
 ***stage3_gather_16bit_weights_on_model_save***: [boolean]

@@ -1165,6 +1165,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             return False
         if param.numel() <= self.partition_stream_chunk_size:
             return False
+        # Streaming only reduces accelerator staging memory when the source
+        # parameter is still off-accelerator. Parameters constructed on the
+        # accelerator already incurred the full allocation and should retain
+        # the standard single-broadcast partition path.
+        if get_accelerator().on_accelerator(param):
+            return False
         if self.remote_device == OffloadDeviceEnum.nvme:
             return False
         if self.quantized_initialization or self.quantized_nontrainable_weights:

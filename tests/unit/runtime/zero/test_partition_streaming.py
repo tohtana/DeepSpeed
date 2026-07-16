@@ -69,7 +69,7 @@ def test_streamed_partitions_match_direct_slicing(numel, num_partitions, chunk_n
 class TestStreamingPartitionMatchesStandard(DistributedTest):
     world_size = 2
 
-    def test_streaming_matches_standard(self):
+    def test_accelerator_resident_param_uses_standard_path(self):
 
         def build(chunk_size):
             config = {
@@ -88,8 +88,10 @@ class TestStreamingPartitionMatchesStandard(DistributedTest):
         reference = build(0)
         reference_partition = reference.weight.ds_tensor.detach().clone()
 
-        # Streaming the same parameter (4096 elements) in 512-element chunks must
-        # produce a byte-identical partition while actually exercising the new path.
+        # This parameter is constructed on the accelerator inside zero.Init. It has
+        # already incurred the full allocation, so enabling host-source streaming
+        # must retain the standard path rather than add chunked broadcasts with no
+        # memory benefit.
         streaming_calls = {"count": 0}
         original = pp.Init._partition_param_streaming
 
@@ -103,7 +105,7 @@ class TestStreamingPartitionMatchesStandard(DistributedTest):
         finally:
             pp.Init._partition_param_streaming = original
 
-        assert streaming_calls["count"] >= 1, "streaming partition path was not exercised"
+        assert streaming_calls["count"] == 0, "accelerator-resident parameter unexpectedly used streaming"
         assert torch.equal(streamed.weight.ds_tensor, reference_partition)
 
         # After partitioning, the empty placeholder left in param.data must live on
@@ -144,9 +146,31 @@ class TestStreamingPartitionMatchesStandard(DistributedTest):
         reference = build(0)
         # weight (4096 elements) streams; bias (64) stays on the standard path but is
         # still passed through the pre-conversion stream check.
-        streamed = build(512)
+        streaming_calls = {"count": 0}
+        original = pp.Init._partition_param_streaming
+
+        def counting_stream(self, param, *args, **kwargs):
+            streaming_calls["count"] += 1
+            return original(self, param, *args, **kwargs)
+
+        pp.Init._partition_param_streaming = counting_stream
+        try:
+            streamed = build(512)
+        finally:
+            pp.Init._partition_param_streaming = original
+
+        assert streaming_calls["count"] >= 1, "host-staged parameter did not use streaming"
         assert torch.equal(streamed.weight.ds_tensor, reference.weight.ds_tensor)
         assert torch.equal(streamed.bias.ds_tensor, reference.bias.ds_tensor)
         # The host-built streamed param must end with its placeholder on the
         # accelerator, in the same state as the standard path.
         assert streamed.weight.device == reference.weight.device
+
+        # The one-parameter list selects _all_gather_sequential. Exercise it on
+        # the host-source streaming case so the placeholder regression is covered.
+        streamed.weight.all_gather_coalesced([streamed.weight]).wait()
+        try:
+            assert streamed.weight.device == reference.weight.device
+            assert streamed.weight.shape == streamed.weight.ds_shape
+        finally:
+            streamed.weight.partition()
