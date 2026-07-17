@@ -7,16 +7,390 @@
 #include "deepcompile.h"
 
 #include <ATen/native/cuda/Resize.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+
+#include <cstdlib>
+#include <iostream>
+#include <unordered_set>
 
 namespace dc {
 
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
+
+namespace {
+
+class GatherBufferPool {
+public:
+    at::Tensor acquire(int64_t numel,
+                       at::ScalarType dtype,
+                       const c10::Device& device,
+                       at::cuda::CUDAStream stream)
+    {
+        observeAllocatorPressure(device.index());
+        if (!enabled_) { return at::Tensor(); }
+
+        Entry* best = nullptr;
+        for (auto& entry : entries_) {
+            if (entry.checked_out || entry.buffer.scalar_type() != dtype ||
+                entry.buffer.device() != device || entry.buffer.numel() < numel) {
+                continue;
+            }
+            if (best == nullptr || entry.buffer.numel() < best->buffer.numel()) { best = &entry; }
+        }
+        if (best == nullptr) { return at::Tensor(); }
+
+        best->ready_event->block(stream);
+        at::Tensor result = best->buffer.narrow(0, 0, numel);
+        best->checked_out = true;
+        best->ready_event.reset();
+        best->last_use = ++clock_;
+        return result;
+    }
+
+    void excludeFromAdmission(const at::Tensor& buffer)
+    {
+        if (!buffer.defined() || buffer.storage().nbytes() == 0) { return; }
+        non_retainable_storages_.insert(buffer.storage().unsafeGetStorageImpl());
+    }
+
+    void cancelAdmissionExclusion(const at::Tensor& buffer)
+    {
+        if (!buffer.defined()) { return; }
+        non_retainable_storages_.erase(buffer.storage().unsafeGetStorageImpl());
+    }
+
+    void discard(const at::Tensor& buffer)
+    {
+        if (!buffer.defined()) { return; }
+
+        auto storage = buffer.storage();
+        if (storage.nbytes() == 0) { return; }
+
+        auto storage_impl = storage.unsafeGetStorageImpl();
+        non_retainable_storages_.erase(storage_impl);
+        buffer.record_stream(at::cuda::getCurrentCUDAStream());
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (storageImpl(*it) == storage_impl) {
+                charged_bytes_ -= it->capacity_bytes;
+                entries_.erase(it);
+                logState("discarded");
+                return;
+            }
+        }
+    }
+
+    bool release(const at::Tensor& buffer)
+    {
+        auto storage = buffer.storage();
+        if (storage.nbytes() == 0) { return false; }
+
+        auto consumer_stream = at::cuda::getCurrentCUDAStream();
+        buffer.record_stream(consumer_stream);
+        observeAllocatorPressure(buffer.device().index());
+
+        auto storage_impl = storage.unsafeGetStorageImpl();
+        if (non_retainable_storages_.erase(storage_impl) > 0) {
+            removeEntryOwnership(storage_impl, "excluded");
+            return false;
+        }
+
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (storageImpl(*it) != storage_impl) { continue; }
+            auto ready_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+            ready_event->record(consumer_stream);
+            it->ready_event = ready_event;
+            it->checked_out = false;
+            it->last_use = ++clock_;
+            if (!enabled_ || charged_bytes_ > budget_bytes_) {
+                charged_bytes_ -= it->capacity_bytes;
+                entries_.erase(it);
+                logState("evicted_on_return");
+                return false;
+            }
+            return true;
+        }
+
+        if (!enabled_) { return false; }
+
+        const size_t capacity_bytes = storage.nbytes();
+        if (capacity_bytes > budget_bytes_ || !makeRoom(capacity_bytes)) { return false; }
+
+        const int64_t capacity_numel = static_cast<int64_t>(capacity_bytes / buffer.element_size());
+        at::Tensor candidate = at::as_strided(buffer.detach(), {capacity_numel}, {1}, 0);
+        auto ready_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+        ready_event->record(consumer_stream);
+        entries_.push_back({candidate, ready_event, false, ++clock_, capacity_bytes});
+        charged_bytes_ += capacity_bytes;
+        if (charged_bytes_ > high_water_bytes_) {
+            high_water_bytes_ = charged_bytes_;
+            logState("high_water");
+        }
+        return true;
+    }
+
+    void setBudgetForTest(int64_t budget_bytes)
+    {
+        test_override_ = true;
+        enabled_ = budget_bytes > 0;
+        budget_bytes_ = budget_bytes > 0 ? static_cast<size_t>(budget_bytes) : 0;
+        baseline_retries_.reset();
+        makeRoom(0);
+        logState("test_budget");
+    }
+
+    void reset()
+    {
+        entries_.clear();
+        non_retainable_storages_.clear();
+        baseline_retries_.reset();
+        budget_bytes_ = 0;
+        charged_bytes_ = 0;
+        high_water_bytes_ = 0;
+        clock_ = 0;
+        enabled_ = false;
+        test_override_ = false;
+        adaptive_budget_initialized_ = false;
+    }
+
+    void observeAllocatorPressureForTest(int64_t retries, int64_t free_bytes, int64_t total_bytes)
+    {
+        TORCH_CHECK(!test_override_,
+                    "allocator-pressure simulation requires the production adaptive pool");
+        TORCH_CHECK(retries >= 0 && free_bytes >= 0 && total_bytes >= 0,
+                    "allocator-pressure simulation values must be nonnegative");
+        updateBudgetForAllocatorPressure(
+            retries, static_cast<size_t>(free_bytes), static_cast<size_t>(total_bytes));
+    }
+
+    std::vector<int64_t> stateForTest() const
+    {
+        size_t checked_out = 0;
+        for (const auto& entry : entries_) { checked_out += entry.checked_out ? 1 : 0; }
+        return {static_cast<int64_t>(budget_bytes_),
+                static_cast<int64_t>(charged_bytes_),
+                static_cast<int64_t>(high_water_bytes_),
+                static_cast<int64_t>(entries_.size()),
+                static_cast<int64_t>(checked_out),
+                baseline_retries_.value_or(-1),
+                enabled_ ? 1 : 0,
+                adaptive_budget_initialized_ ? 1 : 0};
+    }
+
+private:
+    struct Entry {
+        at::Tensor buffer;
+        std::shared_ptr<at::cuda::CUDAEvent> ready_event;
+        bool checked_out;
+        uint64_t last_use;
+        size_t capacity_bytes;
+    };
+
+    static c10::StorageImpl* storageImpl(const Entry& entry)
+    {
+        return entry.buffer.storage().unsafeGetStorageImpl();
+    }
+
+    void removeEntryOwnership(c10::StorageImpl* storage_impl, const char* event)
+    {
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (storageImpl(*it) != storage_impl) { continue; }
+            charged_bytes_ -= it->capacity_bytes;
+            entries_.erase(it);
+            logState(event);
+            return;
+        }
+    }
+
+    void observeAllocatorPressure(c10::DeviceIndex device)
+    {
+        if (test_override_) { return; }
+
+        const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device);
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        if (baseline_retries_ && stats.num_alloc_retries > baseline_retries_.value()) {
+            C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        }
+        updateBudgetForAllocatorPressure(stats.num_alloc_retries, free_bytes, total_bytes);
+    }
+
+    void updateBudgetForAllocatorPressure(int64_t retries, size_t free_bytes, size_t total_bytes)
+    {
+        if (!baseline_retries_) {
+            baseline_retries_ = retries;
+            return;
+        }
+        if (retries < baseline_retries_.value()) {
+            baseline_retries_ = retries;
+            return;
+        }
+        if (retries == baseline_retries_.value()) { return; }
+        baseline_retries_ = retries;
+
+        constexpr size_t granularity = 2 * 1024 * 1024;
+        // Bound prefetch-expanded overlap while preserving headroom for large
+        // non-gather allocations in the compiled graph. On later pressure,
+        // retain the byte-exact capacity already owned by the pool unless the
+        // total-memory hard cap requires reclaim. Shrinking below the active
+        // demand working set causes the next gather to allocate again, which
+        // can turn one allocator retry into a retry/eviction feedback loop.
+        size_t hard_cap = total_bytes / 32;
+        hard_cap -= hard_cap % granularity;
+        size_t free_target = free_bytes / 4;
+        free_target -= free_target % granularity;
+        const size_t observed_budget = std::min(hard_cap, std::max(free_target, charged_bytes_));
+        budget_bytes_ = adaptive_budget_initialized_ ? std::min(budget_bytes_, observed_budget)
+                                                     : observed_budget;
+        adaptive_budget_initialized_ = true;
+        enabled_ = budget_bytes_ > 0;
+        makeRoom(0);
+        logState(enabled_ ? "pressure" : "disabled");
+    }
+
+    bool makeRoom(size_t capacity_bytes)
+    {
+        while (charged_bytes_ + capacity_bytes > budget_bytes_) {
+            auto victim = entries_.end();
+            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+                if (it->checked_out) { continue; }
+                if (victim == entries_.end() || it->last_use < victim->last_use) { victim = it; }
+            }
+            if (victim == entries_.end()) { return false; }
+
+            auto victim_storage = victim->buffer.storage();
+            at::native::resize_bytes_cuda(victim_storage.unsafeGetStorageImpl(), 0);
+            charged_bytes_ -= victim->capacity_bytes;
+            entries_.erase(victim);
+        }
+        return true;
+    }
+
+    void logState(const char* event) const
+    {
+        if (std::getenv("DEEPSPEED_ALLOCATOR_TELEMETRY") == nullptr) { return; }
+        size_t checked_out = 0;
+        for (const auto& entry : entries_) { checked_out += entry.checked_out ? 1 : 0; }
+        std::cout << "DEEPSPEED_Z3_GATHER_BUFFER_POOL event=" << event
+                  << " budget_bytes=" << budget_bytes_ << " charged_bytes=" << charged_bytes_
+                  << " high_water_bytes=" << high_water_bytes_ << " entries=" << entries_.size()
+                  << " checked_out=" << checked_out << std::endl;
+    }
+
+    std::vector<Entry> entries_;
+    std::unordered_set<c10::StorageImpl*> non_retainable_storages_;
+    std::optional<int64_t> baseline_retries_;
+    size_t budget_bytes_ = 0;
+    size_t charged_bytes_ = 0;
+    size_t high_water_bytes_ = 0;
+    uint64_t clock_ = 0;
+    bool enabled_ = false;
+    bool test_override_ = false;
+    bool adaptive_budget_initialized_ = false;
+};
+
+class AdmissionExclusionRollback {
+public:
+    explicit AdmissionExclusionRollback(std::shared_ptr<GatherBufferPool> pool)
+        : pool_(std::move(pool))
+    {
+    }
+
+    AdmissionExclusionRollback(const AdmissionExclusionRollback&) = delete;
+    AdmissionExclusionRollback& operator=(const AdmissionExclusionRollback&) = delete;
+
+    ~AdmissionExclusionRollback() noexcept
+    {
+        if (committed_) { return; }
+        for (const auto& buffer : buffers_) {
+            try {
+                pool_->cancelAdmissionExclusion(buffer);
+            } catch (...) {
+                // Destructors must not replace the original prefetch exception.
+            }
+        }
+    }
+
+    void exclude(const at::Tensor& buffer)
+    {
+        // Retain the Tensor before installing its raw StorageImpl identity so
+        // allocation/event exceptions cannot leave an ABA-prone dangling key.
+        buffers_.push_back(buffer);
+        pool_->excludeFromAdmission(buffers_.back());
+    }
+
+    size_t size() const { return buffers_.size(); }
+
+    void commit()
+    {
+        committed_ = true;
+        buffers_.clear();
+    }
+
+private:
+    std::shared_ptr<GatherBufferPool> pool_;
+    std::vector<at::Tensor> buffers_;
+    bool committed_ = false;
+};
+
+std::weak_ptr<GatherBufferPool> weak_gather_buffer_pool;
+std::optional<int64_t> gather_buffer_pool_test_budget;
+int64_t prefetch_fail_after_exclusions_for_test = 0;
+
+std::shared_ptr<GatherBufferPool> get_gather_buffer_pool()
+{
+    auto pool = weak_gather_buffer_pool.lock();
+    if (!pool) {
+        pool = std::make_shared<GatherBufferPool>();
+        weak_gather_buffer_pool = pool;
+        if (gather_buffer_pool_test_budget) {
+            pool->setBudgetForTest(gather_buffer_pool_test_budget.value());
+        }
+    }
+    return pool;
+}
+
+}  // namespace
+
+void set_z3_gather_buffer_pool_budget_for_test(int64_t budget_bytes)
+{
+    gather_buffer_pool_test_budget = budget_bytes;
+    if (auto pool = weak_gather_buffer_pool.lock()) { pool->setBudgetForTest(budget_bytes); }
+}
+
+void update_z3_gather_buffer_pool_allocator_pressure_for_test(int64_t retries,
+                                                              int64_t free_bytes,
+                                                              int64_t total_bytes)
+{
+    get_gather_buffer_pool()->observeAllocatorPressureForTest(retries, free_bytes, total_bytes);
+}
+
+std::vector<int64_t> get_z3_gather_buffer_pool_state_for_test()
+{
+    return get_gather_buffer_pool()->stateForTest();
+}
+
+void set_z3_param_valid_for_test(long ds_id, bool valid) { param_registry->setValid(ds_id, valid); }
+
+void set_z3_prefetch_fail_after_exclusions_for_test(int64_t count)
+{
+    TORCH_CHECK(count >= 0, "prefetch exclusion failure count must be nonnegative");
+    prefetch_fail_after_exclusions_for_test = count;
+}
+
+void reset_z3_gather_buffer_pool()
+{
+    if (auto pool = weak_gather_buffer_pool.lock()) { pool->reset(); }
+    weak_gather_buffer_pool.reset();
+    gather_buffer_pool_test_budget.reset();
+    prefetch_fail_after_exclusions_for_test = 0;
+}
 
 class Z3CustomOpExecutor : public CustomOpExecutor {
 public:
     Z3CustomOpExecutor(c10::intrusive_ptr<c10d::ProcessGroup> process_group,
                        std::shared_ptr<DSParamRegistry> param_registry,
                        std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets,
+                       std::shared_ptr<GatherBufferPool> gather_buffer_pool,
                        std::vector<long> ds_ids,
                        ncclComm_t nccl_comm,
                        at::cuda::CUDAStream ag_stream,
@@ -33,6 +407,7 @@ public:
                            rs_stream,
                            copy_stream,
                            pre_div_reduce),
+          gather_buffer_pool_(gather_buffer_pool),
           ag_stream_(ag_stream),
           offload_stream_(offload_stream),
           reload_stream_(reload_stream)
@@ -146,8 +521,12 @@ public:
             if (existing.defined() && existing.numel() == padded_numel) { output_buf = existing; }
         }
         if (!output_buf.defined()) {
-            at::cuda::CUDAStreamGuard guard(ag_stream_);
-            output_buf = torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+            output_buf = gather_buffer_pool_->acquire(
+                padded_numel, target_dtype, ds_tensor.device(), ag_stream_);
+            if (!output_buf.defined()) {
+                at::cuda::CUDAStreamGuard guard(ag_stream_);
+                output_buf = torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+            }
         }
 
         assert(hasKey(ag_comp_done_events_, ds_id));
@@ -176,6 +555,7 @@ public:
         }
 
         std::unordered_map<long, at::Tensor> output_bufs;
+        AdmissionExclusionRollback admission_exclusions(gather_buffer_pool_);
         for (const auto& [ds_id, dtype] : invalid_params) {
             const DSParam& param = param_registry_->getParam(ds_id);
             const at::Tensor& ds_tensor = param.getDSTensor();
@@ -187,12 +567,23 @@ public:
                 auto existing = param_registry_->getGatheredParam(ds_id);
                 if (existing.defined() && existing.numel() == padded_numel) {
                     output_bufs[ds_id] = existing;
-                    continue;
                 }
             }
-            auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
-            output_bufs[ds_id] =
-                torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+            if (!hasKey(output_bufs, ds_id)) {
+                auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
+                at::cuda::CUDAStreamGuard guard(ag_stream_);
+                output_bufs[ds_id] =
+                    torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+            }
+            // Prefetch lifetimes are already controlled by the memory-aware scheduler.
+            // Bind the exclusion to the selected storage so a stale ds_id generation
+            // cannot admit a different demand-gather buffer into the independent pool.
+            admission_exclusions.exclude(output_bufs.at(ds_id));
+            if (prefetch_fail_after_exclusions_for_test > 0 &&
+                admission_exclusions.size() >=
+                    static_cast<size_t>(prefetch_fail_after_exclusions_for_test)) {
+                throw std::runtime_error("injected prefetch preparation failure");
+            }
         }
 
         for (const auto& [ds_id, _] : invalid_params) {
@@ -210,6 +601,7 @@ public:
         for (const auto& [ds_id, _] : invalid_params) {
             ag_comm_done_events_[ds_id]->record(ag_stream_);
         }
+        admission_exclusions.commit();
     }
 
     void releaseParam(long ds_id, long n_users)
@@ -226,10 +618,12 @@ public:
             if (gathered_param.defined()) {  // gathered param is undefined while profiling
                 auto storage = gathered_param.storage();
                 if (storage.nbytes() > 0) {
-                    // Required so the caching allocator defers reuse for consumer-stream kernels
-                    // queued behind wait_allgather.
-                    gathered_param.record_stream(at::cuda::getCurrentCUDAStream());
-                    at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
+                    // Demand gathers may enter the byte-bounded pool. Prefetched gathers
+                    // keep the scheduler's ownership boundary and use the original
+                    // resize-to-zero path after their final consumer.
+                    if (!gather_buffer_pool_->release(gathered_param)) {
+                        at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
+                    }
                 }
 
                 const auto options = gathered_param.options();
@@ -420,6 +814,7 @@ public:
     bool hasParam(long ds_id) const { return hasKey(has_acc_grad_, ds_id); }
 
 private:
+    std::shared_ptr<GatherBufferPool> gather_buffer_pool_;
     at::cuda::CUDAStream ag_stream_;
     at::cuda::CUDAStream offload_stream_;
     at::cuda::CUDAStream reload_stream_;
@@ -475,6 +870,7 @@ void register_graph_z3(long graph_id, const std::vector<long>& ds_ids)
     executors[graph_id] = std::make_shared<Z3CustomOpExecutor>(process_group,
                                                                param_registry,
                                                                reduce_buckets,
+                                                               get_gather_buffer_pool(),
                                                                ds_ids,
                                                                nccl_comm,
                                                                get_ag_stream(),
@@ -584,17 +980,22 @@ void invalidate_gathered_param(long ds_id)
     const DSParam& param = param_registry->getParam(ds_id);
     if (param.isPersistent()) { return; }
 
+    auto gathered_param = param_registry->getGatheredParam(ds_id);
+    get_gather_buffer_pool()->discard(gathered_param);
     param_registry->unregisterGatheredParam(ds_id);
     param_registry->registerGatheredParam(ds_id, at::Tensor());
 }
 
 void clear_all_gathered_params()
 {
+    auto gather_buffer_pool = get_gather_buffer_pool();
     for (const auto& it : param_registry->getParams()) {
         long ds_id = it.first;
         const DSParam& param = param_registry->getParam(ds_id);
         if (param.isPersistent()) { continue; }
         if (param_registry->hasGatheredParam(ds_id)) {
+            auto gathered_param = param_registry->getGatheredParam(ds_id);
+            gather_buffer_pool->discard(gathered_param);
             param_registry->unregisterGatheredParam(ds_id);
         }
     }
