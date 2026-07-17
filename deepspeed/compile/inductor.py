@@ -21,7 +21,6 @@ from .util import get_input_nodes
 from .graph_param import DSGraphParamManager
 from .partitioner import get_wrapped_partitioner
 
-
 def _get_graphsafe_run_with_rng_state():
     try:
         from torch._prims import rng_prims
@@ -193,7 +192,7 @@ def register_custom_ops():
 
             def wrap_tensors(x):
                 out = TensorBox.create(x) if isinstance(x, torch._inductor.ir.IRNode) else x
-                if out is not None and never_reuse_output:
+                if never_reuse_output and hasattr(out, "get_name"):
                     V.graph.never_reuse_buffers.add(out.get_name())
                 return out
 

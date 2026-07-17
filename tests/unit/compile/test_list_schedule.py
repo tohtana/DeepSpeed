@@ -404,3 +404,50 @@ def test_register_custom_ops_includes_graphsafe_rng_state_no_reuse(monkeypatch):
     inductor_mod.register_custom_ops()
 
     assert graphsafe_run_with_rng_state in registered_ops
+
+
+def test_graphsafe_rng_state_mixed_outputs_preserve_primitives_and_mark_ir_no_reuse(monkeypatch):
+    graphsafe_run_with_rng_state = inductor_mod._get_graphsafe_run_with_rng_state()
+    if graphsafe_run_with_rng_state is None:
+        pytest.skip("graphsafe_run_with_rng_state is unavailable in this torch build")
+
+    _define_dc_ops()
+    registered_handlers = {}
+
+    class FakeIRNode:
+        pass
+
+    class FakeTensorBox:
+
+        def get_name(self):
+            return "graphsafe_rng_state"
+
+    fake_ir = FakeIRNode()
+    primitive = 7
+
+    def fake_register_lowering(op_overload, **_kwargs):
+
+        def record_handler(handler):
+            registered_handlers[op_overload] = handler
+            return handler
+
+        return record_handler
+
+    monkeypatch.setattr(inductor_mod, "add_needs_realized_inputs", lambda _op_overload: None)
+    monkeypatch.setattr(inductor_mod, "register_lowering", fake_register_lowering)
+    monkeypatch.setattr(inductor_mod, "fallbacks", set())
+    monkeypatch.setattr(inductor_mod.torch._inductor.ir, "IRNode", FakeIRNode)
+    monkeypatch.setattr(inductor_mod.TensorBox, "create", staticmethod(lambda node: FakeTensorBox()))
+    monkeypatch.setattr(inductor_mod.FallbackKernel, "create",
+                        staticmethod(lambda _kernel, *_args, **_kwargs: (fake_ir, primitive, None)))
+    never_reuse_buffers = set()
+    monkeypatch.setattr(inductor_mod, "V",
+                        SimpleNamespace(graph=SimpleNamespace(never_reuse_buffers=never_reuse_buffers)))
+    monkeypatch.setattr(inductor_mod.Scheduler, "is_dc_patched", True, raising=False)
+
+    inductor_mod.register_custom_ops()
+
+    outputs = registered_handlers[graphsafe_run_with_rng_state]()
+    assert isinstance(outputs[0], FakeTensorBox)
+    assert outputs[1:] == (primitive, None)
+    assert never_reuse_buffers == {"graphsafe_rng_state"}
