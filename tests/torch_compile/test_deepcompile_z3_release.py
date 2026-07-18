@@ -67,7 +67,8 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         return values.narrow(0, 0, values.numel() - 1).sum()
 
     def _pool_state(self, dc):
-        keys = ("budget", "charged", "high_water", "entries", "checked_out", "retries", "enabled", "initialized")
+        keys = ("budget", "charged", "high_water", "entries", "checked_out", "retries", "enabled", "initialized",
+                "idle_pressure_score")
         return dict(zip(keys, dc.get_z3_gather_buffer_pool_state_for_test()))
 
     def test_storage_reused_after_release_single_use(self):
@@ -224,7 +225,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         finally:
             dc.cleanup()
 
-    def test_later_allocator_pressure_preserves_checked_out_working_set(self):
+    def test_idle_pressure_hysteresis_preserves_checked_out_working_set(self):
         graph_id = 9100
         first_ds_id, checked_out_ds_id = 9101, 9102
         dc = self._init_dc(pool_budget=None)
@@ -249,18 +250,32 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert before_pressure["checked_out"] == 1
             assert before_pressure["charged"] > 2 << 20
 
-            # The free-memory target falls to 2 MiB, but a later retry must not
-            # shrink below the byte-exact storage already owned by the pool.
+            # The free-memory target falls to 2 MiB. Isolated retries preserve
+            # the byte-exact working set, and crossing the idle threshold must
+            # never reclaim a checked-out lease.
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(2, 8 << 20, 8 * gib)
             after_pressure = self._pool_state(dc)
             assert after_pressure["budget"] == before_pressure["charged"]
             assert after_pressure["charged"] == before_pressure["charged"]
+            assert after_pressure["idle_pressure_score"] == 2
+
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(3, 8 << 20, 8 * gib)
+            after_threshold = self._pool_state(dc)
+            assert after_threshold["charged"] == before_pressure["charged"]
+            assert after_threshold["idle_pressure_score"] == 3
             self._release(checked_out_view, graph_id, checked_out_ds_id, 1)
             assert checked_out_storage.nbytes() == before_pressure["charged"]
+
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(4, 8 << 20, 8 * gib)
+            after_idle_pressure = self._pool_state(dc)
+            assert after_idle_pressure["charged"] == 0
+            assert after_idle_pressure["budget"] == 0
+            assert after_idle_pressure["idle_pressure_score"] == 1
+            assert checked_out_storage.nbytes() == 0
         finally:
             dc.cleanup()
 
-    def test_later_allocator_pressure_preserves_idle_non_aligned_working_set(self):
+    def test_repeated_allocator_pressure_reclaims_idle_non_aligned_working_set(self):
         graph_id, ds_id = 9103, 9104
         dc = self._init_dc(pool_budget=None)
         try:
@@ -280,16 +295,46 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             after_pressure = self._pool_state(dc)
             assert after_pressure["budget"] == before_pressure["charged"]
             assert after_pressure["charged"] == before_pressure["charged"]
+            assert after_pressure["idle_pressure_score"] == 2
             assert storage.nbytes() == before_pressure["charged"]
 
-            # Pressure is observed before acquire in production. The candidate
-            # must still be available when that imminent acquire searches it.
-            next_ds_id = 9105
-            next_shard = self._register_param(dc, graph_id, next_ds_id, [524_289], register_graph=False)
-            dc.register_graph_z3(graph_id, [ds_id, next_ds_id])
-            next_view, next_storage = self._gather_view_and_storage(next_shard, graph_id, next_ds_id)
-            assert next_storage.data_ptr() == storage.data_ptr()
-            self._release(next_view, graph_id, next_ds_id, 1)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(3, 8 << 20, 8 * gib)
+            after_threshold = self._pool_state(dc)
+            assert after_threshold["budget"] == 0
+            assert after_threshold["charged"] == 0
+            assert after_threshold["entries"] == 0
+            assert after_threshold["idle_pressure_score"] == 0
+            assert storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_allocator_retry_jump_evicts_at_most_one_largest_idle_entry(self):
+        graph_id, large_ds_id, small_ds_id = 9105, 9106, 9107
+        dc = self._init_dc(pool_budget=None)
+        try:
+            large_shard = self._register_param(dc, graph_id, large_ds_id, [1_048_577], register_graph=False)
+            small_shard = self._register_param(dc, graph_id, small_ds_id, [524_289], register_graph=False)
+            dc.register_graph_z3(graph_id, [large_ds_id, small_ds_id])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            large_view, large_storage = self._gather_view_and_storage(large_shard, graph_id, large_ds_id)
+            small_view, small_storage = self._gather_view_and_storage(small_shard, graph_id, small_ds_id)
+            self._release(large_view, graph_id, large_ds_id, 1)
+            self._release(small_view, graph_id, small_ds_id, 1)
+            before_jump = self._pool_state(dc)
+            assert before_jump["entries"] == 2
+            assert large_storage.nbytes() > small_storage.nbytes()
+
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+            after_jump = self._pool_state(dc)
+            assert after_jump["entries"] == 1
+            assert after_jump["charged"] == small_storage.nbytes()
+            assert after_jump["budget"] == after_jump["charged"]
+            assert after_jump["idle_pressure_score"] == 2
+            assert large_storage.nbytes() == 0
+            assert small_storage.nbytes() > 0
         finally:
             dc.cleanup()
 
@@ -357,17 +402,21 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             gib = 1 << 30
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(10, gib, 8 * gib)
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(11, gib, 8 * gib)
-            assert self._pool_state(dc)["budget"] == 256 << 20
+            initial_state = self._pool_state(dc)
+            assert initial_state["budget"] == 256 << 20
+            assert initial_state["idle_pressure_score"] == 1
 
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, 8 << 20, 8 * gib)
             reset_state = self._pool_state(dc)
             assert reset_state["retries"] == 0
             assert reset_state["budget"] == 256 << 20
+            assert reset_state["idle_pressure_score"] == 0
 
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 16 << 20, 8 * gib)
             jump_state = self._pool_state(dc)
             assert jump_state["retries"] == 5
             assert jump_state["budget"] == 4 << 20
+            assert jump_state["idle_pressure_score"] == 5
         finally:
             dc.cleanup()
 

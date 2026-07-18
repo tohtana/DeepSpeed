@@ -9,8 +9,10 @@
 #include <ATen/native/cuda/Resize.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <unordered_set>
 
 namespace dc {
@@ -134,6 +136,7 @@ public:
         enabled_ = budget_bytes > 0;
         budget_bytes_ = budget_bytes > 0 ? static_cast<size_t>(budget_bytes) : 0;
         baseline_retries_.reset();
+        idle_pressure_score_ = 0;
         makeRoom(0);
         logState("test_budget");
     }
@@ -143,6 +146,7 @@ public:
         entries_.clear();
         non_retainable_storages_.clear();
         baseline_retries_.reset();
+        idle_pressure_score_ = 0;
         budget_bytes_ = 0;
         charged_bytes_ = 0;
         high_water_bytes_ = 0;
@@ -173,7 +177,8 @@ public:
                 static_cast<int64_t>(checked_out),
                 baseline_retries_.value_or(-1),
                 enabled_ ? 1 : 0,
-                adaptive_budget_initialized_ ? 1 : 0};
+                adaptive_budget_initialized_ ? 1 : 0,
+                idle_pressure_score_};
     }
 
 private:
@@ -218,22 +223,26 @@ private:
     {
         if (!baseline_retries_) {
             baseline_retries_ = retries;
+            idle_pressure_score_ = 0;
             return;
         }
         if (retries < baseline_retries_.value()) {
             baseline_retries_ = retries;
+            idle_pressure_score_ = 0;
             return;
         }
         if (retries == baseline_retries_.value()) { return; }
+        const int64_t retry_delta = retries - baseline_retries_.value();
         baseline_retries_ = retries;
 
         constexpr size_t granularity = 2 * 1024 * 1024;
         // Bound prefetch-expanded overlap while preserving headroom for large
-        // non-gather allocations in the compiled graph. On later pressure,
-        // retain the byte-exact capacity already owned by the pool unless the
-        // total-memory hard cap requires reclaim. Shrinking below the active
-        // demand working set causes the next gather to allocate again, which
-        // can turn one allocator retry into a retry/eviction feedback loop.
+        // non-gather allocations in the compiled graph. Allocator retries are
+        // also the signal that idle cached gathers may need to yield memory.
+        // Keep the byte-exact working set on isolated retries so one eviction
+        // cannot cause a one-for-one retry/refill loop. Repeated pressure while
+        // the pool is full and entirely idle evicts one largest buffer and
+        // ratchets the budget to the remaining charge.
         size_t hard_cap = total_bytes / 32;
         hard_cap -= hard_cap % granularity;
         size_t free_target = free_bytes / 4;
@@ -243,8 +252,50 @@ private:
                                                      : observed_budget;
         adaptive_budget_initialized_ = true;
         enabled_ = budget_bytes_ > 0;
+        idle_pressure_score_ =
+            retry_delta > std::numeric_limits<int64_t>::max() - idle_pressure_score_
+                ? std::numeric_limits<int64_t>::max()
+                : idle_pressure_score_ + retry_delta;
+        const size_t charged_before_hard_cap = charged_bytes_;
         makeRoom(0);
+        if (charged_bytes_ < charged_before_hard_cap) {
+            idle_pressure_score_ = 0;
+        } else if (idle_pressure_score_ >= kIdlePressureEvictionThreshold &&
+                   charged_bytes_ >= budget_bytes_ && allEntriesIdle() && evictLargestIdle()) {
+            idle_pressure_score_ -= kIdlePressureEvictionThreshold;
+            budget_bytes_ = std::min(budget_bytes_, charged_bytes_);
+            enabled_ = budget_bytes_ > 0;
+            logState("evicted_idle_pressure");
+            return;
+        }
         logState(enabled_ ? "pressure" : "disabled");
+    }
+
+    bool allEntriesIdle() const
+    {
+        return !entries_.empty() &&
+               std::all_of(entries_.begin(), entries_.end(), [](const Entry& entry) {
+                   return !entry.checked_out;
+               });
+    }
+
+    bool evictLargestIdle()
+    {
+        auto victim = entries_.end();
+        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+            if (it->checked_out) { continue; }
+            if (victim == entries_.end() || it->capacity_bytes > victim->capacity_bytes ||
+                (it->capacity_bytes == victim->capacity_bytes && it->last_use < victim->last_use)) {
+                victim = it;
+            }
+        }
+        if (victim == entries_.end()) { return false; }
+
+        auto victim_storage = victim->buffer.storage();
+        at::native::resize_bytes_cuda(victim_storage.unsafeGetStorageImpl(), 0);
+        charged_bytes_ -= victim->capacity_bytes;
+        entries_.erase(victim);
+        return true;
     }
 
     bool makeRoom(size_t capacity_bytes)
@@ -273,12 +324,15 @@ private:
         std::cout << "DEEPSPEED_Z3_GATHER_BUFFER_POOL event=" << event
                   << " budget_bytes=" << budget_bytes_ << " charged_bytes=" << charged_bytes_
                   << " high_water_bytes=" << high_water_bytes_ << " entries=" << entries_.size()
-                  << " checked_out=" << checked_out << std::endl;
+                  << " checked_out=" << checked_out
+                  << " idle_pressure_score=" << idle_pressure_score_ << std::endl;
     }
 
+    static constexpr int64_t kIdlePressureEvictionThreshold = 3;
     std::vector<Entry> entries_;
     std::unordered_set<c10::StorageImpl*> non_retainable_storages_;
     std::optional<int64_t> baseline_retries_;
+    int64_t idle_pressure_score_ = 0;
     size_t budget_bytes_ = 0;
     size_t charged_bytes_ = 0;
     size_t high_water_bytes_ = 0;
