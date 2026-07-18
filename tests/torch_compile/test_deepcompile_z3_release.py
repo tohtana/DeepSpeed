@@ -280,8 +280,19 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             # Recovery remembers the largest idle buffer identity. The smaller
             # checked-out gather reused that storage before recovery, but a new
             # gather of the smaller parameter has a different capacity once the
-            # pool is drained. Recreate the remembered largest demand gather to
-            # verify exact-identity readmission.
+            # pool is drained. Its release must be rejected rather than consume
+            # the recovery floor or displace the remembered hot identity.
+            incompatible_view, incompatible_storage = self._gather_view_and_storage(
+                checked_out_shard, graph_id, checked_out_ds_id)
+            assert 0 < incompatible_storage.nbytes() < before_pressure["charged"]
+            self._release(incompatible_view, graph_id, checked_out_ds_id, 1)
+            incompatible_state = self._pool_state(dc)
+            assert incompatible_state["entries"] == 0
+            assert incompatible_state["charged"] == 0
+            assert incompatible_storage.nbytes() == 0
+
+            # Recreate the remembered largest demand gather to verify exact
+            # capacity/dtype/device readmission after the incompatible release.
             recovered_view, recovered_storage = self._gather_view_and_storage(first_shard, graph_id, first_ds_id)
             self._release(recovered_view, graph_id, first_ds_id, 1)
             recovered_state = self._pool_state(dc)
