@@ -415,11 +415,9 @@ def _allgather_allocation_bytes(node: Node):
     return int(node.meta.get("allgather_allocation_bytes", node.meta.get("tensor_size", 0)))
 
 
-def _allgather_schedule_bytes(node: Node, scheduler_budget: Optional[SchedulerMemoryBudget]):
-    """Use logical bytes for legacy ranking and padded bytes for an enabled memory gate."""
-    if scheduler_budget is None:
-        return int(node.meta.get("tensor_size", 0))
-    return _allgather_allocation_bytes(node)
+def _allgather_ranking_bytes(node: Node):
+    """Use legacy logical bytes for deterministic candidate ranking."""
+    return int(node.meta.get("tensor_size", 0))
 
 
 def max_possible_gathered_bytes(graph: Graph):
@@ -673,12 +671,12 @@ def fast_free_schedule(graph: Graph,
 
                 allgather_cost = sum(n.meta["device_time"] for n in schedule_until_ag)
                 free_cost = sum(n.meta["device_time"] for n in diff_required_nodes)
-                allgathered_mem = _allgather_schedule_bytes(node, scheduler_budget)
+                allgathered_mem = _allgather_allocation_bytes(node)
                 allgather_acc_mem = sum(
-                    _allgather_schedule_bytes(n, scheduler_budget) for n in schedule_until_ag
+                    _allgather_ranking_bytes(n) for n in schedule_until_ag
                     if n.target == torch.ops.dc.allgather_param.default)
                 free_acc_mem = sum(
-                    _allgather_schedule_bytes(n, scheduler_budget) for n in diff_required_nodes
+                    _allgather_ranking_bytes(n) for n in diff_required_nodes
                     if n.target == torch.ops.dc.allgather_param.default)
 
                 schedule_until_free = schedule_until_ag + diff_required_nodes

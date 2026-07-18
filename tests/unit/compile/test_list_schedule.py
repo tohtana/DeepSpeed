@@ -1034,6 +1034,54 @@ def test_fast_free_schedule_uses_pressure_tiebreaker_in_fallback_bucket():
     assert names.index(low_ag.name) < names.index(high_ag.name)
 
 
+def test_fast_free_schedule_zero_rejection_budget_preserves_legacy_order():
+    graph = Graph()
+
+    high_param = _placeholder(graph, "non_constraining_high_param")
+    high_extra_param = _placeholder(graph, "non_constraining_high_extra_param")
+    low_param = _placeholder(graph, "non_constraining_low_param")
+    low_extra_param = _placeholder(graph, "non_constraining_low_extra_param")
+
+    high_ag = _allgather(graph, high_param, 70, "non_constraining_high", tensor_size=100, allocation_size=100)
+    high_wait = _wait(graph, high_ag, 70, "non_constraining_high")
+    high_extra_ag = _allgather(graph,
+                               high_extra_param,
+                               71,
+                               "non_constraining_high_extra",
+                               tensor_size=10,
+                               allocation_size=10)
+    high_extra_wait = _wait(graph, high_extra_ag, 71, "non_constraining_high_extra")
+    high_use = _add(graph, high_wait, high_extra_wait, "non_constraining_high_use", device_time=1)
+    high_release = _release(graph, high_use, 70, "non_constraining_high")
+
+    low_ag = _allgather(graph, low_param, 80, "non_constraining_low", tensor_size=1, allocation_size=200)
+    low_wait = _wait(graph, low_ag, 80, "non_constraining_low")
+    low_extra_ag = _allgather(graph,
+                              low_extra_param,
+                              81,
+                              "non_constraining_low_extra",
+                              tensor_size=10,
+                              allocation_size=10)
+    low_extra_wait = _wait(graph, low_extra_ag, 81, "non_constraining_low_extra")
+    low_use = _add(graph, low_wait, low_extra_wait, "non_constraining_low_use", device_time=100)
+    low_release = _release(graph, low_use, 80, "non_constraining_low")
+
+    graph.output((high_release, low_release))
+    graph.lint()
+
+    legacy_graph = _scheduled_graph(graph)
+    legacy_names = [node.name for node in legacy_graph.nodes]
+    budget = schedule_mod.SchedulerMemoryBudget(max_gathered_bytes=220, source="test")
+    assert budget.max_gathered_bytes < schedule_mod.max_possible_gathered_bytes(graph)
+    scheduled_graph = _scheduled_graph(graph, scheduler_budget=budget)
+    budget_names = [node.name for node in scheduled_graph.nodes]
+
+    assert _scheduler_diagnostics(scheduled_graph)["budget_rejections"] == 0
+    assert budget_names == legacy_names
+    assert (zero3_compile_mod._final_schedule_fingerprint(scheduled_graph) ==
+            zero3_compile_mod._final_schedule_fingerprint(legacy_graph))
+
+
 def test_fast_free_schedule_counts_live_gathered_bytes_when_filtering_candidates():
     graph = Graph()
 
