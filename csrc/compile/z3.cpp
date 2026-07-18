@@ -115,6 +115,14 @@ public:
         if (!enabled_) { return false; }
 
         const size_t capacity_bytes = storage.nbytes();
+        if (pressure_recovery_complete_ &&
+            (capacity_bytes != pressure_recovery_budget_bytes_ ||
+             !pressure_recovery_dtype_.has_value() ||
+             buffer.scalar_type() != pressure_recovery_dtype_.value() ||
+             !pressure_recovery_device_.has_value() ||
+             buffer.device() != pressure_recovery_device_.value())) {
+            return false;
+        }
         if (capacity_bytes > budget_bytes_ || !makeRoom(capacity_bytes)) { return false; }
 
         const int64_t capacity_numel = static_cast<int64_t>(capacity_bytes / buffer.element_size());
@@ -137,6 +145,10 @@ public:
         budget_bytes_ = budget_bytes > 0 ? static_cast<size_t>(budget_bytes) : 0;
         baseline_retries_.reset();
         idle_pressure_score_ = 0;
+        pressure_recovery_complete_ = false;
+        pressure_recovery_budget_bytes_ = 0;
+        pressure_recovery_dtype_.reset();
+        pressure_recovery_device_.reset();
         makeRoom(0);
         logState("test_budget");
     }
@@ -147,6 +159,10 @@ public:
         non_retainable_storages_.clear();
         baseline_retries_.reset();
         idle_pressure_score_ = 0;
+        pressure_recovery_complete_ = false;
+        pressure_recovery_budget_bytes_ = 0;
+        pressure_recovery_dtype_.reset();
+        pressure_recovery_device_.reset();
         budget_bytes_ = 0;
         charged_bytes_ = 0;
         high_water_bytes_ = 0;
@@ -178,7 +194,9 @@ public:
                 baseline_retries_.value_or(-1),
                 enabled_ ? 1 : 0,
                 adaptive_budget_initialized_ ? 1 : 0,
-                idle_pressure_score_};
+                idle_pressure_score_,
+                pressure_recovery_complete_ ? 1 : 0,
+                static_cast<int64_t>(pressure_recovery_budget_bytes_)};
     }
 
 private:
@@ -188,6 +206,13 @@ private:
         bool checked_out;
         uint64_t last_use;
         size_t capacity_bytes;
+    };
+
+    struct RecoveryTarget {
+        size_t capacity_bytes;
+        at::ScalarType dtype;
+        c10::Device device;
+        uint64_t last_use;
     };
 
     static c10::StorageImpl* storageImpl(const Entry& entry)
@@ -239,10 +264,11 @@ private:
         // Bound prefetch-expanded overlap while preserving headroom for large
         // non-gather allocations in the compiled graph. Allocator retries are
         // also the signal that idle cached gathers may need to yield memory.
-        // Keep the byte-exact working set on isolated retries so one eviction
-        // cannot cause a one-for-one retry/refill loop. Repeated pressure while
-        // the pool is full and entirely idle evicts one largest buffer and
-        // ratchets the budget to the remaining charge.
+        // Keep the byte-exact working set on isolated retries. On the first
+        // sustained-pressure wave, drain the entirely idle pool once, release
+        // free allocator blocks, and retain a budget for the largest demand
+        // gather to be admitted again. The lifecycle latch prevents later
+        // waves from evicting that hot buffer and recreating per-step churn.
         size_t hard_cap = total_bytes / 32;
         hard_cap -= hard_cap % granularity;
         size_t free_target = free_bytes / 4;
@@ -250,6 +276,10 @@ private:
         const size_t observed_budget = std::min(hard_cap, std::max(free_target, charged_bytes_));
         budget_bytes_ = adaptive_budget_initialized_ ? std::min(budget_bytes_, observed_budget)
                                                      : observed_budget;
+        if (pressure_recovery_complete_) {
+            budget_bytes_ =
+                std::max(budget_bytes_, std::min(pressure_recovery_budget_bytes_, hard_cap));
+        }
         adaptive_budget_initialized_ = true;
         enabled_ = budget_bytes_ > 0;
         idle_pressure_score_ =
@@ -260,13 +290,23 @@ private:
         makeRoom(0);
         if (charged_bytes_ < charged_before_hard_cap) {
             idle_pressure_score_ = 0;
-        } else if (idle_pressure_score_ >= kIdlePressureEvictionThreshold &&
-                   charged_bytes_ >= budget_bytes_ && allEntriesIdle() && evictLargestIdle()) {
-            idle_pressure_score_ -= kIdlePressureEvictionThreshold;
-            budget_bytes_ = std::min(budget_bytes_, charged_bytes_);
-            enabled_ = budget_bytes_ > 0;
-            logState("evicted_idle_pressure");
-            return;
+        } else if (!pressure_recovery_complete_ &&
+                   idle_pressure_score_ >= kIdlePressureEvictionThreshold &&
+                   charged_bytes_ >= budget_bytes_ && allEntriesIdle()) {
+            const auto recovery_target = drainIdlePoolForRecovery();
+            if (recovery_target.has_value()) {
+                const size_t recovery_floor = std::min(recovery_target->capacity_bytes, hard_cap);
+                idle_pressure_score_ = 0;
+                budget_bytes_ = recovery_floor;
+                enabled_ = recovery_floor > 0;
+                pressure_recovery_complete_ = true;
+                pressure_recovery_budget_bytes_ = recovery_floor;
+                pressure_recovery_dtype_ = recovery_target->dtype;
+                pressure_recovery_device_ = recovery_target->device;
+                c10::cuda::CUDACachingAllocator::emptyCache();
+                logState("recovered_idle_pressure");
+                return;
+            }
         }
         logState(enabled_ ? "pressure" : "disabled");
     }
@@ -279,23 +319,27 @@ private:
                });
     }
 
-    bool evictLargestIdle()
+    std::optional<RecoveryTarget> drainIdlePoolForRecovery()
     {
-        auto victim = entries_.end();
-        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-            if (it->checked_out) { continue; }
-            if (victim == entries_.end() || it->capacity_bytes > victim->capacity_bytes ||
-                (it->capacity_bytes == victim->capacity_bytes && it->last_use < victim->last_use)) {
-                victim = it;
+        std::optional<RecoveryTarget> recovery_target;
+        for (auto& entry : entries_) {
+            if (!recovery_target.has_value() ||
+                entry.capacity_bytes > recovery_target->capacity_bytes ||
+                (entry.capacity_bytes == recovery_target->capacity_bytes &&
+                 entry.last_use > recovery_target->last_use)) {
+                recovery_target = RecoveryTarget{entry.capacity_bytes,
+                                                 entry.buffer.scalar_type(),
+                                                 entry.buffer.device(),
+                                                 entry.last_use};
             }
+            // Relinquish the pool's active ownership before flushing free
+            // blocks. Later gathers can still reuse allocator-cached storage.
+            auto victim_storage = entry.buffer.storage();
+            at::native::resize_bytes_cuda(victim_storage.unsafeGetStorageImpl(), 0);
         }
-        if (victim == entries_.end()) { return false; }
-
-        auto victim_storage = victim->buffer.storage();
-        at::native::resize_bytes_cuda(victim_storage.unsafeGetStorageImpl(), 0);
-        charged_bytes_ -= victim->capacity_bytes;
-        entries_.erase(victim);
-        return true;
+        entries_.clear();
+        charged_bytes_ = 0;
+        return recovery_target;
     }
 
     bool makeRoom(size_t capacity_bytes)
@@ -325,7 +369,10 @@ private:
                   << " budget_bytes=" << budget_bytes_ << " charged_bytes=" << charged_bytes_
                   << " high_water_bytes=" << high_water_bytes_ << " entries=" << entries_.size()
                   << " checked_out=" << checked_out
-                  << " idle_pressure_score=" << idle_pressure_score_ << std::endl;
+                  << " idle_pressure_score=" << idle_pressure_score_
+                  << " pressure_recovery_complete=" << (pressure_recovery_complete_ ? 1 : 0)
+                  << " pressure_recovery_budget_bytes=" << pressure_recovery_budget_bytes_
+                  << std::endl;
     }
 
     static constexpr int64_t kIdlePressureEvictionThreshold = 3;
@@ -333,6 +380,10 @@ private:
     std::unordered_set<c10::StorageImpl*> non_retainable_storages_;
     std::optional<int64_t> baseline_retries_;
     int64_t idle_pressure_score_ = 0;
+    bool pressure_recovery_complete_ = false;
+    size_t pressure_recovery_budget_bytes_ = 0;
+    std::optional<at::ScalarType> pressure_recovery_dtype_;
+    std::optional<c10::Device> pressure_recovery_device_;
     size_t budget_bytes_ = 0;
     size_t charged_bytes_ = 0;
     size_t high_water_bytes_ = 0;
