@@ -277,9 +277,13 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert after_idle_pressure["pressure_recovery_complete"] == 1
             assert checked_out_storage.nbytes() == 0
 
-            recovered_view, recovered_storage = self._gather_view_and_storage(checked_out_shard, graph_id,
-                                                                              checked_out_ds_id)
-            self._release(recovered_view, graph_id, checked_out_ds_id, 1)
+            # Recovery remembers the largest idle buffer identity. The smaller
+            # checked-out gather reused that storage before recovery, but a new
+            # gather of the smaller parameter has a different capacity once the
+            # pool is drained. Recreate the remembered largest demand gather to
+            # verify exact-identity readmission.
+            recovered_view, recovered_storage = self._gather_view_and_storage(first_shard, graph_id, first_ds_id)
+            self._release(recovered_view, graph_id, first_ds_id, 1)
             recovered_state = self._pool_state(dc)
             assert recovered_state["entries"] == 1
             assert recovered_state["charged"] == before_pressure["charged"]
