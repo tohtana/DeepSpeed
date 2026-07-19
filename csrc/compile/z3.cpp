@@ -24,13 +24,16 @@ namespace {
 
 class GatherBufferPool {
 public:
+    enum class ReleaseDisposition { Retained, ResizeByCaller, Retired };
+
     at::Tensor acquire(int64_t numel,
                        at::ScalarType dtype,
                        const c10::Device& device,
                        at::cuda::CUDAStream stream)
     {
+        flushCompletedPressureRecovery();
         observeAllocatorPressure(device.index());
-        if (!enabled_) { return at::Tensor(); }
+        if (!enabled_ || pressure_recovery_in_progress_) { return at::Tensor(); }
 
         Entry* best = nullptr;
         for (auto& entry : entries_) {
@@ -67,60 +70,65 @@ public:
         if (!buffer.defined()) { return; }
 
         auto storage = buffer.storage();
-        if (storage.nbytes() == 0) { return; }
-
         auto storage_impl = storage.unsafeGetStorageImpl();
         non_retainable_storages_.erase(storage_impl);
-        buffer.record_stream(at::cuda::getCurrentCUDAStream());
-        for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-            if (storageImpl(*it) == storage_impl) {
-                charged_bytes_ -= it->capacity_bytes;
-                entries_.erase(it);
-                logState("discarded");
-                return;
-            }
+        if (storage.nbytes() == 0) {
+            removeEntryOwnership(storage_impl, "discarded", false);
+            return;
         }
+
+        buffer.record_stream(at::cuda::getCurrentCUDAStream());
+        removeEntryOwnership(storage_impl, "discarded", false);
     }
 
-    bool release(const at::Tensor& buffer)
+    ReleaseDisposition release(const at::Tensor& buffer)
     {
         auto storage = buffer.storage();
-        if (storage.nbytes() == 0) { return false; }
+        if (storage.nbytes() == 0) {
+            auto storage_impl = storage.unsafeGetStorageImpl();
+            non_retainable_storages_.erase(storage_impl);
+            if (removeEntryOwnership(storage_impl, "released_zero_storage", false)) {
+                return ReleaseDisposition::Retired;
+            }
+            return ReleaseDisposition::ResizeByCaller;
+        }
 
         auto consumer_stream = at::cuda::getCurrentCUDAStream();
         buffer.record_stream(consumer_stream);
         observeAllocatorPressure(buffer.device().index());
 
         auto storage_impl = storage.unsafeGetStorageImpl();
-        if (non_retainable_storages_.erase(storage_impl) > 0) {
-            removeEntryOwnership(storage_impl, "excluded");
-            return false;
-        }
+        const bool excluded = non_retainable_storages_.erase(storage_impl) > 0;
 
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             if (storageImpl(*it) != storage_impl) { continue; }
+            if (excluded) { return retireEntry(it, storage_impl, "excluded", false); }
+            if (pressure_recovery_in_progress_) {
+                return retireEntry(it, storage_impl, "recovery_release", true);
+            }
+            if (!enabled_ || charged_bytes_ > budget_bytes_) {
+                return retireEntry(it, storage_impl, "evicted_on_return", true);
+            }
             auto ready_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
             ready_event->record(consumer_stream);
             it->ready_event = ready_event;
             it->checked_out = false;
             it->last_use = ++clock_;
-            if (!enabled_ || charged_bytes_ > budget_bytes_) {
-                charged_bytes_ -= it->capacity_bytes;
-                entries_.erase(it);
-                logState("evicted_on_return");
-                return false;
-            }
-            return true;
+            return ReleaseDisposition::Retained;
         }
 
-        if (!enabled_) { return false; }
+        if (excluded || !enabled_ || pressure_recovery_in_progress_) {
+            return ReleaseDisposition::ResizeByCaller;
+        }
 
         const size_t capacity_bytes = storage.nbytes();
         if (pressure_recovery_complete_ &&
             !hasRecoveryAdmissionSlot(capacity_bytes, buffer.scalar_type(), buffer.device())) {
-            return false;
+            return ReleaseDisposition::ResizeByCaller;
         }
-        if (capacity_bytes > budget_bytes_ || !makeRoom(capacity_bytes)) { return false; }
+        if (capacity_bytes > budget_bytes_ || !makeRoom(capacity_bytes)) {
+            return ReleaseDisposition::ResizeByCaller;
+        }
 
         const int64_t capacity_numel = static_cast<int64_t>(capacity_bytes / buffer.element_size());
         at::Tensor candidate = at::as_strided(buffer.detach(), {capacity_numel}, {1}, 0);
@@ -132,7 +140,7 @@ public:
             high_water_bytes_ = charged_bytes_;
             logState("high_water");
         }
-        return true;
+        return ReleaseDisposition::Retained;
     }
 
     void setBudgetForTest(int64_t budget_bytes)
@@ -142,7 +150,9 @@ public:
         budget_bytes_ = budget_bytes > 0 ? static_cast<size_t>(budget_bytes) : 0;
         baseline_retries_.reset();
         idle_pressure_score_ = 0;
+        pressure_recovery_in_progress_ = false;
         pressure_recovery_complete_ = false;
+        pressure_recovery_flush_pending_ = false;
         pressure_recovery_budget_bytes_ = 0;
         pressure_recovery_targets_.clear();
         makeRoom(0);
@@ -155,7 +165,9 @@ public:
         non_retainable_storages_.clear();
         baseline_retries_.reset();
         idle_pressure_score_ = 0;
+        pressure_recovery_in_progress_ = false;
         pressure_recovery_complete_ = false;
+        pressure_recovery_flush_pending_ = false;
         pressure_recovery_budget_bytes_ = 0;
         pressure_recovery_targets_.clear();
         budget_bytes_ = 0;
@@ -192,7 +204,8 @@ public:
                 idle_pressure_score_,
                 pressure_recovery_complete_ ? 1 : 0,
                 static_cast<int64_t>(pressure_recovery_budget_bytes_),
-                static_cast<int64_t>(recoveryPendingEntries())};
+                static_cast<int64_t>(recoveryPendingEntries()),
+                pressure_recovery_in_progress_ ? 1 : 0};
     }
 
 private:
@@ -208,11 +221,7 @@ private:
         size_t capacity_bytes;
         at::ScalarType dtype;
         c10::Device device;
-    };
-
-    struct RecoveryPlan {
-        std::vector<RecoveryTarget> targets;
-        size_t budget_bytes;
+        uint64_t last_use;
     };
 
     static bool matchesRecoveryTarget(const Entry& entry, const RecoveryTarget& target)
@@ -261,15 +270,84 @@ private:
         return entry.buffer.storage().unsafeGetStorageImpl();
     }
 
-    void removeEntryOwnership(c10::StorageImpl* storage_impl, const char* event)
+    static bool recoveryTargetPriority(const RecoveryTarget& lhs, const RecoveryTarget& rhs)
+    {
+        if (lhs.capacity_bytes != rhs.capacity_bytes) {
+            return lhs.capacity_bytes > rhs.capacity_bytes;
+        }
+        return lhs.last_use > rhs.last_use;
+    }
+
+    void boundRecoveryTargets(size_t hard_cap)
+    {
+        std::stable_sort(pressure_recovery_targets_.begin(),
+                         pressure_recovery_targets_.end(),
+                         recoveryTargetPriority);
+        std::vector<RecoveryTarget> bounded_targets;
+        bounded_targets.reserve(pressure_recovery_targets_.size());
+        size_t bounded_bytes = 0;
+        for (const auto& target : pressure_recovery_targets_) {
+            if (target.capacity_bytes > hard_cap - bounded_bytes) { continue; }
+            bounded_targets.push_back(target);
+            bounded_bytes += target.capacity_bytes;
+        }
+        pressure_recovery_targets_ = std::move(bounded_targets);
+        pressure_recovery_budget_bytes_ = bounded_bytes;
+    }
+
+    void dropRecoveryTarget(const Entry& entry)
+    {
+        auto target = std::find_if(pressure_recovery_targets_.begin(),
+                                   pressure_recovery_targets_.end(),
+                                   [&](const RecoveryTarget& candidate) {
+                                       return candidate.last_use == entry.last_use &&
+                                              matchesRecoveryTarget(entry, candidate);
+                                   });
+        if (target == pressure_recovery_targets_.end()) { return; }
+        pressure_recovery_budget_bytes_ -= target->capacity_bytes;
+        pressure_recovery_targets_.erase(target);
+        budget_bytes_ = std::min(budget_bytes_, pressure_recovery_budget_bytes_);
+        enabled_ = budget_bytes_ > 0;
+    }
+
+    ReleaseDisposition retireEntry(std::vector<Entry>::iterator entry,
+                                   c10::StorageImpl* storage_impl,
+                                   const char* event,
+                                   bool keep_recovery_target)
+    {
+        // The final consumer stream was recorded before this method. Resize
+        // must succeed before pool accounting forgets the live storage.
+        at::native::resize_bytes_cuda(storage_impl, 0);
+        if (pressure_recovery_in_progress_ && !keep_recovery_target) { dropRecoveryTarget(*entry); }
+        charged_bytes_ -= entry->capacity_bytes;
+        entries_.erase(entry);
+        if (pressure_recovery_in_progress_ && entries_.empty()) {
+            completePressureRecovery();
+        } else {
+            logState(event);
+        }
+        return ReleaseDisposition::Retired;
+    }
+
+    bool removeEntryOwnership(c10::StorageImpl* storage_impl,
+                              const char* event,
+                              bool keep_recovery_target)
     {
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             if (storageImpl(*it) != storage_impl) { continue; }
+            if (pressure_recovery_in_progress_ && !keep_recovery_target) {
+                dropRecoveryTarget(*it);
+            }
             charged_bytes_ -= it->capacity_bytes;
             entries_.erase(it);
-            logState(event);
-            return;
+            if (pressure_recovery_in_progress_ && entries_.empty()) {
+                completePressureRecovery();
+            } else {
+                logState(event);
+            }
+            return true;
         }
+        return false;
     }
 
     void observeAllocatorPressure(c10::DeviceIndex device)
@@ -306,10 +384,11 @@ private:
         // non-gather allocations in the compiled graph. Allocator retries are
         // also the signal that idle cached gathers may need to yield memory.
         // Keep the byte-exact working set on isolated retries. On the first
-        // sustained-pressure wave, drain the entirely idle pool once, release
-        // free allocator blocks, and retain a byte-exact, typed recovery plan
-        // for the complete hot working set. The lifecycle latch prevents later
-        // waves from draining it again and recreating per-step churn.
+        // sustained-pressure wave, stop new retention, release idle entries,
+        // and retire checked-out entries as their final consumers return. Keep
+        // a byte-exact, typed recovery plan, preserving the complete hot set
+        // when it fits the hard cap. The lifecycle latch prevents later waves
+        // from draining it again and recreating per-step churn.
         size_t hard_cap = total_bytes / 32;
         hard_cap -= hard_cap % granularity;
         size_t free_target = free_bytes / 4;
@@ -317,9 +396,9 @@ private:
         const size_t observed_budget = std::min(hard_cap, std::max(free_target, charged_bytes_));
         budget_bytes_ = adaptive_budget_initialized_ ? std::min(budget_bytes_, observed_budget)
                                                      : observed_budget;
-        if (pressure_recovery_complete_) {
-            budget_bytes_ =
-                std::max(budget_bytes_, std::min(pressure_recovery_budget_bytes_, hard_cap));
+        if (pressure_recovery_in_progress_ || pressure_recovery_complete_) {
+            boundRecoveryTargets(hard_cap);
+            budget_bytes_ = std::max(budget_bytes_, pressure_recovery_budget_bytes_);
         }
         adaptive_budget_initialized_ = true;
         enabled_ = budget_bytes_ > 0;
@@ -327,55 +406,81 @@ private:
             retry_delta > std::numeric_limits<int64_t>::max() - idle_pressure_score_
                 ? std::numeric_limits<int64_t>::max()
                 : idle_pressure_score_ + retry_delta;
-        const size_t charged_before_hard_cap = charged_bytes_;
-        makeRoom(0);
-        if (charged_bytes_ < charged_before_hard_cap) {
+        if (pressure_recovery_in_progress_) {
             idle_pressure_score_ = 0;
         } else if (!pressure_recovery_complete_ &&
                    idle_pressure_score_ >= kIdlePressureEvictionThreshold &&
-                   charged_bytes_ >= budget_bytes_ && allEntriesIdle()) {
-            auto recovery_plan = drainIdlePoolForRecovery();
-            if (recovery_plan.has_value()) {
-                const size_t recovery_floor = std::min(recovery_plan->budget_bytes, hard_cap);
-                idle_pressure_score_ = 0;
-                budget_bytes_ = recovery_floor;
-                enabled_ = recovery_floor > 0;
-                pressure_recovery_complete_ = true;
-                pressure_recovery_budget_bytes_ = recovery_floor;
-                pressure_recovery_targets_ = std::move(recovery_plan->targets);
-                c10::cuda::CUDACachingAllocator::emptyCache();
-                logState("recovered_idle_pressure");
-                return;
-            }
+                   charged_bytes_ >= budget_bytes_ && beginPressureRecovery(hard_cap)) {
+            return;
+        } else {
+            const size_t charged_before_hard_cap = charged_bytes_;
+            makeRoom(0);
+            if (charged_bytes_ < charged_before_hard_cap) { idle_pressure_score_ = 0; }
         }
         logState(enabled_ ? "pressure" : "disabled");
     }
 
-    bool allEntriesIdle() const
+    bool beginPressureRecovery(size_t hard_cap)
     {
-        return !entries_.empty() &&
-               std::all_of(entries_.begin(), entries_.end(), [](const Entry& entry) {
-                   return !entry.checked_out;
-               });
-    }
+        if (entries_.empty()) { return false; }
 
-    std::optional<RecoveryPlan> drainIdlePoolForRecovery()
-    {
-        RecoveryPlan recovery_plan;
-        recovery_plan.budget_bytes = charged_bytes_;
-        recovery_plan.targets.reserve(entries_.size());
-        for (auto& entry : entries_) {
-            recovery_plan.targets.push_back(RecoveryTarget{
-                entry.capacity_bytes, entry.buffer.scalar_type(), entry.buffer.device()});
+        std::vector<RecoveryTarget> recovery_targets;
+        recovery_targets.reserve(entries_.size());
+        for (const auto& entry : entries_) {
+            recovery_targets.push_back(RecoveryTarget{entry.capacity_bytes,
+                                                      entry.buffer.scalar_type(),
+                                                      entry.buffer.device(),
+                                                      entry.last_use});
+        }
+        pressure_recovery_targets_ = std::move(recovery_targets);
+        boundRecoveryTargets(hard_cap);
+
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->checked_out) {
+                ++it;
+                continue;
+            }
             // Relinquish the pool's active ownership before flushing free
             // blocks. Later gathers can still reuse allocator-cached storage.
-            auto victim_storage = entry.buffer.storage();
+            auto victim_storage = it->buffer.storage();
             at::native::resize_bytes_cuda(victim_storage.unsafeGetStorageImpl(), 0);
+            if (non_retainable_storages_.erase(victim_storage.unsafeGetStorageImpl()) > 0) {
+                dropRecoveryTarget(*it);
+            }
+            charged_bytes_ -= it->capacity_bytes;
+            it = entries_.erase(it);
         }
-        entries_.clear();
-        charged_bytes_ = 0;
-        if (recovery_plan.targets.empty()) { return std::nullopt; }
-        return recovery_plan;
+
+        idle_pressure_score_ = 0;
+        budget_bytes_ = pressure_recovery_budget_bytes_;
+        enabled_ = budget_bytes_ > 0;
+        pressure_recovery_in_progress_ = !entries_.empty();
+        pressure_recovery_complete_ = false;
+        if (entries_.empty()) {
+            completePressureRecovery();
+        } else {
+            logState("recovering_pressure");
+        }
+        return true;
+    }
+
+    void completePressureRecovery()
+    {
+        pressure_recovery_in_progress_ = false;
+        pressure_recovery_complete_ = true;
+        pressure_recovery_flush_pending_ = true;
+        idle_pressure_score_ = 0;
+        budget_bytes_ = pressure_recovery_budget_bytes_;
+        enabled_ = budget_bytes_ > 0;
+        logState("recovered_pressure");
+    }
+
+    void flushCompletedPressureRecovery()
+    {
+        if (!pressure_recovery_flush_pending_) { return; }
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        pressure_recovery_flush_pending_ = false;
+        logState("flushed_recovered_pressure");
     }
 
     bool makeRoom(size_t capacity_bytes)
@@ -406,6 +511,7 @@ private:
                   << " high_water_bytes=" << high_water_bytes_ << " entries=" << entries_.size()
                   << " checked_out=" << checked_out
                   << " idle_pressure_score=" << idle_pressure_score_
+                  << " pressure_recovery_in_progress=" << (pressure_recovery_in_progress_ ? 1 : 0)
                   << " pressure_recovery_complete=" << (pressure_recovery_complete_ ? 1 : 0)
                   << " pressure_recovery_budget_bytes=" << pressure_recovery_budget_bytes_
                   << " pressure_recovery_pending_entries=" << recoveryPendingEntries() << std::endl;
@@ -416,7 +522,9 @@ private:
     std::unordered_set<c10::StorageImpl*> non_retainable_storages_;
     std::optional<int64_t> baseline_retries_;
     int64_t idle_pressure_score_ = 0;
+    bool pressure_recovery_in_progress_ = false;
     bool pressure_recovery_complete_ = false;
+    bool pressure_recovery_flush_pending_ = false;
     size_t pressure_recovery_budget_bytes_ = 0;
     std::vector<RecoveryTarget> pressure_recovery_targets_;
     size_t budget_bytes_ = 0;
@@ -761,7 +869,9 @@ public:
                     // Demand gathers may enter the byte-bounded pool. Prefetched gathers
                     // keep the scheduler's ownership boundary and use the original
                     // resize-to-zero path after their final consumer.
-                    if (!gather_buffer_pool_->release(gathered_param)) {
+                    const auto release_disposition = gather_buffer_pool_->release(gathered_param);
+                    if (release_disposition ==
+                        GatherBufferPool::ReleaseDisposition::ResizeByCaller) {
                         at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
                     }
                 }

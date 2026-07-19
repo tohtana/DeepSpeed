@@ -70,7 +70,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
     def _pool_state(self, dc):
         keys = ("budget", "charged", "high_water", "entries", "checked_out", "retries", "enabled", "initialized",
                 "idle_pressure_score", "pressure_recovery_complete", "pressure_recovery_budget",
-                "pressure_recovery_pending_entries")
+                "pressure_recovery_pending_entries", "pressure_recovery_in_progress")
         return dict(zip(keys, dc.get_z3_gather_buffer_pool_state_for_test()))
 
     def test_storage_reused_after_release_single_use(self):
@@ -227,34 +227,43 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         finally:
             dc.cleanup()
 
-    def test_idle_pressure_recovery_waits_for_checked_out_then_readmits_hot_buffer(self):
+    def test_pressure_recovery_retires_checked_out_working_set_on_final_returns(self):
         graph_id = 9100
-        first_ds_id, checked_out_ds_id = 9101, 9102
+        large_ds_id, small_ds_id, transient_ds_id = 9101, 9102, 9103
         dc = self._init_dc(pool_budget=None)
         try:
-            first_shard = self._register_param(dc, graph_id, first_ds_id, [1_048_577], register_graph=False)
-            checked_out_shard = self._register_param(dc, graph_id, checked_out_ds_id, [524_289], register_graph=False)
-            dc.register_graph_z3(graph_id, [first_ds_id, checked_out_ds_id])
+            large_shard = self._register_param(dc, graph_id, large_ds_id, [1_048_577], register_graph=False)
+            small_shard = self._register_param(dc, graph_id, small_ds_id, [524_289], register_graph=False)
+            transient_shard = self._register_param(dc, graph_id, transient_ds_id, [262_145], register_graph=False)
+            dc.register_graph_z3(graph_id, [large_ds_id, small_ds_id, transient_ds_id])
 
             gib = 1 << 30
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
 
-            first_view, first_storage = self._gather_view_and_storage(first_shard, graph_id, first_ds_id)
-            self._release(first_view, graph_id, first_ds_id, 1)
-            assert first_storage.nbytes() > 2 << 20
+            # Prime two distinct pool entries, then check both out together so
+            # recovery cannot depend on an all-idle observation.
+            large_view, large_storage = self._gather_view_and_storage(large_shard, graph_id, large_ds_id)
+            small_view, small_storage = self._gather_view_and_storage(small_shard, graph_id, small_ds_id)
+            self._release(large_view, graph_id, large_ds_id, 1)
+            self._release(small_view, graph_id, small_ds_id, 1)
+            large_capacity = large_storage.nbytes()
+            small_capacity = small_storage.nbytes()
+            assert large_capacity > small_capacity
 
-            checked_out_view, checked_out_storage = self._gather_view_and_storage(checked_out_shard, graph_id,
-                                                                                  checked_out_ds_id)
-            assert checked_out_storage.data_ptr() == first_storage.data_ptr()
+            checked_out_large, checked_out_large_storage = self._gather_view_and_storage(
+                large_shard, graph_id, large_ds_id)
+            checked_out_small, checked_out_small_storage = self._gather_view_and_storage(
+                small_shard, graph_id, small_ds_id)
 
             before_pressure = self._pool_state(dc)
-            assert before_pressure["checked_out"] == 1
-            assert before_pressure["charged"] > 2 << 20
+            assert before_pressure["entries"] == 2
+            assert before_pressure["checked_out"] == 2
+            assert before_pressure["charged"] == large_capacity + small_capacity
 
-            # The free-memory target falls to 2 MiB. Isolated retries preserve
-            # the byte-exact working set, and crossing the idle threshold must
-            # never reclaim a checked-out lease.
+            # Isolated retries preserve the byte-exact working set. Crossing
+            # the sustained-pressure threshold latches recovery without
+            # reclaiming either live lease.
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(2, 8 << 20, 8 * gib)
             after_pressure = self._pool_state(dc)
             assert after_pressure["budget"] == before_pressure["charged"]
@@ -263,45 +272,154 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
 
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(3, 8 << 20, 8 * gib)
             after_threshold = self._pool_state(dc)
+            assert after_threshold["entries"] == 2
+            assert after_threshold["checked_out"] == 2
             assert after_threshold["charged"] == before_pressure["charged"]
-            assert after_threshold["idle_pressure_score"] == 3
+            assert after_threshold["idle_pressure_score"] == 0
+            assert after_threshold["pressure_recovery_in_progress"] == 1
             assert after_threshold["pressure_recovery_complete"] == 0
-            self._release(checked_out_view, graph_id, checked_out_ds_id, 1)
-            assert checked_out_storage.nbytes() == before_pressure["charged"]
+            assert after_threshold["pressure_recovery_budget"] == before_pressure["charged"]
 
-            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(4, 8 << 20, 8 * gib)
-            after_idle_pressure = self._pool_state(dc)
-            assert after_idle_pressure["charged"] == 0
-            assert after_idle_pressure["budget"] == before_pressure["charged"]
-            assert after_idle_pressure["enabled"] == 1
-            assert after_idle_pressure["idle_pressure_score"] == 0
-            assert after_idle_pressure["pressure_recovery_complete"] == 1
-            assert after_idle_pressure["pressure_recovery_pending_entries"] == 1
-            assert checked_out_storage.nbytes() == 0
+            # New demand during the drain cannot extend pool ownership or the
+            # captured recovery multiset.
+            transient_view, transient_storage = self._gather_view_and_storage(transient_shard, graph_id,
+                                                                              transient_ds_id)
+            self._release(transient_view, graph_id, transient_ds_id, 1)
+            during_drain = self._pool_state(dc)
+            assert during_drain["entries"] == 2
+            assert during_drain["checked_out"] == 2
+            assert during_drain["pressure_recovery_budget"] == before_pressure["charged"]
+            assert transient_storage.nbytes() == 0
 
-            # Recovery remembers the largest idle buffer identity. The smaller
-            # checked-out gather reused that storage before recovery, but a new
-            # gather of the smaller parameter has a different capacity once the
-            # pool is drained. Its release must be rejected rather than consume
-            # the recovery floor or displace the remembered hot identity.
-            incompatible_view, incompatible_storage = self._gather_view_and_storage(
-                checked_out_shard, graph_id, checked_out_ds_id)
-            assert 0 < incompatible_storage.nbytes() < before_pressure["charged"]
-            self._release(incompatible_view, graph_id, checked_out_ds_id, 1)
-            incompatible_state = self._pool_state(dc)
-            assert incompatible_state["entries"] == 0
-            assert incompatible_state["charged"] == 0
-            assert incompatible_storage.nbytes() == 0
+            # Each final return makes bounded progress. No new pressure sample
+            # or all-idle instant is needed to finish the one-shot drain.
+            self._release(checked_out_small, graph_id, small_ds_id, 1)
+            partial = self._pool_state(dc)
+            assert partial["entries"] == 1
+            assert partial["checked_out"] == 1
+            assert partial["charged"] == large_capacity
+            assert partial["pressure_recovery_in_progress"] == 1
+            assert partial["pressure_recovery_complete"] == 0
+            assert partial["pressure_recovery_pending_entries"] == 1
+            assert checked_out_small_storage.nbytes() == 0
 
-            # Recreate the remembered largest demand gather to verify exact
-            # capacity/dtype/device readmission after the incompatible release.
-            recovered_view, recovered_storage = self._gather_view_and_storage(first_shard, graph_id, first_ds_id)
-            self._release(recovered_view, graph_id, first_ds_id, 1)
+            self._release(checked_out_large, graph_id, large_ds_id, 1)
+            drained = self._pool_state(dc)
+            assert drained["entries"] == 0
+            assert drained["charged"] == 0
+            assert drained["budget"] == before_pressure["charged"]
+            assert drained["enabled"] == 1
+            assert drained["pressure_recovery_in_progress"] == 0
+            assert drained["pressure_recovery_complete"] == 1
+            assert drained["pressure_recovery_pending_entries"] == 2
+            assert checked_out_large_storage.nbytes() == 0
+
+            # The complete typed/capacity/device multiset is admitted again.
+            recovered_small, recovered_small_storage = self._gather_view_and_storage(
+                small_shard, graph_id, small_ds_id)
+            self._release(recovered_small, graph_id, small_ds_id, 1)
+            recovered_large, recovered_large_storage = self._gather_view_and_storage(
+                large_shard, graph_id, large_ds_id)
+            self._release(recovered_large, graph_id, large_ds_id, 1)
             recovered_state = self._pool_state(dc)
-            assert recovered_state["entries"] == 1
+            assert recovered_state["entries"] == 2
             assert recovered_state["charged"] == before_pressure["charged"]
             assert recovered_state["pressure_recovery_pending_entries"] == 0
-            assert recovered_storage.nbytes() == before_pressure["charged"]
+            assert recovered_small_storage.nbytes() == small_capacity
+            assert recovered_large_storage.nbytes() == large_capacity
+        finally:
+            dc.cleanup()
+
+    def test_pressure_recovery_retires_multi_user_lease_only_after_final_return(self):
+        graph_id, ds_id = 9170, 9171
+        dc = self._init_dc(pool_budget=None)
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [1_048_577])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            first_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            self._release(first_view, graph_id, ds_id, 1)
+            held_view, held_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
+            held_capacity = held_storage.nbytes()
+
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+            assert self._pool_state(dc)["pressure_recovery_in_progress"] == 1
+
+            self._release(held_view, graph_id, ds_id, 2)
+            first_return = self._pool_state(dc)
+            assert first_return["entries"] == 1
+            assert first_return["checked_out"] == 1
+            assert first_return["charged"] == held_capacity
+            assert first_return["pressure_recovery_in_progress"] == 1
+            assert held_storage.nbytes() == held_capacity
+
+            self._release(held_view, graph_id, ds_id, 2)
+            final_return = self._pool_state(dc)
+            assert final_return["entries"] == 0
+            assert final_return["charged"] == 0
+            assert final_return["pressure_recovery_in_progress"] == 0
+            assert final_return["pressure_recovery_complete"] == 1
+            assert held_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_pressure_recovery_exclusion_retires_without_phantom_target(self):
+        graph_id, ds_id = 9172, 9173
+        dc = self._init_dc(pool_budget=None)
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [1_048_577])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            first_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            self._release(first_view, graph_id, ds_id, 1)
+            held_view, held_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+
+            dc.set_z3_param_valid_for_test(ds_id, False)
+            torch.ops.dc.prefetch_params_fused.default(graph_id, [shard], [ds_id])
+            self._release(held_view, graph_id, ds_id, 1)
+            excluded = self._pool_state(dc)
+            assert excluded["entries"] == 0
+            assert excluded["charged"] == 0
+            assert excluded["pressure_recovery_in_progress"] == 0
+            assert excluded["pressure_recovery_complete"] == 1
+            assert excluded["pressure_recovery_budget"] == 0
+            assert excluded["pressure_recovery_pending_entries"] == 0
+            assert held_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_pressure_recovery_discard_completes_without_phantom_target(self):
+        graph_id, ds_id = 9174, 9175
+        dc = self._init_dc(pool_budget=None)
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [1_048_577])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            first_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            self._release(first_view, graph_id, ds_id, 1)
+            held_view, held_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
+            held_capacity = held_storage.nbytes()
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+
+            dc.invalidate_gathered_param(ds_id)
+            discarded = self._pool_state(dc)
+            assert discarded["entries"] == 0
+            assert discarded["charged"] == 0
+            assert discarded["pressure_recovery_in_progress"] == 0
+            assert discarded["pressure_recovery_complete"] == 1
+            assert discarded["pressure_recovery_budget"] == 0
+            assert discarded["pressure_recovery_pending_entries"] == 0
+            # Discard drops pool ownership but must not mutate a still-live
+            # profiling alias.
+            assert held_storage.nbytes() == held_capacity
+            del held_view
         finally:
             dc.cleanup()
 
@@ -613,6 +731,54 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         finally:
             dc.cleanup()
 
+    def test_over_cap_recovery_drains_and_selects_largest_fitting_target(self):
+        graph_id, large_ds_id, small_ds_id = 9176, 9177, 9178
+        dc = self._init_dc(pool_budget=None)
+        try:
+            large_shard = self._register_param(dc, graph_id, large_ds_id, [1_048_577], register_graph=False)
+            small_shard = self._register_param(dc, graph_id, small_ds_id, [524_289], register_graph=False)
+            dc.register_graph_z3(graph_id, [large_ds_id, small_ds_id])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            large_view, large_storage = self._gather_view_and_storage(large_shard, graph_id, large_ds_id)
+            small_view, small_storage = self._gather_view_and_storage(small_shard, graph_id, small_ds_id)
+            self._release(large_view, graph_id, large_ds_id, 1)
+            self._release(small_view, graph_id, small_ds_id, 1)
+            large_capacity = large_storage.nbytes()
+            small_capacity = small_storage.nbytes()
+            assert large_capacity > small_capacity
+
+            # total / 32 is a 6 MiB cap. Both non-aligned targets exceed it
+            # together, while the larger target fits by itself.
+            hard_cap = 6 << 20
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 192 << 20)
+            recovered = self._pool_state(dc)
+            assert large_capacity <= hard_cap
+            assert large_capacity + small_capacity > hard_cap
+            assert recovered["entries"] == 0
+            assert recovered["charged"] == 0
+            assert recovered["pressure_recovery_complete"] == 1
+            assert recovered["pressure_recovery_budget"] == large_capacity
+            assert recovered["pressure_recovery_budget"] <= hard_cap
+            assert recovered["pressure_recovery_pending_entries"] == 1
+
+            rejected_small, rejected_small_storage = self._gather_view_and_storage(small_shard, graph_id, small_ds_id)
+            self._release(rejected_small, graph_id, small_ds_id, 1)
+            assert rejected_small_storage.nbytes() == 0
+            assert self._pool_state(dc)["entries"] == 0
+
+            admitted_large, admitted_large_storage = self._gather_view_and_storage(large_shard, graph_id, large_ds_id)
+            self._release(admitted_large, graph_id, large_ds_id, 1)
+            admitted = self._pool_state(dc)
+            assert admitted["entries"] == 1
+            assert admitted["charged"] == large_capacity
+            assert admitted["pressure_recovery_pending_entries"] == 0
+            assert admitted_large_storage.nbytes() == large_capacity
+        finally:
+            dc.cleanup()
+
     def test_recovery_floor_yields_to_hard_cap_before_hot_readmission(self):
         graph_id, ds_id = 9133, 9134
         dc = self._init_dc(pool_budget=None)
@@ -633,12 +799,13 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert recovered["pressure_recovery_budget"] == hot_capacity
             assert recovered["entries"] == 0
 
-            # total / 32 is now 2 MiB. The hard cap must lower the mutable
-            # budget below the remembered floor before a hot release can admit.
+            # total / 32 is now 2 MiB. A remembered target larger than the new
+            # cap is removed so the target multiset remains satisfiable.
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(6, 8 << 20, 64 << 20)
             capped = self._pool_state(dc)
             assert capped["budget"] == 2 << 20
-            assert capped["pressure_recovery_budget"] == hot_capacity
+            assert capped["pressure_recovery_budget"] == 0
+            assert capped["pressure_recovery_pending_entries"] == 0
 
             hot_view, hot_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
             self._release(hot_view, graph_id, ds_id, 1)
@@ -663,17 +830,18 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             hot_capacity = storage.nbytes()
             assert hot_capacity > 2 << 20
 
-            # The 2 MiB hard cap is applied by makeRoom before the recovery
-            # transition. It must reclaim the oversized idle entry, clear the
-            # pressure score, and leave the one-shot recovery latch unused.
+            # The 2 MiB hard cap cannot hold this target. Recovery must still
+            # drain the entry and close its one-shot lifecycle with no target,
+            # rather than waiting forever for a budget-fitting all-idle state.
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 64 << 20)
             capped = self._pool_state(dc)
-            assert capped["budget"] == 2 << 20
+            assert capped["budget"] == 0
             assert capped["charged"] == 0
             assert capped["entries"] == 0
             assert capped["idle_pressure_score"] == 0
-            assert capped["pressure_recovery_complete"] == 0
+            assert capped["pressure_recovery_complete"] == 1
             assert capped["pressure_recovery_budget"] == 0
+            assert capped["pressure_recovery_pending_entries"] == 0
             assert storage.nbytes() == 0
 
             hot_view, hot_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
@@ -681,7 +849,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             after_release = self._pool_state(dc)
             assert after_release["entries"] == 0
             assert after_release["charged"] == 0
-            assert after_release["pressure_recovery_complete"] == 0
+            assert after_release["pressure_recovery_complete"] == 1
             assert hot_storage.nbytes() == 0
         finally:
             dc.cleanup()
@@ -874,5 +1042,39 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert torch.allclose(next_view.sum(), self._expected_view_sum([2049]))
             assert storage.nbytes() > 0
             self._release(next_view, graph_id, next_ds_id, 1)
+        finally:
+            dc.cleanup()
+
+    def test_pressure_recovery_waits_for_recorded_consumer_stream_before_reallocation(self):
+        graph_id, ds_id = 9179, 9180
+        if not hasattr(torch.cuda, "_sleep"):  #ignore-cuda
+            pytest.skip("CUDA sleep helper is unavailable")
+        dc = self._init_dc(pool_budget=None)
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [1_048_577])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            first_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            self._release(first_view, graph_id, ds_id, 1)
+            held_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+
+            result = torch.empty((), device=self._device(), dtype=held_view.dtype)
+            consumer_stream = get_accelerator().Stream()
+            with get_accelerator().stream(consumer_stream):
+                torch.cuda._sleep(int(1e8))  #ignore-cuda
+                result.copy_(held_view.sum())
+                self._release(held_view, graph_id, ds_id, 1, synchronize=False)
+
+            # The next acquire performs the one-shot allocator flush. The
+            # recorded consumer stream must finish before its retired block can
+            # participate in the new gather allocation.
+            next_view, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            get_accelerator().synchronize()
+            assert torch.allclose(result, self._expected_view_sum([1_048_577]))
+            assert torch.allclose(next_view.sum(), self._expected_view_sum([1_048_577]))
+            self._release(next_view, graph_id, ds_id, 1)
         finally:
             dc.cleanup()
