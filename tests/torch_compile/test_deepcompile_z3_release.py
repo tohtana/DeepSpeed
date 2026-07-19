@@ -397,7 +397,9 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert self._pool_state(dc)["charged"] == 0
 
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
-            torch.ops.dc.end_backward.default([], graph_id, True)
+            # Keep a tensor dependency so the dispatcher can materialize the
+            # Any argument; an empty Python list has no inferable element type.
+            torch.ops.dc.end_backward.default([torch.empty(0, device=persistent_view.device)], graph_id, True)
             assert persistent_storage.nbytes() > 0
             assert torch.allclose(persistent_view.sum(), self._expected_view_sum([2049]))
         finally:
