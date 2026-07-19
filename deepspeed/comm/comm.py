@@ -322,6 +322,16 @@ def all_gather_into_tensor(output_tensor,
     return cdb.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=tensor, group=group, async_op=async_op)
 
 
+def try_all_gather_into_tensor_coalesced(output_tensors, input_tensors, group=None):
+    """Try the ProcessGroup list-coalesced all-gather API when the backend supports it."""
+    global cdb
+    if cdb is None or not cdb.is_initialized() or not hasattr(cdb, "try_all_gather_into_tensor_coalesced"):
+        return None
+    return cdb.try_all_gather_into_tensor_coalesced(output_tensors=output_tensors,
+                                                    input_tensors=input_tensors,
+                                                    group=group)
+
+
 def has_all_gather_into_tensor():
     global cdb
     assert cdb is not None and cdb.is_initialized(

@@ -266,6 +266,30 @@ class TorchBackend(Backend):
                                             async_op=async_op)
 
     @disable_compiler_collective
+    def try_all_gather_into_tensor_coalesced(self, output_tensors, input_tensors, group=None):
+        """Try the ProcessGroupNCCL list-coalesced all-gather API."""
+        if torch.distributed.get_debug_level() == torch.distributed.DebugLevel.DETAIL:
+            return None
+
+        if group is None:
+            group = self.get_world_group()
+        if self.get_backend(group) != torch.distributed.Backend.NCCL:
+            return None
+
+        if len(output_tensors) == 0 or len(output_tensors) != len(input_tensors):
+            raise ValueError("coalesced all-gather requires equal non-empty input and output tensor lists")
+
+        all_gather = getattr(group, "all_gather_single_coalesced", None)
+        if all_gather is None:
+            all_gather = getattr(group, "allgather_into_tensor_coalesced", None)
+        if all_gather is None:
+            return None
+
+        opts = torch.distributed.distributed_c10d.AllgatherOptions()
+        opts.asyncOp = True
+        return all_gather(output_tensors, input_tensors, opts)
+
+    @disable_compiler_collective
     def all_gather_base(self, output_tensor, input_tensor, group=None, async_op=False):
         if DS_COMM_ALL_GATHER_OFF:
             if int(os.getenv('RANK', '0')) == 0:

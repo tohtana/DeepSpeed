@@ -1226,11 +1226,14 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.ds_id = Init.param_id
         Init.param_id += 1
 
-        def all_gather(param_list=None, async_op=False, hierarchy=0):
+        def all_gather(param_list=None, async_op=False, hierarchy=0, use_post_step_coalesced_fast_path=False):
             cls = param
             if param_list is None:
                 param_list = [cls]
-            return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
+            return self._all_gather(param_list,
+                                    async_op=async_op,
+                                    hierarchy=hierarchy,
+                                    use_post_step_coalesced_fast_path=use_post_step_coalesced_fast_path)
 
         def _all_gather_dtype(params, world_size, rank_in_group, ds_process_group, allgather_dtype):
             comm_dtypes = [get_allgather_dtype(p, p.ds_tensor) for p in params]
@@ -1626,7 +1629,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             swap_in_flight[0].nvme_swapper.synchronize_reads()
 
     @instrument_w_nvtx
-    def _all_gather(self, param_list, async_op=False, hierarchy=None):
+    def _all_gather(self, param_list, async_op=False, hierarchy=None, use_post_step_coalesced_fast_path=False):
 
         # fetches from nvme if the partition is not available and in nvme
         self._ensure_availability_of_partitioned_params(param_list)
@@ -1660,8 +1663,16 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         else:
                             all_gather_nonquantize_list.append(param)
                     # _allgather_params_coalesced always return None
-                    self._allgather_params_coalesced(all_gather_nonquantize_list, hierarchy, quantize=False)
-                    self._allgather_params_coalesced(all_gather_quantize_list, hierarchy, quantize=True)
+                    self._allgather_params_coalesced(
+                        all_gather_nonquantize_list,
+                        hierarchy,
+                        quantize=False,
+                        use_post_step_coalesced_fast_path=use_post_step_coalesced_fast_path)
+                    self._allgather_params_coalesced(
+                        all_gather_quantize_list,
+                        hierarchy,
+                        quantize=True,
+                        use_post_step_coalesced_fast_path=use_post_step_coalesced_fast_path)
             for param in all_gather_list:
                 param.ds_status = ZeroParamStatus.AVAILABLE
             return None
@@ -1923,7 +1934,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.data = replicated_tensor.data
         return handle
 
-    def _allgather_params_coalesced(self, param_list, hierarchy=0, quantize=False):
+    def _allgather_params_coalesced(self,
+                                    param_list,
+                                    hierarchy=0,
+                                    quantize=False,
+                                    use_post_step_coalesced_fast_path=False):
         """ blocking call
         avoid explicit memory copy in _allgather_params
         """
@@ -1969,7 +1984,18 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         # launch
         launch_handles = []
         launch_quantize_handles = []
+        coalesced_handle = None
+        if (use_post_step_coalesced_fast_path and len(param_list) > 1 and not quantize
+                and self.use_all_gather_into_tensor):
+            coalesced_handle = dist.try_all_gather_into_tensor_coalesced(
+                allgather_params, [local_tensor.view(-1) for local_tensor in local_tensors],
+                group=self.get_partition_dp_group(param_list[0]))
+
+        if coalesced_handle is not None:
+            launch_handles.append(coalesced_handle)
         for param_idx, param in enumerate(param_list):
+            if coalesced_handle is not None:
+                break
             input_tensor = local_tensors[param_idx].view(-1)
 
             if self.use_all_gather_into_tensor:

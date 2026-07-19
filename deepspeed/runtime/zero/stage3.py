@@ -2509,7 +2509,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         #Gathering persisting parameters
         if len(self.persistent_parameters) > 0:
-            self.persistent_parameters[0].all_gather(self.persistent_parameters)
+            self.persistent_parameters[0].all_gather(self.persistent_parameters,
+                                                     use_post_step_coalesced_fast_path=True)
 
         if self.swap_optimizer:
             self.optimizer_swapper.log_timers()
