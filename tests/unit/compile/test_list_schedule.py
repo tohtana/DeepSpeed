@@ -712,6 +712,12 @@ def test_zero3_final_schedule_fingerprint_detects_rank_mismatch(monkeypatch):
     monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, "1")
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(zero3_compile_mod, "get_accelerator", lambda: SimpleNamespace(current_device=lambda: "cpu"))
+    messages = []
+    monkeypatch.setattr(
+        zero3_compile_mod,
+        "_print_scheduler_debug",
+        lambda message, process_group=None: messages.append(message),
+    )
 
     def reduce_mismatched_fingerprints(value, op):
         value[0] = 1 if op == zero3_compile_mod.dist.ReduceOp.MIN else 2
@@ -722,6 +728,7 @@ def test_zero3_final_schedule_fingerprint_detects_rank_mismatch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="final schedule fingerprint mismatch"):
         zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=7, bwd=False)
+    assert any("collective_schedule_projection" in message for message in messages)
 
 
 def test_zero3_final_schedule_fingerprint_is_safe_without_distributed(monkeypatch, capsys):
@@ -735,7 +742,50 @@ def test_zero3_final_schedule_fingerprint_is_safe_without_distributed(monkeypatc
     fingerprint = zero3_compile_mod._validate_final_schedule_fingerprint(graph, graph_id=8, bwd=True)
 
     assert fingerprint == zero3_compile_mod._final_schedule_fingerprint(graph)
-    assert "final_schedule_fingerprint" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "collective_schedule_projection" in output
+    assert "final_schedule_fingerprint" in output
+
+
+def test_zero3_collective_schedule_projection_ignores_names_and_graph_ids():
+
+    def make_graph(graph_id, name):
+        graph = Graph()
+        param = _placeholder(graph, f"{name}_param")
+        gather = _with_meta(
+            graph.call_function(torch.ops.dc.allgather_param.default, (param, graph_id, 17), name=f"{name}_gather"))
+        wait = _with_meta(
+            graph.call_function(torch.ops.dc.wait_allgather.default, (gather, graph_id, 17), name=f"{name}_wait"))
+        release = _with_meta(
+            graph.call_function(torch.ops.dc.release_param.default, (wait, graph_id, 17, 1), name=f"{name}_release"))
+        graph.output(release)
+        return graph
+
+    first_projection = zero3_compile_mod._collective_schedule_projection(make_graph(1, "first"))
+    second_projection = zero3_compile_mod._collective_schedule_projection(make_graph(999, "second"))
+
+    assert first_projection == [("gather", 17), ("release", 17)]
+    assert second_projection == first_projection
+    assert (zero3_compile_mod._collective_schedule_fingerprint(first_projection) ==
+            zero3_compile_mod._collective_schedule_fingerprint(second_projection))
+
+
+def test_zero3_collective_schedule_projection_detects_order_divergence():
+    graph = Graph()
+    first_param = _placeholder(graph, "first_param")
+    second_param = _placeholder(graph, "second_param")
+    first_gather = _allgather(graph, first_param, 17, "first")
+    second_gather = _allgather(graph, second_param, 23, "second")
+    first_release = _release(graph, first_gather, 17, "first")
+    second_release = _release(graph, second_gather, 23, "second")
+    graph.output((first_release, second_release))
+
+    projection = zero3_compile_mod._collective_schedule_projection(graph)
+    reordered = [projection[1], projection[0], *projection[2:]]
+
+    assert projection[:2] == [("gather", 17), ("gather", 23)]
+    assert (zero3_compile_mod._collective_schedule_fingerprint(projection)
+            != zero3_compile_mod._collective_schedule_fingerprint(reordered))
 
 
 def test_zero3_final_schedule_fingerprint_is_absent_when_debug_is_disabled(monkeypatch):

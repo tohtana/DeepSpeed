@@ -5,6 +5,7 @@
 
 import gc
 import hashlib
+import json
 import os
 from typing import List, Dict, Tuple
 import _operator
@@ -135,18 +136,47 @@ def _final_schedule_fingerprint(graph: Graph):
     return int.from_bytes(digest[:8], byteorder="big") & ((1 << 63) - 1)
 
 
+def _collective_schedule_projection(graph: Graph):
+    """Return the ordered gather/release identities, excluding graph-local names and IDs."""
+    entries = []
+    for node in graph.nodes:
+        if node.target == torch.ops.dc.allgather_param.default:
+            kind = "gather"
+        elif node.target == torch.ops.dc.release_param.default:
+            kind = "release"
+        else:
+            continue
+        if len(node.args) < 3 or not isinstance(node.args[2], int):
+            raise RuntimeError(f"DeepCompile ZeRO-3 {kind} node has no stable integer ds_id: {node.format_node()}")
+        entries.append((kind, node.args[2]))
+    return entries
+
+
+def _collective_schedule_fingerprint(projection):
+    payload = json.dumps(projection, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool, process_group=None):
     """In scheduler debug mode, fail every rank when final graph order diverges."""
     if not _scheduler_debug_enabled():
         return None
 
     fingerprint = _final_schedule_fingerprint(graph)
+    collective_projection = _collective_schedule_projection(graph)
+    collective_fingerprint = _collective_schedule_fingerprint(collective_projection)
+    collective_message = ("DeepCompile ZeRO-3 collective_schedule_projection "
+                          f"graph_id={graph_id} bwd={bwd} value={collective_fingerprint} "
+                          f"entries={len(collective_projection)} sequence="
+                          f"{json.dumps(collective_projection, separators=(',', ':'))}")
     if not dist.is_initialized():
+        _print_scheduler_debug(collective_message, process_group)
         _print_scheduler_debug(
             f"DeepCompile ZeRO-3 final_schedule_fingerprint graph_id={graph_id} bwd={bwd} value={fingerprint}",
             process_group)
         return fingerprint
 
+    _print_scheduler_debug(collective_message, process_group)
     device = torch.device(get_accelerator().current_device())
     min_fingerprint = torch.tensor([fingerprint], device=device, dtype=torch.int64)
     max_fingerprint = min_fingerprint.clone()
