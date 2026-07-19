@@ -365,6 +365,44 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         finally:
             dc.cleanup()
 
+    def test_selective_persistence_detaches_reused_storage_from_pool_accounting(self):
+        graph_id, second_graph_id, pooled_ds_id, persistent_ds_id = 91006, 91007, 91008, 91009
+        dc = self._init_dc(pool_budget=None)
+        try:
+            pooled_shard = self._register_param(dc, graph_id, pooled_ds_id, [4097], register_graph=False)
+            persistent_shard = self._register_param(dc, graph_id, persistent_ds_id, [2049], register_graph=False)
+            dc.register_graph_z3(graph_id, [pooled_ds_id, persistent_ds_id])
+            dc.register_graph_z3(second_graph_id, [persistent_ds_id])
+            gib = 1 << 30
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(0, gib, 8 * gib)
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(1, gib, 8 * gib)
+
+            pooled_view, pooled_storage = self._gather_view_and_storage(pooled_shard, graph_id, pooled_ds_id)
+            pooled_ptr = pooled_storage.data_ptr()
+            self._release(pooled_view, graph_id, pooled_ds_id, 1)
+            assert self._pool_state(dc)["entries"] == 1
+
+            dc.set_persistent(persistent_ds_id)
+            persistent_view, persistent_storage = self._gather_view_and_storage(persistent_shard, graph_id,
+                                                                                persistent_ds_id)
+            detached = self._pool_state(dc)
+            assert persistent_storage.data_ptr() == pooled_ptr
+            assert persistent_storage.nbytes() > 0
+            assert detached["entries"] == 0
+            assert detached["checked_out"] == 0
+            assert detached["charged"] == 0
+
+            dc.set_persistent(persistent_ds_id)
+            assert persistent_storage.nbytes() > 0
+            assert self._pool_state(dc)["charged"] == 0
+
+            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(5, 8 << 20, 8 * gib)
+            torch.ops.dc.end_backward.default([], graph_id, True)
+            assert persistent_storage.nbytes() > 0
+            assert torch.allclose(persistent_view.sum(), self._expected_view_sum([2049]))
+        finally:
+            dc.cleanup()
+
     def test_pressure_recovery_exclusion_retires_without_phantom_target(self):
         graph_id, ds_id = 9172, 9173
         dc = self._init_dc(pool_budget=None)

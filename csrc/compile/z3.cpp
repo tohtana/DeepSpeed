@@ -1199,13 +1199,22 @@ void set_persistent(long ds_id)
 
     // Allocate buffer here
     // Memory fragmentation will be more severe if we allocate in forward/backward
+    auto gather_buffer_pool = get_gather_buffer_pool();
+    bool gathered = false;
     for (auto& it : executors) {
         if (it.second->hasParam(ds_id)) {
             auto executor = getExecutor<Z3CustomOpExecutor>(it.first, executors);
             auto dtype = param_registry->getParam(ds_id).getDtype();
             executor->allgatherParam(ds_id, dtype, symm_mem);
+            gathered = true;
         }
     }
+    // Selective unsharding owns persistent storage for the remainder of the
+    // compiled lifecycle. If the initial gather reused a demand-pool entry,
+    // transfer that storage out of pool accounting without freeing it so
+    // pressure recovery cannot wait forever for a release that persistent
+    // parameters intentionally never issue.
+    if (gathered) { gather_buffer_pool->discard(param_registry->getGatheredParam(ds_id)); }
 }
 
 void prefetch_params_fused(long graph_id,
