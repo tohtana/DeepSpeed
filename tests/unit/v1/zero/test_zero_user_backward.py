@@ -233,6 +233,25 @@ def assert_all_partitioned(model_engine, zero_stage, step_info=""):
             f"Parameter {name} not partitioned after backward (status={param.ds_status}){step_suffix}"
 
 
+def assert_checkpoint_state_clean(model_engine, zero_stage, step_info=""):
+    """Assert checkpoint replay left no module, token, or parameter ownership behind."""
+    if zero_stage != 3:
+        return
+    step_suffix = f" at {step_info}" if step_info else ""
+    coordinator = model_engine.optimizer.parameter_offload.get_param_coordinator()
+    assert not coordinator.has_active_backward_submodules(), \
+        f"ZeRO coordinator retained an active backward module{step_suffix}"
+    assert not coordinator.has_deferred_releases(), \
+        f"ZeRO coordinator retained a deferred checkpoint release{step_suffix}"
+    for module_name, module in model_engine.module.named_modules():
+        recompute_parameters = getattr(module, "ds_recompute_parameters", set())
+        assert not recompute_parameters, \
+            f"Module {module_name or '<root>'} retained recompute parameters{step_suffix}"
+    for name, param in model_engine.module.named_parameters():
+        assert not param.ds_active_sub_modules, \
+            f"Parameter {name} retained active ZeRO owners {sorted(param.ds_active_sub_modules)}{step_suffix}"
+
+
 def run_frozen_checkpoint_comparison(model_cls,
                                      zero_stage,
                                      use_reentrant,
@@ -241,6 +260,7 @@ def run_frozen_checkpoint_comparison(model_cls,
                                      leaf_module_types=None,
                                      dtype=torch.float32,
                                      param_persistence_threshold=0,
+                                     hidden_dim=_FROZEN_HIDDEN_DIM,
                                      **model_kwargs):
     """Shared driver for the frozen-param + checkpoint regression tests.
 
@@ -248,7 +268,6 @@ def run_frozen_checkpoint_comparison(model_cls,
     reference, (3) ZeRO-3 releases every non-persistent param after backward.
     param_persistence_threshold toggles the persistent vs non-persistent frozen path.
     """
-    hidden_dim = _FROZEN_HIDDEN_DIM
     batch_size = 2
 
     device, rank, _ = initialize_distributed()
@@ -306,6 +325,7 @@ def run_frozen_checkpoint_comparison(model_cls,
 
         # Frozen params must be released (partitioned) after every backward, not left gathered.
         assert_all_partitioned(model_engine, zero_stage, step_info)
+        assert_checkpoint_state_clean(model_engine, zero_stage, step_info)
 
         model_engine.step()
         optimizer_ddp.step()
@@ -1662,6 +1682,65 @@ class LoRAStyleFrozenModel(torch.nn.Module):
         return self.head(x)
 
 
+class QwenPeftRMSNormModel(torch.nn.Module):
+    """Distilled Qwen/PEFT checkpoint topology with frozen 1024- and 128-wide norms."""
+
+    class RMSNorm(torch.nn.Module):
+
+        def __init__(self, hidden_dim, eps=1e-6):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(hidden_dim), requires_grad=False)
+            self.variance_epsilon = eps
+
+        def forward(self, hidden_states):
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.square().mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+
+    class PeftProjection(torch.nn.Module):
+
+        def __init__(self, hidden_dim, rank):
+            super().__init__()
+            self.base = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.base.weight.requires_grad_(False)
+            self.lora_a = torch.nn.Linear(hidden_dim, rank, bias=False)
+            self.lora_b = torch.nn.Linear(rank, hidden_dim, bias=False)
+
+        def forward(self, hidden_states):
+            return self.base(hidden_states) + self.lora_b(self.lora_a(hidden_states))
+
+    def __init__(self, hidden_dim, head_dim=128, rank=8, use_reentrant=False):
+        super().__init__()
+        assert hidden_dim % head_dim == 0
+        self.hidden_dim = hidden_dim
+        self.head_dim = head_dim
+        self.use_reentrant = use_reentrant
+        self.input_layernorm = self.RMSNorm(hidden_dim)
+        self.q_proj = self.PeftProjection(hidden_dim, rank)
+        self.k_proj = self.PeftProjection(hidden_dim, rank)
+        self.q_norm = self.RMSNorm(head_dim)
+        self.k_norm = self.RMSNorm(head_dim)
+        self.output = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def _checkpointed_block(self, hidden_states):
+        hidden_states = self.input_layernorm(hidden_states)
+        q_states = self.q_proj(hidden_states).view(-1, self.hidden_dim // self.head_dim, self.head_dim)
+        k_states = self.k_proj(hidden_states).view(-1, self.hidden_dim // self.head_dim, self.head_dim)
+        q_states = self.q_norm(q_states).reshape(-1, self.hidden_dim)
+        k_states = self.k_norm(k_states).reshape(-1, self.hidden_dim)
+        return torch.tanh(q_states + k_states)
+
+    def forward(self, hidden_states):
+        if self.training:
+            from torch.utils.checkpoint import checkpoint
+            hidden_states = checkpoint(self._checkpointed_block, hidden_states, use_reentrant=self.use_reentrant)
+        else:
+            hidden_states = self._checkpointed_block(hidden_states)
+        return self.output(hidden_states)
+
+
 class MultiTensorLeafBlock(torch.nn.Module):
     """Leaf block with a frozen norm that returns multiple tensors.
 
@@ -1730,6 +1809,20 @@ class TestZeroFrozenParamCheckpointingVariants(DistributedTest):
                                          use_reentrant,
                                          dtype=dtype,
                                          param_persistence_threshold=param_persistence_threshold)
+
+
+class TestZeroQwenPeftCheckpointLifecycle(DistributedTest):
+    """Regression for the Qwen RMSNorm metadata mismatch seen in the HF Trainer MRE."""
+
+    world_size = 2
+
+    def test_nonreentrant_frozen_rmsnorm_release_boundary(self):
+        run_frozen_checkpoint_comparison(QwenPeftRMSNormModel,
+                                         zero_stage=3,
+                                         use_reentrant=False,
+                                         hidden_dim=1024,
+                                         head_dim=128,
+                                         param_persistence_threshold=4096)
 
 
 @pytest.mark.parametrize("param_persistence_threshold", [0, _FROZEN_HIDDEN_DIM], ids=["nopersist", "persist"])
