@@ -514,7 +514,10 @@ class DeepSpeedZeRoOffload(object):
 
                     actual_external_param.all_gather()
 
-            self.post_sub_module_forward_function(module)
+            if forward_failed and torch._C._current_graph_task_id() != -1:
+                self.get_param_coordinator().defer_forward_exception(module)
+            else:
+                self.post_sub_module_forward_function(module)
             if forward_failed and module is self.module:
                 self.release_backward_leftovers()
 
