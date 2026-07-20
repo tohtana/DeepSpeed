@@ -88,6 +88,18 @@ class PartitionedParameterCoordinator:
         param: Parameter
         step_id_last_used_at: int
 
+    class __DeferredRelease:
+        """One checkpoint replay invocation awaiting its activation boundary."""
+
+        __slots__ = ("active", "free_data", "params", "pending_boundaries", "token")
+
+        def __init__(self, token: int, pending_boundaries: int):
+            self.active = True
+            self.free_data = True
+            self.params = set()
+            self.pending_boundaries = pending_boundaries
+            self.token = token
+
     def __init__(
         self,
         prefetch_bucket_sz: int,
@@ -159,6 +171,9 @@ class PartitionedParameterCoordinator:
         self.__leaf_module_lock = threading.Lock()
         # In-progress backward submodules keyed by ds_id; a dict (not LIFO deque) lets release remove the specific module, since multi-tensor z3-leaf hooks fire out of reverse-forward order.
         self.__active_backward_submodules: Dict[int, Module] = {}
+        self.__deferred_release_lock = threading.Lock()
+        self.__deferred_releases: Dict[int, __class__.__DeferredRelease] = {}
+        self.__next_deferred_release_token = -1
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -308,7 +323,7 @@ class PartitionedParameterCoordinator:
     @compiler.disable
     @instrument_w_nvtx
     @torch.no_grad()
-    def fetch_sub_module(self, current_submodule: Module, forward: bool) -> None:
+    def fetch_sub_module(self, current_submodule: Module, forward: bool, deferred_release=None) -> None:
         """This method does the following (in order):
         1. kick off fetch for parameters in immediately required sub module
         2. kick off fetch for next few parameters we will need later (prefetch)
@@ -342,7 +357,7 @@ class PartitionedParameterCoordinator:
             self.__active_backward_submodules[current_submodule.ds_id] = current_submodule
 
         try:
-            self._fetch_sub_module_impl(current_submodule, forward, is_leaf)
+            self._fetch_sub_module_impl(current_submodule, forward, is_leaf, deferred_release)
         finally:
             if needs_sync:
                 # Signal that we're done fetching this leaf module and remove the event
@@ -351,7 +366,11 @@ class PartitionedParameterCoordinator:
                     if event is not None:
                         event.set()
 
-    def _fetch_sub_module_impl(self, current_submodule: Module, forward: bool, is_leaf: bool) -> None:
+    def _fetch_sub_module_impl(self,
+                               current_submodule: Module,
+                               forward: bool,
+                               is_leaf: bool,
+                               deferred_release=None) -> None:
         """Implementation of fetch_sub_module, separated for thread synchronization."""
         if logger.isEnabledFor(logging.DEBUG):
             debug_rank0(
@@ -390,8 +409,11 @@ class PartitionedParameterCoordinator:
         in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
-            if in_checkpoint_recompute and self.__active_backward_submodules:
-                update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
+            if in_checkpoint_recompute:
+                if self.__active_backward_submodules:
+                    update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
+                free_data = not is_leaf or not self.fast_sharding_for_leaf_module
+                self._attach_deferred_release(deferred_release, param, free_data)
 
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
@@ -531,10 +553,98 @@ class PartitionedParameterCoordinator:
                     # empty buffer ensures that all computations are complete
                     param.data = empty_buffer
 
+    def has_active_backward_submodules(self) -> bool:
+        return bool(self.__active_backward_submodules)
+
+    def has_deferred_releases(self) -> bool:
+        with self.__deferred_release_lock:
+            return bool(self.__deferred_releases)
+
+    def begin_deferred_release(self, pending_boundaries: int):
+        """Create a unique owner for one frozen checkpoint replay invocation."""
+        if pending_boundaries < 0:
+            raise ValueError("pending_boundaries must be non-negative")
+        with self.__deferred_release_lock:
+            token = self.__next_deferred_release_token
+            self.__next_deferred_release_token -= 1
+            deferred_release = __class__.__DeferredRelease(token, pending_boundaries)
+            self.__deferred_releases[token] = deferred_release
+        return deferred_release
+
+    @torch.no_grad()
+    def cancel_deferred_release(self, deferred_release) -> None:
+        """Discard an invocation whose activation-boundary binding failed."""
+        params = ()
+        free_data = True
+        with self.__deferred_release_lock:
+            if not deferred_release.active:
+                return
+            deferred_release.active = False
+            self.__deferred_releases.pop(deferred_release.token, None)
+            params = tuple(deferred_release.params)
+            free_data = deferred_release.free_data
+            for param in params:
+                param.ds_active_sub_modules.discard(deferred_release.token)
+        for param in params:
+            self.__release_param(param, free_data)
+
+    def _attach_deferred_release(self, deferred_release, param: Parameter, free_data: bool) -> None:
+        """Protect only otherwise-releasable frozen replay parameters."""
+        if (deferred_release is None or param.requires_grad or param.ds_persist or param.is_external_param):
+            return
+        with self.__deferred_release_lock:
+            if not deferred_release.active or deferred_release.token not in self.__deferred_releases:
+                raise RuntimeError("ZeRO-3 deferred release is no longer active")
+            deferred_release.params.add(param)
+            deferred_release.free_data = deferred_release.free_data and free_data
+            param.ds_active_sub_modules.add(deferred_release.token)
+
+    @torch.no_grad()
+    def finish_deferred_release(self, deferred_release) -> None:
+        """Retire one invocation from its activation-input multi-grad callback."""
+        params = ()
+        free_data = True
+        with self.__deferred_release_lock:
+            if not deferred_release.active:
+                return
+            if deferred_release.pending_boundaries < 1:
+                raise RuntimeError("ZeRO-3 deferred release has no activation boundary")
+            deferred_release.pending_boundaries -= 1
+            if deferred_release.pending_boundaries:
+                return
+            deferred_release.active = False
+            self.__deferred_releases.pop(deferred_release.token, None)
+            params = tuple(deferred_release.params)
+            free_data = deferred_release.free_data
+            for param in params:
+                param.ds_active_sub_modules.discard(deferred_release.token)
+        for param in params:
+            self.__release_param(param, free_data)
+
+    @torch.no_grad()
+    def _release_deferred_leftovers(self) -> None:
+        """Release invocation records missed by local activation boundaries."""
+        params_to_release = set()
+        free_data_by_param = {}
+        with self.__deferred_release_lock:
+            deferred_releases = tuple(self.__deferred_releases.values())
+            self.__deferred_releases.clear()
+            for deferred_release in deferred_releases:
+                if not deferred_release.active:
+                    continue
+                deferred_release.active = False
+                for param in deferred_release.params:
+                    param.ds_active_sub_modules.discard(deferred_release.token)
+                    params_to_release.add(param)
+                    free_data_by_param[param] = (free_data_by_param.get(param, True) and deferred_release.free_data)
+        for param in params_to_release:
+            self.__release_param(param, free_data_by_param[param])
+
     @instrument_w_nvtx
     @torch.no_grad()
     def release_and_reset_all(self, module: Module) -> None:
         """release all module parameters"""
+        self.release_backward_leftovers()
         for param in iter_params(module, recurse=True):
             if param in self.__inflight_param_registry:
                 self.__inflight_param_registry.pop(param).wait()
@@ -563,6 +673,7 @@ class PartitionedParameterCoordinator:
                 param.ds_active_sub_modules.discard(submodule.ds_id)
                 if not param.ds_persist and not param.is_external_param:
                     self.__release_param(param)
+        self._release_deferred_leftovers()
 
     @instrument_w_nvtx
     def __all_gather_params(self, params: Set[Parameter], forward: bool) -> None:

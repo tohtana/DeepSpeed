@@ -6,6 +6,9 @@
 import sys
 import torch
 from collections import OrderedDict
+import threading
+from torch.autograd.graph import _get_grad_fn_or_grad_acc, register_multi_grad_hook
+from torch.utils._pytree import tree_flatten
 from deepspeed.utils import z3_leaf_module, set_z3_leaf_module
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.runtime.zero.utils import apply_to_tensors_only, is_zero_param
@@ -17,6 +20,19 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed import utils
 
 FWD_MODULE_STACK = list()
+
+
+class _FrozenForwardBoundary:
+    """One frozen-module activation boundary awaiting its last consumer."""
+
+    __slots__ = ("active", "deferred_releases", "grad_nodes", "handle", "pending_boundaries")
+
+    def __init__(self, pending_boundaries, grad_nodes=()):
+        self.active = True
+        self.deferred_releases = []
+        self.grad_nodes = grad_nodes
+        self.handle = None
+        self.pending_boundaries = pending_boundaries
 
 
 #for each tensor in outputs run the forward_function and register backward_function as hook
@@ -143,6 +159,10 @@ class DeepSpeedZeRoOffload(object):
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
 
         self.module = module
+        self._has_frozen_params = any(not param.requires_grad for param in module.parameters())
+        if self._has_frozen_params:
+            self._frozen_boundary_lock = threading.Lock()
+            self._frozen_boundaries = set()
         self.timers = timers
         self.zenflow = zenflow
         self.dtype = list(module.parameters())[0].dtype
@@ -219,6 +239,7 @@ class DeepSpeedZeRoOffload(object):
         """Partitioning Parameters that were not partitioned usually if parameters
         of modules whose input parameters do not require grad computation do not
         trigger post call and will therefore will remain unpartitioned"""
+        self.release_backward_leftovers()
         self.get_param_coordinator().release_and_reset_all(self.module)
         for param in iter_params(self.module, recurse=True):
             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
@@ -228,9 +249,99 @@ class DeepSpeedZeRoOffload(object):
         """Release params of submodules whose post-backward hook never fired (e.g. modules
         fed a no-grad input). Cheap no-op when the backward stack is already empty."""
         self.get_param_coordinator().release_backward_leftovers()
+        if self._has_frozen_params:
+            self._clear_frozen_boundaries()
 
     def get_param_coordinator(self):
         return self.param_coordinator
+
+    @property
+    def has_frozen_params(self):
+        return self._has_frozen_params
+
+    def _new_frozen_boundary(self, input_tensors, pending_boundaries):
+        """Register one activation-input completion boundary."""
+        with torch.enable_grad():
+            grad_nodes = tuple(_get_grad_fn_or_grad_acc(tensor) for tensor in input_tensors)
+        boundary = _FrozenForwardBoundary(pending_boundaries, grad_nodes)
+
+        def finish_boundary(unused_grads):
+            deferred_releases = []
+            hook_handle = None
+            with self._frozen_boundary_lock:
+                if not boundary.active:
+                    return
+                boundary.active = False
+                self._frozen_boundaries.discard(boundary)
+                if boundary in pending_boundaries:
+                    pending_boundaries.remove(boundary)
+                deferred_releases = boundary.deferred_releases
+                boundary.deferred_releases = []
+                hook_handle = boundary.handle
+                boundary.handle = None
+            try:
+                for deferred_release in deferred_releases:
+                    self.get_param_coordinator().finish_deferred_release(deferred_release)
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+
+        hook_handle = None
+        try:
+            if input_tensors:
+                hook_handle = register_multi_grad_hook(input_tensors, finish_boundary)
+                boundary.handle = hook_handle
+            with self._frozen_boundary_lock:
+                pending_boundaries.append(boundary)
+                self._frozen_boundaries.add(boundary)
+        except Exception:
+            if hook_handle is not None:
+                hook_handle.remove()
+            raise
+        return boundary
+
+    def _register_frozen_boundary(self, input_tensors, pending_boundaries):
+        """Record an ordinary-forward activation boundary for checkpoint replay."""
+        self._new_frozen_boundary(input_tensors, pending_boundaries)
+
+    def _bind_frozen_boundary(self, pending_boundaries):
+        """Bind one replay invocation to every executable activation boundary."""
+        boundaries = []
+        with self._frozen_boundary_lock:
+            for boundary in reversed(pending_boundaries):
+                if (boundary.active and boundary.grad_nodes
+                        and any(torch._C._will_engine_execute_node(node) for node in boundary.grad_nodes)):
+                    boundaries.append(boundary)
+
+        coordinator = self.get_param_coordinator()
+        deferred_release = coordinator.begin_deferred_release(len(boundaries))
+        try:
+            with self._frozen_boundary_lock:
+                if any(not boundary.active for boundary in boundaries):
+                    raise RuntimeError("ZeRO-3 frozen replay boundary completed before binding")
+                for boundary in boundaries:
+                    boundary.deferred_releases.append(deferred_release)
+        except Exception:
+            coordinator.cancel_deferred_release(deferred_release)
+            raise
+        return deferred_release
+
+    def _clear_frozen_boundaries(self):
+        hook_handles = []
+        with self._frozen_boundary_lock:
+            boundaries = self._frozen_boundaries
+            self._frozen_boundaries = set()
+            for boundary in boundaries:
+                if not boundary.active:
+                    continue
+                boundary.active = False
+                boundary.deferred_releases = []
+                if boundary.handle is not None:
+                    hook_handles.append(boundary.handle)
+                    boundary.handle = None
+                boundary.pending_boundaries.clear()
+        for hook_handle in hook_handles:
+            hook_handle.remove()
 
     def empty_partition_cache(self):
         self.partition_all_parameters()
@@ -271,6 +382,9 @@ class DeepSpeedZeRoOffload(object):
         for hook in self.backward_hooks:
             hook.remove()
 
+        if self._has_frozen_params:
+            self._clear_frozen_boundaries()
+
         self.fwd_pre_hook.remove()
 
         print_rank_0(f'Deleted module hooks: forward = {num_forward_hooks}, backward = {num_backward_hooks}',
@@ -283,6 +397,7 @@ class DeepSpeedZeRoOffload(object):
         @instrument_w_nvtx
         def _start_of_forward_hook(module, *args):
 
+            self.release_backward_leftovers()
             self.get_param_coordinator().reset_step()
 
         self.fwd_pre_hook = self.module.register_forward_pre_hook(_start_of_forward_hook)
@@ -324,6 +439,11 @@ class DeepSpeedZeRoOffload(object):
         my_count = count[0]
         module.ds_id = my_count
         module.ds_recompute_parameters = set()
+        module_has_frozen_params = any(not param.requires_grad
+                                       for param in iter_params(module, recurse=z3_leaf_module(module)))
+        pending_forward_boundaries = [] if module_has_frozen_params else None
+        if module_has_frozen_params:
+            module._ds_frozen_forward_boundaries = pending_forward_boundaries
 
         #print(f"{module.__class__} : {module.ds_id}")
 
@@ -337,12 +457,26 @@ class DeepSpeedZeRoOffload(object):
 
         @torch.compiler.disable
         def _pre_forward_module_hook(module, *args):
-            self.pre_sub_module_forward_function(module)
+            deferred_release = None
+            if module_has_frozen_params:
+                input_tensors = tuple(obj for obj in tree_flatten(args)[0]
+                                      if torch.is_tensor(obj) and obj.requires_grad)
+                if torch._C._current_graph_task_id() == -1:
+                    self._register_frozen_boundary(input_tensors, pending_forward_boundaries)
+                else:
+                    deferred_release = self._bind_frozen_boundary(pending_forward_boundaries)
+            self.pre_sub_module_forward_function(module, deferred_release=deferred_release)
 
         @instrument_w_nvtx
         def _post_forward_module_hook(module, input, output):
 
             global FWD_MODULE_STACK
+            # ``always_call`` also runs when an earlier pre-hook failed before
+            # ZeRO acquired this invocation. Only unwind invocations whose
+            # ZeRO pre-hook actually pushed the module.
+            if not FWD_MODULE_STACK or FWD_MODULE_STACK[-1] is not module:
+                return
+            forward_failed = output is None
             FWD_MODULE_STACK.pop()
             if output is None:
                 output = []
@@ -381,6 +515,8 @@ class DeepSpeedZeRoOffload(object):
                     actual_external_param.all_gather()
 
             self.post_sub_module_forward_function(module)
+            if forward_failed and module is self.module:
+                self.release_backward_leftovers()
 
         def _bwd_hook_unexpected_inputs_msg(value):
             return f"A module has unknown inputs or outputs type ({type(value)}) and the tensors embedded in it cannot be detected. " \
@@ -425,7 +561,7 @@ class DeepSpeedZeRoOffload(object):
         self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))
 
         # Post forward hook
-        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
+        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook, always_call=True))
 
         # Pre backward hook
         if not hasattr(module, "pre_bwd_fn"):
@@ -506,7 +642,7 @@ class DeepSpeedZeRoOffload(object):
         self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
 
     @torch.no_grad()
-    def pre_sub_module_forward_function(self, sub_module):
+    def pre_sub_module_forward_function(self, sub_module, deferred_release=None):
         see_memory_usage(
             f"Before sub module forward function {sub_module.__class__.__name__} {sub_module.ds_id=} before fetch",
             force=False)
@@ -518,7 +654,7 @@ class DeepSpeedZeRoOffload(object):
         param_coordinator.trace_prologue(sub_module)
         if param_coordinator.is_record_trace():
             param_coordinator.record_module(sub_module)
-        param_coordinator.fetch_sub_module(sub_module, forward=True)
+        param_coordinator.fetch_sub_module(sub_module, forward=True, deferred_release=deferred_release)
 
         if self.zenflow:
             params_to_fetch = set(iter_params(sub_module, recurse=z3_leaf_module(sub_module)))

@@ -3,7 +3,6 @@
 
 # DeepSpeed Team
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
@@ -15,14 +14,6 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 from unit.common import DistributedTest
 from unit.v1.zero.test_zero_user_backward import get_config_dict, initialize_distributed
-
-# These two frozen params are released at the recompute owner-module / engine-epilogue boundary
-# rather than at each param's true last use, so they stay gathered until then. Correct and
-# leak-free, but not prompt; prompt per-param recompute release is a follow-up.
-_RECOMPUTE_RELEASE_TIMING = pytest.mark.xfail(
-    reason="Recompute params release at the owner-module/epilogue boundary, not at each frozen "
-    "param's last use, so they stay gathered until then (follow-up).",
-    strict=False)
 
 
 class _StatusProbe:
@@ -213,21 +204,31 @@ class _EarlyStopCheckpointModel(torch.nn.Module):
         return self.head(value)
 
 
+class _FrozenRecomputeExceptionLinear(torch.nn.Linear):
+
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim, hidden_dim)
+        self.weight.requires_grad_(False)
+        self.bias.requires_grad_(False)
+        self.raise_during_recompute = True
+
+    def forward(self, value):
+        value = super().forward(value)
+        if self.raise_during_recompute and torch._C._current_graph_task_id() != -1:
+            raise RuntimeError("injected checkpoint recompute forward")
+        return value
+
+
 class _RecomputeExceptionModel(torch.nn.Module):
 
     def __init__(self, hidden_dim):
         super().__init__()
-        self.frozen = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.frozen.weight.requires_grad_(False)
-        self.frozen.bias.requires_grad_(False)
+        self.frozen = _FrozenRecomputeExceptionLinear(hidden_dim)
         self.trainable = torch.nn.Linear(hidden_dim, hidden_dim)
         self.head = torch.nn.Linear(hidden_dim, 1)
-        self.raise_during_recompute = True
 
     def _checkpointed(self, value):
         value = self.frozen(value)
-        if self.raise_during_recompute and torch._C._current_graph_task_id() != -1:
-            raise RuntimeError("injected checkpoint recompute forward")
         return self.trainable(torch.tanh(value))
 
     def forward(self, value):
@@ -321,7 +322,6 @@ class TestZero3ActivationCheckpointLifecycle(DistributedTest):
         _assert_checkpoint_state_clean(engine)
         engine.destroy()
 
-    @_RECOMPUTE_RELEASE_TIMING
     def test_recomputed_parameter_releases_at_last_activation_consumer(self):
         """Frozen param should release at its real backward consumer, not at outer cleanup."""
         device, _, _ = initialize_distributed()
@@ -399,7 +399,7 @@ class TestZero3ActivationCheckpointLifecycle(DistributedTest):
         else:
             raise AssertionError("the injected recompute exception did not execute")
 
-        model.raise_during_recompute = False
+        model.frozen.raise_during_recompute = False
         retry = torch.randn(2, 8, device=device, dtype=torch.float32, requires_grad=True)
         engine(retry).sum().backward()
         _synchronize()
@@ -439,9 +439,8 @@ class TestZero3ActivationCheckpointLifecycle(DistributedTest):
         _assert_checkpoint_state_clean(engine)
         engine.destroy()
 
-    @_RECOMPUTE_RELEASE_TIMING
-    def test_frozen_parameter_without_backward_consumer_releases_at_last_use(self):
-        """Frozen param with no backward consumer should release at its last use, not at epilogue."""
+    def test_frozen_parameter_without_grad_boundary_uses_outer_cleanup(self):
+        """An integer-only frozen invocation stays owned until the outer fallback."""
         device, _, _ = initialize_distributed()
         model = _FrozenNoConsumerModel(vocab_size=16, hidden_dim=8)
         engine = _initialize_zero3(model)
@@ -450,11 +449,12 @@ class TestZero3ActivationCheckpointLifecycle(DistributedTest):
         engine.backward(engine(indices))
         _synchronize()
 
-        assert model.observations, "the frozen-parameter last-use boundary did not execute"
+        assert model.observations, "the frozen-parameter consumer probe did not execute"
         for observation in model.observations:
-            assert observation["status"] == ZeroParamStatus.NOT_AVAILABLE, (
-                "frozen parameter with no backward consumer stayed gathered after its last use: "
-                f"status={observation['status']}, active={sorted(observation['active_sub_modules'])}")
+            assert observation["status"] == ZeroParamStatus.AVAILABLE
+            assert any(owner < 0 for owner in observation["active_sub_modules"]), (
+                "frozen parameter without a grad-bearing activation input was not retained by "
+                f"its fallback token: active={sorted(observation['active_sub_modules'])}")
         _assert_checkpoint_state_clean(engine)
         engine.destroy()
 
