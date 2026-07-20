@@ -588,9 +588,14 @@ class PartitionedParameterCoordinator:
         for param in params:
             self.__release_param(param, free_data)
 
-    def _attach_deferred_release(self, deferred_release, param: Parameter, free_data: bool) -> None:
+    def _attach_deferred_release(self,
+                                 deferred_release,
+                                 param: Parameter,
+                                 free_data: bool,
+                                 protect_all: bool = False) -> None:
         """Protect only otherwise-releasable frozen replay parameters."""
-        if (deferred_release is None or param.requires_grad or param.ds_persist or param.is_external_param):
+        if (deferred_release is None or (param.requires_grad and not protect_all) or param.ds_persist
+                or param.is_external_param):
             return
         with self.__deferred_release_lock:
             if not deferred_release.active or deferred_release.token not in self.__deferred_releases:
@@ -598,6 +603,27 @@ class PartitionedParameterCoordinator:
             deferred_release.params.add(param)
             deferred_release.free_data = deferred_release.free_data and free_data
             param.ds_active_sub_modules.add(deferred_release.token)
+
+    @torch.no_grad()
+    def defer_forward_exception(self, submodule: Module) -> None:
+        """Transfer an interrupted replay invocation to outer-backward cleanup."""
+        deferred_release = self.begin_deferred_release(0)
+        params = tuple(iter_params(submodule, recurse=z3_leaf_module(submodule)))
+        free_data = not z3_leaf_module(submodule) or not self.fast_sharding_for_leaf_module
+        try:
+            for param in params:
+                self._attach_deferred_release(deferred_release, param, free_data, protect_all=True)
+        except Exception:
+            self.cancel_deferred_release(deferred_release)
+            raise
+
+        # ``always_call`` replaces the missing normal post-forward hook. The
+        # token now owns every releasable parameter until the outer fallback;
+        # persistent and external parameters keep their existing treatment.
+        for param in params:
+            param.ds_active_sub_modules.discard(submodule.ds_id)
+            if not param.ds_persist and not param.is_external_param:
+                self.__release_param(param, free_data)
 
     @torch.no_grad()
     def finish_deferred_release(self, deferred_release) -> None:
