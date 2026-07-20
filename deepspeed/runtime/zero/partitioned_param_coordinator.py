@@ -410,10 +410,10 @@ class PartitionedParameterCoordinator:
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
             if in_checkpoint_recompute:
-                if self.__active_backward_submodules:
-                    update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
                 free_data = not is_leaf or not self.fast_sharding_for_leaf_module
-                self._attach_deferred_release(deferred_release, param, free_data)
+                protected_by_boundary = self._attach_deferred_release(deferred_release, param, free_data)
+                if self.__active_backward_submodules and not protected_by_boundary:
+                    update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
 
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
@@ -592,17 +592,18 @@ class PartitionedParameterCoordinator:
                                  deferred_release,
                                  param: Parameter,
                                  free_data: bool,
-                                 protect_all: bool = False) -> None:
+                                 protect_all: bool = False) -> bool:
         """Protect only otherwise-releasable frozen replay parameters."""
         if (deferred_release is None or (param.requires_grad and not protect_all) or param.ds_persist
                 or param.is_external_param):
-            return
+            return False
         with self.__deferred_release_lock:
             if not deferred_release.active or deferred_release.token not in self.__deferred_releases:
                 raise RuntimeError("ZeRO-3 deferred release is no longer active")
             deferred_release.params.add(param)
             deferred_release.free_data = deferred_release.free_data and free_data
             param.ds_active_sub_modules.add(deferred_release.token)
+        return True
 
     @torch.no_grad()
     def defer_forward_exception(self, submodule: Module) -> None:
