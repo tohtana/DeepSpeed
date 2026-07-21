@@ -213,7 +213,7 @@ def compare_parameters(params_ddp, params_ds, step_info=""):
 
 
 def assert_all_partitioned(model_engine, zero_stage, step_info=""):
-    """For ZeRO-3, assert every parameter is partitioned (released) after backward.
+    """For ZeRO-3, assert every non-persistent parameter is released after backward.
 
     The frozen-param + activation-checkpoint recompute bug left frozen params gathered
     (AVAILABLE) after backward, so checking the release lifetime guards against regressions
@@ -223,6 +223,8 @@ def assert_all_partitioned(model_engine, zero_stage, step_info=""):
         return
     step_suffix = f" at {step_info}" if step_info else ""
     for name, param in model_engine.module.named_parameters():
+        if param.ds_persist:
+            continue
         assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE, \
             f"Parameter {name} not partitioned after backward (status={param.ds_status}){step_suffix}"
 
@@ -253,12 +255,14 @@ def run_frozen_checkpoint_comparison(model_cls,
                                      input_requires_grad=True,
                                      leaf_module_types=None,
                                      hidden_dim=8,
+                                     param_persistence_threshold=0,
                                      **model_kwargs):
     """Train a checkpointed frozen-param model under DDP and DeepSpeed and compare each step.
 
     Shared driver for the frozen-param + activation-checkpoint regression tests. For every
     iteration it verifies (1) backward runs without CheckpointError, (2) DeepSpeed gradients
-    match the DDP reference, and (3) for ZeRO-3 every parameter is partitioned after backward.
+    match the DDP reference, and (3) ZeRO-3 has no stale ownership and releases each
+    non-persistent parameter after backward.
     """
     batch_size = 2
 
@@ -283,6 +287,8 @@ def run_frozen_checkpoint_comparison(model_cls,
         from deepspeed.utils import set_z3_leaf_modules
         set_z3_leaf_modules(model_ds, leaf_module_types)
     config = get_config_dict(zero_stage, force_fp32=True)
+    if zero_stage == 3:
+        config["zero_optimization"]["stage3_param_persistence_threshold"] = param_persistence_threshold
     trainable_params = [p for p in model_ds.parameters() if p.requires_grad]
     model_engine, _, _, _ = deepspeed.initialize(config=config, model=model_ds, model_parameters=trainable_params)
 
@@ -319,7 +325,8 @@ def run_frozen_checkpoint_comparison(model_cls,
         if iteration == 0:
             compare_gradients(ddp_grads, ds_grads, f"frozen-param checkpointing {step_info}")
 
-        # Frozen params must be released (partitioned) after every backward, not left gathered.
+        # Non-persistent frozen params must be released after every backward; persistent
+        # params intentionally remain gathered but must not retain replay ownership.
         assert_all_partitioned(model_engine, zero_stage, step_info)
         assert_checkpoint_state_clean(model_engine, zero_stage, step_info)
 
@@ -1799,7 +1806,8 @@ class TestZeroQwenPeftCheckpointLifecycle(DistributedTest):
                                          zero_stage=3,
                                          use_reentrant=False,
                                          hidden_dim=1024,
-                                         head_dim=128)
+                                         head_dim=128,
+                                         param_persistence_threshold=4096)
 
 
 @pytest.mark.parametrize("use_reentrant", [True, False])
