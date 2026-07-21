@@ -585,16 +585,16 @@ class PartitionedParameterCoordinator:
             for param in params:
                 param.ds_active_sub_modules.discard(deferred_release.token)
         for param in params:
-            self.__release_param(param, free_data)
+            if not param.ds_persist:
+                self.__release_param(param, free_data)
 
     def _attach_deferred_release(self,
                                  deferred_release,
                                  param: Parameter,
                                  free_data: bool,
                                  protect_all: bool = False) -> bool:
-        """Protect only otherwise-releasable frozen replay parameters."""
-        if (deferred_release is None or (param.requires_grad and not protect_all) or param.ds_persist
-                or param.is_external_param):
+        """Protect checkpoint-sensitive parameters during one replay invocation."""
+        if deferred_release is None or (param.requires_grad and not protect_all) or param.is_external_param:
             return False
         with self.__deferred_release_lock:
             if not deferred_release.active or deferred_release.token not in self.__deferred_releases:
@@ -645,7 +645,8 @@ class PartitionedParameterCoordinator:
             for param in params:
                 param.ds_active_sub_modules.discard(deferred_release.token)
         for param in params:
-            self.__release_param(param, free_data)
+            if not param.ds_persist:
+                self.__release_param(param, free_data)
 
     @torch.no_grad()
     def _release_deferred_leftovers(self) -> None:
@@ -664,7 +665,8 @@ class PartitionedParameterCoordinator:
                     params_to_release.add(param)
                     free_data_by_param[param] = (free_data_by_param.get(param, True) and deferred_release.free_data)
         for param in params_to_release:
-            self.__release_param(param, free_data_by_param[param])
+            if not param.ds_persist:
+                self.__release_param(param, free_data_by_param[param])
 
     @instrument_w_nvtx
     @torch.no_grad()

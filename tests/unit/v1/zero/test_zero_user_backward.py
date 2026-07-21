@@ -217,7 +217,7 @@ def compare_parameters(params_ddp, params_ds, step_info=""):
 
 
 def assert_all_partitioned(model_engine, zero_stage, step_info=""):
-    """For ZeRO-3, assert every non-persistent param is released after backward.
+    """For ZeRO-3, assert every non-persistent parameter is released after backward.
 
     The recompute bug left frozen params gathered after backward, so the release check catches
     regressions a crash-only test misses. Persistent params are skipped (meant to stay
@@ -323,7 +323,8 @@ def run_frozen_checkpoint_comparison(model_cls,
         if iteration == 0:
             compare_gradients(ddp_grads, ds_grads, f"frozen-param checkpointing {step_info}")
 
-        # Frozen params must be released (partitioned) after every backward, not left gathered.
+        # Non-persistent frozen params must be released after every backward; persistent
+        # params intentionally remain gathered but must not retain replay ownership.
         assert_all_partitioned(model_engine, zero_stage, step_info)
         assert_checkpoint_state_clean(model_engine, zero_stage, step_info)
 
