@@ -496,11 +496,11 @@ class PartitionedParameterCoordinator:
         be released."""
         # print_rank_0(f"release_sub_module {'fwd' if forward else 'bwd'}: {submodule.ds_id=} {debug_module2name_id(submodule)}", force=False)
         params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
-            p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+            p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule)) if not p.ds_persist))
 
         if not forward:
             assert self.__active_backward_submodules, "active_backward_submodules is empty during backward pass"
-            recompute_params = set([p.ds_id for p in submodule.ds_recompute_parameters])
+            recompute_params = set([p.ds_id for p in submodule.ds_recompute_parameters if not p.ds_persist])
             params_to_release.update(recompute_params)
 
         current_bwd_id = next(reversed(

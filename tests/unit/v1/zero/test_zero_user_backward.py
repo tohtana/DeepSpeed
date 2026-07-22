@@ -217,20 +217,19 @@ def compare_parameters(params_ddp, params_ds, step_info=""):
 
 
 def assert_all_partitioned(model_engine, zero_stage, step_info=""):
-    """For ZeRO-3, assert every non-persistent param is released after backward.
+    """For ZeRO-3, assert each parameter has its configured residency after backward.
 
     The recompute bug left frozen params gathered after backward, so the release check catches
-    regressions a crash-only test misses. Persistent params are skipped (meant to stay
-    resident). No-op for stages 1/2.
+    regressions a crash-only test misses. Persistent params must stay resident while all others
+    must be partitioned. No-op for stages 1/2.
     """
     if zero_stage != 3:
         return
     step_suffix = f" at {step_info}" if step_info else ""
     for name, param in model_engine.module.named_parameters():
-        if param.ds_persist:
-            continue
-        assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE, \
-            f"Parameter {name} not partitioned after backward (status={param.ds_status}){step_suffix}"
+        expected_status = ZeroParamStatus.AVAILABLE if param.ds_persist else ZeroParamStatus.NOT_AVAILABLE
+        assert param.ds_status == expected_status, \
+            f"Parameter {name} has status={param.ds_status}, expected={expected_status}{step_suffix}"
 
 
 def run_frozen_checkpoint_comparison(model_cls,
@@ -304,7 +303,7 @@ def run_frozen_checkpoint_comparison(model_cls,
         if iteration == 0:
             compare_gradients(ddp_grads, ds_grads, f"frozen-param checkpointing {step_info}")
 
-        # Frozen params must be released (partitioned) after every backward, not left gathered.
+        # Check each parameter's configured residency after every backward.
         assert_all_partitioned(model_engine, zero_stage, step_info)
 
         model_engine.step()
@@ -1798,7 +1797,7 @@ class TestZeroFrozenParamNoGradInputAccumulation(DistributedTest):
                 get_accelerator().synchronize()
                 dist.barrier()
 
-                # Frozen params must be partitioned between microbatches, not carried gathered.
+                # Check each parameter's configured residency between microbatches.
                 assert_all_partitioned(model_engine, zero_stage, step_info)
 
                 model_engine.step()
