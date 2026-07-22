@@ -122,6 +122,12 @@ MODAL_CUDA_TEST_VERSION = MODAL_TORCH_CONFIG["cuda_test_version"]
 
 # Full test sub-tree this workflow runs by default.
 DEFAULT_TEST_TARGET = "tests/unit/v1/"
+GDS_TEST_TARGET = "tests/unit/v1/nvme/test_gds.py"
+
+
+def exclude_unsupported_gds_targets(selected_tests):
+    """Remove explicit GDS targets from runners without GPUDirect Storage."""
+    return [target for target in selected_tests if target.split("::", 1)[0].rstrip("/") != GDS_TEST_TARGET]
 
 
 def resolve_selected_tests():
@@ -205,6 +211,10 @@ def pytest():
     )
     selected_tests = os.environ.get("DS_SELECTED_TESTS", DEFAULT_TEST_TARGET).split()
     print(f"Running pytest on diff-selected targets: {selected_tests}")
+    selected_tests = exclude_unsupported_gds_targets(selected_tests)
+    if not selected_tests:
+        print("Skipping the selected GDS tests because this runner has no GPUDirect Storage support")
+        return
     subprocess.run(
         [
             "pytest",
@@ -212,7 +222,7 @@ def pytest():
             "4",
             "--verbose",
             # GDS tests require GPUDirect Storage support unavailable on these runners
-            "--ignore=tests/unit/v1/nvme/test_gds.py",
+            f"--ignore={GDS_TEST_TARGET}",
             *selected_tests,
             f"--torch_ver={MODAL_TORCH_TEST_VERSION}",
             f"--cuda_ver={MODAL_CUDA_TEST_VERSION}",
