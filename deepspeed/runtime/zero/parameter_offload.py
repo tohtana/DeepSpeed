@@ -193,6 +193,8 @@ class DeepSpeedZeRoOffload(object):
 
         zero_config = get_zero_config(ds_config)
         self._retain_trainable_params_for_recompute = zero_config.retain_trainable_params_for_recompute
+        if self._retain_trainable_params_for_recompute:
+            self._recompute_grads_remaining_modules = set()
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,
             max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
@@ -240,11 +242,10 @@ class DeepSpeedZeRoOffload(object):
         if not self._retain_trainable_params_for_recompute:
             return
 
-        for module in self.module.modules():
-            if "ds_grads_remaining" in module.__dict__:
-                module.ds_grads_remaining = 0
-            if "ds_grads_remaining_graph_task_id" in module.__dict__:
-                module.ds_grads_remaining_graph_task_id = -1
+        while self._recompute_grads_remaining_modules:
+            module = self._recompute_grads_remaining_modules.pop()
+            module.ds_grads_remaining = 0
+            module.ds_grads_remaining_graph_task_id = -1
 
     def get_param_coordinator(self):
         return self.param_coordinator
@@ -499,6 +500,7 @@ class DeepSpeedZeRoOffload(object):
                 if sub_module.ds_grads_remaining == 0:
                     if self._retain_trainable_params_for_recompute:
                         sub_module.ds_grads_remaining_graph_task_id = -1
+                        self._recompute_grads_remaining_modules.discard(sub_module)
                     self.post_sub_module_backward_function(sub_module)
 
             class PostBackwardFunctionModule(torch.autograd.Function):
@@ -521,6 +523,9 @@ class DeepSpeedZeRoOffload(object):
                         #if module.ds_grads_remaining == 0:
                         #    print(f"Before Forward: {ctx.module.__class__.__name__}")
                         module.ds_grads_remaining += 1
+                        if (self._retain_trainable_params_for_recompute
+                                and module.ds_grads_remaining_graph_task_id != -1):
+                            self._recompute_grads_remaining_modules.add(module)
                         ctx.post_backward_function = _run_after_backward_function
 
                 @staticmethod

@@ -85,6 +85,8 @@ def _assert_clean(engine, *, require_partitioned=True):
 
 
 def _assert_invocation_state_reset(engine):
+    parameter_offload = engine.optimizer.parameter_offload
+    assert not getattr(parameter_offload, "_recompute_grads_remaining_modules", set())
     for module_name, module in engine.module.named_modules():
         assert module.__dict__.get("ds_grads_remaining",
                                    0) == 0, (f"module {module_name or '<root>'} kept post-backward invocations")
