@@ -9,6 +9,7 @@ from collections import OrderedDict
 from deepspeed.utils import z3_leaf_module, set_z3_leaf_module
 from deepspeed.runtime.utils import see_memory_usage
 from deepspeed.runtime.zero.utils import apply_to_tensors_only, is_zero_param
+from deepspeed.runtime.zero.config import get_zero_config
 from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum
 from deepspeed.runtime.zero.partition_parameters import _init_external_params
 from deepspeed.runtime.zero.partition_parameters import *
@@ -190,6 +191,7 @@ class DeepSpeedZeRoOffload(object):
             self._set_z3_leaf_modules_by_threshold(module, zero_module_granularity_threshold)
             self.fast_sharding_for_leaf_module = True
 
+        zero_config = get_zero_config(ds_config)
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,
             max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
@@ -201,7 +203,7 @@ class DeepSpeedZeRoOffload(object):
             zero_quantized_weights=self.zero_quantized_weights,
             zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
             fast_sharding_for_leaf_module=self.fast_sharding_for_leaf_module,
-            retain_trainable_params_for_recompute=ds_config.zero_config.retain_trainable_params_for_recompute,
+            retain_trainable_params_for_recompute=zero_config.retain_trainable_params_for_recompute,
             log_trace_cache_warnings=self.log_trace_cache_warnings,
         )
 
