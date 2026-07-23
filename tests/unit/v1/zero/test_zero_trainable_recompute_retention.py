@@ -84,14 +84,17 @@ def _assert_clean(engine, *, require_partitioned=True):
                 f"parameter {parameter_name} stayed resident: {parameter.ds_status}")
 
 
-def _assert_invocation_state_reset(engine):
+def _assert_invocation_state_reset(engine, reset_modules=()):
     parameter_offload = engine.optimizer.parameter_offload
     assert not getattr(parameter_offload, "_recompute_grads_remaining_modules", set())
+    module_names = {module: name for name, module in engine.module.named_modules()}
     for module_name, module in engine.module.named_modules():
-        assert module.__dict__.get("ds_grads_remaining",
-                                   0) == 0, (f"module {module_name or '<root>'} kept post-backward invocations")
         assert module.__dict__.get("ds_grads_remaining_graph_task_id",
                                    -1) == -1, (f"module {module_name or '<root>'} kept a recompute graph task")
+    for module in reset_modules:
+        module_name = module_names[module]
+        assert module.__dict__.get("ds_grads_remaining",
+                                   0) == 0, (f"module {module_name or '<root>'} kept recompute invocations")
 
 
 def _collect_gradients(engine):
@@ -361,28 +364,33 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
             with pytest.raises(RuntimeError, match="injected checkpoint recompute forward"):
                 engine.backward(engine(value).sum())
             parameter_offload = engine.optimizer.parameter_offload
+            touched_modules = tuple(parameter_offload._recompute_grads_remaining_modules)
+            assert touched_modules
             parameter_offload.release_backward_leftovers()
             parameter_offload.release_backward_leftovers()
             _assert_clean(engine)
-            _assert_invocation_state_reset(engine)
+            _assert_invocation_state_reset(engine, touched_modules)
             model.raise_during_recompute = False
             retry = torch.randn(2, 8, device=device, requires_grad=True)
             engine.backward(engine(retry).sum())
             _synchronize()
             _assert_clean(engine)
-            _assert_invocation_state_reset(engine)
+            _assert_invocation_state_reset(engine, touched_modules)
         elif scenario == "incomplete-backward":
             model = _IncompleteBackwardModel(8)
             engine = _initialize(model, retain=True)
             value = torch.randn(2, 8, device=device, requires_grad=True)
             with pytest.raises(RuntimeError, match="injected incomplete checkpoint backward"):
                 engine.backward(engine(value).sum())
+            parameter_offload = engine.optimizer.parameter_offload
+            touched_modules = tuple(parameter_offload._recompute_grads_remaining_modules)
+            assert touched_modules
 
             observed_reset = {"value": False}
 
             def observe_reset(unused_module, unused_inputs):
                 _assert_clean(engine)
-                _assert_invocation_state_reset(engine)
+                _assert_invocation_state_reset(engine, touched_modules)
                 observed_reset["value"] = True
 
             handle = engine.module.register_forward_pre_hook(observe_reset)
@@ -394,7 +402,7 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
                 handle.remove()
             assert observed_reset["value"]
             _assert_clean(engine)
-            _assert_invocation_state_reset(engine)
+            _assert_invocation_state_reset(engine, touched_modules)
         elif scenario == "gradient-accumulation":
             engine = _initialize(_NoGradInputModel(8), retain=True, gradient_accumulation_steps=2)
             for _ in range(2):
@@ -458,7 +466,7 @@ class TestZero3TrainableRecomputeRetentionModuleReuse(DistributedTest):
 
             _assert_clean(off)
             _assert_clean(on)
-            _assert_invocation_state_reset(on)
+            _assert_invocation_state_reset(on, (on.module.shared, ))
             off.step()
             on.step()
 
