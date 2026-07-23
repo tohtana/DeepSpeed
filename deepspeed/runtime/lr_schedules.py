@@ -485,6 +485,9 @@ class OneCycle(object):
         cycle_second_step_size = float(
             cycle_second_step_size) if cycle_second_step_size is not None else cycle_first_step_size
 
+        if cycle_first_step_size <= 0:
+            raise ValueError(f"cycle_first_step_size must be positive, got {cycle_first_step_size}")
+
         self.total_size = cycle_first_step_size + cycle_second_step_size
         if self.total_size <= 0:
             raise ValueError("cycle_first_step_size + cycle_second_step_size must be positive, got "

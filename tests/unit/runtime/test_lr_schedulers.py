@@ -655,3 +655,16 @@ def test_one_cycle_rejects_nonpositive_total_step_size(first, second):
                  cycle_max_lr=0.1,
                  cycle_first_step_size=first,
                  cycle_second_step_size=second)
+
+
+@pytest.mark.parametrize("first, second", [(0, 1), (-1, 2)])
+def test_one_cycle_rejects_nonpositive_first_step_size_with_positive_total(first, second):
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=0.1)
+
+    with pytest.raises(ValueError):
+        OneCycle(optimizer,
+                 cycle_min_lr=0.001,
+                 cycle_max_lr=0.1,
+                 cycle_first_step_size=first,
+                 cycle_second_step_size=second)
