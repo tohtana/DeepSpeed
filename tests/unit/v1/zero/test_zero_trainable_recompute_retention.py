@@ -290,7 +290,7 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
                 engine.backward(engine(value).sum())
             model.raise_during_recompute = False
             retry = torch.randn(2, 8, device=device, requires_grad=True)
-            engine.backward(engine(retry).sum())
+            engine(retry).sum().backward()
             _synchronize()
             _assert_clean(engine)
         elif scenario == "incomplete-backward":

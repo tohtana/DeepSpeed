@@ -248,8 +248,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     parameters. Smaller values use less memory, but perform more communication.
     """
 
-    retain_trainable_params_for_recompute: bool = Field(
-        False, alias="stage3_retain_trainable_params_for_recompute")
+    retain_trainable_params_for_recompute: bool = Field(False, alias="stage3_retain_trainable_params_for_recompute")
     """
     Keep trainable, non-persistent, non-external ZeRO-3 parameters resident from
     activation-checkpoint recompute through their matching backward use. The

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import collections
 from collections import UserDict
 import threading
-from typing import Deque, Dict, Set
+from typing import Deque, Dict, Optional, Set
 
 from deepspeed import comm as dist
 from deepspeed.utils import z3_leaf_module
@@ -34,9 +34,9 @@ def debug_rank0(message: str) -> None:
 @torch.no_grad()
 @instrument_w_nvtx
 @compiler.disable
-def update_recompute_parameters(sub_module: Module, param: Parameter) -> None:
+def update_recompute_parameters(sub_module: Module, param: Parameter, active_owner_id: Optional[int] = None) -> None:
     sub_module.ds_recompute_parameters.add(param)
-    param.ds_active_sub_modules.add(sub_module.ds_id)
+    param.ds_active_sub_modules.add(sub_module.ds_id if active_owner_id is None else active_owner_id)
     print_rank_0(f"update_recompute_parameters  {sub_module.ds_id=} to {param.ds_id=}", force=False)
 
 
@@ -255,6 +255,8 @@ class PartitionedParameterCoordinator:
         if is_compiling():
             return
 
+        if self.__retain_trainable_params_for_recompute:
+            self.release_backward_leftovers()
         self._clean_inflight_param_registry()
 
         if not self.is_complete_trace():  # not self.trace_complete:
@@ -391,10 +393,15 @@ class PartitionedParameterCoordinator:
         in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
-            retain_for_recompute = not param.requires_grad or (
-                self.__retain_trainable_params_for_recompute and not param.ds_persist and not param.is_external_param)
-            if in_checkpoint_recompute and self.__active_backward_submodules and retain_for_recompute:
-                update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
+            if in_checkpoint_recompute and self.__active_backward_submodules:
+                if not param.requires_grad:
+                    update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
+                elif (self.__retain_trainable_params_for_recompute and not param.ds_persist
+                      and not param.is_external_param):
+                    owner = self.__active_backward_submodules.get(current_submodule.ds_id)
+                    if owner is None:
+                        owner = next(reversed(self.__active_backward_submodules.values()))
+                    update_recompute_parameters(owner, param, active_owner_id=-(owner.ds_id + 1))
 
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
@@ -520,7 +527,9 @@ class PartitionedParameterCoordinator:
 
         module_params = set(iter_params(submodule, recurse=z3_leaf_module(submodule)))
 
+        recompute_parameters = set()
         if not forward:
+            recompute_parameters = set(submodule.ds_recompute_parameters)
             module_params.update(submodule.ds_recompute_parameters)
             submodule.ds_recompute_parameters.clear()
             # Remove this specific submodule regardless of position (hooks may fire out of reverse-forward order).
@@ -528,6 +537,9 @@ class PartitionedParameterCoordinator:
 
         for param in module_params:
             param.ds_active_sub_modules.discard(submodule.ds_id)
+            if (not forward and self.__retain_trainable_params_for_recompute and param.requires_grad
+                    and param in recompute_parameters):
+                param.ds_active_sub_modules.discard(-(submodule.ds_id + 1))
             if param.ds_id in params_to_release and not param.is_external_param:
                 self.__release_param(param, free_data)
             if not free_data:
@@ -561,10 +573,14 @@ class PartitionedParameterCoordinator:
         while self.__active_backward_submodules:
             _, submodule = self.__active_backward_submodules.popitem()
             params = set(iter_params(submodule, recurse=z3_leaf_module(submodule)))
-            params.update(submodule.ds_recompute_parameters)
+            recompute_parameters = set(submodule.ds_recompute_parameters)
+            params.update(recompute_parameters)
             submodule.ds_recompute_parameters.clear()
             for param in params:
                 param.ds_active_sub_modules.discard(submodule.ds_id)
+                if (self.__retain_trainable_params_for_recompute and param.requires_grad
+                        and param in recompute_parameters):
+                    param.ds_active_sub_modules.discard(-(submodule.ds_id + 1))
                 if not param.ds_persist and not param.is_external_param:
                     self.__release_param(param)
 
