@@ -31,6 +31,13 @@ def test_zero_config_aliasfields():
     assert config.gather_16bit_weights_on_model_save == True
 
 
+def test_retain_trainable_params_for_recompute_config():
+    assert DeepSpeedZeroConfig().retain_trainable_params_for_recompute is False
+
+    config = DeepSpeedZeroConfig(**{"stage3_retain_trainable_params_for_recompute": True})
+    assert config.retain_trainable_params_for_recompute is True
+
+
 def test_zero_config_pipeline_loading_checkpoint():
     for stage in [0, 1, 2]:
         config = DeepSpeedZeroConfig(**{"stage": stage})

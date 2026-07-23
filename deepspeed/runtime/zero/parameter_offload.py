@@ -201,6 +201,7 @@ class DeepSpeedZeRoOffload(object):
             zero_quantized_weights=self.zero_quantized_weights,
             zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
             fast_sharding_for_leaf_module=self.fast_sharding_for_leaf_module,
+            retain_trainable_params_for_recompute=ds_config.zero_config.retain_trainable_params_for_recompute,
             log_trace_cache_warnings=self.log_trace_cache_warnings,
         )
 

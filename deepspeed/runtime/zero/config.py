@@ -22,6 +22,7 @@ ZeRO optimization should be enabled as:
     "stage": [0|1|2],
     "stage3_max_live_parameters" : 1000000000,
     "stage3_max_reuse_distance" : 1000000000,
+    "stage3_retain_trainable_params_for_recompute": [true|false],
     "stage3_use_all_reduce_for_fetch_params": [true|false],
     "stage3_module_granularity_threshold": 0,
     "allgather_partitions": [true|false],
@@ -245,6 +246,14 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
     Do not release a parameter if it will be reused within this threshold of
     parameters. Smaller values use less memory, but perform more communication.
+    """
+
+    retain_trainable_params_for_recompute: bool = Field(
+        False, alias="stage3_retain_trainable_params_for_recompute")
+    """
+    Keep trainable, non-persistent, non-external ZeRO-3 parameters resident from
+    activation-checkpoint recompute through their matching backward use. The
+    default preserves the existing release and refetch behavior.
     """
 
     gather_16bit_weights_on_model_save: bool = Field(False, alias="stage3_gather_16bit_weights_on_model_save")

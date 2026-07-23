@@ -98,6 +98,7 @@ class PartitionedParameterCoordinator:
         zero_quantized_weights=False,
         zero_quantized_nontrainable_weights=False,
         fast_sharding_for_leaf_module=False,
+        retain_trainable_params_for_recompute=False,
         log_trace_cache_warnings=False,
     ) -> None:
         # mapping of param -> handle for each param that is currently in flight
@@ -148,6 +149,7 @@ class PartitionedParameterCoordinator:
         # whether to enable fast fetch for the z3 leaf module.
         # this will improve fetch speed but will not break down leaf module parameters to alleviate memory pressure.
         self.fast_sharding_for_leaf_module = fast_sharding_for_leaf_module
+        self.__retain_trainable_params_for_recompute = retain_trainable_params_for_recompute
 
         # Thread synchronization for leaf module fetches during backward pass.
         # When autograd executes hooks in multiple threads (e.g., for modules returning multiple tensors),
@@ -389,8 +391,9 @@ class PartitionedParameterCoordinator:
         in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
-            # Only frozen params need recompute attribution; trainable ones release via their backward hook.
-            if in_checkpoint_recompute and self.__active_backward_submodules and not param.requires_grad:
+            retain_for_recompute = not param.requires_grad or (
+                self.__retain_trainable_params_for_recompute and not param.ds_persist and not param.is_external_param)
+            if in_checkpoint_recompute and self.__active_backward_submodules and retain_for_recompute:
                 update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
 
             if logger.isEnabledFor(logging.DEBUG):
