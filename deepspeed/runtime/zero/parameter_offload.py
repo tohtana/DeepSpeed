@@ -442,6 +442,8 @@ class DeepSpeedZeRoOffload(object):
                 module.ds_grads_remaining = 0
             if self._retain_trainable_params_for_recompute:
                 module.ds_grads_remaining_graph_task_id = graph_task_id
+                if graph_task_id != -1:
+                    self._recompute_grads_remaining_modules.add(module)
 
             return apply_to_tensors_only(module.post_bwd_fn.apply,
                                          inputs,
@@ -523,9 +525,6 @@ class DeepSpeedZeRoOffload(object):
                         #if module.ds_grads_remaining == 0:
                         #    print(f"Before Forward: {ctx.module.__class__.__name__}")
                         module.ds_grads_remaining += 1
-                        if (self._retain_trainable_params_for_recompute
-                                and module.ds_grads_remaining_graph_task_id != -1):
-                            self._recompute_grads_remaining_modules.add(module)
                         ctx.post_backward_function = _run_after_backward_function
 
                 @staticmethod

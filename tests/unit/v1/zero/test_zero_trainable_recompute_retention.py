@@ -307,6 +307,8 @@ class TestZero3TrainableRecomputeRetentionControls(DistributedTest):
             engine.backward(engine(value).sum())
             _synchronize()
             _assert_clean(engine, require_partitioned=(control != "trainable-external"))
+            if control == "frozen":
+                _assert_invocation_state_reset(engine)
             engine.step()
 
         if control == "trainable-persistent":
