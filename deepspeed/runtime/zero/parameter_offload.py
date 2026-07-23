@@ -192,6 +192,7 @@ class DeepSpeedZeRoOffload(object):
             self.fast_sharding_for_leaf_module = True
 
         zero_config = get_zero_config(ds_config)
+        self._retain_trainable_params_for_recompute = zero_config.retain_trainable_params_for_recompute
         self.param_coordinator = PartitionedParameterCoordinator(
             prefetch_bucket_sz=self._prefetch_bucket_sz,
             max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
@@ -203,7 +204,7 @@ class DeepSpeedZeRoOffload(object):
             zero_quantized_weights=self.zero_quantized_weights,
             zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
             fast_sharding_for_leaf_module=self.fast_sharding_for_leaf_module,
-            retain_trainable_params_for_recompute=zero_config.retain_trainable_params_for_recompute,
+            retain_trainable_params_for_recompute=self._retain_trainable_params_for_recompute,
             log_trace_cache_warnings=self.log_trace_cache_warnings,
         )
 
@@ -230,7 +231,20 @@ class DeepSpeedZeRoOffload(object):
     def release_backward_leftovers(self):
         """Release params of submodules whose post-backward hook never fired (e.g. modules
         fed a no-grad input). Cheap no-op when the backward stack is already empty."""
-        self.get_param_coordinator().release_backward_leftovers()
+        try:
+            self.get_param_coordinator().release_backward_leftovers()
+        finally:
+            self._reset_recompute_grads_remaining()
+
+    def _reset_recompute_grads_remaining(self):
+        if not self._retain_trainable_params_for_recompute:
+            return
+
+        for module in self.module.modules():
+            if "ds_grads_remaining" in module.__dict__:
+                module.ds_grads_remaining = 0
+            if "ds_grads_remaining_graph_task_id" in module.__dict__:
+                module.ds_grads_remaining_graph_task_id = -1
 
     def get_param_coordinator(self):
         return self.param_coordinator
@@ -286,7 +300,10 @@ class DeepSpeedZeRoOffload(object):
         @instrument_w_nvtx
         def _start_of_forward_hook(module, *args):
 
-            self.get_param_coordinator().reset_step()
+            try:
+                self.get_param_coordinator().reset_step()
+            finally:
+                self._reset_recompute_grads_remaining()
 
         self.fwd_pre_hook = self.module.register_forward_pre_hook(_start_of_forward_hook)
 
@@ -418,7 +435,12 @@ class DeepSpeedZeRoOffload(object):
 
         @torch.compiler.disable
         def _post_backward_module_hook(module, inputs):
-            module.ds_grads_remaining = 0
+            graph_task_id = torch._C._current_graph_task_id()
+            if (not self._retain_trainable_params_for_recompute or graph_task_id == -1
+                    or module.__dict__.get("ds_grads_remaining_graph_task_id", -1) != graph_task_id):
+                module.ds_grads_remaining = 0
+            if self._retain_trainable_params_for_recompute:
+                module.ds_grads_remaining_graph_task_id = graph_task_id
 
             return apply_to_tensors_only(module.post_bwd_fn.apply,
                                          inputs,
@@ -475,6 +497,8 @@ class DeepSpeedZeRoOffload(object):
             @instrument_w_nvtx
             def _run_after_backward_function(sub_module):
                 if sub_module.ds_grads_remaining == 0:
+                    if self._retain_trainable_params_for_recompute:
+                        sub_module.ds_grads_remaining_graph_task_id = -1
                     self.post_sub_module_backward_function(sub_module)
 
             class PostBackwardFunctionModule(torch.autograd.Function):

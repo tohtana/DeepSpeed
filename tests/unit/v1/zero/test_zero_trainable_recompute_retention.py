@@ -84,6 +84,14 @@ def _assert_clean(engine, *, require_partitioned=True):
                 f"parameter {parameter_name} stayed resident: {parameter.ds_status}")
 
 
+def _assert_invocation_state_reset(engine):
+    for module_name, module in engine.module.named_modules():
+        assert module.__dict__.get("ds_grads_remaining",
+                                   0) == 0, (f"module {module_name or '<root>'} kept post-backward invocations")
+        assert module.__dict__.get("ds_grads_remaining_graph_task_id",
+                                   -1) == -1, (f"module {module_name or '<root>'} kept a recompute graph task")
+
+
 def _collect_gradients(engine):
     gradients = {}
     for name, parameter in engine.module.named_parameters():
@@ -141,6 +149,23 @@ class _NestedCheckpointRetentionModel(torch.nn.Module):
 
     def forward(self, value):
         value = checkpoint(self._outer_checkpointed, value, use_reentrant=self.use_reentrant)
+        return self.head(value)
+
+
+class _RepeatedModuleCheckpointRetentionModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim, use_reentrant):
+        super().__init__()
+        self.use_reentrant = use_reentrant
+        self.shared = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.head = torch.nn.Linear(hidden_dim, 1)
+
+    def _checkpointed(self, value):
+        value = torch.tanh(self.shared(value))
+        return torch.sin(self.shared(value))
+
+    def forward(self, value):
+        value = checkpoint(self._checkpointed, value, use_reentrant=self.use_reentrant)
         return self.head(value)
 
 
@@ -331,15 +356,17 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
             value = torch.randn(2, 8, device=device, requires_grad=True)
             with pytest.raises(RuntimeError, match="injected checkpoint recompute forward"):
                 engine.backward(engine(value).sum())
-            coordinator = engine.optimizer.parameter_offload.get_param_coordinator()
-            coordinator.release_backward_leftovers()
-            coordinator.release_backward_leftovers()
+            parameter_offload = engine.optimizer.parameter_offload
+            parameter_offload.release_backward_leftovers()
+            parameter_offload.release_backward_leftovers()
             _assert_clean(engine)
+            _assert_invocation_state_reset(engine)
             model.raise_during_recompute = False
             retry = torch.randn(2, 8, device=device, requires_grad=True)
-            engine(retry).sum().backward()
+            engine.backward(engine(retry).sum())
             _synchronize()
             _assert_clean(engine)
+            _assert_invocation_state_reset(engine)
         elif scenario == "incomplete-backward":
             model = _IncompleteBackwardModel(8)
             engine = _initialize(model, retain=True)
@@ -351,6 +378,7 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
 
             def observe_reset(unused_module, unused_inputs):
                 _assert_clean(engine)
+                _assert_invocation_state_reset(engine)
                 observed_reset["value"] = True
 
             handle = engine.module.register_forward_pre_hook(observe_reset)
@@ -362,6 +390,7 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
                 handle.remove()
             assert observed_reset["value"]
             _assert_clean(engine)
+            _assert_invocation_state_reset(engine)
         elif scenario == "gradient-accumulation":
             engine = _initialize(_NoGradInputModel(8), retain=True, gradient_accumulation_steps=2)
             for _ in range(2):
@@ -380,6 +409,57 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
             _assert_clean(engine)
 
         engine.destroy()
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "nonreentrant"])
+class TestZero3TrainableRecomputeRetentionModuleReuse(DistributedTest):
+    world_size = 2
+
+    def test_same_module_reuse_repeated_steps(self, use_reentrant):
+        device, _, _ = initialize_distributed()
+        torch.manual_seed(42)
+        off = _initialize(_RepeatedModuleCheckpointRetentionModel(8, use_reentrant), retain=False)
+        torch.manual_seed(42)
+        on = _initialize(_RepeatedModuleCheckpointRetentionModel(8, use_reentrant), retain=True)
+        off_target = off.module.shared.weight
+        on_target = on.module.shared.weight
+
+        for step in range(2):
+            torch.manual_seed(123 + step)
+            value = torch.randn(2, 8, device=device, requires_grad=True)
+            with (_record_target_lifecycle(off, off_target) as off_events, _record_target_lifecycle(on, on_target) as
+                  on_events):
+                off_loss = off(value.clone()).sum()
+                on_loss = on(value.clone()).sum()
+                assert torch.isfinite(off_loss) and torch.isfinite(on_loss)
+                torch.testing.assert_close(off_loss, on_loss)
+                off.backward(off_loss)
+                on.backward(on_loss)
+                _synchronize()
+
+            off_backward_gathers = [
+                event for event in off_events if event["kind"] == "gather" and not event["forward"]
+            ]
+            on_backward_gathers = [event for event in on_events if event["kind"] == "gather" and not event["forward"]]
+            assert off_backward_gathers, off_events
+            assert not on_backward_gathers, on_events
+
+            off_gradients = _collect_gradients(off)
+            on_gradients = _collect_gradients(on)
+            assert off_gradients.keys() == on_gradients.keys()
+            assert "shared.weight" in on_gradients
+            assert torch.count_nonzero(on_gradients["shared.weight"])
+            for name in off_gradients:
+                torch.testing.assert_close(off_gradients[name], on_gradients[name])
+
+            _assert_clean(off)
+            _assert_clean(on)
+            _assert_invocation_state_reset(on)
+            off.step()
+            on.step()
+
+        off.destroy()
+        on.destroy()
 
 
 @pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "nonreentrant"])
