@@ -33,6 +33,7 @@ from unit.v1.zero.test_zero_user_backward import (
 
 _ACTIVE_BACKWARD = "_PartitionedParameterCoordinator__active_backward_submodules"
 _ALL_GATHER = "_PartitionedParameterCoordinator__all_gather_params"
+_RETAINED_RECOMPUTE = "_PartitionedParameterCoordinator__retained_recompute_submodules"
 
 
 def _zero3_config(*, retain, persistence_threshold=0, gradient_accumulation_steps=1):
@@ -68,6 +69,7 @@ def _synchronize():
 def _assert_clean(engine, *, require_partitioned=True):
     coordinator = engine.optimizer.parameter_offload.get_param_coordinator()
     assert not getattr(coordinator, _ACTIVE_BACKWARD)
+    assert not getattr(coordinator, _RETAINED_RECOMPUTE)
 
     for module_name, module in engine.module.named_modules():
         recompute = getattr(module, "ds_recompute_parameters", set())
@@ -121,6 +123,27 @@ class _PlainRetentionModel(torch.nn.Module):
         return self.second(torch.tanh(self.first(value)))
 
 
+class _NestedCheckpointRetentionModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim, use_reentrant):
+        super().__init__()
+        self.use_reentrant = use_reentrant
+        self.inner = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.outer = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.head = torch.nn.Linear(hidden_dim, 1)
+
+    def _inner_checkpointed(self, value):
+        return torch.tanh(self.inner(value))
+
+    def _outer_checkpointed(self, value):
+        value = checkpoint(self._inner_checkpointed, value, use_reentrant=self.use_reentrant)
+        return torch.sin(self.outer(value))
+
+    def forward(self, value):
+        value = checkpoint(self._outer_checkpointed, value, use_reentrant=self.use_reentrant)
+        return self.head(value)
+
+
 @contextmanager
 def _record_target_lifecycle(engine, target):
     coordinator = engine.optimizer.parameter_offload.get_param_coordinator()
@@ -141,6 +164,7 @@ def _record_target_lifecycle(engine, target):
     def record_release(submodule, forward=False):
         module_parameters = set(submodule.parameters(recurse=z3_leaf_module(submodule)))
         recompute_parameters = getattr(submodule, "ds_recompute_parameters", set())
+        retained_modules = getattr(coordinator, _RETAINED_RECOMPUTE)
         in_recompute = torch._C._current_graph_task_id() != -1
         is_recompute_forward = forward and in_recompute and target in module_parameters
         is_matching_backward = not forward and target in recompute_parameters
@@ -148,6 +172,7 @@ def _record_target_lifecycle(engine, target):
             "status": target.ds_status,
             "owners": set(target.ds_active_sub_modules),
             "owner_module": submodule.ds_id,
+            "retained_modules": set(retained_modules),
         }
         result = original_release(submodule, forward)
         if is_recompute_forward or is_matching_backward:
@@ -157,6 +182,7 @@ def _record_target_lifecycle(engine, target):
                 "after": {
                     "status": target.ds_status,
                     "owners": set(target.ds_active_sub_modules),
+                    "retained_modules": set(retained_modules),
                 },
             })
         return result
@@ -194,10 +220,25 @@ class TestZero3TrainableRecomputeRetentionEvents(DistributedTest):
         if retain:
             assert all(event["before"]["status"] == ZeroParamStatus.AVAILABLE for event in recompute_releases)
             assert all(event["after"]["status"] == ZeroParamStatus.AVAILABLE for event in recompute_releases)
-            assert all(len(event["before"]["owners"]) >= 2 for event in recompute_releases)
+            for event in recompute_releases:
+                module_id = event["before"]["owner_module"]
+                synthetic_owner = -(module_id + 1)
+                assert module_id in event["before"]["owners"], event
+                assert synthetic_owner in event["before"]["owners"], event
+                assert module_id in event["before"]["retained_modules"], event
+                assert module_id not in event["after"]["owners"], event
+                assert synthetic_owner in event["after"]["owners"], event
+                assert module_id in event["after"]["retained_modules"], event
             assert not backward_gathers, events
             assert len(matching_releases) == 1, events
-            assert matching_releases[0]["after"]["status"] == ZeroParamStatus.NOT_AVAILABLE
+            matching_release = matching_releases[0]
+            module_id = matching_release["before"]["owner_module"]
+            synthetic_owner = -(module_id + 1)
+            assert synthetic_owner in matching_release["before"]["owners"], matching_release
+            assert module_id in matching_release["before"]["retained_modules"], matching_release
+            assert synthetic_owner not in matching_release["after"]["owners"], matching_release
+            assert module_id not in matching_release["after"]["retained_modules"], matching_release
+            assert matching_release["after"]["status"] == ZeroParamStatus.NOT_AVAILABLE
         else:
             assert any(event["after"]["status"] == ZeroParamStatus.NOT_AVAILABLE for event in recompute_releases)
             assert backward_gathers, events
@@ -267,10 +308,12 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
 
         if scenario == "nested":
             engine = _initialize(_RecursiveCheckpointModel(8), retain=True)
-            value = torch.randn(2, 8, device=device, requires_grad=True)
-            engine.backward(engine(value).sum())
-            _synchronize()
-            _assert_clean(engine)
+            for _ in range(2):
+                value = torch.randn(2, 8, device=device, requires_grad=True)
+                engine.backward(engine(value).sum())
+                _synchronize()
+                _assert_clean(engine)
+                engine.step()
         elif scenario == "early-stop":
             model = _EarlyStopCheckpointModel(8)
             engine = _initialize(model, retain=True)
@@ -288,6 +331,10 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
             value = torch.randn(2, 8, device=device, requires_grad=True)
             with pytest.raises(RuntimeError, match="injected checkpoint recompute forward"):
                 engine.backward(engine(value).sum())
+            coordinator = engine.optimizer.parameter_offload.get_param_coordinator()
+            coordinator.release_backward_leftovers()
+            coordinator.release_backward_leftovers()
+            _assert_clean(engine)
             model.raise_during_recompute = False
             retry = torch.randn(2, 8, device=device, requires_grad=True)
             engine(retry).sum().backward()
@@ -331,6 +378,25 @@ class TestZero3TrainableRecomputeRetentionCleanup(DistributedTest):
             engine.backward(engine(value).sum())
             _synchronize()
             _assert_clean(engine)
+
+        engine.destroy()
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "nonreentrant"])
+class TestZero3TrainableRecomputeRetentionNested(DistributedTest):
+    world_size = 2
+
+    def test_nested_checkpoint_repeated_steps(self, use_reentrant):
+        device, _, _ = initialize_distributed()
+        engine = _initialize(_NestedCheckpointRetentionModel(8, use_reentrant), retain=True)
+
+        for _ in range(2):
+            value = torch.randn(2, 8, device=device, requires_grad=True)
+            engine.backward(engine(value).sum())
+            _synchronize()
+            assert value.grad is not None and torch.isfinite(value.grad).all()
+            _assert_clean(engine)
+            engine.step()
 
         engine.destroy()
 

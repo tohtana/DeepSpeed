@@ -160,6 +160,10 @@ class PartitionedParameterCoordinator:
         # In-progress backward submodules keyed by ds_id. A dict (not LIFO deque) lets release
         # remove a specific module, since multi-tensor z3-leaf hooks fire out of reverse order.
         self.__active_backward_submodules: Dict[int, Module] = {}
+        # Trainable parameters retained after checkpoint recompute are owned by the module that
+        # fetched them. Non-reentrant checkpointing may recompute that module before its normal
+        # backward pre-hook registers it in __active_backward_submodules.
+        self.__retained_recompute_submodules: Dict[int, Module] = {}
 
     """Tracing and Tracking
     TODO. consider performing trace before initializing PartitionedParameterCoordinator
@@ -393,15 +397,15 @@ class PartitionedParameterCoordinator:
         in_checkpoint_recompute = forward and torch._C._current_graph_task_id() != -1
         for param in params_to_fetch:
             param.ds_active_sub_modules.add(current_submodule.ds_id)
-            if in_checkpoint_recompute and self.__active_backward_submodules:
-                if not param.requires_grad:
+            if in_checkpoint_recompute:
+                if not param.requires_grad and self.__active_backward_submodules:
                     update_recompute_parameters(next(reversed(self.__active_backward_submodules.values())), param)
                 elif (self.__retain_trainable_params_for_recompute and not param.ds_persist
                       and not param.is_external_param):
-                    owner = self.__active_backward_submodules.get(current_submodule.ds_id)
-                    if owner is None:
-                        owner = next(reversed(self.__active_backward_submodules.values()))
-                    update_recompute_parameters(owner, param, active_owner_id=-(owner.ds_id + 1))
+                    update_recompute_parameters(current_submodule,
+                                                param,
+                                                active_owner_id=-(current_submodule.ds_id + 1))
+                    self.__retained_recompute_submodules[current_submodule.ds_id] = current_submodule
 
             if logger.isEnabledFor(logging.DEBUG):
                 debug_rank0(f"-wait: {param.ds_summary()}")
@@ -534,6 +538,7 @@ class PartitionedParameterCoordinator:
             submodule.ds_recompute_parameters.clear()
             # Remove this specific submodule regardless of position (hooks may fire out of reverse-forward order).
             self.__active_backward_submodules.pop(submodule.ds_id, None)
+            self.__retained_recompute_submodules.pop(submodule.ds_id, None)
 
         for param in module_params:
             param.ds_active_sub_modules.discard(submodule.ds_id)
@@ -570,8 +575,13 @@ class PartitionedParameterCoordinator:
         """Release leftover submodules whose post-backward hook never fired (e.g. a no-grad
         block input): drain the backward stack and release as the missing hook would have,
         skipping persistent params to match __params_to_release."""
-        while self.__active_backward_submodules:
-            _, submodule = self.__active_backward_submodules.popitem()
+        while self.__active_backward_submodules or self.__retained_recompute_submodules:
+            if self.__active_backward_submodules:
+                module_id, submodule = self.__active_backward_submodules.popitem()
+            else:
+                module_id, submodule = self.__retained_recompute_submodules.popitem()
+            self.__active_backward_submodules.pop(module_id, None)
+            self.__retained_recompute_submodules.pop(module_id, None)
             params = set(iter_params(submodule, recurse=z3_leaf_module(submodule)))
             recompute_parameters = set(submodule.ds_recompute_parameters)
             params.update(recompute_parameters)
