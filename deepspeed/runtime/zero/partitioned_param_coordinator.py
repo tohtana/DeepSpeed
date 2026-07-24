@@ -546,9 +546,9 @@ class PartitionedParameterCoordinator:
                     and param in recompute_parameters):
                 param.ds_active_sub_modules.discard(-(submodule.ds_id + 1))
             if param.ds_id in params_to_release and not param.is_external_param:
+                partitioned = param.ds_status == ZeroParamStatus.AVAILABLE and not param.ds_active_sub_modules
                 self.__release_param(param, free_data)
-            if not free_data:
-                if param.ds_id in params_to_release and not param.is_external_param:
+                if not free_data and (partitioned or not self.__retain_trainable_params_for_recompute):
                     # empty buffer ensures that all computations are complete
                     param.data = empty_buffer
 

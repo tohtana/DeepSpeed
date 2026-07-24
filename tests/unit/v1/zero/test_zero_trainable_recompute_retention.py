@@ -36,7 +36,7 @@ _ALL_GATHER = "_PartitionedParameterCoordinator__all_gather_params"
 _RETAINED_RECOMPUTE = "_PartitionedParameterCoordinator__retained_recompute_submodules"
 
 
-def _zero3_config(*, retain, persistence_threshold=0, gradient_accumulation_steps=1):
+def _zero3_config(*, retain, persistence_threshold=0, gradient_accumulation_steps=1, module_granularity_threshold=0):
     config = get_config_dict(3,
                              gradient_accumulation_steps=gradient_accumulation_steps,
                              force_fp32=True,
@@ -45,17 +45,25 @@ def _zero3_config(*, retain, persistence_threshold=0, gradient_accumulation_step
     zero["stage3_prefetch_bucket_size"] = 0
     zero["stage3_max_reuse_distance"] = 0
     zero["stage3_retain_trainable_params_for_recompute"] = retain
+    zero["stage3_module_granularity_threshold"] = module_granularity_threshold
     return config
 
 
-def _initialize(model, *, retain, persistence_threshold=0, gradient_accumulation_steps=1, leaf_types=None):
+def _initialize(model,
+                *,
+                retain,
+                persistence_threshold=0,
+                gradient_accumulation_steps=1,
+                module_granularity_threshold=0,
+                leaf_types=None):
     if leaf_types:
         set_z3_leaf_modules(model, leaf_types)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     engine, _, _, _ = deepspeed.initialize(config=_zero3_config(
         retain=retain,
         persistence_threshold=persistence_threshold,
-        gradient_accumulation_steps=gradient_accumulation_steps),
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        module_granularity_threshold=module_granularity_threshold),
                                            model=model,
                                            model_parameters=trainable)
     return engine
@@ -172,6 +180,32 @@ class _RepeatedModuleCheckpointRetentionModel(torch.nn.Module):
     def forward(self, value):
         value = checkpoint(self._checkpointed, value, use_reentrant=self.use_reentrant)
         return self.head(value)
+
+
+class _FineGrainedCheckpointBlock(torch.nn.Module):
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.first = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.second = torch.nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, value):
+        return self.second(torch.tanh(self.first(value)))
+
+
+class _FastShardedCheckpointRetentionModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim, use_reentrant):
+        super().__init__()
+        self.use_reentrant = use_reentrant
+        self.block = _FineGrainedCheckpointBlock(hidden_dim)
+        # Keep the root granularity above the checkpointed block so the
+        # configured threshold selects the block instead of the root.
+        self.head = torch.nn.Linear(hidden_dim, hidden_dim * 16)
+
+    def forward(self, value):
+        value = checkpoint(self.block, value, use_reentrant=self.use_reentrant)
+        return self.head(torch.sin(value))
 
 
 @contextmanager
@@ -471,6 +505,40 @@ class TestZero3TrainableRecomputeRetentionModuleReuse(DistributedTest):
 
         off.destroy()
         on.destroy()
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "nonreentrant"])
+class TestZero3TrainableRecomputeRetentionFastSharding(DistributedTest):
+    world_size = 2
+
+    def test_fine_grained_leaf_retention(self, use_reentrant):
+        device, _, _ = initialize_distributed()
+        engine = _initialize(_FastShardedCheckpointRetentionModel(8, use_reentrant),
+                             retain=True,
+                             module_granularity_threshold=64)
+        parameter_offload = engine.optimizer.parameter_offload
+        assert parameter_offload.fast_sharding_for_leaf_module
+        assert z3_leaf_module(engine.module.block)
+        assert not z3_leaf_module(engine.module)
+        target = engine.module.block.first.weight
+
+        for _ in range(2):
+            value = torch.randn(2, 8, device=device, requires_grad=True)
+            with _record_target_lifecycle(engine, target) as events:
+                loss = engine(value).sum()
+                assert torch.isfinite(loss)
+                engine.backward(loss)
+                _synchronize()
+
+            backward_gathers = [event for event in events if event["kind"] == "gather" and not event["forward"]]
+            assert not backward_gathers, events
+            gradient = safe_get_full_grad(target)
+            assert gradient is not None and torch.isfinite(gradient).all() and torch.count_nonzero(gradient)
+            _assert_clean(engine)
+            _assert_invocation_state_reset(engine, (engine.module.block, ))
+            engine.step()
+
+        engine.destroy()
 
 
 @pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "nonreentrant"])
