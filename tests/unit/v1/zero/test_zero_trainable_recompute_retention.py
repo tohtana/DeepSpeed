@@ -116,12 +116,6 @@ def _collect_gradients(engine):
     return gradients
 
 
-def _backward_demand_gathers(events):
-    return [
-        event for event in events if event["kind"] == "gather" and not event["forward"] and not event["in_recompute"]
-    ]
-
-
 class _CheckpointRetentionModel(torch.nn.Module):
 
     def __init__(self, hidden_dim, use_reentrant):
@@ -283,7 +277,7 @@ class TestZero3TrainableRecomputeRetentionEvents(DistributedTest):
             _synchronize()
 
         recompute_releases = [event for event in events if event["kind"] == "recompute_forward_release"]
-        backward_gathers = _backward_demand_gathers(events)
+        backward_gathers = [event for event in events if event["kind"] == "gather" and not event["forward"]]
         matching_releases = [event for event in events if event["kind"] == "matching_backward_release"]
         assert recompute_releases, events
 
@@ -488,8 +482,10 @@ class TestZero3TrainableRecomputeRetentionModuleReuse(DistributedTest):
                 on.backward(on_loss)
                 _synchronize()
 
-            off_backward_gathers = _backward_demand_gathers(off_events)
-            on_backward_gathers = _backward_demand_gathers(on_events)
+            off_backward_gathers = [
+                event for event in off_events if event["kind"] == "gather" and not event["forward"]
+            ]
+            on_backward_gathers = [event for event in on_events if event["kind"] == "gather" and not event["forward"]]
             assert off_backward_gathers, off_events
             assert not on_backward_gathers, on_events
 
@@ -534,8 +530,16 @@ class TestZero3TrainableRecomputeRetentionFastSharding(DistributedTest):
                 engine.backward(loss)
                 _synchronize()
 
-            backward_gathers = _backward_demand_gathers(events)
-            assert not backward_gathers, events
+            backward_gathers = [event for event in events if event["kind"] == "gather" and not event["forward"]]
+            if use_reentrant:
+                assert not backward_gathers, events
+            else:
+                # Fast-sharding leaf hooks report the nonreentrant checkpoint's
+                # recompute fetch as a backward fetch. It is the single gather
+                # that establishes the retained lease, not a later demand fetch.
+                assert len(backward_gathers) == 1 and backward_gathers[0]["in_recompute"], events
+            matching_releases = [event for event in events if event["kind"] == "matching_backward_release"]
+            assert len(matching_releases) == 1, events
             gradient = safe_get_full_grad(target)
             assert gradient is not None and torch.isfinite(gradient).all() and torch.count_nonzero(gradient)
             _assert_clean(engine)
