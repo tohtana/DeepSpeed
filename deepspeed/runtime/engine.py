@@ -331,6 +331,12 @@ class DeepSpeedEngine(Module):
 
         self.pipeline_parallelism = isinstance(model, PipelineModule)
 
+        if not self.managed_gradient_accumulation():
+            assert not self.zero_optimization_partition_gradients(), \
+                "managed_gradient_accumulation=False is only supported for ZeRO stage 0 and 1"
+            assert not self.pipeline_parallelism, \
+                "managed_gradient_accumulation=False is not supported with pipeline parallelism"
+
         self._deepcompile_active = False
 
         # Configure distributed model
@@ -472,6 +478,10 @@ class DeepSpeedEngine(Module):
         # Otherwise, we fallback to DeepSpeed style backward only.
         # See `count_used_parameters_in_backward` for more details.
         self._running_engine_backward = False
+        # Set only while step() executes. In unmanaged gradient accumulation mode the
+        # caller's step() call is the accumulation boundary, so this flag is what
+        # is_gradient_accumulation_boundary() returns there.
+        self._running_engine_step = False
         self._support_torch_style_backward = False
         # Flag to control whether gradients should be scaled by gradient accumulation steps
         self._scale_wrt_gas = True
@@ -1280,6 +1290,9 @@ class DeepSpeedEngine(Module):
 
     def gradient_accumulation_steps(self):
         return self._config.gradient_accumulation_steps
+
+    def managed_gradient_accumulation(self):
+        return self._config.managed_gradient_accumulation
 
     def use_node_local_storage(self):
         return self._config.use_node_local_storage
@@ -3125,6 +3138,11 @@ class DeepSpeedEngine(Module):
 
         """
         if self._is_gradient_accumulation_boundary is None:
+            if not self.managed_gradient_accumulation():
+                # Unmanaged mode: micro-step tracking is disabled and the caller's
+                # step() call is the accumulation boundary. This flag is only set
+                # while step() runs, so backward accumulates and step reduces/updates.
+                return self._running_engine_step
             if self.zenflow:
                 return self._is_zenflow_update_boundary()
             else:
@@ -3262,6 +3280,15 @@ class DeepSpeedEngine(Module):
 
         self._step_applied = False  # assume False, will flip to True
 
+        # Marks step() as the accumulation boundary for unmanaged gradient accumulation.
+        self._running_engine_step = True
+
+        # In unmanaged mode backward() only accumulates grads locally, so reduce the
+        # accumulated ZeRO 0/1 / DDP gradients here before applying the optimizer step.
+        if not self.managed_gradient_accumulation():
+            if self.enable_backward_allreduce and not self.inside_no_sync_ctxt:
+                self.allreduce_gradients()
+
         if self.zenflow:
             self.optimizer._sync_selective_optimizer_lr()
             if self.auto_update:
@@ -3355,6 +3382,7 @@ class DeepSpeedEngine(Module):
 
                 self.timers.log(self.engine_timers.global_timers)
 
+        self._running_engine_step = False
         self.micro_steps += 1
         see_memory_usage("Engine after step", force=self.memory_breakdown())
 
