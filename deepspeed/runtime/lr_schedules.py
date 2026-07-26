@@ -484,6 +484,8 @@ class OneCycle(object):
 
         self.total_size = cycle_first_step_size + cycle_second_step_size
         self.step_ratio = cycle_first_step_size / self.total_size
+        self.first_step_size = cycle_first_step_size
+        self.second_step_size = cycle_second_step_size
         self.first_stair_count = cycle_first_stair_count
         self.second_stair_count = cycle_first_stair_count if cycle_second_stair_count is None else cycle_second_stair_count
         self.decay_step_size = decay_step_size
@@ -544,7 +546,12 @@ class OneCycle(object):
         # instead of moving them every batch, the same floor() the LR range test staircase
         # uses. A count of 0 keeps the continuous schedule.
         if stair_count > 0:
-            scale_factor = math.floor(scale_factor * stair_count) / stair_count
+            cycle_iteration = batch_iteration % self.total_size
+            if cycle_iteration <= self.first_step_size:
+                stair_position = cycle_iteration * stair_count / self.first_step_size
+            else:
+                stair_position = (self.total_size - cycle_iteration) * stair_count / self.second_step_size
+            scale_factor = math.floor(stair_position) / stair_count
 
         return scale_factor
 
