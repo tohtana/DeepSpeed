@@ -535,8 +535,16 @@ class OneCycle(object):
         x = 1. + batch_iteration / self.total_size - cycle
         if x <= self.step_ratio:
             scale_factor = x / self.step_ratio
+            stair_count = self.first_stair_count
         else:
             scale_factor = (x - 1) / (self.step_ratio - 1)
+            stair_count = self.second_stair_count
+
+        # A stair count holds lr/mom flat across each of that many steps of the half cycle
+        # instead of moving them every batch, the same floor() the LR range test staircase
+        # uses. A count of 0 keeps the continuous schedule.
+        if stair_count > 0:
+            scale_factor = math.floor(scale_factor * stair_count) / stair_count
 
         return scale_factor
 

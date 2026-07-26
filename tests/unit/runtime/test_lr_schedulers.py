@@ -16,7 +16,7 @@ from deepspeed.runtime.lr_schedules import ONE_CYCLE, CYCLE_MIN_LR, CYCLE_MAX_LR
 from deepspeed.runtime.lr_schedules import CYCLE_MIN_MOM, CYCLE_MAX_MOM, DECAY_MOM_RATE
 from deepspeed.runtime.lr_schedules import WARMUP_DECAY_LR, TOTAL_NUM_STEPS
 from deepspeed.runtime.lr_schedules import WARMUP_COSINE_LR, WARMUP_MIN_RATIO, COS_MIN_RATIO, WarmupCosineLR
-from deepspeed.runtime.lr_schedules import WarmupLR, WarmupDecayLR
+from deepspeed.runtime.lr_schedules import WarmupLR, WarmupDecayLR, OneCycle
 
 
 def _verify_continuous_decrease(values):
@@ -627,3 +627,39 @@ def test_warmup_cosine_lr_linear_warmup_type_produces_linear_ratios():
     for step in range(warmup_num_steps):
         scheduler.step(step)
         assert scheduler.get_lr_ratio() == pytest.approx(step / warmup_num_steps)
+
+
+def _one_cycle_lrs(stair_count, steps=16):
+    param = torch.nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.Adam([{"params": [param], "lr": 0.001}], betas=(0.9, 0.99))
+    scheduler = OneCycle(optimizer=optimizer,
+                         cycle_min_lr=0.001,
+                         cycle_max_lr=0.01,
+                         cycle_first_step_size=8,
+                         cycle_second_step_size=8,
+                         cycle_first_stair_count=stair_count,
+                         cycle_second_stair_count=stair_count)
+    lrs = []
+    for _ in range(steps):
+        scheduler.step()
+        lrs.append(scheduler.get_lr()[0])
+    return lrs
+
+
+def test_one_cycle_stair_count_holds_lr_flat():
+    # cycle_first_stair_count / cycle_second_stair_count are documented, exposed as CLI
+    # flags and plumbed through the config, but were read nowhere, so every value produced
+    # the continuous schedule. A stair count must hold the lr flat across each step of the
+    # half cycle, and 0 must stay continuous.
+    continuous = _one_cycle_lrs(0)
+    assert len(set(continuous[:8])) == 8
+
+    stairs = _one_cycle_lrs(2)
+    assert stairs != continuous
+    # two stairs over an eight-batch half cycle: the lr changes far less often
+    assert len(set(stairs[:8])) < len(set(continuous[:8]))
+    # and it is flat within a stair rather than moving every batch
+    assert stairs[0] == stairs[1]
+
+    # a stair count matching the half-cycle length is the continuous schedule again
+    assert _one_cycle_lrs(8) == continuous
