@@ -19,12 +19,13 @@ from unit.simple_model import SimpleModel
 from unit.common import allclose_on_all_ranks
 
 
-def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None):
+def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None, rtol=None, atol=None):
     hidden_dim = hidden_dim_override if hidden_dim_override is not None else 10
 
-    # the default tolerances of torch.testing.assert_close are too small
-    RTOL = 5e-1
-    ATOL = 1e-2
+    # the default tolerances of torch.testing.assert_close are too small for the
+    # cross-stage (ZeRO-0 eager vs ZeRO-3 compiled) comparison below
+    RTOL = 5e-1 if rtol is None else rtol
+    ATOL = 1e-2 if atol is None else atol
 
     # Use a fixed seed for determinism. We don't use the @enable_determinism decorator
     # because it also sets torch.use_deterministic_algorithms(True), which seems
@@ -70,9 +71,11 @@ def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None):
     xs = [torch.randn(train_batch_size, hidden_dim, device=device, dtype=dtype) for _ in range(iteration)]
     ys = [torch.randn_like(x) for x in xs]
 
+    target_losses = []
     for x, y in zip(xs, ys):
         baseline_loss = baseline_engine(x, y)
         target_loss = target_engine(x, y)
+        target_losses.append(target_loss.detach().float().item())
 
         allclose_on_all_ranks(baseline_loss, target_loss, "Loss values are not close.", rtol=RTOL, atol=ATOL)
 
@@ -88,6 +91,10 @@ def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None):
 
     baseline_engine.destroy()
     target_engine.destroy()
+
+    # The per-step target losses let callers compare two compiled configurations against
+    # each other (e.g. offloading on vs off) far more tightly than the cross-stage check.
+    return target_losses
 
 
 def compare_sp_loss(self, config, sp_size, iterations=3):

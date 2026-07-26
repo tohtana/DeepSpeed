@@ -21,11 +21,6 @@ WARMUP = 5
 _MISSING = object()
 
 
-def _print_rank0(msg):
-    if dist.get_rank() == 0:
-        print(f"[DeepCompile] {msg}", flush=True)
-
-
 def _resolve_expected_grad_dtype(param):
     # Match PyTorch's leaf grad accumulation contract. grad_dtype can be a
     # dtype, or None to allow any incoming gradient dtype:
@@ -42,14 +37,6 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     optimizer = engine.optimizer
     use_opt = not isinstance(optimizer, DeepSpeedZeRoOffload)
-
-    _print_rank0(f"init_z3: backend={backend} offload_parameters={compile_config.offload_parameters} "
-                 f"offload_opt_states={compile_config.offload_opt_states} "
-                 f"free_activation={compile_config.free_activation} double_buffer={compile_config.double_buffer} "
-                 f"symmetric_memory={compile_config.symmetric_memory} debug_log={compile_config.debug_log}")
-    _print_rank0(f"init_z3: optimizer={type(optimizer).__module__}.{type(optimizer).__name__} use_opt={use_opt} "
-                 f"(use_opt=False only when ZeRO-3 was initialized without a real optimizer, "
-                 f"i.e. engine.optimizer is DeepSpeedZeRoOffload)")
 
     if use_opt and hasattr(optimizer, "ipg_buckets"):
         optimizer.ipg_buckets.clear()
@@ -76,8 +63,6 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         group_name = engine.data_parallel_group.group_name
         dist.enable_symm_mem_for_group(group_name)
 
-    n_params = 0
-    shard_bytes = 0
     for p in engine.module.parameters():
         grad_buffer = torch.Tensor()
         if use_opt:
@@ -87,18 +72,13 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         p.ds_persist = False
         dc.register_z3_param(p.ds_id, p.ds_shape, p.ds_tensor, grad_buffer, p.ds_persist,
                              _resolve_expected_grad_dtype(p))
-        n_params += 1
-        shard_bytes += p.ds_tensor.numel() * p.ds_tensor.element_size()
 
-    _print_rank0(f"init_z3: registered {n_params} ZeRO-3 params, "
-                 f"shard bytes on this rank={shard_bytes / 1e9:.2f}GB (world_size={dist.get_world_size()}), "
-                 f"persistent params disabled at init")
-
-    schedule_source = "default" if schedule is None else "user-provided"
     if schedule is None:
         if compile_config.offload_parameters and compile_config.offload_opt_states:
             raise ValueError("offload_parameters and offload_opt_states cannot be enabled together; "
-                             "choose one offloading target per run.")
+                             "choose one offloading target per run. Note that offload_parameters may have "
+                             "been enabled implicitly: the engine turns it on when the ZeRO config "
+                             "offloads both optimizer and parameters to CPU.")
         schedule = []
         if (compile_config.offload_parameters):
             schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
@@ -116,9 +96,6 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                 (WARMUP,
                  [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
 
-    for step, passes in schedule:
-        _print_rank0(f"init_z3: {schedule_source} schedule from step {step}: "
-                     f"passes={[opt_pass.__name__ for opt_pass in passes]}")
     init_schedule(schedule)
 
     if use_opt:

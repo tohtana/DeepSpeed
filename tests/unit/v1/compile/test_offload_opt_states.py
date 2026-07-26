@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import os
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,21 @@ from unit.v1.compile.util import compare_loss
 
 pytestmark = pytest.mark.skipif(not required_torch_version(min_version=2.1),
                                 reason="Compile tests requires Pytorch version 2.1 or above")
+
+
+@pytest.fixture(autouse=True)
+def _reset_offload_pass_globals():
+    # The pass keeps its planning state in module globals; reset after every test so tests
+    # pass in any order and in isolation.
+    yield
+    offload_pass.offload_tasks.clear()
+    offload_pass.offload_tasks_scheduled.clear()
+    offload_pass.offload_tasks_inserted = 0
+    offload_pass.reload_tasks_remaining = []
+    offload_pass.total_reload_mem = 0
+    offload_pass._op_task_registry.clear()
+    offload_pass._empty_cache_pending = False
+    offload_pass.reset_offload_op_stats()
 
 
 def _ensure_dc_ops():
@@ -80,6 +96,65 @@ def test_register_offload_ops_idempotent():
         overload = getattr(torch.ops.dc, name).default
         assert overload is not None
         assert overload in torch.fx.node._side_effectful_functions
+
+
+def test_offload_ops_registered_with_ordered_effects():
+    _ensure_dc_ops()
+    from torch._higher_order_ops.effects import SIDE_EFFECTS
+
+    for name, _, _ in offload_pass._OFFLOAD_OP_SPECS:
+        overload = getattr(torch.ops.dc, name).default
+        # The ORDERED effect is what makes stock inductor keep these ops and preserve their
+        # program order; _side_effectful_functions alone only protects FX-level DCE, and the
+        # scheduler's own DCE would silently drop the ops (states never move, loss unchanged).
+        # test_side_effect_ops_survive_stock_inductor proves the mechanism itself.
+        assert overload in SIDE_EFFECTS
+
+
+def test_side_effect_ops_survive_stock_inductor():
+    # Mechanism guard: an anchor-only `-> ()` op is dropped by stock inductor's scheduler DCE
+    # unless it carries an ORDERED effect, and with the effect its program order is preserved.
+    # Uses a throwaway namespace so it needs no dc C++ extension and runs on CPU.
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
+    from torch._inductor.scheduler import Scheduler
+
+    if getattr(Scheduler, "is_dc_patched", False):
+        pytest.skip("inductor DCE already patched out in this process; mechanism not observable")
+
+    if not hasattr(test_side_effect_ops_survive_stock_inductor, "_probe"):
+        lib = torch.library.Library("dctest_probe", "DEF")
+        lib.define("side_op(Tensor anchor, int idx) -> ()")
+        calls = []
+        lib.impl("side_op", lambda anchor, idx: calls.append(idx), "CompositeExplicitAutograd")
+        lib.impl("side_op", lambda anchor, idx: None, "Meta")
+        op = torch.ops.dctest_probe.side_op.default
+        torch.fx.node._side_effectful_functions.add(op)
+        _register_effectful_op(op, _EffectType.ORDERED)
+        # Keep the library object alive or the ops deregister on garbage collection.
+        test_side_effect_ops_survive_stock_inductor._probe = (lib, op, calls)
+    _, op, calls = test_side_effect_ops_survive_stock_inductor._probe
+
+    def f(x):
+        return ((x * 2).relu().sin().sum(), )
+
+    gm = make_fx(f)(torch.randn(8, 8))
+    nodes = list(gm.graph.nodes)
+    placeholder = nodes[0]
+    compute = [n for n in nodes if n.op == "call_function"]
+    out = next(n for n in nodes if n.op == "output")
+    with gm.graph.inserting_before(compute[0]):
+        gm.graph.create_node("call_function", op, (placeholder, 0), {})
+    with gm.graph.inserting_before(compute[-1]):
+        gm.graph.create_node("call_function", op, (placeholder, 1), {})
+    with gm.graph.inserting_before(out):
+        gm.graph.create_node("call_function", op, (placeholder, 2), {})
+    gm.recompile()
+
+    compiled = torch._inductor.compile(gm, [torch.randn(8, 8)])
+    calls.clear()
+    compiled(torch.randn(8, 8))
+    assert calls == [0, 1, 2], f"side-effect ops dropped or reordered by stock inductor: {calls}"
 
 
 def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
@@ -217,17 +292,36 @@ class TestOffloadOptStates(DistributedTest):
             },
         }
 
+        # Reference run: identical stage/compile configuration with offloading off. Comparing
+        # against it isolates the offload pass alone, so a much tighter tolerance applies than
+        # compare_loss's cross-stage default. Silently-stale states (a missed stream ordering)
+        # would show up here as a small persistent loss drift.
+        config_no_offload = deepcopy(config)
+        config_no_offload["compile"]["offload_opt_states"] = False
+        losses_no_offload = compare_loss(self, config_no_offload, dtype, iteration=8)
+
         # Force every optimizer-state tensor to be scheduled for offload (including hp_param,
         # which covers the event-key regression) regardless of the device's actual memory.
         os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"] = "0.000001"
         try:
             offload_pass.reset_offload_op_stats()
-            # WARMUP is 5, so run enough iterations for the offload phase to engage.
-            compare_loss(self, config, dtype, iteration=8)
+            # The offload schedule engages at step 1 (not WARMUP); 8 iterations give several
+            # steady offloaded steps.
+            losses_offload = compare_loss(self, config, dtype, iteration=8)
         finally:
             del os.environ["DS_DC_OFFLOAD_OPT_BUDGET_GB"]
 
         stats = offload_pass.get_offload_op_stats()
         assert stats["launches"] > 0, "offload launch ops never executed"
+        # This is the assertion that carries the weight: launch ops also execute while the
+        # pass-time profilers interpret the graph eagerly, but _reload_opt_impl early-returns
+        # during profiling, so a nonzero reload count proves the ops ran in the compiled graph
+        # (i.e. no dead-code elimination silently removed them).
         assert stats["reloads"] > 0, "reload ops never executed outside profiling"
         assert stats["reloads"] <= stats["launches"]
+
+        # compare_loss seeds identically at entry, so both runs saw the same data and the same
+        # kernel sequence; moving states off-GPU and back must not change the arithmetic.
+        for step, (ref, got) in enumerate(zip(losses_no_offload, losses_offload)):
+            assert got == pytest.approx(ref, rel=1e-4, abs=1e-5), \
+                f"offloading changed the loss at step {step}: {ref} vs {got}"
