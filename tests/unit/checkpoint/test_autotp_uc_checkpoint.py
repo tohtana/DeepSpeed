@@ -140,6 +140,46 @@ def test_resolve_autotp_partition_subparam_sizes_uneven_gqa_like():
     assert torch.equal(slice_flat, expected)
 
 
+def test_resolve_autotp_partition_uses_uneven_partition_sizes():
+    full_hp_param = torch.arange(101 * 4, dtype=torch.float32).view(101, 4)
+    param = _make_param(
+        (50, 4), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (101, 4),
+            'output_shape': (101, ),
+            'partition_sizes': (51, 50),
+            'original_shape': (101, 4),
+            'is_bias': False,
+            'replicated': False,
+        })
+
+    slice_flat = _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=1, tp_world_size=2)
+
+    expected = full_hp_param.narrow(0, 51, 50).flatten()
+    assert torch.equal(slice_flat, expected)
+
+
+def test_resolve_autotp_partition_uses_uneven_partition_sizes_for_bias():
+    full_hp_param = torch.arange(101, dtype=torch.float32)
+    param = _make_param(
+        (50, ), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (101, ),
+            'output_shape': (101, ),
+            'partition_sizes': (51, 50),
+            'original_shape': (101, ),
+            'is_bias': True,
+            'replicated': False,
+        })
+
+    slice_flat = _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=1, tp_world_size=2)
+
+    expected = full_hp_param.narrow(0, 51, 50).flatten()
+    assert torch.equal(slice_flat, expected)
+
+
 def test_resolve_autotp_partition_replicated_bias():
     full_hp_param = torch.arange(8, dtype=torch.float32)
     param = _make_param(

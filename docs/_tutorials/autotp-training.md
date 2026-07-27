@@ -121,7 +121,10 @@ DeepSpeed will read the model's `tp_plan` at initialization and convert it to
 internal partition rules. The supported types are `colwise`, `rowwise`,
 and `colwise_gather_output`(`colwise_rep`). The gathered column styles shard
 the linear weight along its output dimension and AllGather the local output
-shards so every tensor-parallel rank receives the complete output.
+shards so every tensor-parallel rank receives the complete output. For untied
+output layers, the output dimension does not need to be divisible by
+`autotp_size`; DeepSpeed uses uneven local shards and gathers back to the
+original logical output size.
 
 Gathered column parallelism currently supports untied output layers. If an
 output layer such as `lm_head` shares the same runtime `Parameter` object with

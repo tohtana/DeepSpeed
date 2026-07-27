@@ -40,6 +40,7 @@ def _resolve_autotp_partition(current_param, ckpt_dict, full_hp_param, tp_rank, 
     logical_shape = meta.get('logical_shape')
     sub_param_shape = meta.get('sub_param_shape')
     sub_param_sizes = meta.get('sub_param_sizes')
+    partition_sizes = meta.get('partition_sizes')
     replicated = meta.get('replicated', False)
 
     if replicated:
@@ -90,6 +91,12 @@ def _resolve_autotp_partition(current_param, ckpt_dict, full_hp_param, tp_rank, 
             offset += sub_dim_size
 
         slice_tensor = torch.cat(merged_chunks, dim=partition_dim)
+        return slice_tensor.flatten()
+
+    if partition_sizes is not None:
+        shard_offset = sum(partition_sizes[:tp_rank])
+        shard_size = partition_sizes[tp_rank]
+        slice_tensor = full_view.narrow(partition_dim, shard_offset, shard_size)
         return slice_tensor.flatten()
 
     slice_tensor = full_view.chunk(tp_world_size, dim=partition_dim)[tp_rank]
