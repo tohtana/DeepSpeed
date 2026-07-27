@@ -110,10 +110,7 @@ GRADIENT_ACCUMULATION_STEPS_DEFAULT = None
 #########################################
 # Managed Gradient Accumulation
 #########################################
-# When True (default), DeepSpeed tracks micro-steps and only applies an optimizer
-# step at the gradient accumulation boundary, so clients can call forward/backward/step
-# symmetrically. When False, the client is responsible for calling step() at the
-# accumulation boundary and each step() performs an optimizer update.
+# True (default): DeepSpeed tracks micro-steps and steps on the boundary. False: the client owns the boundary and each step() applies an optimizer update.
 MANAGED_GRADIENT_ACCUMULATION = "managed_gradient_accumulation"
 MANAGED_GRADIENT_ACCUMULATION_DEFAULT = True
 

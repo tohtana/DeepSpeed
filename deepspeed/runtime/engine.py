@@ -305,6 +305,7 @@ class DeepSpeedEngine(Module):
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
+        self.pipeline_parallelism = isinstance(model, PipelineModule)
         self._do_sanity_check()
         if self.log_level() is not None:
             set_log_level_from_string(self.log_level())
@@ -328,14 +329,6 @@ class DeepSpeedEngine(Module):
             "DeepSpeed Engine: Before configure distributed model",
             force=self.memory_breakdown(),
         )
-
-        self.pipeline_parallelism = isinstance(model, PipelineModule)
-
-        if not self.managed_gradient_accumulation():
-            assert not self.zero_optimization_partition_gradients(), \
-                "managed_gradient_accumulation=False is only supported for ZeRO stage 0 and 1"
-            assert not self.pipeline_parallelism, \
-                "managed_gradient_accumulation=False is not supported with pipeline parallelism"
 
         self._deepcompile_active = False
 
@@ -478,9 +471,7 @@ class DeepSpeedEngine(Module):
         # Otherwise, we fallback to DeepSpeed style backward only.
         # See `count_used_parameters_in_backward` for more details.
         self._running_engine_backward = False
-        # Set only while step() executes. In unmanaged gradient accumulation mode the
-        # caller's step() call is the accumulation boundary, so this flag is what
-        # is_gradient_accumulation_boundary() returns there.
+        # True only while step() runs; the unmanaged-mode accumulation boundary.
         self._running_engine_step = False
         self._support_torch_style_backward = False
         # Flag to control whether gradients should be scaled by gradient accumulation steps
@@ -1603,6 +1594,16 @@ class DeepSpeedEngine(Module):
         if isinstance(self.client_lr_scheduler, _LRScheduler):
             assert isinstance(self.client_optimizer, Optimizer), \
                 f'Client Optimizer (type = {type(self.client_optimizer)} is not instantiated but Client LR Scheduler is instantiated'
+
+        if not self.managed_gradient_accumulation():
+            assert not self.zero_optimization_partition_gradients(), \
+                "managed_gradient_accumulation=False is only supported for ZeRO stage 0 and 1"
+            assert not self.pipeline_parallelism, \
+                "managed_gradient_accumulation=False is not supported with pipeline parallelism"
+            assert not self.is_deepcompile_enabled(), \
+                "managed_gradient_accumulation=False is not supported with DeepCompile"
+            assert not self.amp_enabled(), \
+                "managed_gradient_accumulation=False is not supported with Apex AMP"
 
     def _broadcast_model(self):
         if self.dist_backend is None:
@@ -3139,9 +3140,7 @@ class DeepSpeedEngine(Module):
         """
         if self._is_gradient_accumulation_boundary is None:
             if not self.managed_gradient_accumulation():
-                # Unmanaged mode: micro-step tracking is disabled and the caller's
-                # step() call is the accumulation boundary. This flag is only set
-                # while step() runs, so backward accumulates and step reduces/updates.
+                # Unmanaged mode: step() is the accumulation boundary (set only while step() runs).
                 return self._running_engine_step
             if self.zenflow:
                 return self._is_zenflow_update_boundary()
@@ -3280,11 +3279,10 @@ class DeepSpeedEngine(Module):
 
         self._step_applied = False  # assume False, will flip to True
 
-        # Marks step() as the accumulation boundary for unmanaged gradient accumulation.
+        # Unmanaged mode: step() is the accumulation boundary.
         self._running_engine_step = True
 
-        # In unmanaged mode backward() only accumulates grads locally, so reduce the
-        # accumulated ZeRO 0/1 / DDP gradients here before applying the optimizer step.
+        # Unmanaged mode: backward() only accumulates locally, so reduce grads here.
         if not self.managed_gradient_accumulation():
             if self.enable_backward_allreduce and not self.inside_no_sync_ctxt:
                 self.allreduce_gradients()
