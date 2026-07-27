@@ -426,6 +426,39 @@ class TensorParallel_Layer(nn.Module, ABC):
         global DEEPSPEED_AUTOTP_MODE
         return DEEPSPEED_AUTOTP_MODE == AUTOTP_MODE.TRAINING
 
+    @torch.no_grad()
+    def _all_gather_shards(self, shard, partition_sizes, dim):
+        """Reassemble a parameter from its tensor parallel shards along ``dim``.
+
+        ``partition_sizes`` is derived locally from the same deterministic split used to
+        create the shards, so no extra collective is needed to discover the remote sizes.
+        Uneven shards are zero padded to a common size, which keeps the uniform (and
+        faster) ``all_gather_into_tensor`` collective usable, and are then trimmed back.
+        """
+        world_size = len(partition_sizes)
+        assert partition_sizes[self.tp_index] == shard.shape[dim], (
+            f"Rank {self.tp_index} holds {shard.shape[dim]} elements along dim {dim} of "
+            f"{self.name}, but the partition scheme expects {partition_sizes[self.tp_index]}.")
+
+        max_size = max(partition_sizes)
+        padded_shape = list(shard.shape)
+        padded_shape[dim] = max_size
+        if shard.shape[dim] == max_size:
+            padded = shard.contiguous()
+        else:
+            padded = shard.new_zeros(padded_shape)
+            padded.narrow(dim, 0, shard.shape[dim]).copy_(shard)
+
+        buffer = shard.new_empty((world_size * padded_shape[0], *padded_shape[1:]))
+        dist.all_gather_into_tensor(buffer, padded, group=self.mp_group)
+
+        if dim == 0 and min(partition_sizes) == max_size:
+            # Shards are uniform and concatenated along dim 0, so the flat buffer is the result.
+            return buffer
+
+        shards = buffer.view(world_size, *padded_shape)
+        return torch.cat([shards[i].narrow(dim, 0, size) for i, size in enumerate(partition_sizes)], dim=dim)
+
     def __deepcopy__(self, memo):
         # This function is designed for
         # 'mp_group' (a 'ProcessGroup') cannot be pickled during deepcopy in some usage.
@@ -631,6 +664,7 @@ class LinearAllreduce(TensorParallel_Layer):
         super(LinearAllreduce, self).__init__(mp_group, **kwargs)
         self.weight = module.weight
         self.bias = module.bias
+        self._orig_weight_shape = tuple(module.weight.shape)
 
         if self._should_materialize_tp_partition():
             self._tp_partition([self.weight, self.bias])
@@ -650,51 +684,34 @@ class LinearAllreduce(TensorParallel_Layer):
 
     @torch.no_grad()
     def gather_params(self, params_list):
+        # Row parallelism only shards the weight; the bias is replicated across ranks.
+        weight = params_list[0]
+        if weight is None:
+            return
 
-        for idx, param in enumerate(params_list):
-            if param is None or idx > 0:
-                # don't gather bias
-                return
-            params_list[idx].data_partition = param.data
-            param = param.transpose(0, 1).contiguous()
+        weight.data_partition = weight.data
+        if self.mp_group is None or self.tp_world_size == 1:
+            weight.data = weight.data.contiguous()
+            return
 
-            output_param = torch.empty(self.tp_world_size * param.shape[0],
-                                       param.shape[1],
-                                       dtype=param.dtype,
-                                       device=param.device)
-            dist.all_gather_into_tensor(output_param, param, group=self.mp_group)
-            params_list[idx].data = output_param.transpose(0, 1).contiguous()
-        return
+        partition_sizes = get_shard_size_list(self._orig_weight_shape[1], self.tp_world_size, self.name)
+        weight.data = self._all_gather_shards(weight, partition_sizes, dim=1).contiguous()
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
+        # Row parallelism shards the weight's input dimension; the bias stays replicated.
+        self.uneven_partition(params_list)
 
-        if not self.is_training_mode():
-            self.uneven_partition(params_list)
-            return
-
-        else:
-            for idx, param in enumerate(params_list):
-                if param is None:
-                    # don't slipt bias
-                    return
-                if idx > 0:  # move bias to device at initialization
-                    _partition = self.move(param).detach()
-                    params_list[idx].data = _partition
-                    return
-
-                _partition = torch.chunk(param, self.tp_world_size, dim=-1)[self.tp_index]
-
-                _partition = self.move(_partition).detach()
-
-                params_list[idx].data = _partition
+        bias = params_list[1] if len(params_list) > 1 else None
+        if bias is not None and self.is_training_mode():
+            # Training materializes the replicated bias on the target device.
+            bias.data = self.move(bias).detach()
 
     def uneven_partition(self, params_list):
         for idx, param in enumerate(params_list):
             if param is None or idx > 0:
                 # don't slipt bias
                 return
-            assert self.name is not None, "The module name must be provided in the initialization."
             _partition = params_list[idx].split(get_shard_size_list(params_list[idx].shape[1], self.tp_world_size,
                                                                     self.name),
                                                 dim=1)[self.tp_index]
@@ -703,13 +720,15 @@ class LinearAllreduce(TensorParallel_Layer):
             params_list[idx].data = _partition
 
     def _mark_uc_metadata(self):
-        original_weight_shape = (self.weight.shape[0], self.weight.shape[1] * self.tp_world_size)
+        partition_sizes = get_shard_size_list(self._orig_weight_shape[1], self.tp_world_size, self.name)
         self._set_param_uc_meta(self.weight,
                                 partition_type='row',
                                 partition_dim=1,
-                                logical_shape=original_weight_shape,
-                                output_shape=(original_weight_shape[0], ),
-                                original_shape=original_weight_shape)
+                                logical_shape=self._orig_weight_shape,
+                                output_shape=(self._orig_weight_shape[0], ),
+                                partition_sizes=partition_sizes,
+                                target_partition_shape=tuple(self.weight.shape),
+                                original_shape=self._orig_weight_shape)
         if self.bias is not None:
             self._set_param_uc_meta(self.bias,
                                     partition_type='row',
@@ -762,30 +781,13 @@ class LinearLayer(TensorParallel_Layer):
 
             params_list[idx].data_partition = param.data
             if self.mp_group is None or self.tp_world_size == 1:
-                output_param = param.data.contiguous()
-            else:
-                local_size = torch.tensor([param.shape[0]], dtype=torch.long, device=param.device)
-                gathered_sizes = [torch.empty_like(local_size) for _ in range(self.tp_world_size)]
-                dist.all_gather(gathered_sizes, local_size, group=self.mp_group)
-                partition_sizes = tuple(int(size.item()) for size in gathered_sizes)
-                max_partition_size = max(partition_sizes)
+                params_list[idx].data = param.data.contiguous()
+                continue
 
-                if param.shape[0] == max_partition_size:
-                    param_padded = param.contiguous()
-                else:
-                    padded_shape = (max_partition_size, *param.shape[1:])
-                    param_padded = param.new_zeros(padded_shape)
-                    param_padded[:param.shape[0]].copy_(param)
-
-                gathered = [torch.empty_like(param_padded) for _ in range(self.tp_world_size)]
-                dist.all_gather(gathered, param_padded, group=self.mp_group)
-                output_param = torch.cat([shard[:size] for shard, size in zip(gathered, partition_sizes)], dim=0)
-
-            if param is self.weight:
-                output_param = output_param.reshape(self._orig_weight_shape)
-            elif param is self.bias and self._orig_bias_shape is not None:
-                output_param = output_param.reshape(self._orig_bias_shape)
-            params_list[idx].data = output_param.contiguous()
+            # Column parallelism shards dim 0 of both the weight and the bias, so gathering
+            # along dim 0 restores the original shape.
+            partition_sizes = get_shard_size_list(self._orig_weight_shape[0], self.tp_world_size, self.name)
+            params_list[idx].data = self._all_gather_shards(param, partition_sizes, dim=0).contiguous()
 
     @torch.no_grad()
     def _tp_partition(self, params_list):

@@ -3,20 +3,28 @@
 
 # DeepSpeed Team
 
+import os
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from deepspeed.checkpoint.constants import (CAT_DIM, FP32_WEIGHT_KEY, PARAM, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-                                            PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE,
-                                            TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO)
+import deepspeed
+import deepspeed.comm as dist
+from deepspeed.checkpoint.ds_to_universal import main as convert_to_universal
+from deepspeed.checkpoint.constants import (CAT_DIM, FP32_WEIGHT_KEY, PARAM, PARAM_SHAPES,
+                                            PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
+                                            SUB_PARAM_SHAPE, TP_REPLICATED_PARAMETER_PATTERNS,
+                                            UNIVERSAL_CHECKPOINT_INFO)
 from deepspeed.checkpoint.universal_checkpoint import SubparamShape as CheckpointSubparamShape
-from deepspeed.checkpoint.ds_to_universal import merge_tp_slices
+from deepspeed.checkpoint.ds_to_universal import _collect_slice_shapes, merge_tp_slices
 from deepspeed.checkpoint.universal_checkpoint import (_get_param_uc_restore_meta, _resolve_autotp_partition,
                                                        load_hp_checkpoint_state)
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
+
+from unit.common import DistributedTest
 
 
 class _DummyAddress:
@@ -270,7 +278,8 @@ def test_merge_tp_slices_emits_subparam_shape_metadata(tmp_path):
     ds_checkpoint = SimpleNamespace(
         get_checkpoint_info=lambda key: uc_info if key == UNIVERSAL_CHECKPOINT_INFO else {})
 
-    unmatched = merge_tp_slices(ds_checkpoint, str(output_dir), str(slice_dir), 2, (param_name, torch.Size([3, 4])))
+    unmatched = merge_tp_slices(ds_checkpoint, str(output_dir), str(slice_dir), 2,
+                                (param_name, [torch.Size([3, 4]), torch.Size([3, 4])]))
 
     ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
     assert not unmatched
@@ -283,8 +292,9 @@ def test_merge_tp_slices_uses_row_parallel_cat_dim(tmp_path):
     output_dir = tmp_path / "out"
     param_name = "module.proj.weight"
 
-    tp0 = torch.arange(16, dtype=torch.float32).view(4, 4)
-    tp1 = torch.arange(16, 32, dtype=torch.float32).view(4, 4)
+    # Uneven row-parallel shards: rank 0 owns 3 input columns, rank 1 owns 2.
+    tp0 = torch.arange(12, dtype=torch.float32).view(4, 3)
+    tp1 = torch.arange(12, 20, dtype=torch.float32).view(4, 2)
     _write_tp_states(slice_dir, param_name, 0, tp0)
     _write_tp_states(slice_dir, param_name, 1, tp1)
 
@@ -297,7 +307,8 @@ def test_merge_tp_slices_uses_row_parallel_cat_dim(tmp_path):
     ds_checkpoint = SimpleNamespace(
         get_checkpoint_info=lambda key: uc_info if key == UNIVERSAL_CHECKPOINT_INFO else {})
 
-    merge_tp_slices(ds_checkpoint, str(output_dir), str(slice_dir), 2, (param_name, torch.Size([4, 4])))
+    merge_tp_slices(ds_checkpoint, str(output_dir), str(slice_dir), 2,
+                    (param_name, [torch.Size([4, 3]), torch.Size([4, 2])]))
 
     ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
     assert ckpt[CAT_DIM] == 1
@@ -350,3 +361,257 @@ def test_get_param_uc_restore_meta_returns_top_level_restore_schema():
 
     assert restore_meta["partition_dim"] == 1
     assert restore_meta["conversion"]["partition_dim"] == 999
+
+
+CP_TAG = "uneven_tp"
+UNIVERSAL_TAG = f"{CP_TAG}_universal"
+
+
+class UnevenVocabLmHeadModel(torch.nn.Module):
+
+    def __init__(self, hidden_dim, vocab_size):
+        super().__init__()
+        self.lm_head = torch.nn.Linear(hidden_dim, vocab_size)
+
+    def forward(self, x):
+        return self.lm_head(x).sum()
+
+
+class GQAAttentionModel(torch.nn.Module):
+    """Column-parallel q/k/v feeding a row-parallel o_proj, sharded on kv-head boundaries."""
+
+    class Config:
+
+        def __init__(self, hidden_dim, num_heads):
+            self.hidden_size = hidden_dim
+            self.num_attention_heads = num_heads
+            self.num_key_value_heads = num_heads
+
+    class Attention(torch.nn.Module):
+
+        def __init__(self, hidden_dim):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.k_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.v_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.o_proj = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        def forward(self, x):
+            return self.o_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
+
+    class Layer(torch.nn.Module):
+
+        def __init__(self, hidden_dim):
+            super().__init__()
+            self.self_attn = GQAAttentionModel.Attention(hidden_dim)
+
+        def forward(self, x):
+            return self.self_attn(x)
+
+    def __init__(self, hidden_dim, num_heads):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([GQAAttentionModel.Layer(hidden_dim)])
+        self.config = GQAAttentionModel.Config(hidden_dim, num_heads)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x.sum()
+
+
+def _convert_to_universal(checkpoint_dir, universal_dir):
+    convert_to_universal(
+        SimpleNamespace(input_folder=checkpoint_dir,
+                        output_folder=universal_dir,
+                        num_extract_workers=1,
+                        num_merge_workers=1,
+                        keep_temp_folder=False,
+                        strict=True,
+                        inject_missing_state=False))
+
+
+def _train_steps(engine, hidden_dim, steps=3):
+    for _ in range(steps):
+        batch = torch.randn(2, hidden_dim, device=engine.device)
+        dist.broadcast(batch, src=0)
+        engine.backward(engine(batch))
+        engine.step()
+
+
+def _save_and_convert(engine, tmpdir):
+    engine.save_checkpoint(tmpdir, tag=CP_TAG, client_state={"iteration": 3})
+    dist.barrier()
+    if dist.get_rank() == 0:
+        _convert_to_universal(os.path.join(tmpdir, CP_TAG), os.path.join(tmpdir, UNIVERSAL_TAG))
+    dist.barrier()
+
+
+class TestUnevenColumnUniversalCheckpoint(DistributedTest):
+    world_size = 2
+    reuse_dist_env = False
+
+    def test_save_convert_load_uneven_lm_head(self, tmpdir):
+        hidden_dim = 12
+        vocab_size = 101  # Not divisible by the two TP ranks, giving shards of 51 and 50.
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size,
+                "partition_config": {
+                    "use_default_specs":
+                    False,
+                    "layer_specs": [{
+                        "patterns": [r".*lm_head\.weight$"],
+                        "partition_type": "column",
+                        "gather_output": True,
+                    }],
+                },
+            },
+            "zero_optimization": {
+                "stage": 1
+            },
+        }
+
+        torch.manual_seed(42)
+        model = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+        assert engine.module.lm_head.weight.shape[0] in (51, 50)
+
+        _train_steps(engine, hidden_dim)
+        expected_weight = engine.module.lm_head.weight.detach().cpu().clone()
+        expected_bias = engine.module.lm_head.bias.detach().cpu().clone()
+        _save_and_convert(engine, tmpdir)
+
+        if dist.get_rank() == 0:
+            merged = torch.load(os.path.join(tmpdir, UNIVERSAL_TAG, "zero", "lm_head.weight", "fp32.pt"),
+                                weights_only=False)
+            assert tuple(merged[PARAM].shape) == (vocab_size, hidden_dim)
+
+        config_dict["checkpoint"] = {"load_universal": True}
+        torch.manual_seed(123)
+        restored = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+        restored_engine, _, _, _ = deepspeed.initialize(model=restored,
+                                                        model_parameters=restored.parameters(),
+                                                        config=config_dict)
+        restored_engine.load_checkpoint(tmpdir, tag=UNIVERSAL_TAG, load_optimizer_states=True)
+
+        torch.testing.assert_close(restored_engine.module.lm_head.weight.detach().cpu(), expected_weight)
+        torch.testing.assert_close(restored_engine.module.lm_head.bias.detach().cpu(), expected_bias)
+
+        # The optimizer must be usable after the restore.
+        _train_steps(restored_engine, hidden_dim, steps=1)
+
+
+class TestUnevenRowUniversalCheckpoint(DistributedTest):
+    world_size = 4
+    reuse_dist_env = False
+
+    def test_save_convert_load_uneven_row_parallel(self, tmpdir):
+        hidden_dim = 384
+        num_heads = 6  # Not divisible by the four TP ranks, giving shards of 128/128/64/64.
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size
+            },
+            "zero_optimization": {
+                "stage": 1
+            },
+        }
+
+        torch.manual_seed(42)
+        model = GQAAttentionModel(hidden_dim, num_heads)
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        attn = engine.module.layers[0].self_attn
+        # Column and row parallelism must shard the same dimension identically.
+        assert attn.q_proj.weight.shape[0] == attn.o_proj.weight.shape[1]
+
+        _train_steps(engine, hidden_dim)
+        expected_q = attn.q_proj.weight.detach().cpu().clone()
+        expected_o = attn.o_proj.weight.detach().cpu().clone()
+        _save_and_convert(engine, tmpdir)
+
+        if dist.get_rank() == 0:
+            merged = torch.load(os.path.join(tmpdir, UNIVERSAL_TAG, "zero", "layers.0.self_attn.o_proj.weight",
+                                             "fp32.pt"),
+                                weights_only=False)
+            assert tuple(merged[PARAM].shape) == (hidden_dim, hidden_dim)
+
+        config_dict["checkpoint"] = {"load_universal": True}
+        torch.manual_seed(123)
+        restored = GQAAttentionModel(hidden_dim, num_heads)
+        restored_engine, _, _, _ = deepspeed.initialize(model=restored,
+                                                        model_parameters=restored.parameters(),
+                                                        config=config_dict)
+        restored_engine.load_checkpoint(tmpdir, tag=UNIVERSAL_TAG, load_optimizer_states=True)
+
+        restored_attn = restored_engine.module.layers[0].self_attn
+        torch.testing.assert_close(restored_attn.q_proj.weight.detach().cpu(), expected_q)
+        torch.testing.assert_close(restored_attn.o_proj.weight.detach().cpu(), expected_o)
+
+        _train_steps(restored_engine, hidden_dim, steps=1)
+
+
+def _write_mp_rank_file(dir_path, mp_rank, param_shapes):
+    os.makedirs(dir_path, exist_ok=True)
+    path = os.path.join(dir_path, f"mp_rank_{mp_rank:02d}_model_states.pt")
+    torch.save({PARAM_SHAPES: param_shapes}, path)
+    return path
+
+
+def test_collect_slice_shapes_keeps_uneven_shapes_in_tp_order(tmp_path):
+    # tp=2 with a column dimension of 5, giving shards of 3 and 2.
+    files = [
+        _write_mp_rank_file(tmp_path, 0, [{
+            "lm_head.weight": torch.Size([3, 4])
+        }]),
+        _write_mp_rank_file(tmp_path, 1, [{
+            "lm_head.weight": torch.Size([2, 4])
+        }]),
+    ]
+    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=1)
+
+    shapes = _collect_slice_shapes(ds_checkpoint)
+
+    assert shapes["lm_head.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
+
+
+def test_collect_slice_shapes_pipeline_parallel_layout(tmp_path):
+    # Model-parallel ranks enumerate the (pp, tp) grid with tp varying fastest, and each
+    # pipeline stage only owns its own parameters.
+    stage0 = {"layers.0.weight": torch.Size([3, 4])}, {"layers.0.weight": torch.Size([2, 4])}
+    stage1 = {"layers.1.weight": torch.Size([3, 4])}, {"layers.1.weight": torch.Size([2, 4])}
+    files = [
+        _write_mp_rank_file(tmp_path, 0, [stage0[0]]),
+        _write_mp_rank_file(tmp_path, 1, [stage0[1]]),
+        _write_mp_rank_file(tmp_path, 2, [stage1[0]]),
+        _write_mp_rank_file(tmp_path, 3, [stage1[1]]),
+    ]
+    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=2)
+
+    shapes = _collect_slice_shapes(ds_checkpoint)
+
+    # Every parameter is collected once per tp rank, in tp order, despite spanning two stages.
+    assert shapes["layers.0.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
+    assert shapes["layers.1.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
+
+
+def test_collect_slice_shapes_rejects_unexpected_rank_count(tmp_path):
+    files = [_write_mp_rank_file(tmp_path, 0, [{"lm_head.weight": torch.Size([3, 4])}])]
+    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=1)
+
+    with pytest.raises(AssertionError, match="one per tp rank"):
+        _collect_slice_shapes(ds_checkpoint)

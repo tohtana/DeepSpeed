@@ -76,4 +76,11 @@ def get_shard_size_list(total_size, mp_size, name=None):
     shard_sizes = []
     for i in range(mp_size):
         shard_sizes.append(get_shard_size(total_size, mp_size, name, i))
+    # Shards must tile the dimension exactly, otherwise the partitioned weights no longer
+    # reconstruct the original tensor. tp_grain_size quantization can violate this when the
+    # dimension is not a multiple of the grain size.
+    assert sum(shard_sizes) == total_size, (
+        f"AutoTP shard sizes {shard_sizes} for layer '{name}' do not sum to the dimension size {total_size} "
+        f"with tp_size={mp_size} and tp_grain_size={tp_grain_size}. Choose a tp_grain_size that divides "
+        f"{total_size}.")
     return shard_sizes
