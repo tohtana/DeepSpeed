@@ -64,6 +64,7 @@ def _build_param_uc_restore_meta(*,
                                  output_shape=None,
                                  sub_param_shape=None,
                                  sub_param_sizes=None,
+                                 partition_sizes=None,
                                  target_partition_shape=None,
                                  original_shape=None,
                                  is_bias=False,
@@ -86,6 +87,8 @@ def _build_param_uc_restore_meta(*,
         _normalize_uc_shape(sub_param_shape),
         'sub_param_sizes':
         _normalize_uc_shape(sub_param_sizes),
+        'partition_sizes':
+        _normalize_uc_shape(partition_sizes),
         'target_partition_shape':
         _normalize_uc_shape(target_partition_shape),
         'original_shape':
@@ -389,6 +392,7 @@ class TensorParallel_Layer(nn.Module, ABC):
                            output_shape=None,
                            sub_param_shape=None,
                            sub_param_sizes=None,
+                           partition_sizes=None,
                            target_partition_shape=None,
                            original_shape=None,
                            is_bias=False,
@@ -403,6 +407,7 @@ class TensorParallel_Layer(nn.Module, ABC):
                                          output_shape=output_shape,
                                          sub_param_shape=sub_param_shape,
                                          sub_param_sizes=sub_param_sizes,
+                                         partition_sizes=partition_sizes,
                                          target_partition_shape=target_partition_shape,
                                          original_shape=original_shape,
                                          is_bias=is_bias,
@@ -724,6 +729,8 @@ class LinearLayer(TensorParallel_Layer):
         self.weight = module.weight
         self.bias = module.bias
         self.gather_output = gather_output
+        self._orig_weight_shape = tuple(module.weight.shape)
+        self._orig_bias_shape = tuple(module.bias.shape) if self.bias is not None else None
         if not skip_partition and self._should_materialize_tp_partition():
             self._tp_partition([self.weight, self.bias])
         self.support_training = True
@@ -749,31 +756,40 @@ class LinearLayer(TensorParallel_Layer):
 
     @torch.no_grad()
     def gather_params(self, params_list):
-        #  Does not support uneven shard.
         for idx, param in enumerate(params_list):
+            if param is None:
+                continue
 
             params_list[idx].data_partition = param.data
-            output_param = torch.empty((self.tp_world_size * param.shape[0], *param.shape[1:]),
-                                       dtype=param.dtype,
-                                       device=param.device)
-            dist.all_gather_into_tensor(output_param, param, group=self.mp_group)
+            if self.mp_group is None or self.tp_world_size == 1:
+                output_param = param.data.contiguous()
+            else:
+                local_size = torch.tensor([param.shape[0]], dtype=torch.long, device=param.device)
+                gathered_sizes = [torch.empty_like(local_size) for _ in range(self.tp_world_size)]
+                dist.all_gather(gathered_sizes, local_size, group=self.mp_group)
+                partition_sizes = tuple(int(size.item()) for size in gathered_sizes)
+                max_partition_size = max(partition_sizes)
+
+                if param.shape[0] == max_partition_size:
+                    param_padded = param.contiguous()
+                else:
+                    padded_shape = (max_partition_size, *param.shape[1:])
+                    param_padded = param.new_zeros(padded_shape)
+                    param_padded[:param.shape[0]].copy_(param)
+
+                gathered = [torch.empty_like(param_padded) for _ in range(self.tp_world_size)]
+                dist.all_gather(gathered, param_padded, group=self.mp_group)
+                output_param = torch.cat([shard[:size] for shard, size in zip(gathered, partition_sizes)], dim=0)
+
+            if param is self.weight:
+                output_param = output_param.reshape(self._orig_weight_shape)
+            elif param is self.bias and self._orig_bias_shape is not None:
+                output_param = output_param.reshape(self._orig_bias_shape)
             params_list[idx].data = output_param.contiguous()
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
-
-        if not self.is_training_mode():
-            self.uneven_partition(params_list)
-            return
-        for idx, param in enumerate(params_list):
-            if param is None:
-                return
-            #split bias if provide
-            _partition = torch.chunk(param, self.tp_world_size, dim=0)[self.tp_index]
-
-            _partition = self.move(_partition).detach()
-
-            params_list[idx].data = _partition
+        self.uneven_partition(params_list)
 
     def uneven_partition(self, params_list):
 
@@ -781,7 +797,6 @@ class LinearLayer(TensorParallel_Layer):
             if param is None:
                 #split bias if provide
                 return
-            assert self.name is not None, "The module name must be provided in the initialization."
             _partition = params_list[idx].split(get_shard_size_list(params_list[idx].shape[0], self.tp_world_size,
                                                                     self.name),
                                                 dim=0)[self.tp_index]
@@ -791,22 +806,25 @@ class LinearLayer(TensorParallel_Layer):
             params_list[idx].data = _partition
 
     def _mark_uc_metadata(self):
-        original_out_dim = self.weight.shape[0] * self.tp_world_size
-        original_weight_shape = (original_out_dim, self.weight.shape[1])
+        original_out_dim = self._orig_weight_shape[0]
+        partition_sizes = get_shard_size_list(original_out_dim, self.tp_world_size, self.name)
         self._set_param_uc_meta(self.weight,
                                 partition_type='column',
                                 partition_dim=0,
-                                logical_shape=original_weight_shape,
+                                logical_shape=self._orig_weight_shape,
                                 output_shape=(original_out_dim, ),
-                                original_shape=original_weight_shape)
+                                partition_sizes=partition_sizes,
+                                target_partition_shape=tuple(self.weight.shape),
+                                original_shape=self._orig_weight_shape)
         if self.bias is not None:
-            original_bias_shape = (self.bias.shape[0] * self.tp_world_size, )
             self._set_param_uc_meta(self.bias,
                                     partition_type='column',
                                     partition_dim=0,
-                                    logical_shape=original_bias_shape,
-                                    output_shape=original_bias_shape,
-                                    original_shape=original_bias_shape,
+                                    logical_shape=self._orig_bias_shape,
+                                    output_shape=self._orig_bias_shape,
+                                    partition_sizes=partition_sizes,
+                                    target_partition_shape=tuple(self.bias.shape),
+                                    original_shape=self._orig_bias_shape,
                                     is_bias=True)
 
     # for bwc

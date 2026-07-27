@@ -80,6 +80,26 @@ def test_subparam_layer_marks_standardized_param_metadata():
     assert tuple(bias_meta["target_partition_shape"]) == tuple(layer.bias.shape)
 
 
+def test_linear_layer_marks_uneven_column_metadata():
+    layer = LinearLayer(torch.nn.Linear(8, 101, bias=True), mp_group=None, name="lm_head")
+    layer.tp_world_size = 2
+    layer.weight.data = layer.weight.data[:51].contiguous()
+    layer.bias.data = layer.bias.data[:51].contiguous()
+    layer._mark_uc_metadata()
+
+    weight_meta = getattr(layer.weight, DS_AUTOTP_UC_META)
+    bias_meta = getattr(layer.bias, DS_AUTOTP_UC_META)
+
+    assert weight_meta["logical_shape"] == (101, 8)
+    assert weight_meta["output_shape"] == (101, )
+    assert weight_meta["partition_sizes"] == (51, 50)
+    assert weight_meta["target_partition_shape"] == (51, 8)
+    assert weight_meta["original_shape"] == (101, 8)
+    assert bias_meta["logical_shape"] == (101, )
+    assert bias_meta["partition_sizes"] == (51, 50)
+    assert bias_meta["target_partition_shape"] == (51, )
+
+
 def test_universal_checkpoint_info_excludes_param_level_recovery_fields():
     layer = SubParamLinearLayer(torch.nn.Linear(12, 12, bias=True),
                                 mp_group=None,
@@ -96,6 +116,7 @@ def test_universal_checkpoint_info_excludes_param_level_recovery_fields():
     assert "partition_dim" in subparam_entry
     assert "patterns" in subparam_entry
     assert "sub_param_sizes" not in subparam_entry
+    assert "partition_sizes" not in subparam_entry
     assert "target_partition_shape" not in subparam_entry
 
 
@@ -126,6 +147,7 @@ def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
                                                 output_shape=[12],
                                                 sub_param_shape=[3, -1],
                                                 sub_param_sizes=[4, 4, 4],
+                                                partition_sizes=[6, 6],
                                                 target_partition_shape=torch.Size([4, 8]),
                                                 original_shape=torch.Size([12, 8]),
                                                 is_bias=False,
@@ -135,6 +157,7 @@ def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
     assert restore_meta["output_shape"] == (12, )
     assert restore_meta["sub_param_shape"] == (3, -1)
     assert restore_meta["sub_param_sizes"] == (4, 4, 4)
+    assert restore_meta["partition_sizes"] == (6, 6)
     assert restore_meta["target_partition_shape"] == (4, 8)
     assert restore_meta["original_shape"] == (12, 8)
     assert restore_meta["conversion"] == {
