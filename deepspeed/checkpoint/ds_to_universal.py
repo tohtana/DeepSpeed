@@ -212,7 +212,30 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     _save_checkpoint(path, state_flat_tensor)
 
 
-def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
+def _collect_slice_shapes(ds_checkpoint):
+    """Collect each parameter's per-tp-rank slice shape, ordered by tp rank.
+
+    AutoTP may shard a dimension unevenly, so tp ranks cannot be assumed to share a single
+    slice shape. Model state files are named by model-parallel rank, which enumerates the
+    (pp, tp) grid with tp varying fastest, so reading them in order yields tp order.
+    """
+    slice_shapes = {}
+    for mp_rank_file in ds_checkpoint.mp_rank_files:
+        mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
+        for sub_group_shapes in mp_sd[PARAM_SHAPES]:
+            for param_name, param_shape in sub_group_shapes.items():
+                slice_shapes.setdefault(param_name, []).append(param_shape)
+
+    for param_name, shapes in slice_shapes.items():
+        assert len(shapes) == ds_checkpoint.tp_degree, (
+            f"Expected {ds_checkpoint.tp_degree} slice shapes for {param_name} (one per tp rank), "
+            f"but found {len(shapes)}. The checkpoint layout does not match tp_degree="
+            f"{ds_checkpoint.tp_degree}, pp_degree={ds_checkpoint.pp_degree}.")
+
+    return slice_shapes
+
+
+def _merge_zero_shards(param_base_path, state, tp_degree, slice_shapes=None):
     slices = []
     for tp_index in range(tp_degree):
         prefix_path = os.path.join(param_base_path, str(tp_index), f"{state}")
@@ -237,18 +260,18 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
             assert all(v == shards[0] for v in shards), "All shards must have the same step value"
             slice = shards[0]
         else:
-            if slice_shape is None:
-                slice = torch.cat(shards, dim=0)
-            else:
-                slice = torch.cat(shards, dim=0).reshape(slice_shape)
+            slice = torch.cat(shards, dim=0)
+            if slice_shapes is not None:
+                # AutoTP may shard a dimension unevenly, so each tp rank has its own slice shape.
+                slice = slice.reshape(slice_shapes[tp_index])
 
         slices.append(slice)
     return slices
 
 
-def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
+def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shapes):
 
-    name, shape = name_and_shape
+    name, slice_shapes = name_and_shapes
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
 
@@ -284,15 +307,14 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     matched_sub_params_shape = get_matched_sub_params_pattern(name)
 
-    step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, shape)
+    step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, slice_shapes)
     if step_merged:
         _save_checkpoint(os.path.join(param_base_path, "step.pt"), step_merged[0])
 
     for state in ("fp32", "exp_avg", "exp_avg_sq"):
-        slices = _merge_zero_shards(slice_base_path, state, tp_degree, shape)
+        slices = _merge_zero_shards(slice_base_path, state, tp_degree, slice_shapes)
         final_path = os.path.join(param_base_path, f"{state}.pt")
 
-        #print(f"Expected shape: {shape}")
         #print(f"Fragment sizes:", list(frag.shape for frag in slices))
         ckpt_dict = {}
         if get_matched_pattern(replicated_parameters, name):
@@ -779,13 +801,7 @@ def main(args):
         checkpoint_paths = _create_checkpoint_paths(args.output_folder, iteration, ds_checkpoint.tp_degree,
                                                     ds_checkpoint.pp_degree)
 
-        slice_shapes = []
-        for mp_rank_file in ds_checkpoint.mp_rank_files:
-            mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
-            slice_shapes += mp_sd[PARAM_SHAPES]
-
-        # fix back to normal flat dict, merge duplicates for tp>1
-        slice_shapes = dict((k, v) for d in slice_shapes for k, v in d.items())
+        slice_shapes = _collect_slice_shapes(ds_checkpoint)
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         print('*** 1. Extracting ZeRO fragments')

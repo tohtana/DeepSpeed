@@ -163,7 +163,10 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size, ep_rank=0, ep
         # the converter to universal currently strips the original padding completely so the saved
         # weight is padding-free and we just need to add new padding depending on the target TP
         # degree
-        is_vocab_tensor = ckpt_dict.get(VOCAB_TENSOR, False) and not is_expert_param
+        # AutoTP restore metadata already describes the exact (possibly uneven) partition layout,
+        # so the legacy tp-degree-derived vocab padding must not be applied on top of it.
+        has_autotp_meta = _get_param_uc_restore_meta(self) is not None
+        is_vocab_tensor = ckpt_dict.get(VOCAB_TENSOR, False) and not is_expert_param and not has_autotp_meta
         if is_vocab_tensor:
             # In the absence of data passed from the user wrt new padded vocab specific to tp degree
             # we can again derive that data by reverse engineering the target shapes like so:
