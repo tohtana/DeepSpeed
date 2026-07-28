@@ -5,7 +5,6 @@
 
 import copy
 import os
-import time
 from typing import List, Tuple
 
 import torch
@@ -92,19 +91,17 @@ def move_key(state, key, key_event=None):
         key_event.record(stream=copy_stream)
 
 
-def _alloc_reload_buffer(like_tensor):
-    # Allocate the reload destination in the pool that has room at the moment the reload
-    # runs -- measured both ways to fail otherwise. Default placement reloads at the end
-    # of backward, right after the activations were freed from the compute stream's pool:
-    # allocate there so the buffers recycle those blocks (forcing them into the copy
-    # stream's pool grew it by ~100 driver requests/step at seq 2400). The experimental
-    # early-reload path (DS_DC_RELOAD_EARLY) fires at backward START, when activations
-    # still fill the compute pool: allocate on copy_stream so the buffers recycle the
-    # morning's freed copy blocks instead (the compute-pool form thrashed there).
-    if os.environ.get("DS_DC_RELOAD_EARLY") == "1":
-        with get_accelerator().stream(copy_stream):
-            return torch.empty_like(like_tensor, device=device)
-    return torch.empty_like(like_tensor, device=device)
+def _alloc_reload_buffer(like_tensor, compute_stream):
+    # Allocate on the compute stream, whose pool has just freed the backward activations
+    # that the reload buffers can reuse. That memory is only safe to write from another
+    # stream once the compute stream has passed the kernels still reading those blocks:
+    # the caching allocator hands out freed blocks immediately for same-stream reuse
+    # (safe, a later kernel cannot overtake an earlier one) but a write from copy_stream
+    # can race them. Without this wait, a reload placed mid-backward silently overwrites
+    # a live activation -- observed as NaN losses one step after the pass engaged.
+    buf = torch.empty_like(like_tensor, device=device)
+    copy_stream.wait_stream(compute_stream)
+    return buf
 
 
 def move_back_key(state, key, key_event=None):
@@ -113,7 +110,7 @@ def move_back_key(state, key, key_event=None):
     # compute-stream reads need no extra guard: they are ordered before the next
     # offload's D2H copy by the launch op's wait_stream, and the D2H read is protected
     # at free time by move_key's record_stream.
-    buf = _alloc_reload_buffer(state[_make_offload_state_key(key)])
+    buf = _alloc_reload_buffer(state[_make_offload_state_key(key)], get_accelerator().current_stream())
     with get_accelerator().stream(copy_stream):
         buf.copy_(state[_make_offload_state_key(key)], non_blocking=True)
     buf.record_stream(copy_stream)
@@ -145,7 +142,7 @@ def move_hp_param(src_tensor, dest_buf, key_event=None):
 
 def move_back_hp_param(src_tensor, dest_buf, key_event=None):
     # Same allocation/ownership discipline and safety argument as move_back_key.
-    buf = _alloc_reload_buffer(src_tensor)
+    buf = _alloc_reload_buffer(src_tensor, get_accelerator().current_stream())
     with get_accelerator().stream(copy_stream):
         buf.copy_(src_tensor, non_blocking=True)
     buf.record_stream(copy_stream)
@@ -305,30 +302,9 @@ def _opt_empty_cache_impl(anchor):
     get_accelerator().empty_cache()
 
 
-# Previous cumulative allocator counters, for per-step deltas in the timing print.
-_prev_alloc_stats = {}
-
-
 def _offload_copy_stream_sync_impl(anchor):
-    # DS_DC_TIMING=1 prints the host wait here (the exposed reload tail) each step plus the
-    # caching allocator's slow-path counters, separating exposed transfer time from
-    # allocator-induced stalls in overlap experiments.
-    if os.environ.get("DS_DC_TIMING") == "1":
-        start = time.perf_counter()
-        copy_stream.synchronize()
-        if dist.get_rank() == 0:
-            wait = time.perf_counter() - start
-            stats = get_accelerator().memory_stats()
-            keys = ("num_alloc_retries", "num_sync_all_streams", "num_device_alloc", "num_device_free")
-            current = {key: stats.get(key, 0) for key in keys}
-            delta = {key: current[key] - _prev_alloc_stats.get(key, 0) for key in keys}
-            _prev_alloc_stats.update(current)
-            print(
-                f"[DeepCompile][timing] reload tail wait: {wait:.3f}s "
-                f"alloc_retries=+{delta['num_alloc_retries']} sync_all_streams=+{delta['num_sync_all_streams']} "
-                f"device_alloc=+{delta['num_device_alloc']} device_free=+{delta['num_device_free']}",
-                flush=True)
-        return
+    # The optimizer step runs right after the graph returns and reads the reloaded states,
+    # so the host must not proceed until copy_stream has finished writing them.
     copy_stream.synchronize()
 
 
@@ -538,21 +514,6 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             # Reset once per step's backward, not once per backward graph: with graph breaks
             # each graph reloads its share and later graphs continue from the remainder.
             reload_tasks_remaining = copy.copy(offload_tasks_scheduled)
-
-        # DS_DC_RELOAD_EARLY=1 queues every reload at the start of backward instead of using the
-        # budget-driven placement, giving the transfers the whole backward to hide under. Used to
-        # separate structural exposure (placement) from irreducible transfer cost in experiments;
-        # costs peak memory, so it is not the default.
-        if os.environ.get("DS_DC_RELOAD_EARLY") == "1" and is_first_graph:
-            for node in graph.nodes:
-                if node.op != 'placeholder':
-                    for task in reload_tasks_remaining:
-                        with graph.inserting_before(node):
-                            graph.create_node('call_function',
-                                              torch.ops.dc.reload_opt.default, (anchor, _register_op_task(task)), {},
-                                              name=f"reload_opt_{task[0]}_{task[2]}")
-                    reload_tasks_remaining = []
-                    break
 
         for node in graph.nodes:
             if node.name not in peak_mem \
