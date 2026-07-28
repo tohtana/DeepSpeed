@@ -12,6 +12,8 @@ from typing import Optional
 import torch
 from deepspeed import comm as dist
 from .layers import *
+from .layers import _build_param_uc_restore_meta
+from deepspeed.checkpoint.constants import DS_AUTOTP_UC_META
 from deepspeed.accelerator import get_accelerator
 from .fusedqkv_utils import require_tp_fused_qkvw
 from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
@@ -534,6 +536,20 @@ class AutoTP():
             if spec is None or spec.partition_type != PartitionType.COLUMN or not spec.gather_output:
                 continue
 
+            original_shape = tuple(module.weight.shape)
+            setattr(
+                module.weight,
+                DS_AUTOTP_UC_META,
+                _build_param_uc_restore_meta(
+                    partition_type=spec.partition_type.value,
+                    partition_dim=None,
+                    logical_shape=original_shape,
+                    output_shape=original_shape,
+                    target_partition_shape=original_shape,
+                    original_shape=original_shape,
+                    replicated=True,
+                ),
+            )
             self._tied_gathered_column_module_names.update((module_name, tied_embedding_name))
             print_dist(
                 f"AutoTP: '{module_name}.weight' is tied to '{tied_embedding_name}.weight'; leaving both modules "
