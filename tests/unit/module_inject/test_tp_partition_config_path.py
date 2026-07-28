@@ -177,7 +177,7 @@ def test_gathered_lm_head_falls_back_for_runtime_parameter_tie():
     assert model.lm_head.weight is model.embed_tokens.weight
     replicated_patterns = collect_autotp_universal_checkpoint_info(model)[TP_REPLICATED_PARAMETER_PATTERNS]
     assert r"^embed_tokens\.weight$" in replicated_patterns
-    assert r"^lm_head\.weight$" in replicated_patterns
+    assert r"^lm_head\.weight$" not in replicated_patterns
 
 
 def test_gathered_lm_head_uses_column_parallel_layer_when_output_dim_is_uneven():
