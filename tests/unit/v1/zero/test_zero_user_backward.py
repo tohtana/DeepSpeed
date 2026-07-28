@@ -1895,7 +1895,8 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
         data_loader = random_dataloader(model=engine,
-                                        total_samples=2 * gradient_accumulation_steps,
+                                        total_samples=2 * gradient_accumulation_steps *
+                                        engine.train_micro_batch_size_per_gpu(),
                                         hidden_dim=hidden_dim,
                                         device=device,
                                         dtype=torch.float32)
@@ -1934,7 +1935,7 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
                                                          model=model_unmanaged,
                                                          model_parameters=model_unmanaged.parameters())
 
-        total_samples = num_cycles * gradient_accumulation_steps
+        total_samples = num_cycles * gradient_accumulation_steps * managed_engine.train_micro_batch_size_per_gpu()
         # Materialize the batches so both engines consume identical data.
         batches = list(
             random_dataloader(model=managed_engine,
@@ -1964,6 +1965,96 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         managed_engine.destroy()
         unmanaged_engine.destroy()
 
+    def test_unmanaged_variable_backward_counts_matches_ddp(self, zero_stage):
+        """Variable N with caller scaling matches DDP after every optimizer step."""
+        hidden_dim = 4
+        configured_gradient_accumulation_steps = 4
+        backward_counts = [1, 3, 2]
+        learning_rate = 1e-2
+
+        device, rank, _ = initialize_distributed()
+
+        torch.manual_seed(42)
+        model_ddp = SimpleModel(hidden_dim=hidden_dim, nlayers=2).to(device=device, dtype=torch.float32)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.SGD(model_ddp.parameters(), lr=learning_rate)
+
+        torch.manual_seed(42)
+        model_unmanaged = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          configured_gradient_accumulation_steps,
+                                          managed_gradient_accumulation=False)
+        config["optimizer"] = {
+            "type": "SGD",
+            "params": {
+                "lr": learning_rate
+            },
+        }
+        # Match plain torch SGD: DeepSpeed otherwise clips gradients at 1.0 by default,
+        # which would make this an optimizer-policy comparison rather than a scaling proof.
+        config["gradient_clipping"] = 0.0
+        # SGD keeps scaling errors observable; opt in because ZeRO classifies it as untested.
+        config["zero_allow_untested_optimizer"] = True
+        unmanaged_engine, _, _, _ = deepspeed.initialize(config=config,
+                                                         model=model_unmanaged,
+                                                         model_parameters=model_unmanaged.parameters())
+
+        # Give each rank distinct samples so equality depends on the distributed reduction.
+        torch.manual_seed(1000 + dist.get_rank())
+        total_samples = sum(backward_counts) * unmanaged_engine.train_micro_batch_size_per_gpu()
+        batches = list(
+            random_dataloader(model=unmanaged_engine,
+                              total_samples=total_samples,
+                              hidden_dim=hidden_dim,
+                              device=device,
+                              dtype=torch.float32))
+
+        batch_index = 0
+        for step_index, backward_count in enumerate(backward_counts, start=1):
+            for micro_step in range(backward_count):
+                batch = batches[batch_index]
+                batch_index += 1
+
+                # DDP reduces once at the actual caller-owned boundary.
+                if micro_step + 1 < backward_count:
+                    with model_ddp.no_sync():
+                        loss_ddp = model_ddp(batch[0], batch[1])
+                        (loss_ddp / backward_count).backward()
+                else:
+                    loss_ddp = model_ddp(batch[0], batch[1])
+                    (loss_ddp / backward_count).backward()
+
+                # N is independent of configured GAS, so the caller owns scaling.
+                loss_unmanaged = unmanaged_engine(batch[0], batch[1])
+                unmanaged_engine.backward(loss_unmanaged / backward_count, scale_wrt_gas=False)
+
+            optimizer_ddp.step()
+            optimizer_ddp.zero_grad(set_to_none=True)
+            unmanaged_engine.step()
+
+            assert unmanaged_engine.was_step_applied()
+            assert unmanaged_engine.global_steps == step_index
+            compare_parameters(collect_ddp_parameters(model_ddp),
+                               collect_deepspeed_parameters(unmanaged_engine, zero_stage),
+                               f"variable backward count step {step_index} (N={backward_count})")
+
+        unmanaged_engine.destroy()
+
+    def test_unmanaged_rejects_manual_boundary_override(self, zero_stage):
+        """Unmanaged mode owns the boundary and rejects the legacy manual override."""
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          gradient_accumulation_steps=1,
+                                          managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        with pytest.raises(AssertionError, match="set_gradient_accumulation_boundary is not supported"):
+            engine.set_gradient_accumulation_boundary(False)
+
+        engine.destroy()
+
 
 @pytest.mark.parametrize("zero_stage", [2, 3])
 class TestUnmanagedGradientAccumulationValidation(DistributedTest):
@@ -1979,6 +2070,31 @@ class TestUnmanagedGradientAccumulationValidation(DistributedTest):
                                           gradient_accumulation_steps=1,
                                           managed_gradient_accumulation=False)
         with pytest.raises(AssertionError, match="only supported for ZeRO stage 0 and 1"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+
+class TestUnmanagedGradientAccumulationZero1Validation(DistributedTest):
+    """Unmanaged ZeRO-1 rejects deferred-reduction paths that are not supported yet."""
+    world_size = 1
+
+    def test_unmanaged_rejects_overlap_comm(self):
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(1, gradient_accumulation_steps=1, managed_gradient_accumulation=False)
+        config["zero_optimization"]["overlap_comm"] = True
+
+        with pytest.raises(AssertionError, match="not supported with ZeRO stage 1 overlap_comm"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+    def test_unmanaged_rejects_optimizer_offload(self):
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(1, gradient_accumulation_steps=1, managed_gradient_accumulation=False)
+        config["zero_optimization"]["offload_optimizer"] = {"device": "cpu"}
+
+        with pytest.raises(AssertionError, match="not supported with optimizer offload"):
             deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
 

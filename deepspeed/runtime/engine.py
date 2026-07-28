@@ -1598,6 +1598,10 @@ class DeepSpeedEngine(Module):
         if not self.managed_gradient_accumulation():
             assert not self.zero_optimization_partition_gradients(), \
                 "managed_gradient_accumulation=False is only supported for ZeRO stage 0 and 1"
+            assert not (self.zero_optimization_stage() == ZeroStageEnum.optimizer_states and self.zero_overlap_comm()), \
+                "managed_gradient_accumulation=False is not supported with ZeRO stage 1 overlap_comm"
+            assert self.zero_offload_optimizer() is None, \
+                "managed_gradient_accumulation=False is not supported with optimizer offload"
             assert not self.pipeline_parallelism, \
                 "managed_gradient_accumulation=False is not supported with pipeline parallelism"
             assert not self.is_deepcompile_enabled(), \
@@ -3178,6 +3182,8 @@ class DeepSpeedEngine(Module):
         Arguments:
             is_boundary (bool): are we at a gradient accumulation boundary or not?
         """
+        assert self.managed_gradient_accumulation(), \
+            "set_gradient_accumulation_boundary is not supported when managed_gradient_accumulation=False"
         self._is_gradient_accumulation_boundary = is_boundary
         self.optimizer.is_gradient_accumulation_boundary = is_boundary
 
