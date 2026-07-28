@@ -212,19 +212,37 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     _save_checkpoint(path, state_flat_tensor)
 
 
+def _collect_tp_rank_slice_shapes(ds_checkpoint, tp_index):
+    """Collect one slice shape per parameter owned by a single tp rank.
+
+    Parameters tied across pipeline stages are replicated in every stage's model state file,
+    so the replicas are merged into a single entry after checking that they agree.
+    """
+    shapes_of_tp_rank = {}
+    for pp_index in range(ds_checkpoint.pp_degree):
+        for mp_rank_file in ds_checkpoint.get_2d_parallel_files(tp_index=tp_index, pp_index=pp_index):
+            mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
+            for sub_group_shapes in mp_sd[PARAM_SHAPES]:
+                for param_name, param_shape in sub_group_shapes.items():
+                    replicated_shape = shapes_of_tp_rank.setdefault(param_name, param_shape)
+                    assert replicated_shape == param_shape, (
+                        f"Pipeline replicas of {param_name} on tp rank {tp_index} disagree on "
+                        f"shape: {replicated_shape} vs {param_shape}.")
+
+    return shapes_of_tp_rank
+
+
 def _collect_slice_shapes(ds_checkpoint):
     """Collect each parameter's per-tp-rank slice shape, ordered by tp rank.
 
     AutoTP may shard a dimension unevenly, so tp ranks cannot be assumed to share a single
-    slice shape. Model state files are named by model-parallel rank, which enumerates the
-    (pp, tp) grid with tp varying fastest, so reading them in order yields tp order.
+    slice shape. Model state files are gathered per tp rank so that the collected shapes
+    follow tp order regardless of how model-parallel ranks are laid out on disk.
     """
     slice_shapes = {}
-    for mp_rank_file in ds_checkpoint.mp_rank_files:
-        mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
-        for sub_group_shapes in mp_sd[PARAM_SHAPES]:
-            for param_name, param_shape in sub_group_shapes.items():
-                slice_shapes.setdefault(param_name, []).append(param_shape)
+    for tp_index in range(ds_checkpoint.tp_degree):
+        for param_name, param_shape in _collect_tp_rank_slice_shapes(ds_checkpoint, tp_index).items():
+            slice_shapes.setdefault(param_name, []).append(param_shape)
 
     for param_name, shapes in slice_shapes.items():
         assert len(shapes) == ds_checkpoint.tp_degree, (

@@ -572,6 +572,22 @@ def _write_mp_rank_file(dir_path, mp_rank, param_shapes):
     return path
 
 
+class _FakeDSCheckpoint:
+    """Minimal stand-in for DeepSpeedCheckpoint that maps (pp, tp) to model state files."""
+
+    def __init__(self, mp_rank_files, tp_degree, pp_degree):
+        self.mp_rank_files = mp_rank_files
+        self.tp_degree = tp_degree
+        self.pp_degree = pp_degree
+
+    def get_2d_parallel_files(self, tp_index, pp_index):
+        # Model-parallel ranks enumerate the (pp, tp) grid with tp varying fastest.
+        mp_rank = pp_index * self.tp_degree + tp_index
+        if mp_rank >= len(self.mp_rank_files):
+            return []
+        return [self.mp_rank_files[mp_rank]]
+
+
 def test_collect_slice_shapes_keeps_uneven_shapes_in_tp_order(tmp_path):
     # tp=2 with a column dimension of 5, giving shards of 3 and 2.
     files = [
@@ -582,7 +598,7 @@ def test_collect_slice_shapes_keeps_uneven_shapes_in_tp_order(tmp_path):
             "lm_head.weight": torch.Size([2, 4])
         }]),
     ]
-    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=1)
+    ds_checkpoint = _FakeDSCheckpoint(files, tp_degree=2, pp_degree=1)
 
     shapes = _collect_slice_shapes(ds_checkpoint)
 
@@ -600,7 +616,7 @@ def test_collect_slice_shapes_pipeline_parallel_layout(tmp_path):
         _write_mp_rank_file(tmp_path, 2, [stage1[0]]),
         _write_mp_rank_file(tmp_path, 3, [stage1[1]]),
     ]
-    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=2)
+    ds_checkpoint = _FakeDSCheckpoint(files, tp_degree=2, pp_degree=2)
 
     shapes = _collect_slice_shapes(ds_checkpoint)
 
@@ -611,7 +627,35 @@ def test_collect_slice_shapes_pipeline_parallel_layout(tmp_path):
 
 def test_collect_slice_shapes_rejects_unexpected_rank_count(tmp_path):
     files = [_write_mp_rank_file(tmp_path, 0, [{"lm_head.weight": torch.Size([3, 4])}])]
-    ds_checkpoint = SimpleNamespace(mp_rank_files=files, tp_degree=2, pp_degree=1)
+    ds_checkpoint = _FakeDSCheckpoint(files, tp_degree=2, pp_degree=1)
 
     with pytest.raises(AssertionError, match="one per tp rank"):
         _collect_slice_shapes(ds_checkpoint)
+
+
+def test_collect_slice_shapes_dedupes_pipeline_tied_parameters(tmp_path):
+    # A tied embedding is replicated in the first and last pipeline stages, so it appears in
+    # every stage's model state file but must still yield exactly one shape per tp rank.
+    tied_tp0 = {"tied_modules.embed.word_embeddings.weight": torch.Size([3, 4])}
+    tied_tp1 = {"tied_modules.embed.word_embeddings.weight": torch.Size([2, 4])}
+    files = [
+        _write_mp_rank_file(tmp_path, 0, [{
+            **tied_tp0, "layers.0.weight": torch.Size([3, 4])
+        }]),
+        _write_mp_rank_file(tmp_path, 1, [{
+            **tied_tp1, "layers.0.weight": torch.Size([2, 4])
+        }]),
+        _write_mp_rank_file(tmp_path, 2, [{
+            **tied_tp0, "layers.1.weight": torch.Size([3, 4])
+        }]),
+        _write_mp_rank_file(tmp_path, 3, [{
+            **tied_tp1, "layers.1.weight": torch.Size([2, 4])
+        }]),
+    ]
+    ds_checkpoint = _FakeDSCheckpoint(files, tp_degree=2, pp_degree=2)
+
+    shapes = _collect_slice_shapes(ds_checkpoint)
+
+    assert shapes["tied_modules.embed.word_embeddings.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
+    assert shapes["layers.0.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
+    assert shapes["layers.1.weight"] == [torch.Size([3, 4]), torch.Size([2, 4])]
