@@ -9,10 +9,13 @@ import sys
 import torch
 
 from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict, ensure_zero_ordered_dict
-from deepspeed.runtime.zero.partition_parameters import _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, ZeroParamStatus
+from deepspeed.runtime.zero.partition_parameters import (
+    _FALLBACK_OWNER_ATTR,
+    _GATHERED_PARAM_CONTEXT_DEPTH_ATTR,
+    ZeroParamStatus,
+)
 
 _ACTIVE_FALLBACK = None
-_FALLBACK_OWNER_ATTR = "_deepcompile_z3_eager_fallback_owner"
 
 
 def get_active_z3_eager_fallback():
