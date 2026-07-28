@@ -85,10 +85,9 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         elif compile_config.offload_opt_states:
             from .passes.offload_adam_states import move_opt_states, offload_adam_states_for_init
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            # Optimizer states materialize at step 0's optimizer step, so offloading can engage at
-            # step 1. for_init empties the GPU of optimizer state before the profilers run: the
-            # plan is made against the floor, and a job that only fits with offloading never has
-            # to survive a step with every state resident alongside the activations.
+            # States exist from step 0's optimizer step, so offloading engages at step 1.
+            # for_init empties them before profiling, so the plan is made against the floor and a
+            # job that only fits with offloading never runs a step with everything resident.
             schedule.append((1, [offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))

@@ -22,8 +22,7 @@ except ImportError:
 try:
     from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
 except ImportError:
-    # Torch without the effects registry: the ops then survive inductor only through the
-    # scheduler-DCE patch in inductor.py (see register_offload_ops for why that matters).
+    # Without the effects registry the ops survive inductor only via the DCE patch in inductor.py.
     _register_effectful_op = None
 
 from ..profilers import ProfilingResult
@@ -70,8 +69,7 @@ nz3 = None
 
 
 def move_key(state, key, key_event=None):
-    # Nothing to copy when the key is already offloaded (e.g. a second offload call in the
-    # same phase); check before touching state[key] so the pinned-buffer setup cannot raise.
+    # Already offloaded: return before touching state[key], which no longer exists.
     if key not in state:
         return
     offload_buf_key = _make_offload_state_key(key)
@@ -80,8 +78,7 @@ def move_key(state, key, key_event=None):
 
     with get_accelerator().stream(copy_stream):
         state[offload_buf_key].copy_(state[key], non_blocking=True)
-        # Callers may drop their reference to state[key] without waiting for this copy; keep the
-        # allocator from recycling the block until copy_stream has finished reading it.
+        # Callers free state[key] without waiting, so hold the block until the copy is done.
         if state[key].device.type != "cpu":
             state[key].record_stream(copy_stream)
 
@@ -92,24 +89,17 @@ def move_key(state, key, key_event=None):
 
 
 def _alloc_reload_buffer(like_tensor, compute_stream):
-    # Allocate on the compute stream, whose pool has just freed the backward activations
-    # that the reload buffers can reuse. That memory is only safe to write from another
-    # stream once the compute stream has passed the kernels still reading those blocks:
-    # the caching allocator hands out freed blocks immediately for same-stream reuse
-    # (safe, a later kernel cannot overtake an earlier one) but a write from copy_stream
-    # can race them. Without this wait, a reload placed mid-backward silently overwrites
-    # a live activation -- observed as NaN losses one step after the pass engaged.
+    # Reuse the activation blocks backward just freed, but wait for the compute stream first:
+    # the allocator reissues them while its kernels may still read, and a mid-backward reload
+    # writing from copy_stream would overwrite a live activation (seen as NaN losses).
     buf = torch.empty_like(like_tensor, device=device)
     copy_stream.wait_stream(compute_stream)
     return buf
 
 
 def move_back_key(state, key, key_event=None):
-    # The buffer is written on copy_stream; record_stream keeps the allocator from
-    # recycling it for compute-pool work until the copy has finished. Its later
-    # compute-stream reads need no extra guard: they are ordered before the next
-    # offload's D2H copy by the launch op's wait_stream, and the D2H read is protected
-    # at free time by move_key's record_stream.
+    # record_stream holds the buffer until the copy lands; later compute reads are already
+    # ordered before the next offload by the launch op's wait_stream.
     buf = _alloc_reload_buffer(state[_make_offload_state_key(key)], get_accelerator().current_stream())
     with get_accelerator().stream(copy_stream):
         buf.copy_(state[_make_offload_state_key(key)], non_blocking=True)
@@ -125,11 +115,8 @@ def move_back_key(state, key, key_event=None):
 def move_hp_param(src_tensor, dest_buf, key_event=None):
     with get_accelerator().stream(copy_stream):
         dest_buf.copy_(src_tensor, non_blocking=True)
-        # The .data rebind drops the only reference to the GPU storage while the async copy may
-        # still be reading it; keep the allocator from recycling it until copy_stream catches up.
-        # Skip tensors already offloaded to host memory (e.g. re-offload after a profiling run,
-        # where reloads are skipped): there is no GPU storage at risk and CPU tensors do not
-        # support record_stream.
+        # The .data rebind below drops the GPU storage the copy is still reading; hold it.
+        # Already-offloaded tensors have no GPU storage and cannot take record_stream.
         if src_tensor.device.type != "cpu":
             src_tensor.record_stream(copy_stream)
         src_tensor.data = dest_buf
@@ -141,7 +128,7 @@ def move_hp_param(src_tensor, dest_buf, key_event=None):
 
 
 def move_back_hp_param(src_tensor, dest_buf, key_event=None):
-    # Same allocation/ownership discipline and safety argument as move_back_key.
+    # Same allocation and ownership discipline as move_back_key.
     buf = _alloc_reload_buffer(src_tensor, get_accelerator().current_stream())
     with get_accelerator().stream(copy_stream):
         buf.copy_(src_tensor, non_blocking=True)
@@ -218,24 +205,16 @@ def sync_reload_states(event=None):
             event.wait(copy_stream)
 
 
-# The offload/reload work used to be inserted into FX graphs as Python closures.
-# That works in eager mode (FX just calls the objects) but not under inductor:
-# FxGraphCache serializes call_function targets by qualified name (a closure's
-# `<locals>` qualname is unimportable), and lowering requires a registered op
-# with a schema and a Meta kernel. The dc.* ops below carry only an int index
-# into this registry; the task tuples (which hold live tensors) never cross the
-# op boundary. The anchor tensor argument is ignored at runtime -- it exists so
-# the dispatcher and fake-tensor tracing have a tensor to route on (see the
-# "Undefined" fallback for end_backward in csrc/compile/init.cpp for what
-# happens without one).
+# This work used to be inserted as Python closures, which inductor cannot compile or cache
+# (no importable qualified name, no schema, no Meta kernel). The dc.* ops below carry only an
+# int index into this registry, so the task tuples holding live tensors never cross the op
+# boundary; the anchor tensor exists only to give the dispatcher something to route on.
 _op_task_registry = []
 _offload_ops_lib = None
 
-# Rank-local counts of op executions. Launches also run during pass-time memory profiling;
-# reloads are skipped while profiling, so "reloads" only counts real training steps. Tests use
-# these to assert the offload machinery actually ran: if any dead-code elimination silently
-# dropped the ops from the compiled graph (see register_offload_ops), training would proceed
-# with resident states and identical loss -- these counters are the only cheap detector.
+# Rank-local op execution counts. Reloads are skipped while profiling, so a nonzero reload
+# count proves the ops ran in the compiled graph -- the only cheap detector for the silent
+# failure where dead-code elimination drops them and training just keeps the states resident.
 _offload_op_stats = {"launches": 0, "reloads": 0}
 
 
@@ -256,8 +235,7 @@ def _register_op_task(task) -> int:
 def _offload_opt_launch_impl(anchor, idx):
     _offload_op_stats["launches"] += 1
     task = _op_task_registry[idx]
-    # The states were last written by the optimizer step on the compute stream; make the
-    # D2H reads wait for those writes. Stream-level dependency only, no host wait.
+    # The optimizer step just wrote these states on the compute stream; order the reads after it.
     copy_stream.wait_stream(get_accelerator().current_stream())
     if task[2] == "hp_param":
         move_hp_param(task[1][0], task[1][1])
@@ -265,10 +243,7 @@ def _offload_opt_launch_impl(anchor, idx):
         assert task[1] in optimizer.state, f"State {task[1]} not found in optimizer"
         state = optimizer.state[task[1]]
         move_key(state, task[2])
-        # move_key record_stream'd the source on copy_stream, so the allocator will not hand the
-        # block out again until the copy completes. Drop the reference right here instead of at a
-        # separately placed host-blocking sync node: waiting on the copy event from the launch
-        # thread stalled the whole kernel-submission pipeline for the duration of the drain.
+        # Safe now: move_key's record_stream keeps the block alive until the copy completes.
         if task[2] in state:
             del state[task[2]]
 
@@ -291,10 +266,7 @@ _empty_cache_pending = False
 
 
 def _opt_empty_cache_impl(anchor):
-    # Emptying the cache on every training step forces the backward working set back through
-    # cudaMalloc each step (measured at +28% step time on an 8xH200 14B run). One call after
-    # each recompile is enough to return the segments freed by offloading to the driver; the
-    # pass re-arms the flag whenever it runs.
+    # Once per compile phase is enough to return the freed segments; per step costs +28%.
     global _empty_cache_pending
     if not _empty_cache_pending:
         return
@@ -303,8 +275,7 @@ def _opt_empty_cache_impl(anchor):
 
 
 def _offload_copy_stream_sync_impl(anchor):
-    # The optimizer step runs right after the graph returns and reads the reloaded states,
-    # so the host must not proceed until copy_stream has finished writing them.
+    # The optimizer step reads the reloaded states as soon as the graph returns.
     copy_stream.synchronize()
 
 
@@ -321,8 +292,7 @@ def register_offload_ops():
     if _offload_ops_lib is not None:
         return
 
-    # FRAGMENT extends the "dc" namespace defined by the C++ extension, so this
-    # must only run after get_deepcompile_handle() has loaded it.
+    # FRAGMENT extends the C++ extension's "dc" namespace, so it must be loaded first.
     lib = torch.library.Library("dc", "FRAGMENT")
     for name, schema, impl in _OFFLOAD_OP_SPECS:
         lib.define(schema)
@@ -330,16 +300,10 @@ def register_offload_ops():
         lib.impl(name, lambda *args: None, "Meta")
         overload = getattr(torch.ops.dc, name).default
 
-        # These ops return nothing, so no node consumes their output and two independent
-        # dead-code eliminations would drop them:
-        #  1. FX GraphModule.eliminate_dead_code() -- guarded by _side_effectful_functions.
-        #  2. Inductor's scheduler DCE -- keys off the op schema (mutation/effects), not the
-        #     FX impurity set. Registering an ORDERED effect makes stock inductor keep the
-        #     ops AND preserve their program order relative to each other (EffectfulKernel
-        #     StarDep chaining). The reload-before-sync order is correctness-critical: the
-        #     optimizer reads the states right after the graph returns. Without the effect
-        #     registration the ops survive only because inductor.py disables
-        #     Scheduler.dead_node_elimination process-wide, which this pass must not rely on.
+        # Nothing consumes these ops' output, so two dead-code eliminations would drop them:
+        # FX's, guarded by _side_effectful_functions, and inductor's scheduler DCE, which keys
+        # off the schema instead. The ORDERED effect covers the second and also pins the ops in
+        # program order, which reload-before-sync depends on.
         torch.fx.node._side_effectful_functions.add(overload)
         if _register_effectful_op is not None:
             _register_effectful_op(overload, _EffectType.ORDERED)
@@ -352,8 +316,7 @@ def _find_graph_anchor(graph: Graph):
     for node in graph.nodes:
         if node.op == 'placeholder' and isinstance(node.meta.get("val"), torch.Tensor):
             return node
-    # A non-tensor anchor (e.g. a SymInt placeholder) would violate the op schemas at
-    # runtime; fail here instead of falling back silently.
+    # A non-tensor anchor would violate the op schemas at runtime; fail loudly instead.
     raise AssertionError("no tensor placeholder found to anchor the offload ops on")
 
 
@@ -366,8 +329,8 @@ def update_max_memory(name):
 
 offload_tasks = []
 offload_tasks_scheduled = []
-# How many entries of offload_tasks_scheduled already have launch nodes: with graph breaks
-# the pass runs once per forward graph and must not re-insert the whole list each time.
+# Entries of offload_tasks_scheduled that already have launch nodes (graph breaks run the
+# pass once per forward graph, and each must only insert its own share).
 offload_tasks_inserted = 0
 reload_tasks_remaining = []
 total_reload_mem = 0
@@ -393,8 +356,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
     accelerator = get_accelerator()
     budget_override = os.environ.get("DS_DC_OFFLOAD_OPT_BUDGET_GB")
     if budget_override is not None:
-        # Test/debug hook: pretend the device has this much usable memory so task scheduling
-        # can be forced (or suppressed) independently of the hardware the run lands on.
+        # Test hook: pretend the device has this much memory, to force or suppress offloading.
         total_mem = float(budget_override) * 1e9
     else:
         total_mem = accelerator.total_memory() * (1 - MARGIN)
@@ -408,8 +370,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
     ordered_node = reversed(graph.nodes) if bwd else graph.nodes
     for node in ordered_node:
-        # Nodes without a profiled entry (inserted by a pass whose profiling was skipped)
-        # inherit the running peak instead of raising.
+        # Nodes with no profiled entry inherit the running peak instead of raising.
         if node.name in mem_dict and mem_dict[node.name] > current_peak_mem:
             current_peak_mem = mem_dict[node.name]
         peak_mem[node.name] = current_peak_mem
@@ -419,8 +380,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
         # At the beginning of the first graph, we schedule offload tasks to launch all offloading
         if is_first_graph:
-            # This one-shot module state survives across compile phases; reset it so re-running
-            # the pass (a later phase or a second engine.compile) does not double-append tasks.
+            # Module state survives compile phases; reset so re-running does not double-append.
             offload_tasks.clear()
             offload_tasks_scheduled.clear()
             offload_tasks_inserted = 0
@@ -458,8 +418,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
             to_offload = []
             optim_size = sum([task[3] for task in offload_tasks])
 
-            # The peaks were profiled after offload_adam_states_for_init emptied the GPU of
-            # optimizer state, so keeping optim_size bytes resident adds on top of them.
+            # Peaks were profiled with the states already emptied, so residency adds on top.
             while total_mem - peak_mem[node.name] - optim_size < 0:
                 if len(offload_tasks) == 0:
                     break
@@ -468,16 +427,12 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
                 to_offload.append(task)
                 optim_size = sum([task[3] for task in offload_tasks])
 
-            # No sync/free node is inserted: the launch op drops the reference itself and
-            # record_stream makes the free completion-driven, so this loop only decides which
-            # tasks are offloaded at all.
+            # No sync node needed: the launch op frees the state, gated by record_stream.
             for task in to_offload:
                 print_r0(f"Scheduling offload of optimizer state {task[0]}_{task[2]}")
                 offload_tasks_scheduled.append(task)
 
-        # Only tasks scheduled since the last insertion get launch nodes: with graph breaks
-        # this runs once per forward graph, and earlier graphs already carry the launches
-        # for their share of the list.
+        # Only newly scheduled tasks get launch nodes; earlier graphs carry their own share.
         new_tasks = offload_tasks_scheduled[offload_tasks_inserted:]
         for node in graph.nodes:
             if node.op != 'placeholder':
@@ -511,8 +466,7 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
                     inserted_sync = True
         if is_first_graph:
-            # Reset once per step's backward, not once per backward graph: with graph breaks
-            # each graph reloads its share and later graphs continue from the remainder.
+            # Reset once per backward, not per graph: later graphs continue from the remainder.
             reload_tasks_remaining = copy.copy(offload_tasks_scheduled)
 
         for node in graph.nodes:

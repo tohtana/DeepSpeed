@@ -22,8 +22,7 @@ from unit.common import allclose_on_all_ranks
 def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None, rtol=None, atol=None):
     hidden_dim = hidden_dim_override if hidden_dim_override is not None else 10
 
-    # the default tolerances of torch.testing.assert_close are too small for the
-    # cross-stage (ZeRO-0 eager vs ZeRO-3 compiled) comparison below
+    # the default tolerances are too small for the ZeRO-0 eager vs ZeRO-3 compiled comparison
     RTOL = 5e-1 if rtol is None else rtol
     ATOL = 1e-2 if atol is None else atol
 
@@ -92,8 +91,7 @@ def compare_loss(self, config, dtype, iteration=5, hidden_dim_override=None, rto
     baseline_engine.destroy()
     target_engine.destroy()
 
-    # The per-step target losses let callers compare two compiled configurations against
-    # each other (e.g. offloading on vs off) far more tightly than the cross-stage check.
+    # Returned so callers can compare two compiled configurations far more tightly.
     return target_losses
 
 
