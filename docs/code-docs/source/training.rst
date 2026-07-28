@@ -89,11 +89,14 @@ are responsible for calling ``step()`` when accumulation is complete:
 .. code-block:: python
 
     # ds_config = {..., "managed_gradient_accumulation": False}
-    for step_batches in batched_micro_batches:   # caller decides the boundary
+    for step_batches in batched_micro_batches:            # caller decides the boundary
+        num_micro_batches = len(step_batches)             # may differ from gradient_accumulation_steps
         for micro_batch in step_batches:
             loss = model_engine(micro_batch)
-            model_engine.backward(loss)          # accumulate only
-        model_engine.step()                      # reduce + optimizer update
+            # scale_wrt_gas=False disables DeepSpeed's 1/gradient_accumulation_steps scaling;
+            # average over the actual micro-batch count instead.
+            model_engine.backward(loss / num_micro_batches, scale_wrt_gas=False)   # accumulate only
+        model_engine.step()                               # reduce + optimizer update
 
 This is useful when ``backward`` and ``step`` must be decoupled and the number of
 ``backward()`` calls per optimizer step is decided by the caller at run time -- for example
@@ -104,10 +107,13 @@ Unmanaged mode currently supports **ZeRO stage 0/1 and DDP**: ``backward()`` acc
 locally, and ``step()`` performs the gradient all-reduce followed by the optimizer update.
 
 .. note::
-   DeepSpeed scales the loss and gradients by the configured ``gradient_accumulation_steps``. In
-   unmanaged mode the number of ``backward()`` calls per step may differ from that value (and may
-   vary per step); in that case call ``engine.backward(loss, scale_wrt_gas=False)`` and average the
-   loss yourself.
+   By default ``backward()`` scales the loss and gradients by the configured
+   ``gradient_accumulation_steps``. In unmanaged mode the number of ``backward()`` calls per step is
+   owned by the caller and may differ from that value (and may vary per step), so the default scaling
+   would be incorrect. Pass ``scale_wrt_gas=False`` to disable DeepSpeed's scaling and average the
+   loss yourself over the actual micro-batch count, as shown above. (If you intentionally call
+   ``backward()`` exactly ``gradient_accumulation_steps`` times per step, the default scaling still
+   applies and no manual averaging is needed.)
 
 .. note::
    Unmanaged mode is being added incrementally. Only ZeRO stage 0/1 (and DDP) is supported today;
