@@ -104,11 +104,6 @@ Per-stage behavior:
 
 * **ZeRO stage 0/1 and DDP**: ``backward()`` accumulates gradients locally; ``step()`` performs
   the gradient all-reduce and then the optimizer update.
-* **ZeRO stage 2/3**: gradients are still reduced/partitioned on every ``backward()`` (unchanged
-  from managed mode); only the ``averaged_gradients`` finalization and the optimizer update are
-  deferred to ``step()``.
-* **ZeRO optimizer offload (CPU/NVMe)**: the boundary-time gradient-norm computation and the
-  fp32/optimizer-buffer copies run during ``step()``.
 
 .. note::
    DeepSpeed scales the loss and gradients by the configured ``gradient_accumulation_steps``. In
@@ -117,9 +112,10 @@ Per-stage behavior:
    loss yourself.
 
 .. note::
-   Unmanaged mode is being added incrementally: ZeRO stage 0/1 is available first, with stage 2/3
-   and optimizer offload following. It is incompatible with pipeline parallelism, DeepCompile, and
-   Apex AMP, which are rejected at initialization.
+   Unmanaged mode currently supports ZeRO stage 0/1 without optimizer offload or ZeRO-1
+   ``overlap_comm``. It is incompatible with ZeRO stage 2/3, pipeline parallelism, DeepCompile,
+   Apex AMP, and the manual ``set_gradient_accumulation_boundary()`` override. Unsupported
+   combinations are rejected instead of silently using a different reduction boundary.
 
 .. autofunction:: deepspeed.DeepSpeedEngine.set_gradient_accumulation_boundary
 

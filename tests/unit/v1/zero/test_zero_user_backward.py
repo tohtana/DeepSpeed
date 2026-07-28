@@ -1895,7 +1895,8 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
         data_loader = random_dataloader(model=engine,
-                                        total_samples=2 * gradient_accumulation_steps,
+                                        total_samples=2 * gradient_accumulation_steps *
+                                        engine.train_micro_batch_size_per_gpu(),
                                         hidden_dim=hidden_dim,
                                         device=device,
                                         dtype=torch.float32)
@@ -1934,7 +1935,7 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
                                                          model=model_unmanaged,
                                                          model_parameters=model_unmanaged.parameters())
 
-        total_samples = num_cycles * gradient_accumulation_steps
+        total_samples = num_cycles * gradient_accumulation_steps * managed_engine.train_micro_batch_size_per_gpu()
         # Materialize the batches so both engines consume identical data.
         batches = list(
             random_dataloader(model=managed_engine,
@@ -1964,6 +1965,21 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         managed_engine.destroy()
         unmanaged_engine.destroy()
 
+    def test_unmanaged_rejects_manual_boundary_override(self, zero_stage):
+        """Unmanaged mode owns the boundary and rejects the legacy manual override."""
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          gradient_accumulation_steps=1,
+                                          managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+        with pytest.raises(AssertionError, match="set_gradient_accumulation_boundary is not supported"):
+            engine.set_gradient_accumulation_boundary(False)
+
+        engine.destroy()
+
 
 @pytest.mark.parametrize("zero_stage", [2, 3])
 class TestUnmanagedGradientAccumulationValidation(DistributedTest):
@@ -1979,6 +1995,31 @@ class TestUnmanagedGradientAccumulationValidation(DistributedTest):
                                           gradient_accumulation_steps=1,
                                           managed_gradient_accumulation=False)
         with pytest.raises(AssertionError, match="only supported for ZeRO stage 0 and 1"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+
+class TestUnmanagedGradientAccumulationZero1Validation(DistributedTest):
+    """Unmanaged ZeRO-1 rejects deferred-reduction paths that are not supported yet."""
+    world_size = 1
+
+    def test_unmanaged_rejects_overlap_comm(self):
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(1, gradient_accumulation_steps=1, managed_gradient_accumulation=False)
+        config["zero_optimization"]["overlap_comm"] = True
+
+        with pytest.raises(AssertionError, match="not supported with ZeRO stage 1 overlap_comm"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+    def test_unmanaged_rejects_optimizer_offload(self):
+        hidden_dim = 4
+        initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(1, gradient_accumulation_steps=1, managed_gradient_accumulation=False)
+        config["zero_optimization"]["offload_optimizer"] = {"device": "cpu"}
+
+        with pytest.raises(AssertionError, match="not supported with optimizer offload"):
             deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
 
