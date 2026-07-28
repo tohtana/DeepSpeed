@@ -100,15 +100,8 @@ This is useful when ``backward`` and ``step`` must be decoupled and the number o
 client- or RPC-driven RL backends where a single optimizer step arrives as ``N`` ``backward()``
 calls followed by one ``step()``, with ``N`` unknown at configuration time.
 
-Per-stage behavior:
-
-* **ZeRO stage 0/1 and DDP**: ``backward()`` accumulates gradients locally; ``step()`` performs
-  the gradient all-reduce and then the optimizer update.
-* **ZeRO stage 2/3**: gradients are still reduced/partitioned on every ``backward()`` (unchanged
-  from managed mode); only the ``averaged_gradients`` finalization and the optimizer update are
-  deferred to ``step()``.
-* **ZeRO optimizer offload (CPU/NVMe)**: the boundary-time gradient-norm computation and the
-  fp32/optimizer-buffer copies run during ``step()``.
+Unmanaged mode currently supports **ZeRO stage 0/1 and DDP**: ``backward()`` accumulates gradients
+locally, and ``step()`` performs the gradient all-reduce followed by the optimizer update.
 
 .. note::
    DeepSpeed scales the loss and gradients by the configured ``gradient_accumulation_steps``. In
@@ -117,9 +110,11 @@ Per-stage behavior:
    loss yourself.
 
 .. note::
-   Unmanaged mode is being added incrementally: ZeRO stage 0/1 is available first, with stage 2/3
-   and optimizer offload following. It is incompatible with pipeline parallelism, DeepCompile, and
-   Apex AMP, which are rejected at initialization.
+   Unmanaged mode is being added incrementally. Only ZeRO stage 0/1 (and DDP) is supported today;
+   ZeRO stage 2/3 and ZeRO optimizer offload are planned but **not yet available** -- enabling them
+   with ``managed_gradient_accumulation=false`` raises an ``AssertionError`` at initialization.
+   Unmanaged mode is likewise incompatible with pipeline parallelism, DeepCompile, and Apex AMP,
+   which are also rejected at initialization.
 
 .. autofunction:: deepspeed.DeepSpeedEngine.set_gradient_accumulation_boundary
 
