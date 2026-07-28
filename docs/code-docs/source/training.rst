@@ -57,7 +57,71 @@ Optimizer Step
 
 Gradient Accumulation
 ---------------------
+DeepSpeed accumulates gradients over ``gradient_accumulation_steps`` micro-batches
+before averaging them and applying an optimizer step. The ``managed_gradient_accumulation``
+config flag (default ``true``) controls who decides when that accumulation boundary occurs.
+
 .. autofunction:: deepspeed.DeepSpeedEngine.is_gradient_accumulation_boundary
+
+Managed Gradient Accumulation (default)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With ``"managed_gradient_accumulation": true`` (the default), DeepSpeed tracks an
+internal micro-step counter and treats every ``gradient_accumulation_steps``-th
+micro-batch as the accumulation boundary
+(``(micro_steps + 1) % gradient_accumulation_steps == 0``). Only on that boundary does
+``step()`` reduce gradients and apply the optimizer update, so you can call
+``forward``/``backward``/``step`` symmetrically on every micro-batch:
+
+.. code-block:: python
+
+    for step, batch in enumerate(data_loader):
+        loss = model_engine(batch)
+        model_engine.backward(loss)
+        model_engine.step()   # optimizer runs only on the accumulation boundary
+
+Unmanaged Gradient Accumulation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With ``"managed_gradient_accumulation": false``, micro-step tracking is disabled and the
+caller owns the accumulation boundary. ``backward()`` only accumulates gradients, and each
+``step()`` finalizes the accumulated gradients and applies exactly one optimizer update. You
+are responsible for calling ``step()`` when accumulation is complete:
+
+.. code-block:: python
+
+    # ds_config = {..., "managed_gradient_accumulation": False}
+    for step_batches in batched_micro_batches:   # caller decides the boundary
+        for micro_batch in step_batches:
+            loss = model_engine(micro_batch)
+            model_engine.backward(loss)          # accumulate only
+        model_engine.step()                      # reduce + optimizer update
+
+This is useful when ``backward`` and ``step`` must be decoupled and the number of
+``backward()`` calls per optimizer step is decided by the caller at run time -- for example
+client- or RPC-driven RL backends where a single optimizer step arrives as ``N`` ``backward()``
+calls followed by one ``step()``, with ``N`` unknown at configuration time.
+
+Per-stage behavior:
+
+* **ZeRO stage 0/1 and DDP**: ``backward()`` accumulates gradients locally; ``step()`` performs
+  the gradient all-reduce and then the optimizer update.
+* **ZeRO stage 2/3**: gradients are still reduced/partitioned on every ``backward()`` (unchanged
+  from managed mode); only the ``averaged_gradients`` finalization and the optimizer update are
+  deferred to ``step()``.
+* **ZeRO optimizer offload (CPU/NVMe)**: the boundary-time gradient-norm computation and the
+  fp32/optimizer-buffer copies run during ``step()``.
+
+.. note::
+   DeepSpeed scales the loss and gradients by the configured ``gradient_accumulation_steps``. In
+   unmanaged mode the number of ``backward()`` calls per step may differ from that value (and may
+   vary per step); in that case call ``engine.backward(loss, scale_wrt_gas=False)`` and average the
+   loss yourself.
+
+.. note::
+   Unmanaged mode is being added incrementally: ZeRO stage 0/1 is available first, with stage 2/3
+   and optimizer offload following. It is incompatible with pipeline parallelism, DeepCompile, and
+   Apex AMP, which are rejected at initialization.
+
+.. autofunction:: deepspeed.DeepSpeedEngine.set_gradient_accumulation_boundary
 
 Coalesced Gradient Reduction
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~

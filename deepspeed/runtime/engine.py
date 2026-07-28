@@ -3086,6 +3086,10 @@ class DeepSpeedEngine(Module):
                 forward on user defined choice of retain_graph
             scale_wrt_gas: bool, default: true
                 whether to scale gradients and return value by gradient accumulation steps
+
+        With ``managed_gradient_accumulation=false``, ``backward()`` only accumulates
+        gradients locally (it does not trigger the accumulation-boundary reduction); the
+        reduction and optimizer update happen in ``step()``.
         """
         assert self.optimizer is not None and not isinstance(self.optimizer, DummyOptim), \
             "must provide optimizer during init in order to use backward"
@@ -3133,6 +3137,10 @@ class DeepSpeedEngine(Module):
         Query whether the current micro-batch is at the boundary of
         gradient accumulation, and thus will trigger gradient reductions and
         an optimizer step.
+
+        In managed gradient accumulation (default), the result is driven by the internal
+        micro-step counter. With ``managed_gradient_accumulation=false``, it is ``True``
+        only while ``step()`` runs, since that call is the caller-owned boundary.
 
         Returns:
             bool: if the current step is a gradient accumulation boundary.
@@ -3259,6 +3267,11 @@ class DeepSpeedEngine(Module):
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation
         on effective_train_batch.
+
+        In managed gradient accumulation (default), the optimizer update is applied only
+        on the accumulation boundary tracked by the internal micro-step counter. With
+        ``managed_gradient_accumulation=false``, every ``step()`` is the accumulation
+        boundary: it finalizes the locally accumulated gradients and applies an update.
         """
         assert not self.inside_no_sync_ctxt, \
         "It is illegal to call Engine.step() inside no_sync context manager"
