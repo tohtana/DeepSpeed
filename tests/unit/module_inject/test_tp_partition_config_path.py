@@ -45,11 +45,11 @@ class DummyModel(nn.Module):
 
 class OutputModel(nn.Module):
 
-    def __init__(self, tied):
+    def __init__(self, tied, bias=False):
         super().__init__()
         self.config = type("Config", (), {"tie_word_embeddings": not tied})()
         self.embed_tokens = nn.Embedding(100, 32)
-        self.lm_head = nn.Linear(32, 100, bias=False)
+        self.lm_head = nn.Linear(32, 100, bias=bias)
         if tied:
             self.lm_head.weight = self.embed_tokens.weight
 
@@ -178,6 +178,17 @@ def test_gathered_lm_head_falls_back_for_runtime_parameter_tie():
     replicated_patterns = collect_autotp_universal_checkpoint_info(model)[TP_REPLICATED_PARAMETER_PATTERNS]
     assert r"^embed_tokens\.weight$" in replicated_patterns
     assert r"^lm_head\.weight$" not in replicated_patterns
+
+
+def test_gathered_lm_head_marks_fallback_bias_replicated():
+    model = OutputModel(tied=True, bias=True)
+
+    _build_gathered_lm_head_autotp(model)._replace_module(model)
+
+    assert isinstance(model.lm_head, nn.Linear)
+    assert model.lm_head.bias is not None
+    replicated_patterns = collect_autotp_universal_checkpoint_info(model)[TP_REPLICATED_PARAMETER_PATTERNS]
+    assert r"^lm_head\.bias$" in replicated_patterns
 
 
 def test_gathered_lm_head_uses_column_parallel_layer_when_output_dim_is_uneven():

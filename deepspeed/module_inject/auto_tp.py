@@ -550,6 +550,23 @@ class AutoTP():
                     replicated=True,
                 ),
             )
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                original_bias_shape = tuple(bias.shape)
+                setattr(
+                    bias,
+                    DS_AUTOTP_UC_META,
+                    _build_param_uc_restore_meta(
+                        partition_type=spec.partition_type.value,
+                        partition_dim=None,
+                        logical_shape=original_bias_shape,
+                        output_shape=original_bias_shape,
+                        target_partition_shape=original_bias_shape,
+                        original_shape=original_bias_shape,
+                        is_bias=True,
+                        replicated=True,
+                    ),
+                )
             self._tied_gathered_column_module_names.update((module_name, tied_embedding_name))
             print_dist(
                 f"AutoTP: '{module_name}.weight' is tied to '{tied_embedding_name}.weight'; leaving both modules "
