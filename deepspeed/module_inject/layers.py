@@ -235,7 +235,15 @@ class GatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather last-dimension shards while keeping the output replicated."""
 
     @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor) -> torch.Tensor:
+    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor, total_size: int,
+                name: Optional[str]) -> torch.Tensor:
+        """Gather the shards of a column parallel output whose full width is ``total_size``.
+
+        The shard widths follow the same deterministic split used to partition the weight, so
+        they are derived locally instead of being discovered with an extra collective. Uneven
+        shards are zero padded to a common width, which keeps the uniform (and faster)
+        ``all_gather_into_tensor`` collective usable, and are then trimmed back.
+        """
         ctx.group = group
         if group is None:
             ctx.partition_sizes = (input.shape[-1], )
@@ -248,29 +256,32 @@ class GatherFromTensorParallelRegion(torch.autograd.Function):
             ctx.partition_sizes = (input.shape[-1], )
             return input
 
-        local_size = torch.tensor([input.shape[-1]], dtype=torch.long, device=input.device)
-        gathered_sizes = [torch.empty_like(local_size) for _ in range(tp_world_size)]
-        dist.all_gather(gathered_sizes, local_size, group=group)
-        ctx.partition_sizes = tuple(int(size.item()) for size in gathered_sizes)
+        ctx.partition_sizes = tuple(get_shard_size_list(total_size, tp_world_size, name))
+        local_size = ctx.partition_sizes[ctx.tp_index]
+        assert local_size == input.shape[-1], (
+            f"Rank {ctx.tp_index} produced {input.shape[-1]} output features for {name}, but the "
+            f"partition scheme for a width of {total_size} expects {local_size}.")
 
         max_partition_size = max(ctx.partition_sizes)
-        if input.shape[-1] == max_partition_size:
+        if local_size == max_partition_size:
             input_padded = input.contiguous()
         else:
             padded_shape = (*input.shape[:-1], max_partition_size)
             input_padded = input.new_zeros(padded_shape)
-            input_padded[..., :input.shape[-1]].copy_(input)
+            input_padded[..., :local_size].copy_(input)
 
-        gathered = [torch.empty_like(input_padded) for _ in range(tp_world_size)]
-        dist.all_gather(gathered, input_padded, group=group)
-        return torch.cat([shard[..., :size] for shard, size in zip(gathered, ctx.partition_sizes)], dim=-1)
+        buffer = input.new_empty((tp_world_size * input_padded.shape[0], *input_padded.shape[1:]))
+        dist.all_gather_into_tensor(buffer, input_padded, group=group)
+
+        shards = buffer.view(tp_world_size, *input_padded.shape)
+        return torch.cat([shards[i].narrow(-1, 0, size) for i, size in enumerate(ctx.partition_sizes)], dim=-1)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
         shard_offset = sum(ctx.partition_sizes[:ctx.tp_index])
         shard_size = ctx.partition_sizes[ctx.tp_index]
         grad_input = grad_output.narrow(-1, shard_offset, shard_size).contiguous()
-        return None, grad_input
+        return None, grad_input, None, None
 
 
 class TensorParallel_Layer(nn.Module, ABC):
@@ -769,7 +780,7 @@ class LinearLayer(TensorParallel_Layer):
             output = AsyncColumnParallel.apply(self.mp_group, input, self.weight, self.bias)
 
         if self.gather_output:
-            output = GatherFromTensorParallelRegion.apply(self.mp_group, output)
+            output = GatherFromTensorParallelRegion.apply(self.mp_group, output, self._orig_weight_shape[0], self.name)
 
         return output
 
