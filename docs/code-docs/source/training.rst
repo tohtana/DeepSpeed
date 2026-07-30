@@ -93,9 +93,10 @@ are responsible for calling ``step()`` when accumulation is complete:
         num_micro_batches = len(step_batches)             # may differ from gradient_accumulation_steps
         for micro_batch in step_batches:
             loss = model_engine(micro_batch)
-            # scale_wrt_gas=False disables DeepSpeed's 1/gradient_accumulation_steps scaling;
-            # average over the actual micro-batch count instead.
-            model_engine.backward(loss / num_micro_batches, scale_wrt_gas=False)   # accumulate only
+            # scale_wrt_gas=False disables DeepSpeed's 1/gradient_accumulation_steps scaling,
+            # so average over the actual micro-batch count yourself.
+            averaged_loss = loss / num_micro_batches
+            model_engine.backward(averaged_loss, scale_wrt_gas=False)   # accumulate only
         model_engine.step()                               # reduce + optimizer update
 
 This is useful when ``backward`` and ``step`` must be decoupled and the number of
