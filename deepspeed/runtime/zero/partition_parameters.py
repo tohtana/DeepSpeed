@@ -2326,6 +2326,7 @@ class GatheredParameters:
 
         self.enabled = enabled
         self._param_versions = None
+        self._fallback_owners = {}
         if not enabled:
             return
 
@@ -2378,7 +2379,8 @@ class GatheredParameters:
             setattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, depth + 1)
             fallback_owner = getattr(param, _FALLBACK_OWNER_ATTR, None)
             if fallback_owner is not None:
-                fallback_owner.transfer_gathered_param_to_user(param)
+                self._fallback_owners[int(param.ds_id)] = fallback_owner
+                fallback_owner.record_user_context_claim(param)
         if self.src_rank is None and self.enable_sanity_checks:
             self._param_versions = [(p, p.data.data_ptr(), p._version) for p in self.params]
 
@@ -2395,6 +2397,30 @@ class GatheredParameters:
                         delattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR)
                 else:
                     setattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, depth - 1)
+            for param in self.params:
+                fallback_owner = self._fallback_owners.get(int(param.ds_id))
+                if fallback_owner is not None:
+                    fallback_owner.release_user_context_claim(param)
+
+    def _params_to_partition(self):
+        return [
+            param for param in self.params
+            if not (self._fallback_owners.get(int(param.ds_id))
+                    and self._fallback_owners[int(param.ds_id)].has_outstanding_graph_claim(param))
+        ]
+
+    @staticmethod
+    def _partition_params(params, has_been_updated):
+        if params:
+            params[0].partition(param_list=params, has_been_updated=has_been_updated)
+
+    def _record_deferred_updates(self, params_to_partition):
+        partition_param_ids = {int(param.ds_id) for param in params_to_partition}
+        for param in self.params:
+            ds_id = int(param.ds_id)
+            fallback_owner = self._fallback_owners.get(ds_id)
+            if fallback_owner is not None and ds_id not in partition_param_ids:
+                fallback_owner.record_deferred_user_update(param)
 
     def _exit(self, *exc):
         if self.src_rank is None:
@@ -2413,11 +2439,11 @@ class GatheredParameters:
                     dist.all_reduce(modified_flag, op=dist.ReduceOp.MAX, group=self.params[0].ds_process_group)
                     modified_global = bool(modified_flag.item())
                 if modified_global:
-                    self.params[0].partition(param_list=self.params, has_been_updated=False)
+                    self._partition_params(self._params_to_partition(), has_been_updated=False)
                     raise RuntimeError(
                         "Detected in-place modification of ZeRO-3 parameters inside GatheredParameters with "
                         "modifier_rank=None. Use modifier_rank=<rank> to broadcast updates across ranks.")
-            self.params[0].partition(param_list=self.params, has_been_updated=False)
+            self._partition_params(self._params_to_partition(), has_been_updated=False)
             return
 
         # Broadcast parameters from modifier_rank to all other ranks.
@@ -2440,4 +2466,6 @@ class GatheredParameters:
         ]
         for h in handles:
             h.wait()
-        self.params[0].partition(param_list=self.params, has_been_updated=True)
+        params_to_partition = self._params_to_partition()
+        self._record_deferred_updates(params_to_partition)
+        self._partition_params(params_to_partition, has_been_updated=True)
