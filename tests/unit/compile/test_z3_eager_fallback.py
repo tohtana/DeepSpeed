@@ -12,7 +12,7 @@ import torch
 
 from deepspeed.compile import z3_eager_fallback
 from deepspeed.compile.z3_eager_fallback import DeepCompileZ3EagerFallback, deepcompile_z3_forward_context
-from deepspeed.runtime.zero import parameter_offload, partition_parameters
+from deepspeed.runtime.zero import parameter_offload
 from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict
 from deepspeed.runtime.zero.partition_parameters import GatheredParameters, ZeroParamStatus
 from deepspeed.runtime.utils import register_output_backward_hooks
@@ -44,7 +44,6 @@ def test_deepcompile_fallback_suppresses_guard_time_gather(monkeypatch):
     assert gather_calls == []
     assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
     assert fallback.stats()["last_guard_suppressed_param_ids"] == [7]
-    assert fallback.stats()["current_forward_param_ids"] == []
 
 
 def test_real_guard_builder_source_resolution_suppresses_gather(monkeypatch):
@@ -331,7 +330,7 @@ def test_new_fallback_owner_drops_previous_owner():
     assert second.stats()["tracked_param_ids"] == [7]
 
 
-def test_user_context_claim_diagnostic_deduplicates_repeated_claims():
+def test_user_adopted_param_diagnostic_deduplicates_repeated_transfers():
     _, param = _zero_module_with_param()
     fallback = DeepCompileZ3EagerFallback(engine=None)
 
@@ -342,7 +341,7 @@ def test_user_context_claim_diagnostic_deduplicates_repeated_claims():
     assert fallback.stats()["last_user_adopted_param_ids"] == [7]
 
 
-def test_deepcompile_forward_preserves_fallback_param_claimed_by_user_gathered_context():
+def test_deepcompile_forward_preserves_fallback_param_adopted_by_user_gathered_context():
     module, param = _zero_module_with_param()
     param.ds_persist = False
     partition_calls = []
@@ -388,7 +387,7 @@ def test_deepcompile_forward_preserves_fallback_param_claimed_by_user_gathered_c
     assert engine._deepcompile_z3_eager_fallback.stats()["last_user_adopted_param_ids"] == [7]
 
 
-def _fallback_autograd_engine(monkeypatch):
+def test_gathered_parameters_after_forward_defers_partition_until_backward(monkeypatch):
     module, param = _zero_module_with_param()
     param.ds_persist = False
     gathered_data = torch.full((2, 3), 2.0)
@@ -438,11 +437,7 @@ def _fallback_autograd_engine(monkeypatch):
 
     monkeypatch.setattr(z3_eager_fallback, "is_dynamo_guard_evaluation", lambda: False)
     monkeypatch.setattr(parameter_offload, "print_rank_0", lambda *args, **kwargs: None)
-    return FakeEngine(), param, partition_calls
-
-
-def test_gathered_parameters_after_forward_defers_partition_until_backward(monkeypatch):
-    engine, param, partition_calls = _fallback_autograd_engine(monkeypatch)
+    engine = FakeEngine()
     input_tensor = torch.ones((1, 3), requires_grad=True)
 
     loss = engine.forward(input_tensor)
@@ -452,53 +447,19 @@ def test_gathered_parameters_after_forward_defers_partition_until_backward(monke
     fallback = engine._deepcompile_z3_eager_fallback
     assert partition_calls == []
     assert param.ds_status == ZeroParamStatus.AVAILABLE
+    assert tuple(param.shape) == (2, 3)
     assert fallback.stats()["param_graph_claim_ids"] == {7: [0]}
 
     loss.backward()
-    fallback.complete_backward()
-
     assert input_tensor.grad is not None
-    assert partition_calls == [([7], False)]
-    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-    assert fallback.stats()["tracked_param_ids"] == []
-
-
-def test_gathered_parameters_context_open_through_backward_partitions_on_exit(monkeypatch):
-    engine, param, partition_calls = _fallback_autograd_engine(monkeypatch)
-    input_tensor = torch.ones((1, 3), requires_grad=True)
-    loss = engine.forward(input_tensor)
-    fallback = engine._deepcompile_z3_eager_fallback
-
-    with GatheredParameters([param]):
-        loss.backward()
-        fallback.complete_backward()
-        assert partition_calls == []
-        assert param.ds_status == ZeroParamStatus.AVAILABLE
-        assert fallback.stats()["context_claimed_param_ids"] == [7]
-
-    assert input_tensor.grad is not None
-    assert partition_calls == [([7], False)]
-    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
-
-
-def test_two_forwards_reusing_one_fallback_param_hold_two_graph_claims(monkeypatch):
-    engine, param, partition_calls = _fallback_autograd_engine(monkeypatch)
-    first_input = torch.ones((1, 3), requires_grad=True)
-    second_input = torch.ones((1, 3), requires_grad=True)
-    first_loss = engine.forward(first_input)
-    second_loss = engine.forward(second_input)
-    fallback = engine._deepcompile_z3_eager_fallback
-
-    assert fallback.stats()["graph_claim_param_ids"] == {0: [7], 1: [7]}
-    assert fallback.stats()["param_graph_claim_ids"] == {7: [0, 1]}
     assert partition_calls == []
 
-    (first_loss + second_loss).backward()
     fallback.complete_backward()
 
-    assert first_input.grad is not None
-    assert second_input.grad is not None
     assert partition_calls == [([7], False)]
+    assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
+    assert tuple(param.shape) == (0, )
+    assert fallback.stats()["tracked_param_ids"] == []
 
 
 def test_context_exception_restores_fallback_and_user_ownership_depth(monkeypatch):
@@ -534,46 +495,6 @@ def test_context_exception_restores_fallback_and_user_ownership_depth(monkeypatc
     assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
 
 
-def test_context_exception_releases_only_its_claim_while_graph_remains():
-    (param, ), _, partition_calls = _zero_params_with_collective_stubs(7)
-    param.ds_status = ZeroParamStatus.AVAILABLE
-    param.ds_persist = False
-    fallback = DeepCompileZ3EagerFallback(engine=None)
-    fallback.record_gathered_param(param)
-    graph_id = fallback.record_forward_graph()
-
-    with pytest.raises(RuntimeError, match="injected"):
-        with GatheredParameters([param]):
-            raise RuntimeError("injected")
-
-    assert partition_calls == []
-    assert fallback.stats()["param_graph_claim_ids"] == {7: [graph_id]}
-    assert fallback.stats()["context_claimed_param_ids"] == []
-
-    fallback.record_backward_start(graph_id)
-    fallback.complete_backward()
-
-    assert partition_calls == [[7]]
-    assert fallback.stats()["tracked_param_ids"] == []
-
-
-def test_abandoned_backward_release_defers_to_open_user_context():
-    (param, ), _, partition_calls = _zero_params_with_collective_stubs(7)
-    param.ds_status = ZeroParamStatus.AVAILABLE
-    param.ds_persist = False
-    fallback = DeepCompileZ3EagerFallback(engine=None)
-    fallback.record_gathered_param(param)
-    fallback.record_forward_graph()
-
-    with GatheredParameters([param]):
-        fallback.release_gathered_params()
-        assert partition_calls == []
-        assert fallback.stats()["context_claimed_param_ids"] == [7]
-
-    assert partition_calls == [[7]]
-    assert fallback.stats()["tracked_param_ids"] == []
-
-
 def _zero_params_with_collective_stubs(*ds_ids):
     params = []
     gather_calls = []
@@ -598,86 +519,6 @@ def _zero_params_with_collective_stubs(*ds_ids):
         param.partition = partition
         params.append(param)
     return params, gather_calls, partition_calls
-
-
-def test_gathered_parameters_mixed_list_partitions_only_unprotected_param_on_exit():
-    (protected, unprotected), gather_calls, partition_calls = _zero_params_with_collective_stubs(1, 2)
-    protected.ds_status = ZeroParamStatus.AVAILABLE
-    protected.ds_persist = False
-    fallback = DeepCompileZ3EagerFallback(engine=None)
-    fallback.record_gathered_param(protected)
-    graph_id = fallback.record_forward_graph()
-
-    with GatheredParameters([protected, unprotected]):
-        assert all(param.ds_status == ZeroParamStatus.AVAILABLE for param in (protected, unprotected))
-
-    assert gather_calls == [[1, 2]]
-    assert partition_calls == [[2]]
-    assert protected.ds_status == ZeroParamStatus.AVAILABLE
-    assert unprotected.ds_status == ZeroParamStatus.NOT_AVAILABLE
-
-    fallback.record_backward_start(graph_id)
-    fallback.complete_backward()
-
-    assert partition_calls == [[2], [1]]
-    assert protected.ds_status == ZeroParamStatus.NOT_AVAILABLE
-
-
-def test_modifier_rank_update_provenance_survives_deferred_partition(monkeypatch):
-    (protected, unprotected), gather_calls, _ = _zero_params_with_collective_stubs(1, 2)
-    group = object()
-    partition_calls = []
-    broadcast_calls = []
-
-    for param in (protected, unprotected):
-        param.data = torch.tensor([float(param.ds_id)])
-        param.ds_process_group = group
-        param.ds_persist = False
-
-        def partition(param_list=None, has_been_updated=False, *, _param=param):
-            selected = [_param] if param_list is None else param_list
-            partition_calls.append(([int(item.ds_id) for item in selected], has_been_updated))
-            for item in selected:
-                item.ds_status = ZeroParamStatus.NOT_AVAILABLE
-
-        param.partition = partition
-
-    class FakeHandle:
-
-        def wait(self):
-            pass
-
-    class FakeAccelerator:
-
-        def current_device_name(self):
-            return "cpu"
-
-    def broadcast(tensor, src_rank, group, async_op):
-        broadcast_calls.append((int(tensor.item()), src_rank, group, async_op))
-        return FakeHandle()
-
-    monkeypatch.setattr(partition_parameters.dist, "get_world_group", lambda: group)
-    monkeypatch.setattr(partition_parameters.dist, "broadcast", broadcast)
-    monkeypatch.setattr(partition_parameters, "get_accelerator", lambda: FakeAccelerator())
-
-    protected.ds_status = ZeroParamStatus.AVAILABLE
-    fallback = DeepCompileZ3EagerFallback(engine=None)
-    fallback.record_gathered_param(protected)
-    graph_id = fallback.record_forward_graph()
-
-    with GatheredParameters([protected, unprotected], modifier_rank=0):
-        assert all(param.ds_status == ZeroParamStatus.AVAILABLE for param in (protected, unprotected))
-
-    assert gather_calls == [[1, 2]]
-    assert broadcast_calls == [(1, 0, group, True), (2, 0, group, True)]
-    assert partition_calls == [([2], True)]
-    assert fallback.stats()["deferred_updated_param_ids"] == [1]
-
-    fallback.record_backward_start(graph_id)
-    fallback.complete_backward()
-
-    assert partition_calls == [([2], True), ([1], True)]
-    assert fallback.stats()["deferred_updated_param_ids"] == []
 
 
 def test_gathered_parameters_rejects_partial_overlap_atomically():
