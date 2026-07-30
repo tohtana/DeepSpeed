@@ -1832,9 +1832,13 @@ class TestZeroFrozenParamNoGradInputAccumulation(DistributedTest):
 
 
 def build_managed_gas_config(zero_stage, gradient_accumulation_steps, managed_gradient_accumulation):
-    """fp32 config toggling managed_gradient_accumulation for exact managed-vs-unmanaged comparison."""
+    """fp32 config toggling managed_gradient_accumulation for exact managed-vs-unmanaged comparison.
+
+    Uses micro-batch size 1 so that random_dataloader's total_samples equals the number of
+    micro-batches, keeping the per-step accounting in these tests straightforward.
+    """
     return {
-        "train_micro_batch_size_per_gpu": 2,
+        "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "steps_per_print": 1,
         "managed_gradient_accumulation": managed_gradient_accumulation,
@@ -1964,6 +1968,20 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         managed_engine.destroy()
         unmanaged_engine.destroy()
 
+    def test_set_gradient_accumulation_boundary_rejected(self, zero_stage):
+        """set_gradient_accumulation_boundary() is unsupported in unmanaged mode (caller owns the boundary)."""
+        hidden_dim = 4
+        initialize_distributed()
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          gradient_accumulation_steps=4,
+                                          managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        with pytest.raises(AssertionError, match="set_gradient_accumulation_boundary"):
+            engine.set_gradient_accumulation_boundary(True)
+        engine.destroy()
+
 
 @pytest.mark.parametrize("zero_stage", [2, 3])
 class TestUnmanagedGradientAccumulationValidation(DistributedTest):
@@ -1979,6 +1997,22 @@ class TestUnmanagedGradientAccumulationValidation(DistributedTest):
                                           gradient_accumulation_steps=1,
                                           managed_gradient_accumulation=False)
         with pytest.raises(AssertionError, match="only supported for ZeRO stage 0 and 1"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+
+class TestUnmanagedGradientAccumulationOffloadValidation(DistributedTest):
+    """Unmanaged mode does not support ZeRO optimizer offload (checked with stage 1, before the
+    partition-gradients guard that already rejects stages 2/3)."""
+    world_size = 1
+
+    def test_unmanaged_rejects_offload(self):
+        hidden_dim = 4
+        initialize_distributed()
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(1, gradient_accumulation_steps=1, managed_gradient_accumulation=False)
+        config["zero_optimization"]["offload_optimizer"] = {"device": "cpu"}
+        with pytest.raises(AssertionError, match="not supported with ZeRO offload"):
             deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
 
