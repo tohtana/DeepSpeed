@@ -1832,11 +1832,7 @@ class TestZeroFrozenParamNoGradInputAccumulation(DistributedTest):
 
 
 def build_managed_gas_config(zero_stage, gradient_accumulation_steps, managed_gradient_accumulation):
-    """fp32 config toggling managed_gradient_accumulation for exact managed-vs-unmanaged comparison.
-
-    Uses micro-batch size 1 so that random_dataloader's total_samples equals the number of
-    micro-batches, keeping the per-step accounting in these tests straightforward.
-    """
+    """fp32 config toggling managed_gradient_accumulation; micro-batch 1 so total_samples == micro-batch count."""
     return {
         "train_micro_batch_size_per_gpu": 1,
         "gradient_accumulation_steps": gradient_accumulation_steps,
@@ -2001,8 +1997,7 @@ class TestUnmanagedGradientAccumulationValidation(DistributedTest):
 
 
 class TestUnmanagedGradientAccumulationOffloadValidation(DistributedTest):
-    """Unmanaged mode does not support ZeRO optimizer offload (checked with stage 1, before the
-    partition-gradients guard that already rejects stages 2/3)."""
+    """Unmanaged mode does not support ZeRO optimizer offload (stage 1: before the stage-2/3 guard)."""
     world_size = 1
 
     def test_unmanaged_rejects_offload(self):
