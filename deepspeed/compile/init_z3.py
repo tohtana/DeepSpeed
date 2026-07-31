@@ -35,6 +35,9 @@ def _resolve_expected_grad_dtype(param):
 
 def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
+    if compile_config.offload_opt_states and engine.zero_use_cpu_optimizer():
+        raise ValueError("compile.offload_opt_states cannot be enabled with ZeRO optimizer offload to CPU or NVMe")
+
     optimizer = engine.optimizer
     use_opt = not isinstance(optimizer, DeepSpeedZeRoOffload)
 

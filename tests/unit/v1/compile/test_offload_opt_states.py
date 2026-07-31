@@ -12,6 +12,9 @@ import torch
 
 import deepspeed.compile.passes.offload_adam_states as offload_pass
 from deepspeed.accelerator import get_accelerator
+from deepspeed.compile.config import CompileConfig
+from deepspeed.compile.init_z3 import init_z3
+from deepspeed.runtime.zero.offload_config import DeepSpeedZeroOffloadOptimizerConfig, OffloadDeviceEnum
 from deepspeed.runtime.zero.offload_states import _make_offload_state_key
 from deepspeed.utils.torch import required_torch_version
 
@@ -44,6 +47,26 @@ def _ensure_dc_ops():
         from deepspeed.compile.util import get_deepcompile_handle
         get_deepcompile_handle()
     offload_pass.register_offload_ops()
+
+
+def _get_effect_registry_api():
+    try:
+        from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
+    except ImportError:
+        pytest.skip("PyTorch effect registration is unavailable")
+
+    try:
+        from torch._higher_order_ops.effects import _get_effect
+    except ImportError:
+        try:
+            from torch._higher_order_ops.effects import SIDE_EFFECTS
+        except ImportError:
+            pytest.skip("PyTorch effect registry is unavailable")
+        get_effect = SIDE_EFFECTS.get
+    else:
+        get_effect = _get_effect
+
+    return _EffectType, _register_effectful_op, get_effect
 
 
 def _make_fake_optimizer():
@@ -97,21 +120,22 @@ def test_register_offload_ops_idempotent():
 
 def test_offload_ops_registered_with_ordered_effects():
     _ensure_dc_ops()
-    from torch._higher_order_ops.effects import SIDE_EFFECTS
+    effect_type, _, get_effect = _get_effect_registry_api()
 
     for name, _, _ in offload_pass._OFFLOAD_OP_SPECS:
         overload = getattr(torch.ops.dc, name).default
         # Only the ORDERED effect protects these ops from inductor's scheduler DCE;
         # _side_effectful_functions covers FX's DCE alone. The next test proves the mechanism.
-        assert overload in SIDE_EFFECTS
+        assert get_effect(overload) == effect_type.ORDERED
 
 
 def test_side_effect_ops_survive_stock_inductor():
     # Stock inductor drops an anchor-only `-> ()` op unless it carries an ORDERED effect, and
     # keeps its program order with one. A throwaway namespace keeps this runnable on CPU.
     from torch.fx.experimental.proxy_tensor import make_fx
-    from torch._higher_order_ops.effects import _EffectType, _register_effectful_op
     from torch._inductor.scheduler import Scheduler
+
+    effect_type, register_effectful_op, _ = _get_effect_registry_api()
 
     if getattr(Scheduler, "is_dc_patched", False):
         pytest.skip("inductor DCE already patched out in this process; mechanism not observable")
@@ -124,7 +148,7 @@ def test_side_effect_ops_survive_stock_inductor():
         lib.impl("side_op", lambda anchor, idx: None, "Meta")
         op = torch.ops.dctest_probe.side_op.default
         torch.fx.node._side_effectful_functions.add(op)
-        _register_effectful_op(op, _EffectType.ORDERED)
+        register_effectful_op(op, effect_type.ORDERED)
         # The ops deregister if the library object is collected.
         test_side_effect_ops_survive_stock_inductor._probe = (lib, op, calls)
     _, op, calls = test_side_effect_ops_survive_stock_inductor._probe
@@ -149,6 +173,19 @@ def test_side_effect_ops_survive_stock_inductor():
     calls.clear()
     compiled(torch.randn(8, 8))
     assert calls == [0, 1, 2], f"side-effect ops dropped or reordered by stock inductor: {calls}"
+
+
+@pytest.mark.parametrize("offload_device", [OffloadDeviceEnum.cpu, OffloadDeviceEnum.nvme])
+def test_zero_optimizer_offload_is_rejected_before_deepcompile_setup(offload_device):
+    zero_offload_config = DeepSpeedZeroOffloadOptimizerConfig(device=offload_device)
+    engine = SimpleNamespace(
+        zero_use_cpu_optimizer=lambda: zero_offload_config.device in [OffloadDeviceEnum.cpu, OffloadDeviceEnum.nvme])
+    compile_config = CompileConfig(offload_opt_states=True)
+
+    # The minimal engine intentionally has no optimizer or hook state: the rejection must happen
+    # before init_z3 accesses or mutates DeepCompile setup.
+    with pytest.raises(ValueError, match="ZeRO optimizer offload to CPU or NVMe"):
+        init_z3(engine, "inductor", compile_config, {})
 
 
 def test_fwd_insertion_schedules_all_tasks_under_forced_budget(monkeypatch):
