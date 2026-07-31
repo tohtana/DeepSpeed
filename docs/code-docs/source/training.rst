@@ -120,8 +120,8 @@ locally, and ``step()`` performs the gradient all-reduce followed by the optimiz
    Unmanaged mode is being added incrementally. Only ZeRO stage 0/1 (and DDP) is supported today;
    ZeRO stage 2/3 and ZeRO optimizer offload are planned but **not yet available** -- enabling them
    with ``managed_gradient_accumulation=false`` raises an ``AssertionError`` at initialization.
-   Unmanaged mode is likewise incompatible with pipeline parallelism, DeepCompile, and Apex AMP,
-   which are also rejected at initialization.
+   Unmanaged mode is likewise incompatible with pipeline parallelism, DeepCompile, Apex AMP, and
+   ZeRO ``overlap_comm``, which are also rejected at initialization.
 
 .. autofunction:: deepspeed.DeepSpeedEngine.set_gradient_accumulation_boundary
 

@@ -2011,6 +2011,24 @@ class TestUnmanagedGradientAccumulationOffloadValidation(DistributedTest):
             deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
 
 
+@pytest.mark.parametrize("zero_stage", [0, 1])
+class TestUnmanagedGradientAccumulationOverlapCommValidation(DistributedTest):
+    """Unmanaged mode does not support ZeRO overlap_comm (step-time reduce skips the param walk)."""
+    world_size = 1
+
+    def test_unmanaged_rejects_overlap_comm(self, zero_stage):
+        hidden_dim = 4
+        initialize_distributed()
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          gradient_accumulation_steps=1,
+                                          managed_gradient_accumulation=False)
+        config["zero_optimization"]["overlap_comm"] = True
+        with pytest.raises(AssertionError, match="not supported with ZeRO overlap_comm"):
+            deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+
+
 class TestUnmanagedGradientAccumulationPipelineValidation(DistributedTest):
     """Unmanaged mode is incompatible with pipeline parallelism."""
     world_size = 2
