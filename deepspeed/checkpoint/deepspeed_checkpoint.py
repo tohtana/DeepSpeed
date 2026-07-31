@@ -32,6 +32,11 @@ SEQUENTIAL_LAYERS = [
 LAYER_CONCAT_DIM = {'self_attention.dense.weight': 1, 'mlp.dense_4h_to_h.weight': 1}
 
 
+def _get_pipeline_layer_files(file_list):
+    return sorted(
+        [file_path for file_path in file_list if re.fullmatch(LAYER_FILE_PREFIX_PATTERN, os.path.basename(file_path))])
+
+
 class DeepSpeedCheckpoint(object):
 
     def __init__(self,
@@ -43,14 +48,14 @@ class DeepSpeedCheckpoint(object):
         self.final_layer_norm_idx = final_layer_norm_idx
         self.dir = dir
 
-        pipeline_parallel = len(get_files_with_prefix(get_files(dir), LAYER_FILE_PREFIX)) > 0
+        self.file_list = get_files(dir)
+        self.layer_files = _get_pipeline_layer_files(self.file_list)
+        pipeline_parallel = len(self.layer_files) > 0
 
         self._validate_folder(dir, pipeline_parallel)
 
         self.zero_checkpoint = ZeROCheckpoint(dir)
 
-        self.file_list = get_files(dir)
-        self.layer_files = get_files_with_prefix(self.file_list, LAYER_FILE_PREFIX)
         self.mp_rank_files = get_files_with_prefix(self.file_list, MODEL_FILE_PREFIX)
 
         self.layer_keys = self._get_layer_keys()

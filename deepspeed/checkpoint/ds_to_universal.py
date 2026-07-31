@@ -397,10 +397,14 @@ def _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree,
     _do_parallel_work(do_work, list(range(dp_degree)), args.num_extract_workers)
 
 
-def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir):
+def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir, exclude_param_names=None):
+    exclude_param_names = exclude_param_names or set()
     zero_output_folder = os.path.join(args.output_folder, "zero")
     do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
-    unmatched_patterns_lists = _do_parallel_work(do_work, list(slice_shapes.items()), args.num_merge_workers)
+    merge_shapes = [(name, shape) for name, shape in slice_shapes.items() if name not in exclude_param_names]
+    unmatched_patterns_lists = _do_parallel_work(do_work, merge_shapes, args.num_merge_workers)
+    if not unmatched_patterns_lists:
+        return
 
     # verify that all patterns were used
     # if a pattern was not used by any of the workers, then it was not used at all -> assert/alert
@@ -788,32 +792,44 @@ def main(args):
         slice_shapes = dict((k, v) for d in slice_shapes for k, v in d.items())
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
-        print('*** 1. Extracting ZeRO fragments')
-        _extract_zero_shard_files(args, ds_checkpoint, temp_dir)
-
-        print('*** 2. Merging slices .....')
-        _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir)
-
-        print('*** 2.5. Consolidating AutoEP expert files')
         from deepspeed.checkpoint.autoep_universal import (
-            consolidate_autoep_expert_files,
-            consolidate_autoep_optimizer_states,
+            consolidate_autoep_zero12_expert_states,
+            get_autoep_zero12_expert_param_info,
         )
 
-        # Load AutoEP metadata from main checkpoint
+        # Load AutoEP metadata before the generic merge so expert parameters can
+        # be reconstructed by EP rank from the authoritative ZeRO fragments.
         main_sd = torch.load(ds_checkpoint.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
         autoep_metadata = main_sd.get(AUTOEP_LAYERS_KEY)
         if autoep_metadata is None:
             autoep_metadata = main_sd.get(AUTOEP_LAYERS_KEY_LEGACY)
 
-        # Check for expert files in checkpoint directory
         expert_files = glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*_model_states.pt'))
         autoep_expert_file_type = _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files)
+        autoep_expert_param_info = (get_autoep_zero12_expert_param_info(autoep_metadata)
+                                    if autoep_expert_file_type == 'autoep' else {})
+        source_ds_config = main_sd.get('ds_config', {})
+        if not isinstance(source_ds_config, dict):
+            raise RuntimeError("DeepSpeed checkpoint ds_config must be a dictionary.")
+        use_data_before_expert_parallel = source_ds_config.get('use_data_before_expert_parallelism', False)
+        if not isinstance(use_data_before_expert_parallel, bool):
+            raise RuntimeError("DeepSpeed checkpoint use_data_before_expert_parallelism must be a boolean.")
+
+        print('*** 1. Extracting ZeRO fragments')
+        _extract_zero_shard_files(args, ds_checkpoint, temp_dir)
+
+        print('*** 2. Merging slices .....')
+        _merge_tp_slice_files(args,
+                              ds_checkpoint,
+                              slice_shapes,
+                              temp_dir,
+                              exclude_param_names=set(autoep_expert_param_info))
 
         if autoep_expert_file_type == 'autoep':
-            consolidate_autoep_expert_files(args.input_folder, args.output_folder, autoep_metadata)
-            ep_size = autoep_metadata[0]['ep_size'] if autoep_metadata else 1
-            consolidate_autoep_optimizer_states(args.input_folder, args.output_folder, autoep_metadata, ep_size)
+            print('*** 2.5. Consolidating AutoEP ZeRO-1/2 expert states')
+            consolidate_autoep_zero12_expert_states(temp_dir, args.output_folder, autoep_expert_param_info,
+                                                    slice_shapes, ds_checkpoint.dp_degree, ds_checkpoint.tp_degree,
+                                                    use_data_before_expert_parallel)
             print(f'    Consolidated {len(autoep_metadata)} AutoEP layer(s)')
         elif autoep_expert_file_type == 'native_moe':
             print(f'    Found {len(expert_files)} expert checkpoint file(s) but no AutoEP metadata; '
