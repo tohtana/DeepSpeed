@@ -227,9 +227,9 @@ def test_bwd_insertion_reloads_at_graph_end(monkeypatch):
 
     assert "empty_cache" in names
     assert len(reload_names) == 3
-    assert "sync_offload_copy_stream" in names
+    assert "reload_copy_stream_sync" in names
     # A zero budget leaves no mid-graph headroom, so all reloads land at the end.
-    assert names.index("sync_offload_copy_stream") > max(names.index(n) for n in reload_names)
+    assert names.index("reload_copy_stream_sync") > max(names.index(n) for n in reload_names)
     # Running the backward pass re-arms the once-per-phase empty_cache.
     assert offload_pass._empty_cache_pending is True
 

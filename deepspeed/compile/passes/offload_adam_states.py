@@ -211,6 +211,11 @@ def sync_reload_states(event=None):
 # boundary; the anchor tensor exists only to give the dispatcher something to route on.
 _op_task_registry = []
 _offload_ops_lib = None
+# Strong references to the registered overloads. torch keeps the ORDERED effect in a
+# weak-key dictionary, so the registration lapses if the overload object is ever collected --
+# and a lapsed registration is silent: inductor drops the ops and training runs with the
+# states resident.
+_registered_overloads = []
 
 # Rank-local op execution counts. Reloads are skipped while profiling, so a nonzero reload
 # count proves the ops ran in the compiled graph -- the only cheap detector for the silent
@@ -274,8 +279,9 @@ def _opt_empty_cache_impl(anchor):
     get_accelerator().empty_cache()
 
 
-def _offload_copy_stream_sync_impl(anchor):
-    # The optimizer step reads the reloaded states as soon as the graph returns.
+def _reload_copy_stream_sync_impl(anchor):
+    # Inserted at the end of backward: the optimizer step reads the reloaded states as soon as
+    # the graph returns. Draining the whole stream also covers any offload still in flight.
     copy_stream.synchronize()
 
 
@@ -283,7 +289,7 @@ _OFFLOAD_OP_SPECS = [
     ("offload_opt_launch", "offload_opt_launch(Tensor anchor, int idx) -> ()", _offload_opt_launch_impl),
     ("reload_opt", "reload_opt(Tensor anchor, int idx) -> ()", _reload_opt_impl),
     ("opt_empty_cache", "opt_empty_cache(Tensor anchor) -> ()", _opt_empty_cache_impl),
-    ("offload_copy_stream_sync", "offload_copy_stream_sync(Tensor anchor) -> ()", _offload_copy_stream_sync_impl),
+    ("reload_copy_stream_sync", "reload_copy_stream_sync(Tensor anchor) -> ()", _reload_copy_stream_sync_impl),
 ]
 
 
@@ -305,6 +311,7 @@ def register_offload_ops():
         # off the schema instead. The ORDERED effect covers the second and also pins the ops in
         # program order, which reload-before-sync depends on.
         torch.fx.node._side_effectful_functions.add(overload)
+        _registered_overloads.append(overload)
         if _register_effectful_op is not None:
             _register_effectful_op(overload, _EffectType.ORDERED)
 
@@ -511,8 +518,8 @@ def offload_opt_states_inc(graph: Graph, graph_id: int, graph_order: List[Tuple[
 
                     with graph.inserting_before(node):
                         graph.create_node('call_function',
-                                          torch.ops.dc.offload_copy_stream_sync.default, (anchor, ), {},
-                                          name="sync_offload_copy_stream")
+                                          torch.ops.dc.reload_copy_stream_sync.default, (anchor, ), {},
+                                          name="reload_copy_stream_sync")
 
         print_r0(
             f"offload_opt_states_inc graph {graph_id} graph_order {graph_order} bwd is_first_graph {is_first_graph} is_last_graph {is_last_graph}"
