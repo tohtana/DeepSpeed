@@ -261,6 +261,8 @@ class DeepSpeedEngine(Module):
         self.global_steps = 0
         self.global_samples = 0
         self.micro_steps = 0
+        # Unmanaged mode: backward() calls since the last step(), used to advance global_samples.
+        self._unmanaged_backward_count = 0
         self.skipped_steps = 0
         self.gradient_average = True
         self.warn_unscaled_loss = True
@@ -3104,6 +3106,10 @@ class DeepSpeedEngine(Module):
         # Store scale_wrt_gas so the hook can respect it
         self._scale_wrt_gas = scale_wrt_gas
 
+        # Unmanaged mode: count this backward so step() can advance global_samples by the actual micro-batch count.
+        if not self.managed_gradient_accumulation():
+            self._unmanaged_backward_count += 1
+
         # Set flag to prevent hooks from firing (we'll manually call prologue/epilogue)
         backward_kwargs = {"retain_graph": retain_graph}
         if self.eigenvalue_enabled():
@@ -3269,7 +3275,13 @@ class DeepSpeedEngine(Module):
 
         self.losses = None
         self.global_steps += 1
-        self.global_samples += self.train_batch_size()
+        if not self.managed_gradient_accumulation():
+            # Caller owns the boundary: count actual micro-batches since last step(), not the fixed train_batch_size().
+            samples_per_micro_batch = self.train_batch_size() // self.gradient_accumulation_steps()
+            self.global_samples += samples_per_micro_batch * self._unmanaged_backward_count
+            self._unmanaged_backward_count = 0
+        else:
+            self.global_samples += self.train_batch_size()
 
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation

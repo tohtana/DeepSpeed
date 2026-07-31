@@ -1964,6 +1964,68 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
         managed_engine.destroy()
         unmanaged_engine.destroy()
 
+    def test_unmanaged_varying_backward_count(self, zero_stage):
+        """Varying backward() count per step matches a managed manual-boundary reference and tracks global_samples."""
+        hidden_dim = 4
+        gradient_accumulation_steps = 4  # config value; unmanaged boundary is caller-owned
+        backward_counts = [2, 5, 3]  # micro-batches per step: differs per step and from GAS
+
+        device, _, _ = initialize_distributed()
+
+        torch.manual_seed(42)
+        model_unmanaged = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        unmanaged_engine, _, _, _ = deepspeed.initialize(config=build_managed_gas_config(
+            zero_stage, gradient_accumulation_steps, managed_gradient_accumulation=False),
+                                                         model=model_unmanaged,
+                                                         model_parameters=model_unmanaged.parameters())
+
+        torch.manual_seed(42)
+        model_managed = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        managed_engine, _, _, _ = deepspeed.initialize(config=build_managed_gas_config(
+            zero_stage, gradient_accumulation_steps, managed_gradient_accumulation=True),
+                                                       model=model_managed,
+                                                       model_parameters=model_managed.parameters())
+
+        total_samples = sum(backward_counts)
+        batches = list(
+            random_dataloader(model=unmanaged_engine,
+                              total_samples=total_samples,
+                              hidden_dim=hidden_dim,
+                              device=device,
+                              dtype=torch.float32))
+
+        # Unmanaged: N backwards accumulate locally, one step() reduces + updates; global_samples advances by N micro-batches.
+        samples_per_micro_batch = unmanaged_engine.train_batch_size() // unmanaged_engine.gradient_accumulation_steps()
+        expected_samples = unmanaged_engine.global_samples
+        idx = 0
+        for n in backward_counts:
+            for _ in range(n):
+                loss = unmanaged_engine(batches[idx][0], batches[idx][1])
+                unmanaged_engine.backward(loss / n, scale_wrt_gas=False)
+                idx += 1
+            unmanaged_engine.step()
+            assert unmanaged_engine.was_step_applied(), "Every step() must apply an update in unmanaged mode"
+            expected_samples += samples_per_micro_batch * n
+            assert unmanaged_engine.global_samples == expected_samples, \
+                f"global_samples {unmanaged_engine.global_samples} != expected {expected_samples} at n={n}"
+
+        # Managed reference: reproduce the same variable boundary via set_gradient_accumulation_boundary.
+        idx = 0
+        for n in backward_counts:
+            for micro in range(n):
+                managed_engine.set_gradient_accumulation_boundary(micro == n - 1)
+                loss = managed_engine(batches[idx][0], batches[idx][1])
+                managed_engine.backward(loss / n, scale_wrt_gas=False)
+                idx += 1
+            managed_engine.step()
+
+        unmanaged_params = collect_deepspeed_parameters(unmanaged_engine, zero_stage)
+        managed_params = collect_deepspeed_parameters(managed_engine, zero_stage)
+        compare_parameters(managed_params, unmanaged_params, "unmanaged varying-N vs managed manual boundary")
+
+        unmanaged_engine.destroy()
+        managed_engine.destroy()
+
     def test_set_gradient_accumulation_boundary_rejected(self, zero_stage):
         """set_gradient_accumulation_boundary() is unsupported in unmanaged mode (caller owns the boundary)."""
         hidden_dim = 4
