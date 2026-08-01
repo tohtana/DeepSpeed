@@ -13,7 +13,7 @@ import argparse
 from torch.optim import Optimizer
 import math
 from deepspeed.utils import logger
-from torch import tensor, is_tensor
+from torch import is_tensor
 
 LR_SCHEDULE = 'lr_schedule'
 LR_RANGE_TEST = 'LRRangeTest'
@@ -250,10 +250,11 @@ def get_lr_from_config(config):
 
 def update_lr(param_groups, lrs):
     for param_group, lr in zip(param_groups, lrs):
-        # new LR should match the type of current LR for scalar and Tensor LR support
         if is_tensor(param_group['lr']):
-            lr = tensor([lr], device=param_group['lr'].device)
-        param_group['lr'] = lr
+            lr = lr.squeeze() if is_tensor(lr) else lr
+            param_group['lr'].fill_(lr)
+        else:
+            param_group['lr'] = lr
     return [group['lr'] for group in param_groups]
 
 
