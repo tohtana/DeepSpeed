@@ -1855,6 +1855,29 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
     """managed_gradient_accumulation=False: the caller's step() is the accumulation boundary."""
     world_size = 2
 
+    def test_direct_backward_is_rejected(self, zero_stage):
+        """Direct backward cannot honor caller-owned scaling or sample accounting."""
+        hidden_dim = 4
+
+        device, _, _ = initialize_distributed()
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(zero_stage,
+                                          gradient_accumulation_steps=4,
+                                          managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        data_loader = random_dataloader(model=engine,
+                                        total_samples=2,
+                                        hidden_dim=hidden_dim,
+                                        device=device,
+                                        dtype=torch.float32)
+        batch = next(iter(data_loader))
+        loss = engine(batch[0], batch[1])
+
+        with pytest.raises(RuntimeError, match="Direct calls to tensor.backward.*managed_gradient_accumulation=False"):
+            engine.scale(loss).backward()
+
+        engine.destroy()
+
     def test_step_always_applies_update(self, zero_stage):
         """Every step() applies an optimizer update regardless of gradient_accumulation_steps."""
         hidden_dim = 4

@@ -2823,6 +2823,11 @@ class DeepSpeedEngine(Module):
             return
         self._start_timers(self.engine_timers.backward_timers)
 
+        if not self.managed_gradient_accumulation() and not self._running_engine_backward:
+            raise RuntimeError("Direct calls to tensor.backward() are not supported with "
+                               "managed_gradient_accumulation=False. Please use "
+                               "engine.backward(loss, scale_wrt_gas=False) instead.")
+
         # When necessary internal APIs are not available, we disable direct calls to tensor.backward()
         # and limit to engine.backward(loss) only.
         if not self._support_torch_style_backward and not self._running_engine_backward:

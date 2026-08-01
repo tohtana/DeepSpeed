@@ -117,6 +117,11 @@ locally, and ``step()`` performs the gradient all-reduce followed by the optimiz
    applies and no manual averaging is needed.)
 
 .. note::
+   Direct calls to ``tensor.backward()``, including ``engine.scale(loss).backward()``, are not
+   supported in unmanaged mode because they cannot communicate the caller-owned scaling and sample
+   count to DeepSpeed. Use ``engine.backward(loss, scale_wrt_gas=False)`` as shown above.
+
+.. note::
    Unmanaged mode is being added incrementally. Only ZeRO stage 0/1 (and DDP) is supported today;
    ZeRO stage 2/3 and ZeRO optimizer offload are planned but **not yet available** -- enabling them
    with ``managed_gradient_accumulation=false`` raises an ``AssertionError`` at initialization.
