@@ -300,6 +300,35 @@ class TestMoESingleton(DistributedTest):
 
 class TestTopkGate(DistributedTest):
 
+    @staticmethod
+    def _assert_tutel_routes_match(combine_weights, tutel_output):
+        _, capacity, num_experts, indices_, locations_, gates_, _ = tutel_output
+        reconstructed = torch.zeros_like(combine_weights)
+        for indices_s, locations_s, gates_s in zip(indices_, locations_, gates_):
+            route_mask = indices_s.ge(0)
+            safe_indices = indices_s.clamp_min(0)
+            expert_mask = torch.nn.functional.one_hot(safe_indices, num_classes=num_experts)
+            expert_mask *= route_mask.unsqueeze(1)
+            location_mask = torch.nn.functional.one_hot(locations_s, num_classes=int(capacity))
+            reconstructed += torch.einsum("s,se,sc->sec", gates_s, expert_mask, location_mask)
+        torch.testing.assert_close(reconstructed, combine_weights)
+
+    def test_tutel_top2_routing(self):
+        logits = torch.tensor([[0.1, 0.9, 0.2], [0.8, 0.1, 0.3], [0.4, 0.6, 0.5], [0.7, 0.2, 0.1]])
+        native_output = top2gating(logits, 0.5, 0, top2_2nd_expert_sampling=False)
+        tutel_output = top2gating(logits, 0.5, 0, top2_2nd_expert_sampling=False, use_tutel=True)
+
+        assert len(tutel_output[3]) == 2
+        self._assert_tutel_routes_match(native_output[1], tutel_output)
+
+    def test_tutel_topk_routing(self):
+        logits = torch.tensor([[0.1, 0.9, 0.2, 0.3], [0.8, 0.1, 0.3, 0.2], [0.4, 0.6, 0.5, 0.7], [0.7, 0.2, 0.1, 0.8]])
+        native_output = topkgating(logits, 3, 0.5, 0)
+        tutel_output = topkgating(logits, 3, 0.5, 0, use_tutel=True)
+
+        assert len(tutel_output[3]) == 3
+        self._assert_tutel_routes_match(native_output[1], tutel_output)
+
     def test(self):
 
         def check_equal(logits, cap, sparse_truth, res):
@@ -352,6 +381,42 @@ class TestTopkGate(DistributedTest):
         sec_sparse = torch.tensor([[0, 0, 0], [0, 2, 0], [1, 0, 1], [1, 2, 1], [2, 0, 2], [2, 1, 0], [3, 0, 3],
                                    [3, 1, 1]])
         check_equal(logits3, 4, sec_sparse, dispatch_res)
+
+
+# The drop branches select at most num_tokens rows with torch.topk(..., dim=0), while the
+# configured capacity still sizes the dispatch width.
+def test_topkgating_probs_capacity_exceeds_num_tokens():
+    # s=8, e=2, k=2, capacity_factor=2 -> capacity = ceil(8/2 * (2*2)) = 16 > 8.
+    num_tokens, num_experts, k = 8, 2, 2
+    logits = torch.randn(num_tokens, num_experts)
+    _, _, dispatch_mask, _ = topkgating(logits, k, capacity_factor=2.0, min_capacity=0, drop_policy='probs')
+    assert dispatch_mask.shape[-1] == 16
+    assert int(dispatch_mask.sum()) == num_tokens * k
+
+
+def test_top1gating_drop_capacity_exceeds_num_tokens():
+    # s=8, e=2, capacity_factor=4 -> capacity = ceil(8/2 * 4) = 16 > 8. This is the
+    # top1gating drop branch, which reaches torch.topk via _top_idx.
+    num_tokens, num_experts = 8, 2
+    logits = torch.randn(num_tokens, num_experts)
+    _, _, dispatch_mask, _ = top1gating(logits, capacity_factor=4.0, min_capacity=0, drop_tokens=True, use_rts=False)
+    assert dispatch_mask.shape[-1] == 16
+    assert int(dispatch_mask.sum()) == num_tokens
+
+
+def test_topkgating_position_preserves_min_capacity():
+    # drop_policy='position' never selects over the token dimension, so min_capacity padding stays.
+    num_tokens, num_experts = 4, 2
+    logits = torch.randn(num_tokens, num_experts)
+    _, _, dispatch_mask, _ = topkgating(logits, 1, capacity_factor=1.0, min_capacity=8, drop_policy='position')
+    assert dispatch_mask.shape[-1] == 8
+
+
+def test_top1gating_preserves_tensor_parallel_capacity():
+    # s=3, e=4, capacity_factor=8 -> capacity = 6, which drop_tokens() needs divisible by tp=2.
+    logits = torch.randn(3, 4)
+    _, _, dispatch_mask, _ = top1gating(logits, capacity_factor=8.0, min_capacity=0, drop_tokens=True, use_rts=False)
+    assert dispatch_mask.shape[-1] == 6
 
 
 class TestExpertWeightGradWithZero(DistributedTest):
