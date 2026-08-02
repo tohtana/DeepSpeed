@@ -382,6 +382,8 @@ def _rank_zero_call(function):
 
 
 def _inspect_source_checkpoint(checkpoint_dir):
+    assert not glob.glob(os.path.join(checkpoint_dir, "expp_rank_*_optim_states.pt")), (
+        "ZeRO-1/2 checkpoints must use authoritative ZeRO optimizer shards instead of empty per-expert payloads")
     model_files = sorted(glob.glob(os.path.join(checkpoint_dir, "mp_rank_*_model_states.pt")))
     assert [os.path.basename(path) for path in model_files] == [
         "mp_rank_00_model_states.pt",

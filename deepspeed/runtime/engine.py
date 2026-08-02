@@ -4990,27 +4990,27 @@ class DeepSpeedEngine(Module):
         expert_checkpoint_writer = (groups._get_data_parallel_rank() < folding_spec.ep_size
                                     if folded_autoep_tp else is_expert_dp_writer)
 
-        # Non-ZeRO AutoEP keeps per-expert optimizer files. ZeRO-3 AutoEP
-        # restores experts from ZeRO optimizer shards, so every ZeRO partition
-        # rank continues to write its model-state file below instead.
-        if expert_checkpoint_writer and not self.zero_optimization_partition_weights():
-            optimizer_state = {
-                'optimizer': self.optimizer.state_dict() if self.optimizer and not self.zero_optimization() else None
-            }
-            if folded_autoep_tp:
-                optimizer_state[FOLDING_METADATA_KEY] = folding_metadata(family="routed_expert",
-                                                                         ep_rank=expp_rank,
-                                                                         zero_partition_group="edp",
-                                                                         zero_partition_rank=exp_dp_rank,
-                                                                         zero_partition_count=folding_spec.edp_size)
-            # TODO: why use BufferedWriter not the path
-            file_path = self._get_optimizer_ckpt_name(save_dir, tag, expp_rank)
-            saveable_state_dict = optimizer_state
-            if self.checkpoint_engine.preserves_storage_sharing():
-                saveable_state_dict = clone_tensors_for_torch_save(optimizer_state)
-            self.checkpoint_engine.save(saveable_state_dict, file_path)
-        elif not self.zero_optimization_partition_weights():
-            return
+        # Non-ZeRO AutoEP keeps per-expert optimizer files. ZeRO-1/2 and ZeRO-3
+        # restore optimizer state from ZeRO shards, so do not emit an empty
+        # per-expert optimizer payload for those stages.
+        if not self.zero_optimization_partition_weights():
+            if not expert_checkpoint_writer:
+                return
+            if not self.zero_optimization():
+                optimizer_state = {'optimizer': self.optimizer.state_dict() if self.optimizer else None}
+                if folded_autoep_tp:
+                    optimizer_state[FOLDING_METADATA_KEY] = folding_metadata(
+                        family="routed_expert",
+                        ep_rank=expp_rank,
+                        zero_partition_group="edp",
+                        zero_partition_rank=exp_dp_rank,
+                        zero_partition_count=folding_spec.edp_size)
+                # TODO: why use BufferedWriter not the path
+                file_path = self._get_optimizer_ckpt_name(save_dir, tag, expp_rank)
+                saveable_state_dict = optimizer_state
+                if self.checkpoint_engine.preserves_storage_sharing():
+                    saveable_state_dict = clone_tensors_for_torch_save(optimizer_state)
+                self.checkpoint_engine.save(saveable_state_dict, file_path)
 
         # Load flow uses below saved file for model parameters, RNG and more
         if self.zero_optimization_partition_weights() or groups._get_data_parallel_rank() == 0:

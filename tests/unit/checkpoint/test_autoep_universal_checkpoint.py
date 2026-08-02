@@ -18,8 +18,10 @@ from deepspeed.checkpoint.constants import (
     EP_NUM_EXPERTS,
     PARAM,
 )
+from deepspeed.checkpoint.autoep_universal import _autoep_zero12_dp_ranks
 from deepspeed.checkpoint.ds_to_universal import _aggregate_autoep_zero12_metadata, main as convert_to_universal
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
+from deepspeed.utils.groups import _get_expert_parallel_ranks
 from unit.common import DistributedTest
 from unit.v1.moe.autoep_test_utils import (
     MockMoETransformer,
@@ -89,6 +91,48 @@ def test_aggregate_autoep_zero12_metadata_rejects_ordering_disagreement(tmpdir):
 
     with pytest.raises(RuntimeError, match="disagrees across model-state files"):
         _aggregate_autoep_zero12_metadata([stage0_path, stage1_path])
+
+
+@pytest.mark.parametrize("use_data_before_expert_parallelism", [False, True], ids=["E+D", "D+E"])
+def test_autoep_zero12_dp_rank_mapping_matches_pipeline_runtime_groups(use_data_before_expert_parallelism):
+    for world_size in range(2, 65):
+        for pp_degree in (1, 2, 4):
+            if world_size % pp_degree != 0:
+                continue
+            dp_degree = world_size // pp_degree
+            for ep_size in range(1, dp_degree + 1):
+                if dp_degree % ep_size != 0:
+                    continue
+                ep_groups, edp_groups = _get_expert_parallel_ranks(
+                    world_size=world_size,
+                    tensor_parallel_size_=1,
+                    expert_parallel_size_=ep_size,
+                    pipeline_parallel_size_=pp_degree,
+                    use_data_before_expert_parallel_=use_data_before_expert_parallelism)
+
+                for stage_start in range(0, world_size, dp_degree):
+                    stage_end = stage_start + dp_degree
+                    ep_rank_by_global_rank = {}
+                    for group in ep_groups:
+                        if not all(stage_start <= rank < stage_end for rank in group):
+                            continue
+                        for ep_rank, global_rank in enumerate(group):
+                            ep_rank_by_global_rank[global_rank] = ep_rank
+
+                    runtime_classes = []
+                    for ep_rank in range(ep_size):
+                        runtime_local_ranks = sorted(global_rank - stage_start
+                                                     for global_rank, rank_ep in ep_rank_by_global_rank.items()
+                                                     if rank_ep == ep_rank)
+                        conversion_local_ranks = list(
+                            _autoep_zero12_dp_ranks(ep_rank, dp_degree, ep_size, use_data_before_expert_parallelism))
+                        assert conversion_local_ranks == runtime_local_ranks
+                        runtime_classes.append(runtime_local_ranks)
+
+                    stage_edp_groups = sorted(
+                        sorted(global_rank - stage_start for global_rank in group) for group in edp_groups
+                        if all(stage_start <= rank < stage_end for rank in group))
+                    assert sorted(runtime_classes) == stage_edp_groups
 
 
 def _convert_checkpoint(save_dir, tag):

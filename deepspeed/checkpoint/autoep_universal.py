@@ -12,6 +12,8 @@ import os
 import glob
 import torch
 
+from deepspeed.utils import logger
+
 from .constants import (
     AUTOEP_EP_SIZE,
     AUTOEP_EXPERT_KEY_PREFIX,
@@ -257,6 +259,16 @@ def _zero12_fragment_path(temp_dir, param_name, state_name, dp_rank):
     return os.path.join(temp_dir, param_name, "0", f"{state_name}.{dp_rank:0>2d}")
 
 
+def _autoep_zero12_dp_ranks(ep_rank, dp_degree, ep_size, use_data_before_expert_parallel):
+    """Return stage-local ZeRO DP ranks that own one EP rank's fragments."""
+    if dp_degree % ep_size != 0:
+        raise RuntimeError(f"ZeRO DP degree {dp_degree} is not divisible by AutoEP size {ep_size}.")
+    if use_data_before_expert_parallel:
+        edp_size = dp_degree // ep_size
+        return range(ep_rank * edp_size, (ep_rank + 1) * edp_size)
+    return range(ep_rank, dp_degree, ep_size)
+
+
 def _zero12_values_equal(left, right):
     if torch.is_tensor(left) and torch.is_tensor(right):
         return torch.equal(left, right)
@@ -277,9 +289,6 @@ def consolidate_autoep_zero12_expert_states(temp_dir, output_dir, expert_param_i
         ep_size = metadata['ep_size']
         num_experts = metadata['num_experts']
         num_local_experts = metadata['num_local_experts']
-        if dp_degree % ep_size != 0:
-            raise RuntimeError(f"ZeRO DP degree {dp_degree} is not divisible by AutoEP size {ep_size} "
-                               f"for {param_name}.")
 
         local_shape = tuple(slice_shapes[param_name])
         if not local_shape or local_shape[0] != num_local_experts:
@@ -293,11 +302,7 @@ def consolidate_autoep_zero12_expert_states(temp_dir, output_dir, expert_param_i
             ep_tensors = []
             for ep_rank in range(ep_size):
                 fragments = []
-                if use_data_before_expert_parallel:
-                    edp_size = dp_degree // ep_size
-                    dp_ranks = range(ep_rank * edp_size, (ep_rank + 1) * edp_size)
-                else:
-                    dp_ranks = range(ep_rank, dp_degree, ep_size)
+                dp_ranks = _autoep_zero12_dp_ranks(ep_rank, dp_degree, ep_size, use_data_before_expert_parallel)
                 for dp_rank in dp_ranks:
                     fragment_path = _zero12_fragment_path(temp_dir, param_name, state_name, dp_rank)
                     if not os.path.isfile(fragment_path):
@@ -443,6 +448,8 @@ def consolidate_autoep_optimizer_states(checkpoint_dir, output_dir, autoep_layer
     # Extract optimizer state dict
     optim_sd = optim_states[0].get('optimizer')
     if optim_sd is None:
+        logger.warning("AutoEP per-expert optimizer checkpoint has no optimizer payload; ZeRO-1/2 checkpoints "
+                       "must be consolidated from their ZeRO optimizer shards instead.")
         return
 
     state = optim_sd.get('state', {})
