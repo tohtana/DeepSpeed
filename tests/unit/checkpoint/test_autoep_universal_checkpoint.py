@@ -13,11 +13,12 @@ import pytest
 import torch
 
 from deepspeed.checkpoint.constants import (
+    AUTOEP_LAYERS_KEY,
     EP_IS_EXPERT_PARAM,
     EP_NUM_EXPERTS,
     PARAM,
 )
-from deepspeed.checkpoint.ds_to_universal import main as convert_to_universal
+from deepspeed.checkpoint.ds_to_universal import _aggregate_autoep_zero12_metadata, main as convert_to_universal
 from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer
 from unit.common import DistributedTest
 from unit.v1.moe.autoep_test_utils import (
@@ -29,6 +30,65 @@ from unit.v1.moe.autoep_test_utils import (
 )
 
 EXPERT_STATE_KEYS = ("fp32", "exp_avg", "exp_avg_sq")
+
+
+def _metadata_entry(module_path):
+    return {
+        "moe_layer_id": 0,
+        "module_path": module_path,
+        "num_experts": 4,
+        "num_local_experts": 2,
+        "ep_size": 2,
+        "expert_key_prefix": f"{module_path}.experts",
+    }
+
+
+def _write_model_state(path, metadata, use_data_before_expert_parallelism=False):
+    torch.save(
+        {
+            AUTOEP_LAYERS_KEY: metadata,
+            "ds_config": {
+                "use_data_before_expert_parallelism": use_data_before_expert_parallelism,
+            },
+        },
+        path,
+    )
+
+
+def test_aggregate_autoep_zero12_metadata_unions_pipeline_stages(tmpdir):
+    stage0_path = os.path.join(str(tmpdir), "mp_rank_00_model_states.pt")
+    stage1_path = os.path.join(str(tmpdir), "mp_rank_01_model_states.pt")
+    _write_model_state(stage0_path, [_metadata_entry("0.mlp")])
+    _write_model_state(stage1_path, [_metadata_entry("2.mlp")])
+
+    model_states, metadata, use_data_before_expert_parallelism = _aggregate_autoep_zero12_metadata(
+        [stage0_path, stage1_path])
+
+    assert len(model_states) == 2
+    assert [entry["module_path"] for entry in metadata] == ["0.mlp", "2.mlp"]
+    assert use_data_before_expert_parallelism is False
+
+
+def test_aggregate_autoep_zero12_metadata_rejects_conflicting_prefix(tmpdir):
+    stage0_path = os.path.join(str(tmpdir), "mp_rank_00_model_states.pt")
+    stage1_path = os.path.join(str(tmpdir), "mp_rank_01_model_states.pt")
+    stage0 = _metadata_entry("0.mlp")
+    stage1 = dict(stage0, num_experts=8)
+    _write_model_state(stage0_path, [stage0])
+    _write_model_state(stage1_path, [stage1])
+
+    with pytest.raises(RuntimeError, match="Conflicting AutoEP metadata"):
+        _aggregate_autoep_zero12_metadata([stage0_path, stage1_path])
+
+
+def test_aggregate_autoep_zero12_metadata_rejects_ordering_disagreement(tmpdir):
+    stage0_path = os.path.join(str(tmpdir), "mp_rank_00_model_states.pt")
+    stage1_path = os.path.join(str(tmpdir), "mp_rank_01_model_states.pt")
+    _write_model_state(stage0_path, [_metadata_entry("0.mlp")])
+    _write_model_state(stage1_path, [_metadata_entry("2.mlp")], use_data_before_expert_parallelism=True)
+
+    with pytest.raises(RuntimeError, match="disagrees across model-state files"):
+        _aggregate_autoep_zero12_metadata([stage0_path, stage1_path])
 
 
 def _convert_checkpoint(save_dir, tag):

@@ -3,7 +3,24 @@
 
 # DeepSpeed Team
 
-from deepspeed.checkpoint import model_3d_desc
+import os
+
+import pytest
+import torch
+
+from deepspeed.checkpoint import get_model_3d_descriptor, model_3d_desc
+from deepspeed.checkpoint.constants import (CHECKPOINT_PARALLEL_DIMS, CHECKPOINT_PP_DEGREE, CHECKPOINT_TP_DEGREE)
+
+
+def _write_checkpoint_layout(tmpdir, parallel_dimensions):
+    for mp_rank, dimensions in enumerate(parallel_dimensions):
+        state = {}
+        if dimensions is not None:
+            state[CHECKPOINT_PARALLEL_DIMS] = dimensions
+        torch.save(state, os.path.join(str(tmpdir), f"mp_rank_{mp_rank:02d}_model_states.pt"))
+        for dp_rank in range(2):
+            torch.save({},
+                       os.path.join(str(tmpdir), f"bf16_zero_pp_rank_{dp_rank}_mp_rank_{mp_rank:02d}_optim_states.pt"))
 
 
 def _do_reshape(src_3d, tgt_3d):
@@ -58,3 +75,38 @@ def test_reshape_222_to_211():
 
     assert new_3d_map[0].get_data(pp_index=0, tp_index=0) == [0, 4, 1, 5]
     assert new_3d_map[0].get_data(pp_index=1, tp_index=0) == [2, 6, 3, 7]
+
+
+def test_checkpoint_descriptor_uses_explicit_parallel_dimensions(tmpdir):
+    dimensions = {
+        CHECKPOINT_PP_DEGREE: 2,
+        CHECKPOINT_TP_DEGREE: 1,
+    }
+    _write_checkpoint_layout(tmpdir, [dimensions, dimensions])
+
+    descriptor = get_model_3d_descriptor(str(tmpdir))
+
+    assert descriptor.pp_degree == 2
+    assert descriptor.tp_degree == 1
+    assert descriptor.dp_degree == 2
+
+
+def test_checkpoint_descriptor_preserves_legacy_inference(tmpdir):
+    _write_checkpoint_layout(tmpdir, [None, None])
+
+    descriptor = get_model_3d_descriptor(str(tmpdir))
+
+    assert descriptor.pp_degree == 1
+    assert descriptor.tp_degree == 2
+    assert descriptor.dp_degree == 2
+
+
+def test_checkpoint_descriptor_rejects_partial_parallel_dimensions(tmpdir):
+    dimensions = {
+        CHECKPOINT_PP_DEGREE: 2,
+        CHECKPOINT_TP_DEGREE: 1,
+    }
+    _write_checkpoint_layout(tmpdir, [dimensions, None])
+
+    with pytest.raises(RuntimeError, match="missing from model-state files"):
+        get_model_3d_descriptor(str(tmpdir))

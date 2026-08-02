@@ -13,6 +13,11 @@ import glob
 import torch
 
 from .constants import (
+    AUTOEP_EP_SIZE,
+    AUTOEP_EXPERT_KEY_PREFIX,
+    AUTOEP_NUM_EXPERTS,
+    AUTOEP_NUM_LOCAL_EXPERTS,
+    AUTOEP_ZERO12_REQUIRED_FIELDS,
     PARAM,
     CAT_DIM,
     EP_IS_EXPERT_PARAM,
@@ -214,23 +219,22 @@ def get_autoep_zero12_expert_param_info(autoep_layers_metadata):
         if not isinstance(layer_info, dict):
             raise RuntimeError("AutoEP layer metadata must contain dictionaries.")
 
-        required_fields = ('expert_key_prefix', 'num_experts', 'num_local_experts', 'ep_size')
-        missing_fields = [field for field in required_fields if field not in layer_info]
+        missing_fields = [field for field in AUTOEP_ZERO12_REQUIRED_FIELDS if field not in layer_info]
         if missing_fields:
             raise RuntimeError(f"AutoEP layer metadata is missing fields: {missing_fields}")
 
-        prefix = layer_info['expert_key_prefix']
+        prefix = layer_info[AUTOEP_EXPERT_KEY_PREFIX]
         if not isinstance(prefix, str) or not prefix:
             raise RuntimeError("AutoEP expert_key_prefix must be a non-empty string.")
 
-        for field in ('num_experts', 'num_local_experts', 'ep_size'):
+        for field in (AUTOEP_NUM_EXPERTS, AUTOEP_NUM_LOCAL_EXPERTS, AUTOEP_EP_SIZE):
             value = layer_info[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise RuntimeError(f"AutoEP {field} must be a positive integer, got {value!r}.")
 
-        num_experts = layer_info['num_experts']
-        num_local_experts = layer_info['num_local_experts']
-        ep_size = layer_info['ep_size']
+        num_experts = layer_info[AUTOEP_NUM_EXPERTS]
+        num_local_experts = layer_info[AUTOEP_NUM_LOCAL_EXPERTS]
+        ep_size = layer_info[AUTOEP_EP_SIZE]
         if num_experts != num_local_experts * ep_size:
             raise RuntimeError(f"AutoEP expert count mismatch for {prefix}: num_experts={num_experts}, "
                                f"num_local_experts={num_local_experts}, ep_size={ep_size}.")

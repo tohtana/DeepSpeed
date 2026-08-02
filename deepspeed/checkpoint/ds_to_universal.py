@@ -45,6 +45,7 @@ from deepspeed.checkpoint import (
     PARAMETER_WITH_SUB_PARAMS,
     AUTOEP_LAYERS_KEY,
     AUTOEP_LAYERS_KEY_LEGACY,
+    AUTOEP_EXPERT_KEY_PREFIX,
     EP_IS_EXPERT_PARAM,
     EP_NUM_EXPERTS,
     EXPERT_PARAMETER_PATTERNS,
@@ -760,6 +761,53 @@ def _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files):
     return 'none'
 
 
+def _aggregate_autoep_zero12_metadata(model_files):
+    model_states = []
+    metadata_by_prefix = {}
+    metadata_source_by_prefix = {}
+    use_data_before_expert_parallel_by_file = {}
+
+    for model_file in model_files:
+        model_state = torch.load(model_file, map_location=torch.device('cpu'), weights_only=False)
+        model_states.append(model_state)
+
+        autoep_metadata = _get_autoep_metadata(model_state)
+        if autoep_metadata is not None:
+            if not isinstance(autoep_metadata, list):
+                raise RuntimeError(f"AutoEP metadata must be a list in {model_file}.")
+            for layer_info in autoep_metadata:
+                if not isinstance(layer_info, dict):
+                    raise RuntimeError(f"AutoEP layer metadata must contain dictionaries in {model_file}.")
+                prefix = layer_info.get(AUTOEP_EXPERT_KEY_PREFIX)
+                if not isinstance(prefix, str) or not prefix:
+                    raise RuntimeError(f"AutoEP expert_key_prefix must be a non-empty string in {model_file}.")
+                existing = metadata_by_prefix.get(prefix)
+                if existing is not None and existing != layer_info:
+                    raise RuntimeError(f"Conflicting AutoEP metadata for expert_key_prefix {prefix!r} in "
+                                       f"{metadata_source_by_prefix[prefix]} and {model_file}.")
+                if existing is None:
+                    metadata_by_prefix[prefix] = layer_info
+                    metadata_source_by_prefix[prefix] = model_file
+
+        source_ds_config = model_state.get('ds_config', {})
+        if not isinstance(source_ds_config, dict):
+            raise RuntimeError(f"DeepSpeed checkpoint ds_config must be a dictionary in {model_file}.")
+        use_data_before_expert_parallel = source_ds_config.get('use_data_before_expert_parallelism', False)
+        if not isinstance(use_data_before_expert_parallel, bool):
+            raise RuntimeError("DeepSpeed checkpoint use_data_before_expert_parallelism must be a boolean "
+                               f"in {model_file}.")
+        use_data_before_expert_parallel_by_file[model_file] = use_data_before_expert_parallel
+
+    use_data_before_expert_parallel_values = set(use_data_before_expert_parallel_by_file.values())
+    if len(use_data_before_expert_parallel_values) != 1:
+        raise RuntimeError("DeepSpeed checkpoint use_data_before_expert_parallelism disagrees across model-state "
+                           f"files: {use_data_before_expert_parallel_by_file}")
+
+    autoep_metadata = list(metadata_by_prefix.values()) or None
+    use_data_before_expert_parallel = next(iter(use_data_before_expert_parallel_values))
+    return model_states, autoep_metadata, use_data_before_expert_parallel
+
+
 def main(args):
     print('Convert DeepSpeed Checkpoint to Universal Checkpoint')
 
@@ -783,9 +831,10 @@ def main(args):
         checkpoint_paths = _create_checkpoint_paths(args.output_folder, iteration, ds_checkpoint.tp_degree,
                                                     ds_checkpoint.pp_degree)
 
+        model_states, autoep_metadata, use_data_before_expert_parallel = _aggregate_autoep_zero12_metadata(
+            ds_checkpoint.mp_rank_files)
         slice_shapes = []
-        for mp_rank_file in ds_checkpoint.mp_rank_files:
-            mp_sd = torch.load(mp_rank_file, map_location=torch.device('cpu'), weights_only=False)
+        for mp_sd in model_states:
             slice_shapes += mp_sd[PARAM_SHAPES]
 
         # fix back to normal flat dict, merge duplicates for tp>1
@@ -797,23 +846,10 @@ def main(args):
             get_autoep_zero12_expert_param_info,
         )
 
-        # Load AutoEP metadata before the generic merge so expert parameters can
-        # be reconstructed by EP rank from the authoritative ZeRO fragments.
-        main_sd = torch.load(ds_checkpoint.mp_rank_files[0], map_location=torch.device('cpu'), weights_only=False)
-        autoep_metadata = main_sd.get(AUTOEP_LAYERS_KEY)
-        if autoep_metadata is None:
-            autoep_metadata = main_sd.get(AUTOEP_LAYERS_KEY_LEGACY)
-
         expert_files = glob.glob(os.path.join(args.input_folder, 'layer_*_expert_*_model_states.pt'))
         autoep_expert_file_type = _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files)
         autoep_expert_param_info = (get_autoep_zero12_expert_param_info(autoep_metadata)
                                     if autoep_expert_file_type == 'autoep' else {})
-        source_ds_config = main_sd.get('ds_config', {})
-        if not isinstance(source_ds_config, dict):
-            raise RuntimeError("DeepSpeed checkpoint ds_config must be a dictionary.")
-        use_data_before_expert_parallel = source_ds_config.get('use_data_before_expert_parallelism', False)
-        if not isinstance(use_data_before_expert_parallel, bool):
-            raise RuntimeError("DeepSpeed checkpoint use_data_before_expert_parallelism must be a boolean.")
 
         print('*** 1. Extracting ZeRO fragments')
         _extract_zero_shard_files(args, ds_checkpoint, temp_dir)
@@ -844,7 +880,7 @@ def main(args):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         # Copy mp* files into output folder, injecting AutoEP metadata into UNIVERSAL_CHECKPOINT_INFO
-        for f in glob.glob(os.path.join(args.input_folder, 'mp*')):
+        for f in ds_checkpoint.mp_rank_files:
             if autoep_metadata is not None:
                 # Load -> update with AutoEP metadata -> save
                 mp_sd = torch.load(f, map_location=torch.device('cpu'), weights_only=False)

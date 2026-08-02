@@ -78,6 +78,9 @@ from deepspeed.checkpoint.constants import (
     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_VERSION_KEY,
     AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY,
     AUTOEP_ZERO3_PARTITIONED_EXPERT_STATE_FORMAT,
+    CHECKPOINT_PARALLEL_DIMS,
+    CHECKPOINT_PP_DEGREE,
+    CHECKPOINT_TP_DEGREE,
     EXPERT_PARAMETER_PATTERNS,
     FOLDING_METADATA_KEY,
     FROZEN_PARAM_FRAGMENTS,
@@ -4755,6 +4758,12 @@ class DeepSpeedEngine(Module):
         return full_state_dict
 
     def _common_checkpoint_state(self, module_state_dict, zero_optimizer_state, save_frozen_param):
+        from deepspeed.utils.bwc import bwc_pipeline_parallel_world_size, bwc_tensor_model_parallel_world_size
+
+        parallel_dimensions = {
+            CHECKPOINT_PP_DEGREE: bwc_pipeline_parallel_world_size(self.mpu),
+            CHECKPOINT_TP_DEGREE: bwc_tensor_model_parallel_world_size(self.mpu),
+        }
         return dict(module=module_state_dict,
                     buffer_names=self._get_buffer_names(),
                     optimizer=self.optimizer.state_dict() if self.optimizer and not zero_optimizer_state else None,
@@ -4774,6 +4783,7 @@ class DeepSpeedEngine(Module):
                     global_samples=self.global_samples,
                     dp_world_size=self.seq_dp_world_size,
                     mp_world_size=self.mp_world_size,
+                    **{CHECKPOINT_PARALLEL_DIMS: parallel_dimensions},
                     ds_config=self.config,
                     ds_version=version)
 
@@ -5052,11 +5062,14 @@ class DeepSpeedEngine(Module):
                     zero_partition_count=folding_spec.dp_size,
                     param_families=DeepSpeedEngine._autoep_non_expert_param_families(model_state_dict))
             # Check for reserved-key collisions with client_state
-            reserved_keys = {'ds_autoep_layers', 'autoep_layers', UNIVERSAL_CHECKPOINT_INFO, FOLDING_METADATA_KEY}
+            reserved_keys = {
+                'ds_autoep_layers', 'autoep_layers', UNIVERSAL_CHECKPOINT_INFO, FOLDING_METADATA_KEY,
+                CHECKPOINT_PARALLEL_DIMS
+            }
             collisions = reserved_keys.intersection(client_state.keys())
             if collisions:
                 raise KeyError(f"client_state contains reserved checkpoint keys: {sorted(collisions)}. "
-                               f"These keys are used internally by DeepSpeed for AutoEP metadata.")
+                               f"These keys are used internally by DeepSpeed checkpoint metadata.")
             state.update(client_state)
             logger.info(f'Saving model checkpoint: {save_path}')
             saveable_state_dict = state
@@ -5105,6 +5118,9 @@ class DeepSpeedEngine(Module):
         autotp_uc_info = getattr(self.module, UNIVERSAL_CHECKPOINT_INFO, None)
         if autotp_uc_info is not None:
             state[UNIVERSAL_CHECKPOINT_INFO] = autotp_uc_info
+        if CHECKPOINT_PARALLEL_DIMS in client_state:
+            raise KeyError(f"client_state contains reserved checkpoint key: {CHECKPOINT_PARALLEL_DIMS}. "
+                           "This key is used internally by DeepSpeed checkpoint metadata.")
         state.update(client_state)
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
