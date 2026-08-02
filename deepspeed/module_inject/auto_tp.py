@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 # Automatic Tensor Parallelism
+import logging
 import re
 
 from torch import nn
@@ -16,7 +17,7 @@ from deepspeed.accelerator import get_accelerator
 from .fusedqkv_utils import require_tp_fused_qkvw
 from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
 from deepspeed.utils import groups
-from deepspeed.utils.logging import print_dist
+from deepspeed.utils.logging import log_dist
 from deepspeed.module_inject.layers import is_autotp_training_mode
 from .autotp_config import TPLayerSpec, AutoTPConfig, PartitionType
 
@@ -435,8 +436,8 @@ class AutoTP():
                     "partition_type": spec.partition_type.value,
                     "gather_output": spec.gather_output,
                 }
-            print_dist(f"AutoTP lm_head spec match: parameter={param_name!r}; matched_spec={spec_details!r}",
-                       ranks=[0])
+            log_dist(f"AutoTP lm_head spec match: parameter={param_name!r}; matched_spec={spec_details!r}",
+                     ranks=[0])
 
         if spec is None:
             # No matching spec found
@@ -492,7 +493,7 @@ class AutoTP():
                 name=name,
             )
         if spec.gather_output:
-            print_dist(f"AutoTP: replacing '{name}' with LinearLayer(gather_output=True)", ranks=[0])
+            log_dist(f"AutoTP: replacing '{name}' with LinearLayer(gather_output=True)", ranks=[0])
         return LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output)
 
     def _configure_gathered_column_tie_fallbacks(self):
@@ -535,10 +536,11 @@ class AutoTP():
                 continue
 
             self._tied_gathered_column_module_names.update((module_name, tied_embedding_name))
-            print_dist(
+            log_dist(
                 f"AutoTP: '{module_name}.weight' is tied to '{tied_embedding_name}.weight'; leaving both modules "
                 "replicated because coupled vocabulary-parallel embedding is not supported yet.",
                 ranks=[0],
+                level=logging.WARNING,
             )
 
         self._gathered_column_tie_fallbacks_configured = True
