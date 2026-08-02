@@ -762,14 +762,14 @@ def _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files):
 
 
 def _aggregate_autoep_zero12_metadata(model_files):
-    model_states = []
+    param_shapes = []
     metadata_by_prefix = {}
     metadata_source_by_prefix = {}
     use_data_before_expert_parallel_by_file = {}
 
     for model_file in model_files:
         model_state = torch.load(model_file, map_location=torch.device('cpu'), weights_only=False)
-        model_states.append(model_state)
+        param_shapes.extend(model_state[PARAM_SHAPES])
 
         autoep_metadata = _get_autoep_metadata(model_state)
         if autoep_metadata is not None:
@@ -797,6 +797,7 @@ def _aggregate_autoep_zero12_metadata(model_files):
             raise RuntimeError("DeepSpeed checkpoint use_data_before_expert_parallelism must be a boolean "
                                f"in {model_file}.")
         use_data_before_expert_parallel_by_file[model_file] = use_data_before_expert_parallel
+        del model_state
 
     use_data_before_expert_parallel_values = set(use_data_before_expert_parallel_by_file.values())
     if len(use_data_before_expert_parallel_values) != 1:
@@ -805,7 +806,7 @@ def _aggregate_autoep_zero12_metadata(model_files):
 
     autoep_metadata = list(metadata_by_prefix.values()) or None
     use_data_before_expert_parallel = next(iter(use_data_before_expert_parallel_values))
-    return model_states, autoep_metadata, use_data_before_expert_parallel
+    return param_shapes, autoep_metadata, use_data_before_expert_parallel
 
 
 def main(args):
@@ -831,11 +832,8 @@ def main(args):
         checkpoint_paths = _create_checkpoint_paths(args.output_folder, iteration, ds_checkpoint.tp_degree,
                                                     ds_checkpoint.pp_degree)
 
-        model_states, autoep_metadata, use_data_before_expert_parallel = _aggregate_autoep_zero12_metadata(
+        slice_shapes, autoep_metadata, use_data_before_expert_parallel = _aggregate_autoep_zero12_metadata(
             ds_checkpoint.mp_rank_files)
-        slice_shapes = []
-        for mp_sd in model_states:
-            slice_shapes += mp_sd[PARAM_SHAPES]
 
         # fix back to normal flat dict, merge duplicates for tp>1
         slice_shapes = dict((k, v) for d in slice_shapes for k, v in d.items())

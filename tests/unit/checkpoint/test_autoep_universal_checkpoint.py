@@ -17,6 +17,7 @@ from deepspeed.checkpoint.constants import (
     EP_IS_EXPERT_PARAM,
     EP_NUM_EXPERTS,
     PARAM,
+    PARAM_SHAPES,
 )
 from deepspeed.checkpoint.autoep_universal import _autoep_zero12_dp_ranks
 from deepspeed.checkpoint.ds_to_universal import _aggregate_autoep_zero12_metadata, main as convert_to_universal
@@ -46,9 +47,11 @@ def _metadata_entry(module_path):
 
 
 def _write_model_state(path, metadata, use_data_before_expert_parallelism=False):
+    param_shapes = [{f"{entry['module_path']}.weight": torch.Size([1]) for entry in metadata}]
     torch.save(
         {
             AUTOEP_LAYERS_KEY: metadata,
+            PARAM_SHAPES: param_shapes,
             "ds_config": {
                 "use_data_before_expert_parallelism": use_data_before_expert_parallelism,
             },
@@ -63,10 +66,10 @@ def test_aggregate_autoep_zero12_metadata_unions_pipeline_stages(tmpdir):
     _write_model_state(stage0_path, [_metadata_entry("0.mlp")])
     _write_model_state(stage1_path, [_metadata_entry("2.mlp")])
 
-    model_states, metadata, use_data_before_expert_parallelism = _aggregate_autoep_zero12_metadata(
+    param_shapes, metadata, use_data_before_expert_parallelism = _aggregate_autoep_zero12_metadata(
         [stage0_path, stage1_path])
 
-    assert len(model_states) == 2
+    assert param_shapes == [{"0.mlp.weight": torch.Size([1])}, {"2.mlp.weight": torch.Size([1])}]
     assert [entry["module_path"] for entry in metadata] == ["0.mlp", "2.mlp"]
     assert use_data_before_expert_parallelism is False
 
