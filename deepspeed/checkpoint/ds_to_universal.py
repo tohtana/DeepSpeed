@@ -159,11 +159,26 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
                                     fragment_mapping.start, fragment_mapping.numel)
 
 
-def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index, exclude_param_names=None):
+def extract_zero_shards_stage3(optim_files_grid,
+                               param_shapes_grid,
+                               dp_degree,
+                               temp_dir,
+                               indices,
+                               exclude_param_names=None):
+    # indices is a (tp_index, dp_index) work item. With AutoTP the optimizer files
+    # span a (tp, dp) grid; each holds the ZeRO-DP partition of one tensor-parallel
+    # shard, so fragments must be dumped under the real tp_index (not 0) to allow the
+    # TP-aware merge to reassemble the full parameter afterwards.
+    tp_index, dp_index = indices
     exclude_param_names = exclude_param_names or set()
-    state_dict = torch.load(optim_files[dp_index], map_location='cpu', weights_only=False)
+    optim_file = optim_files_grid[tp_index][dp_index]
+    state_dict = torch.load(optim_file, map_location='cpu', weights_only=False)
     optim_sd = state_dict[OPTIMIZER_STATE_DICT]
     partition_groups = optim_sd.get('ds_zero_partition_groups') or []
+
+    # param_shapes are per tensor-parallel rank (the TP shard shapes), since each TP
+    # rank stores the shapes of its own shard in its model_states file.
+    param_shapes = param_shapes_grid[tp_index]
 
     for idx, sub_group_shape in enumerate(param_shapes):
         flat_state = dict(
@@ -182,7 +197,7 @@ def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, d
                                             unpartitioned_numel - partition_rank * partitioned_numel))
             if name not in exclude_param_names:
                 for state_key in flat_state.keys():
-                    dump_param_fragment(temp_dir, 0, dp_index, state_key, flat_state[state_key], name, offset,
+                    dump_param_fragment(temp_dir, tp_index, dp_index, state_key, flat_state[state_key], name, offset,
                                         padding_free_numel)
             offset += partitioned_numel
 
@@ -213,7 +228,11 @@ def dump_param_fragment(dir, tp_index, dp_index, state_name, state_flat_tensor, 
     _save_checkpoint(path, state_flat_tensor)
 
 
-def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
+def _merge_zero_shards(param_base_path, state, tp_degree, slice_shapes=None):
+    # slice_shapes, when provided, is a per-tp list of shapes (one entry per tp_index) so
+    # that uneven TP shards -- e.g. a partition dim not divisible by tp_degree, or uneven
+    # GQA sub-params -- reshape to the correct per-rank shape instead of a single shape
+    # taken from one rank. None keeps each merged fragment flat.
     slices = []
     for tp_index in range(tp_degree):
         prefix_path = os.path.join(param_base_path, str(tp_index), f"{state}")
@@ -238,22 +257,22 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shape=None):
             assert all(v == shards[0] for v in shards), "All shards must have the same step value"
             slice = shards[0]
         else:
-            if slice_shape is None:
+            if slice_shapes is None:
                 slice = torch.cat(shards, dim=0)
             else:
-                slice = torch.cat(shards, dim=0).reshape(slice_shape)
+                slice = torch.cat(shards, dim=0).reshape(slice_shapes[tp_index])
 
         slices.append(slice)
     return slices
 
 
-def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
+def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
 
-    name, shape = name_and_shape
+    name, per_tp_shapes = name_and_shapes
     slice_base_path = os.path.join(slice_dir, name)
     param_base_path = os.path.join(dir, name)
 
-    universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
+    universal_checkpoint_info = uc_info
     replicated_parameters = universal_checkpoint_info.get(TP_REPLICATED_PARAMETER_PATTERNS, [])
     parameters_to_average = universal_checkpoint_info.get(PARAMETER_TO_AVERAGE_PATTERNS, [])
     parameters_with_row_parallelism = universal_checkpoint_info.get(PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, [])
@@ -285,12 +304,12 @@ def merge_tp_slices(ds_checkpoint, dir, slice_dir, tp_degree, name_and_shape):
 
     matched_sub_params_shape = get_matched_sub_params_pattern(name)
 
-    step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, shape)
+    step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, per_tp_shapes)
     if step_merged:
         _save_checkpoint(os.path.join(param_base_path, "step.pt"), step_merged[0])
 
     for state in ("fp32", "exp_avg", "exp_avg_sq"):
-        slices = _merge_zero_shards(slice_base_path, state, tp_degree, shape)
+        slices = _merge_zero_shards(slice_base_path, state, tp_degree, per_tp_shapes)
         final_path = os.path.join(param_base_path, f"{state}.pt")
 
         #print(f"Expected shape: {shape}")
@@ -388,20 +407,27 @@ def _extract_zero_shard_files(args, ds_checkpoint, temp_dir):
     _do_parallel_work(do_work, _3d_range_list, args.num_extract_workers)
 
 
-def _extract_zero_shard_files_stage3(args, optim_files, param_shapes, dp_degree, temp_dir, exclude_param_names=None):
+def _extract_zero_shard_files_stage3(args,
+                                     optim_files_grid,
+                                     param_shapes_grid,
+                                     dp_degree,
+                                     tp_degree,
+                                     temp_dir,
+                                     exclude_param_names=None):
+    work_items = [(tp_index, dp_index) for tp_index in range(tp_degree) for dp_index in range(dp_degree)]
     do_work = partial(extract_zero_shards_stage3,
-                      optim_files,
-                      param_shapes,
+                      optim_files_grid,
+                      param_shapes_grid,
                       dp_degree,
                       temp_dir,
                       exclude_param_names=exclude_param_names)
-    _do_parallel_work(do_work, list(range(dp_degree)), args.num_extract_workers)
+    _do_parallel_work(do_work, work_items, args.num_extract_workers)
 
 
-def _merge_tp_slice_files(args, ds_checkpoint, slice_shapes, temp_dir, exclude_param_names=None):
+def _merge_tp_slice_files(args, uc_info, tp_degree, slice_shapes, temp_dir, exclude_param_names=None):
     exclude_param_names = exclude_param_names or set()
     zero_output_folder = os.path.join(args.output_folder, "zero")
-    do_work = partial(merge_tp_slices, ds_checkpoint, zero_output_folder, temp_dir, ds_checkpoint.tp_degree)
+    do_work = partial(merge_tp_slices, uc_info, zero_output_folder, temp_dir, tp_degree)
     merge_shapes = [(name, shape) for name, shape in slice_shapes.items() if name not in exclude_param_names]
     unmatched_patterns_lists = _do_parallel_work(do_work, merge_shapes, args.num_merge_workers)
     if not unmatched_patterns_lists:
@@ -441,6 +467,36 @@ def _zero3_rank_from_file(path):
     if match is None:
         raise ValueError(f"Cannot parse ZeRO rank from checkpoint file name: {path}")
     return int(match.group(1))
+
+
+def _zero3_tp_dp_ranks_from_file(path):
+    # A ZeRO-3 checkpoint file is named zero_pp_rank_{dp_rank}_mp_rank_{tp_rank}_*.
+    # Under AutoTP, the mp_rank enumerates tensor-parallel ranks and the pp_rank
+    # enumerates the ZeRO data-parallel partition ranks, so both dimensions must be
+    # recovered to reassemble a full parameter.
+    match = re.search(r'(?:bf16_)?zero_pp_rank_([0-9]+)_mp_rank_([0-9]+)', os.path.basename(path))
+    if match is None:
+        raise ValueError(f"Cannot parse ZeRO-3 tp/dp ranks from checkpoint file name: {path}")
+    return int(match.group(2)), int(match.group(1))  # (tp_rank, dp_rank)
+
+
+def _build_zero3_rank_grid(files):
+    # Group files into grid[tp_rank][dp_rank] = path and infer tp/dp degrees.
+    # Returns (grid_as_list_of_lists, tp_degree, dp_degree) and validates that the
+    # grid is complete (every (tp, dp) pair present), which catches corruption that
+    # would otherwise silently produce incomplete weights during conversion.
+    grid = {}
+    for path in files:
+        tp_rank, dp_rank = _zero3_tp_dp_ranks_from_file(path)
+        grid.setdefault(tp_rank, {})[dp_rank] = path
+    tp_degree = max(grid) + 1
+    dp_degree = max(max(dp_map) for dp_map in grid.values()) + 1
+    for tp_rank in range(tp_degree):
+        for dp_rank in range(dp_degree):
+            if tp_rank not in grid or dp_rank not in grid[tp_rank]:
+                raise RuntimeError(f"Missing ZeRO-3 checkpoint file for tp_rank={tp_rank}, dp_rank={dp_rank}")
+    return [[grid[tp_rank][dp_rank] for dp_rank in range(dp_degree)]
+            for tp_rank in range(tp_degree)], tp_degree, dp_degree
 
 
 def _get_autoep_metadata(model_state):
@@ -664,6 +720,32 @@ def _parse_model_states_stage3(files):
     return torch.load(files[0], map_location=torch.device('cpu'), weights_only=False)[PARAM_SHAPES]
 
 
+def _load_universal_checkpoint_info_stage3(model_files):
+    # The UNIVERSAL_CHECKPOINT_INFO schema (TP merge patterns, etc.) is identical on
+    # every rank, so loading it from any model_states file is sufficient. It is only
+    # populated under AutoTP, which is exactly the case that needs the TP-aware merge.
+    model_state = torch.load(model_files[0], map_location=torch.device('cpu'), weights_only=False)
+    return model_state.get(UNIVERSAL_CHECKPOINT_INFO) or {}
+
+
+def _group_per_tp_shapes(slice_shapes_by_tp, pp_degree, tp_degree):
+    # mp_rank_files are pp-major (pp0_tp0, pp0_tp1, ..., pp1_tp0, ...), matching
+    # meg_2d_parallel_map.simple_init() which maps index i to (pp=i // tp_degree,
+    # tp=i % tp_degree). Group slice_shapes_by_tp entries by TP rank, union PP
+    # stages within each TP rank so that PP-local parameters are not lost, then
+    # build one per-TP shape list per param name.
+    per_tp = []
+    for tp in range(tp_degree):
+        tp_dict = {}
+        for pp in range(pp_degree):
+            tp_dict.update(slice_shapes_by_tp[pp * tp_degree + tp])
+        per_tp.append(tp_dict)
+    all_names = set()
+    for d in per_tp:
+        all_names.update(d.keys())
+    return {name: [d.get(name) for d in per_tp] for name in all_names}
+
+
 def _save_optimizer_state(args, ds_checkpoint):
     sharded_states = [BASE_OPTIMIZER_STATE, PARAM_SLICE_MAPPINGS, SINGLE_PARTITION_OF_FP32_GROUPS]
     sd = ds_checkpoint.get_zero_checkpoint_state(pp_index=0, tp_index=0, dp_index=0)
@@ -762,14 +844,14 @@ def _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files):
 
 
 def _aggregate_autoep_zero12_metadata(model_files):
-    param_shapes = []
+    slice_shapes_by_tp = []
     metadata_by_prefix = {}
     metadata_source_by_prefix = {}
     use_data_before_expert_parallel_by_file = {}
 
     for model_file in model_files:
         model_state = torch.load(model_file, map_location=torch.device('cpu'), weights_only=False)
-        param_shapes.extend(model_state[PARAM_SHAPES])
+        slice_shapes_by_tp.append(dict((k, v) for group in model_state[PARAM_SHAPES] for k, v in group.items()))
 
         autoep_metadata = _get_autoep_metadata(model_state)
         if autoep_metadata is not None:
@@ -806,7 +888,7 @@ def _aggregate_autoep_zero12_metadata(model_files):
 
     autoep_metadata = list(metadata_by_prefix.values()) or None
     use_data_before_expert_parallel = next(iter(use_data_before_expert_parallel_values))
-    return param_shapes, autoep_metadata, use_data_before_expert_parallel
+    return slice_shapes_by_tp, autoep_metadata, use_data_before_expert_parallel
 
 
 def main(args):
@@ -832,11 +914,17 @@ def main(args):
         checkpoint_paths = _create_checkpoint_paths(args.output_folder, iteration, ds_checkpoint.tp_degree,
                                                     ds_checkpoint.pp_degree)
 
-        slice_shapes, autoep_metadata, use_data_before_expert_parallel = _aggregate_autoep_zero12_metadata(
+        slice_shapes_by_tp, autoep_metadata, use_data_before_expert_parallel = _aggregate_autoep_zero12_metadata(
             ds_checkpoint.mp_rank_files)
-
-        # fix back to normal flat dict, merge duplicates for tp>1
-        slice_shapes = dict((k, v) for d in slice_shapes for k, v in d.items())
+        # Each mp_rank file stores one TP rank's PARAM_SHAPES for one PP stage.
+        # mp_rank_files are ordered pp-major (pp0_tp0, pp0_tp1, ..., pp1_tp0, ...),
+        # matching meg_2d_parallel_map.simple_init() (i -> pp=i // tp_degree,
+        # tp=i % tp_degree). _group_per_tp_shapes groups them by TP rank, unions
+        # the PP stages within each TP rank (so PP-local parameters are not lost),
+        # and returns one per-TP shape list per parameter name. The per-TP shapes
+        # let _merge_zero_shards reshape each TP rank's slice to its own shape,
+        # which matters for uneven TP splits.
+        slice_shapes = _group_per_tp_shapes(slice_shapes_by_tp, ds_checkpoint.pp_degree, ds_checkpoint.tp_degree)
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         from deepspeed.checkpoint.autoep_universal import (
@@ -854,16 +942,18 @@ def main(args):
 
         print('*** 2. Merging slices .....')
         _merge_tp_slice_files(args,
-                              ds_checkpoint,
+                              ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO),
+                              ds_checkpoint.tp_degree,
                               slice_shapes,
                               temp_dir,
                               exclude_param_names=set(autoep_expert_param_info))
 
         if autoep_expert_file_type == 'autoep':
             print('*** 2.5. Consolidating AutoEP ZeRO-1/2 expert states')
+            autoep_slice_shapes = {name: per_tp_shapes[0] for name, per_tp_shapes in slice_shapes.items()}
             consolidate_autoep_zero12_expert_states(temp_dir, args.output_folder, autoep_expert_param_info,
-                                                    slice_shapes, ds_checkpoint.dp_degree, ds_checkpoint.tp_degree,
-                                                    use_data_before_expert_parallel)
+                                                    autoep_slice_shapes, ds_checkpoint.dp_degree,
+                                                    ds_checkpoint.tp_degree, use_data_before_expert_parallel)
             print(f'    Consolidated {len(autoep_metadata)} AutoEP layer(s)')
         elif autoep_expert_file_type == 'native_moe':
             print(f'    Found {len(expert_files)} expert checkpoint file(s) but no AutoEP metadata; '
@@ -906,22 +996,48 @@ def main(args):
         else:
             _validate_zero3_model_optim_rank_sets(model_files, optim_files)
         param_shapes = _parse_model_states_stage3(model_files)
-        dp_degree = len(model_files)
+        # Recover the tensor-parallel / data-parallel grid from the file names. With
+        # AutoTP, mp_rank enumerates TP ranks and pp_rank enumerates the ZeRO-DP
+        # partition ranks, so len(model_files) over-counts dp_degree by tp_degree.
+        model_files_grid, tp_degree, dp_degree = _build_zero3_rank_grid(model_files)
+        optim_files_grid, tp_degree_optim, dp_degree_optim = _build_zero3_rank_grid(optim_files)
+        if tp_degree != tp_degree_optim or dp_degree != dp_degree_optim:
+            raise RuntimeError("ZeRO-3 model/optimizer tp_degree or dp_degree mismatch: "
+                               f"model=({tp_degree},{dp_degree}), optim=({tp_degree_optim},{dp_degree_optim})")
+        # param_shapes are per TP rank (each rank stores its own shard shapes).
+        param_shapes_grid = [
+            _parse_model_states_stage3([model_files_grid[tp_index][0]]) for tp_index in range(tp_degree)
+        ]
 
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         print('*** 1. Extracting ZeRO fragments')
         _extract_zero_shard_files_stage3(args,
-                                         optim_files,
-                                         param_shapes,
+                                         optim_files_grid,
+                                         param_shapes_grid,
                                          dp_degree,
+                                         tp_degree,
                                          temp_dir,
                                          exclude_param_names=autoep_expert_param_names)
 
         print('*** 2. Merging slices .....')
         param_keys = {key for sub_group_shapes in param_shapes for key in sub_group_shapes.keys()}
         param_keys -= autoep_expert_param_names
-        _merge_zero3_slice_files(args, param_keys, dp_degree, temp_dir)
+        if tp_degree > 1:
+            # Reassemble both the ZeRO data-parallel and tensor-parallel dimensions by
+            # reusing the stage<=2 TP-aware merge machinery. Use the per-TP-rank shapes from
+            # param_shapes_grid (not a single rank's shape) so uneven TP shards -- e.g. a
+            # partition dim not divisible by tp_degree, or uneven GQA sub-params -- merge
+            # under their correct per-rank shape instead of the first rank's shape.
+            param_shapes_by_tp = [
+                dict((k, v) for sub in grid_tp for k, v in sub.items()) for grid_tp in param_shapes_grid
+            ]
+            slice_shapes = {name: [param_shapes_by_tp[tp][name] for tp in range(tp_degree)] for name in param_keys}
+            uc_info = _load_universal_checkpoint_info_stage3(model_files)
+            _merge_tp_slice_files(args, uc_info, tp_degree, slice_shapes, temp_dir)
+        else:
+            # Plain ZeRO-3 (no tensor parallelism): DP-only merge, unchanged behavior.
+            _merge_zero3_slice_files(args, param_keys, dp_degree, temp_dir)
 
         if has_zero3_partitioned_autoep:
             print('*** 2.5. Consolidating AutoEP ZeRO-3 expert states')
