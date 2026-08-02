@@ -410,7 +410,7 @@ private:
             idle_pressure_score_ = 0;
         } else if (!pressure_recovery_complete_ &&
                    idle_pressure_score_ >= kIdlePressureEvictionThreshold &&
-                   charged_bytes_ >= budget_bytes_ && beginPressureRecovery(hard_cap)) {
+                   beginPressureRecovery(hard_cap)) {
             return;
         } else {
             const size_t charged_before_hard_cap = charged_bytes_;

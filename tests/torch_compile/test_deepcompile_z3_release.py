@@ -508,7 +508,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         finally:
             dc.cleanup()
 
-    def test_repeated_allocator_pressure_preserves_idle_pool_below_budget(self):
+    def test_repeated_allocator_pressure_recovers_once_below_budget(self):
         graph_id, ds_id = 9108, 9109
         dc = self._init_dc(pool_budget=None)
         try:
@@ -524,24 +524,15 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
 
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(2, gib, 8 * gib)
             dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(3, gib, 8 * gib)
-            below_budget = self._pool_state(dc)
-            assert below_budget["charged"] == before_pressure["charged"]
-            assert below_budget["budget"] == before_pressure["budget"]
-            assert below_budget["entries"] == 1
-            assert below_budget["enabled"] == 1
-            assert below_budget["idle_pressure_score"] == 3
-            assert storage.nbytes() == before_pressure["charged"]
-
-            # The same sustained score performs one recovery once pressure
-            # lowers the budget to the retained charge.
-            dc.update_z3_gather_buffer_pool_allocator_pressure_for_test(4, 8 << 20, 8 * gib)
-            at_budget = self._pool_state(dc)
-            assert at_budget["charged"] == 0
-            assert at_budget["budget"] == before_pressure["charged"]
-            assert at_budget["entries"] == 0
-            assert at_budget["enabled"] == 1
-            assert at_budget["idle_pressure_score"] == 0
-            assert at_budget["pressure_recovery_complete"] == 1
+            recovered = self._pool_state(dc)
+            assert recovered["charged"] == 0
+            assert recovered["budget"] == before_pressure["charged"]
+            assert recovered["entries"] == 0
+            assert recovered["enabled"] == 1
+            assert recovered["idle_pressure_score"] == 0
+            assert recovered["pressure_recovery_complete"] == 1
+            assert recovered["pressure_recovery_budget"] == before_pressure["charged"]
+            assert recovered["pressure_recovery_pending_entries"] == 1
             assert storage.nbytes() == 0
 
             recovered_view, recovered_storage = self._gather_view_and_storage(shard, graph_id, ds_id)
