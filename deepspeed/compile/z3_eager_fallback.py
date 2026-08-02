@@ -10,8 +10,8 @@ import torch
 
 from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict, ensure_zero_ordered_dict
 from deepspeed.runtime.zero.partition_parameters import (
-    _FALLBACK_OWNER_ATTR,
-    _GATHERED_PARAM_CONTEXT_DEPTH_ATTR,
+    DS_Z3_EAGER_FALLBACK_OWNER_ATTR,
+    DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR,
     ZeroParamStatus,
 )
 
@@ -83,10 +83,10 @@ class DeepCompileZ3EagerFallback:
         previous = _ACTIVE_FALLBACK
         self._depth += 1
         if self._depth == 1:
-            self._last_gathered_param_ids = []
-            self._last_guard_suppressed_param_ids = []
-            self._last_pre_forward_released_param_ids = []
-            self._current_forward_param_ids = set()
+            self._last_gathered_param_ids.clear()
+            self._last_guard_suppressed_param_ids.clear()
+            self._last_pre_forward_released_param_ids.clear()
+            self._current_forward_param_ids.clear()
             self.release_available_params_for_next_forward()
             self._enable_forward_fallback()
         _ACTIVE_FALLBACK = self
@@ -109,19 +109,19 @@ class DeepCompileZ3EagerFallback:
                 module._parameters._in_forward = False
 
     def record_gathered_param(self, param):
-        ds_id = int(param.ds_id)
-        previous_owner = getattr(param, _FALLBACK_OWNER_ATTR, None)
+        ds_id = param.ds_id
+        previous_owner = getattr(param, DS_Z3_EAGER_FALLBACK_OWNER_ATTR, None)
         if previous_owner is not None and previous_owner is not self:
             previous_owner._drop_tracked_param(ds_id, param)
         self._tracked_params[ds_id] = param
-        setattr(param, _FALLBACK_OWNER_ATTR, self)
+        setattr(param, DS_Z3_EAGER_FALLBACK_OWNER_ATTR, self)
         self._current_forward_param_ids.add(ds_id)
         self._last_gathered_param_ids.append(ds_id)
         self.total_gathered_params += 1
 
     def record_param_access(self, param):
         """Associate an already-gathered fallback parameter with the current forward."""
-        ds_id = int(param.ds_id)
+        ds_id = param.ds_id
         if self._tracked_params.get(ds_id) is param:
             self._current_forward_param_ids.add(ds_id)
 
@@ -132,32 +132,33 @@ class DeepCompileZ3EagerFallback:
         for graph_id in self._param_graph_claim_ids.pop(ds_id, set()):
             self._graph_claim_param_ids.get(graph_id, set()).discard(ds_id)
         self._deferred_updated_param_ids.discard(ds_id)
-        if getattr(param, _FALLBACK_OWNER_ATTR, None) is self:
-            delattr(param, _FALLBACK_OWNER_ATTR)
+        if getattr(param, DS_Z3_EAGER_FALLBACK_OWNER_ATTR, None) is self:
+            delattr(param, DS_Z3_EAGER_FALLBACK_OWNER_ATTR)
 
     def record_user_context_claim(self, param):
         """Record that an explicit user context overlaps this fallback-owned parameter."""
-        ds_id = int(param.ds_id)
+        ds_id = param.ds_id
         if ds_id not in self._user_adopted_param_ids:
             self._user_adopted_param_ids.add(ds_id)
             self._last_user_adopted_param_ids.append(ds_id)
 
     def release_user_context_claim(self, param):
         """Drop fallback provenance once neither a graph nor user context protects the parameter."""
-        ds_id = int(param.ds_id)
-        if (not self._param_graph_claim_ids.get(ds_id) and not getattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
+        ds_id = param.ds_id
+        if (not self._param_graph_claim_ids.get(ds_id)
+                and not getattr(param, DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
             self._drop_tracked_param(ds_id, param)
 
     def has_outstanding_graph_claim(self, param):
-        return bool(self._param_graph_claim_ids.get(int(param.ds_id)))
+        return bool(self._param_graph_claim_ids.get(param.ds_id))
 
     def record_deferred_user_update(self, param):
         """Preserve modifier-rank update provenance until the graph claim releases."""
-        self._deferred_updated_param_ids.add(int(param.ds_id))
+        self._deferred_updated_param_ids.add(param.ds_id)
 
     def record_guard_suppressed_param(self, param):
         """Record a guard probe that intentionally observed the partitioned parameter."""
-        self._last_guard_suppressed_param_ids.append(int(param.ds_id))
+        self._last_guard_suppressed_param_ids.append(param.ds_id)
 
     def record_forward_graph(self):
         """Record a grad-bearing forward whose fallback gathers must survive until backward."""
@@ -184,9 +185,9 @@ class DeepCompileZ3EagerFallback:
             for param in self.engine.module.parameters():
                 if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
                         and not getattr(param, "ds_persist", False)
-                        and not getattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
+                        and not getattr(param, DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
                     param.partition()
-                    released.append(int(param.ds_id))
+                    released.append(param.ds_id)
 
         self._last_pre_forward_released_param_ids = released
 
@@ -194,7 +195,7 @@ class DeepCompileZ3EagerFallback:
     def _release_unclaimed_tracked_params(self):
         released = []
         for ds_id, param in list(self._tracked_params.items()):
-            if (self._param_graph_claim_ids.get(ds_id) or getattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
+            if (self._param_graph_claim_ids.get(ds_id) or getattr(param, DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)):
                 continue
             if (hasattr(param, "ds_status") and param.ds_status == ZeroParamStatus.AVAILABLE
                     and not getattr(param, "ds_persist", False)):
@@ -268,7 +269,7 @@ class DeepCompileZ3EagerFallback:
             },
             "context_claimed_param_ids":
             sorted(ds_id for ds_id, param in self._tracked_params.items()
-                   if getattr(param, _GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)),
+                   if getattr(param, DS_Z3_GATHERED_PARAM_CONTEXT_DEPTH_ATTR, 0)),
             "deferred_updated_param_ids":
             sorted(self._deferred_updated_param_ids),
             "last_completed_forward_graph_ids":

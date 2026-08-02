@@ -194,7 +194,7 @@ def test_two_disjoint_fallback_forwards_remain_gathered_until_combined_backward(
             _param.ds_status = ZeroParamStatus.AVAILABLE
 
         def partition(*, _param=param):
-            partition_calls.append(int(_param.ds_id))
+            partition_calls.append(_param.ds_id)
             _param.data = torch.empty(0)
             _param.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
@@ -402,7 +402,7 @@ def test_gathered_parameters_after_forward_defers_partition_until_backward(monke
     def partition(param_list=None, has_been_updated=False):
         selected = [param] if param_list is None else param_list
         assert selected == [param]
-        partition_calls.append(([int(item.ds_id) for item in selected], has_been_updated))
+        partition_calls.append(([item.ds_id for item in selected], has_been_updated))
         param.data = torch.empty(0)
         param.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
@@ -491,7 +491,7 @@ def test_context_exception_restores_fallback_and_user_ownership_depth(monkeypatc
                 raise RuntimeError("injected")
 
     assert z3_eager_fallback.get_active_z3_eager_fallback() is previous
-    assert not hasattr(param, "_deepspeed_gathered_param_context_depth")
+    assert not hasattr(param, "_ds_z3_gathered_param_context_depth")
     assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
 
 
@@ -505,13 +505,13 @@ def _zero_params_with_collective_stubs(*ds_ids):
         param.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
         def all_gather(param_list, *, _calls=gather_calls):
-            _calls.append([int(item.ds_id) for item in param_list])
+            _calls.append([item.ds_id for item in param_list])
             for item in param_list:
                 item.ds_status = ZeroParamStatus.AVAILABLE
 
         def partition(param_list=None, has_been_updated=False, *, _param=param, _calls=partition_calls):
             selected = [_param] if param_list is None else param_list
-            _calls.append([int(item.ds_id) for item in selected])
+            _calls.append([item.ds_id for item in selected])
             for item in selected:
                 item.ds_status = ZeroParamStatus.NOT_AVAILABLE
 
@@ -526,8 +526,8 @@ def test_gathered_parameters_rejects_partial_overlap_atomically():
 
     with GatheredParameters([first, shared]):
         assert gather_calls == [[1, 2]]
-        assert getattr(first, "_deepspeed_gathered_param_context_depth") == 1
-        assert getattr(shared, "_deepspeed_gathered_param_context_depth") == 1
+        assert getattr(first, "_ds_z3_gathered_param_context_depth") == 1
+        assert getattr(shared, "_ds_z3_gathered_param_context_depth") == 1
 
         with pytest.raises(RuntimeError, match=r"cannot overlap parameters.*\[2\]"):
             with GatheredParameters([shared, new]):
@@ -538,14 +538,14 @@ def test_gathered_parameters_rejects_partial_overlap_atomically():
         assert first.ds_status == ZeroParamStatus.AVAILABLE
         assert shared.ds_status == ZeroParamStatus.AVAILABLE
         assert new.ds_status == ZeroParamStatus.NOT_AVAILABLE
-        assert getattr(first, "_deepspeed_gathered_param_context_depth") == 1
-        assert getattr(shared, "_deepspeed_gathered_param_context_depth") == 1
-        assert not hasattr(new, "_deepspeed_gathered_param_context_depth")
+        assert getattr(first, "_ds_z3_gathered_param_context_depth") == 1
+        assert getattr(shared, "_ds_z3_gathered_param_context_depth") == 1
+        assert not hasattr(new, "_ds_z3_gathered_param_context_depth")
 
     assert gather_calls == [[1, 2]]
     assert partition_calls == [[1, 2]]
     assert all(param.ds_status == ZeroParamStatus.NOT_AVAILABLE for param in (first, shared, new))
-    assert all(not hasattr(param, "_deepspeed_gathered_param_context_depth") for param in (first, shared, new))
+    assert all(not hasattr(param, "_ds_z3_gathered_param_context_depth") for param in (first, shared, new))
 
 
 def test_gathered_parameters_preserves_disjoint_nesting():
@@ -554,15 +554,15 @@ def test_gathered_parameters_preserves_disjoint_nesting():
     with GatheredParameters([first]):
         with GatheredParameters([second]):
             assert gather_calls == [[1], [2]]
-            assert getattr(first, "_deepspeed_gathered_param_context_depth") == 1
-            assert getattr(second, "_deepspeed_gathered_param_context_depth") == 1
+            assert getattr(first, "_ds_z3_gathered_param_context_depth") == 1
+            assert getattr(second, "_ds_z3_gathered_param_context_depth") == 1
 
         assert first.ds_status == ZeroParamStatus.AVAILABLE
         assert second.ds_status == ZeroParamStatus.NOT_AVAILABLE
-        assert getattr(first, "_deepspeed_gathered_param_context_depth") == 1
-        assert not hasattr(second, "_deepspeed_gathered_param_context_depth")
+        assert getattr(first, "_ds_z3_gathered_param_context_depth") == 1
+        assert not hasattr(second, "_ds_z3_gathered_param_context_depth")
 
     assert gather_calls == [[1], [2]]
     assert partition_calls == [[2], [1]]
     assert all(param.ds_status == ZeroParamStatus.NOT_AVAILABLE for param in (first, second))
-    assert all(not hasattr(param, "_deepspeed_gathered_param_context_depth") for param in (first, second))
+    assert all(not hasattr(param, "_ds_z3_gathered_param_context_depth") for param in (first, second))
