@@ -235,34 +235,30 @@ class GatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather last-dimension shards while keeping the output replicated."""
 
     @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor, total_size: int,
-                name: Optional[str]) -> torch.Tensor:
-        """Gather the shards of a column parallel output whose full width is ``total_size``.
+    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor,
+                partition_sizes: Tuple[int, ...]) -> torch.Tensor:
+        """Gather the shards of a column parallel output described by ``partition_sizes``.
 
-        The shard widths follow the same deterministic split used to partition the weight, so
-        they are derived locally instead of being discovered with an extra collective. Uneven
-        shards are zero padded to a common width, which keeps the uniform (and faster)
+        The widths were resolved when the layer was built, so they need neither an extra
+        collective nor a second lookup of the tensor parallel globals. Uneven shards are zero
+        padded to a common width, which keeps the uniform (and faster)
         ``all_gather_into_tensor`` collective usable, and are then trimmed back.
         """
         ctx.group = group
-        if group is None:
-            ctx.partition_sizes = (input.shape[-1], )
-            ctx.tp_index = 0
+        ctx.partition_sizes = partition_sizes
+        ctx.tp_index = 0
+
+        tp_world_size = len(partition_sizes)
+        if group is None or tp_world_size == 1:
             return input
 
-        tp_world_size = dist.get_world_size(group=group)
         ctx.tp_index = dist.get_rank(group=group)
-        if tp_world_size == 1:
-            ctx.partition_sizes = (input.shape[-1], )
-            return input
-
-        ctx.partition_sizes = tuple(get_shard_size_list(total_size, tp_world_size, name))
-        local_size = ctx.partition_sizes[ctx.tp_index]
+        local_size = partition_sizes[ctx.tp_index]
         assert local_size == input.shape[-1], (
-            f"Rank {ctx.tp_index} produced {input.shape[-1]} output features for {name}, but the "
-            f"partition scheme for a width of {total_size} expects {local_size}.")
+            f"Rank {ctx.tp_index} produced {input.shape[-1]} output features, but the partition "
+            f"scheme {partition_sizes} frozen at construction expects {local_size}.")
 
-        max_partition_size = max(ctx.partition_sizes)
+        max_partition_size = max(partition_sizes)
         if local_size == max_partition_size:
             input_padded = input.contiguous()
         else:
@@ -274,14 +270,14 @@ class GatherFromTensorParallelRegion(torch.autograd.Function):
         dist.all_gather_into_tensor(buffer, input_padded, group=group)
 
         shards = buffer.view(tp_world_size, *input_padded.shape)
-        return torch.cat([shards[i].narrow(-1, 0, size) for i, size in enumerate(ctx.partition_sizes)], dim=-1)
+        return torch.cat([shards[i].narrow(-1, 0, size) for i, size in enumerate(partition_sizes)], dim=-1)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None, None]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None]:
         shard_offset = sum(ctx.partition_sizes[:ctx.tp_index])
         shard_size = ctx.partition_sizes[ctx.tp_index]
         grad_input = grad_output.narrow(-1, shard_offset, shard_size).contiguous()
-        return None, grad_input, None, None
+        return None, grad_input, None
 
 
 class TensorParallel_Layer(nn.Module, ABC):
@@ -436,6 +432,23 @@ class TensorParallel_Layer(nn.Module, ABC):
     def is_training_mode(self):
         global DEEPSPEED_AUTOTP_MODE
         return DEEPSPEED_AUTOTP_MODE == AUTOTP_MODE.TRAINING
+
+    def _freeze_partition_sizes(self, total_size):
+        """Resolve the tensor parallel split of this layer once, while the layer is built.
+
+        ``get_shard_size_list`` reads the process-wide tp_shard globals (``num_kv_heads``,
+        ``tp_grain_size``), which a later ``init_inference`` call or a second AutoTP model
+        overwrites. The split is part of the checkpoint contract, so it is resolved here and
+        every later consumer -- the forward gather, the parameter gather and the checkpoint
+        metadata -- reads the cached value rather than querying those globals again.
+        """
+        if self.tp_world_size == 1:
+            # Nothing to split, so bypass the shard helper and its grain quantization, which
+            # would otherwise drop the tail of a dimension that is not a multiple of the grain.
+            self._partition_sizes = (total_size, )
+        else:
+            self._partition_sizes = tuple(get_shard_size_list(total_size, self.tp_world_size, self.name))
+        return self._partition_sizes
 
     @torch.no_grad()
     def _all_gather_shards(self, shard, partition_sizes, dim):
@@ -676,6 +689,7 @@ class LinearAllreduce(TensorParallel_Layer):
         self.weight = module.weight
         self.bias = module.bias
         self._orig_weight_shape = tuple(module.weight.shape)
+        self._freeze_partition_sizes(self._orig_weight_shape[1])
 
         if self._should_materialize_tp_partition():
             self._tp_partition([self.weight, self.bias])
@@ -705,8 +719,7 @@ class LinearAllreduce(TensorParallel_Layer):
             weight.data = weight.data.contiguous()
             return
 
-        partition_sizes = get_shard_size_list(self._orig_weight_shape[1], self.tp_world_size, self.name)
-        weight.data = self._all_gather_shards(weight, partition_sizes, dim=1).contiguous()
+        weight.data = self._all_gather_shards(weight, self._partition_sizes, dim=1).contiguous()
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
@@ -723,21 +736,18 @@ class LinearAllreduce(TensorParallel_Layer):
             if param is None or idx > 0:
                 # don't slipt bias
                 return
-            _partition = params_list[idx].split(get_shard_size_list(params_list[idx].shape[1], self.tp_world_size,
-                                                                    self.name),
-                                                dim=1)[self.tp_index]
+            _partition = params_list[idx].split(self._partition_sizes, dim=1)[self.tp_index]
 
             _partition = self.move(_partition).detach()
             params_list[idx].data = _partition
 
     def _mark_uc_metadata(self):
-        partition_sizes = get_shard_size_list(self._orig_weight_shape[1], self.tp_world_size, self.name)
         self._set_param_uc_meta(self.weight,
                                 partition_type='row',
                                 partition_dim=1,
                                 logical_shape=self._orig_weight_shape,
                                 output_shape=(self._orig_weight_shape[0], ),
-                                partition_sizes=partition_sizes,
+                                partition_sizes=self._partition_sizes,
                                 target_partition_shape=tuple(self.weight.shape),
                                 original_shape=self._orig_weight_shape)
         if self.bias is not None:
@@ -761,6 +771,7 @@ class LinearLayer(TensorParallel_Layer):
         self.gather_output = gather_output
         self._orig_weight_shape = tuple(module.weight.shape)
         self._orig_bias_shape = tuple(module.bias.shape) if self.bias is not None else None
+        self._freeze_partition_sizes(self._orig_weight_shape[0])
         if not skip_partition and self._should_materialize_tp_partition():
             self._tp_partition([self.weight, self.bias])
         self.support_training = True
@@ -780,7 +791,7 @@ class LinearLayer(TensorParallel_Layer):
             output = AsyncColumnParallel.apply(self.mp_group, input, self.weight, self.bias)
 
         if self.gather_output:
-            output = GatherFromTensorParallelRegion.apply(self.mp_group, output, self._orig_weight_shape[0], self.name)
+            output = GatherFromTensorParallelRegion.apply(self.mp_group, output, self._partition_sizes)
 
         return output
 
@@ -797,8 +808,7 @@ class LinearLayer(TensorParallel_Layer):
 
             # Column parallelism shards dim 0 of both the weight and the bias, so gathering
             # along dim 0 restores the original shape.
-            partition_sizes = get_shard_size_list(self._orig_weight_shape[0], self.tp_world_size, self.name)
-            params_list[idx].data = self._all_gather_shards(param, partition_sizes, dim=0).contiguous()
+            params_list[idx].data = self._all_gather_shards(param, self._partition_sizes, dim=0).contiguous()
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
@@ -810,9 +820,7 @@ class LinearLayer(TensorParallel_Layer):
             if param is None:
                 #split bias if provide
                 return
-            _partition = params_list[idx].split(get_shard_size_list(params_list[idx].shape[0], self.tp_world_size,
-                                                                    self.name),
-                                                dim=0)[self.tp_index]
+            _partition = params_list[idx].split(self._partition_sizes, dim=0)[self.tp_index]
 
             _partition = self.move(_partition).detach()
 
@@ -820,13 +828,12 @@ class LinearLayer(TensorParallel_Layer):
 
     def _mark_uc_metadata(self):
         original_out_dim = self._orig_weight_shape[0]
-        partition_sizes = get_shard_size_list(original_out_dim, self.tp_world_size, self.name)
         self._set_param_uc_meta(self.weight,
                                 partition_type='column',
                                 partition_dim=0,
                                 logical_shape=self._orig_weight_shape,
                                 output_shape=(original_out_dim, ),
-                                partition_sizes=partition_sizes,
+                                partition_sizes=self._partition_sizes,
                                 target_partition_shape=tuple(self.weight.shape),
                                 original_shape=self._orig_weight_shape)
         if self.bias is not None:
@@ -835,7 +842,7 @@ class LinearLayer(TensorParallel_Layer):
                                     partition_dim=0,
                                     logical_shape=self._orig_bias_shape,
                                     output_shape=self._orig_bias_shape,
-                                    partition_sizes=partition_sizes,
+                                    partition_sizes=self._partition_sizes,
                                     target_partition_shape=tuple(self.bias.shape),
                                     original_shape=self._orig_bias_shape,
                                     is_bias=True)

@@ -82,7 +82,9 @@ def test_subparam_layer_marks_standardized_param_metadata():
 
 def test_linear_layer_marks_uneven_column_metadata():
     layer = LinearLayer(torch.nn.Linear(8, 101, bias=True), mp_group=None, name="lm_head")
+    # Stand in for a layer built under tp=2; the split is normally frozen during construction.
     layer.tp_world_size = 2
+    layer._freeze_partition_sizes(101)
     layer.weight.data = layer.weight.data[:51].contiguous()
     layer.bias.data = layer.bias.data[:51].contiguous()
     layer._mark_uc_metadata()
