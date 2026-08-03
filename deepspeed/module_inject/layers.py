@@ -569,44 +569,47 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
     parameter_with_sub_params = []
     original_vocab_size = None
 
-    for module_name, module in model.named_modules():
+    for _, module in model.named_modules():
         marker = getattr(module, "_mark_uc_metadata", None)
         if marker is not None:
             marker()
 
-        for param_name, param in module.named_parameters(recurse=False):
-            full_name = f"{module_name}.{param_name}" if module_name else param_name
-            pattern = rf"^{re.escape(full_name)}$"
+    # Checkpoint creation uses the canonical, de-duplicated names returned by
+    # model.named_parameters(). Shared parameters can be reachable through several
+    # module aliases, but strict conversion rejects patterns for aliases that do not
+    # appear in the optimizer checkpoint.
+    for full_name, param in model.named_parameters():
+        pattern = rf"^{re.escape(full_name)}$"
 
-            conversion_meta = _get_param_uc_conversion_meta(param)
-            if not conversion_meta:
-                # AutoTP left this parameter untouched, so it is identical across TP
-                # ranks. Classify it as TP-replicated; otherwise it falls through to
-                # the converter's default dim-0 concat and is wrongly expanded (e.g.
-                # LayerNorm/RMSNorm weights [H] -> [H * tp_degree]).
-                replicated_patterns.append(pattern)
-                continue
+        conversion_meta = _get_param_uc_conversion_meta(param)
+        if not conversion_meta:
+            # AutoTP left this parameter untouched, so it is identical across TP
+            # ranks. Classify it as TP-replicated; otherwise it falls through to
+            # the converter's default dim-0 concat and is wrongly expanded (e.g.
+            # LayerNorm/RMSNorm weights [H] -> [H * tp_degree]).
+            replicated_patterns.append(pattern)
+            continue
 
-            if conversion_meta.get('replicated'):
-                replicated_patterns.append(pattern)
+        if conversion_meta.get('replicated'):
+            replicated_patterns.append(pattern)
 
-            if conversion_meta.get('partition_type') == 'row' and not conversion_meta.get('is_bias', False):
-                row_parallel_patterns.append(pattern)
+        if conversion_meta.get('partition_type') == 'row' and not conversion_meta.get('is_bias', False):
+            row_parallel_patterns.append(pattern)
 
-            original_shape = conversion_meta.get('original_shape')
-            if original_shape and len(original_shape) == 2 and ('embed' in full_name or 'lm_head' in full_name):
-                vocabulary_patterns.append(pattern)
-                if original_vocab_size is None:
-                    original_vocab_size = original_shape[0]
+        original_shape = conversion_meta.get('original_shape')
+        if original_shape and len(original_shape) == 2 and ('embed' in full_name or 'lm_head' in full_name):
+            vocabulary_patterns.append(pattern)
+            if original_vocab_size is None:
+                original_vocab_size = original_shape[0]
 
-            sub_param_shape = conversion_meta.get('sub_param_shape')
-            partition_dim = conversion_meta.get('partition_dim')
-            if sub_param_shape is not None and partition_dim is not None and not conversion_meta.get('is_bias', False):
-                parameter_with_sub_params.append({
-                    'patterns': [pattern],
-                    'shape': list(sub_param_shape),
-                    'partition_dim': partition_dim,
-                })
+        sub_param_shape = conversion_meta.get('sub_param_shape')
+        partition_dim = conversion_meta.get('partition_dim')
+        if sub_param_shape is not None and partition_dim is not None and not conversion_meta.get('is_bias', False):
+            parameter_with_sub_params.append({
+                'patterns': [pattern],
+                'shape': list(sub_param_shape),
+                'partition_dim': partition_dim,
+            })
 
     uc_info = {
         UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,

@@ -11,8 +11,9 @@ because the name was just ``0.self_attn.q_proj``.
 import pytest
 import torch.nn as nn
 
+from deepspeed.checkpoint.constants import TP_REPLICATED_PARAMETER_PATTERNS
 from deepspeed.module_inject.auto_tp import AutoTP, AutoTPConfig, PartitionType, TPLayerSpec
-from deepspeed.module_inject.layers import LinearLayer
+from deepspeed.module_inject.layers import LinearLayer, collect_autotp_universal_checkpoint_info
 
 
 class SubAttn(nn.Module):
@@ -174,6 +175,9 @@ def test_gathered_lm_head_falls_back_for_runtime_parameter_tie():
     assert isinstance(model.embed_tokens, nn.Embedding)
     assert isinstance(model.lm_head, nn.Linear)
     assert model.lm_head.weight is model.embed_tokens.weight
+    replicated_patterns = collect_autotp_universal_checkpoint_info(model)[TP_REPLICATED_PARAMETER_PATTERNS]
+    assert r"^embed_tokens\.weight$" in replicated_patterns
+    assert r"^lm_head\.weight$" not in replicated_patterns
 
 
 def test_gathered_lm_head_uses_column_parallel_layer_when_output_dim_is_uneven():
