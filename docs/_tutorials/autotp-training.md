@@ -227,7 +227,7 @@ For Grouped Query Attention with different Q/K/V sizes:
 
 ## Limitations
 
-1. **TP size must divide model dimensions**: The tensor parallel size must evenly divide the attention head count and hidden dimensions for the runtime TP math to be correct. (Checkpoint conversion handles an uneven partition dimension -- e.g. a non-divisible vocab or hidden size -- via per-TP-rank shapes, so a single parameter's partition dimension no longer must be divisible. Uneven sharding within a fused/GQA sub-parameter weight is not yet supported.)
+1. **TP size must not exceed the key/value head count**: Attention heads are distributed whole, and the distribution may be uneven -- 6 key/value heads over 4 ranks becomes 2/2/1/1, and a fused QKV weight is cut on the same head boundaries. What is not supported is more ranks than key/value heads, for example an 8-head model at `autotp_size=16`. Serving those ranks means replicating heads rather than splitting further, so AutoTP raises instead of cutting inside a head, which would leave each rank computing a partial attention score. Hidden and vocabulary dimensions do not need to be divisible by the tensor parallel size: uneven shards are carried through save, conversion and restore via per-TP-rank shapes and widths.
 
 2. **Cross-topology universal restore**: Loading a universal checkpoint back into a topology with a *different* tensor-parallel degree goes through DeepSpeed's Megatron-style model-state loader, which is not AutoTP-aware; prefer same-topology restore when changing world size.
 

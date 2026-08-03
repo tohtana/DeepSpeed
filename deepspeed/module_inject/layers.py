@@ -39,6 +39,7 @@ def _build_param_uc_conversion_meta(*,
                                     partition_type,
                                     partition_dim=None,
                                     sub_param_shape=None,
+                                    sub_param_shard_widths=None,
                                     original_shape=None,
                                     is_bias=False,
                                     replicated=False):
@@ -51,6 +52,7 @@ def _build_param_uc_conversion_meta(*,
         'partition_type': partition_type,
         'partition_dim': partition_dim,
         'sub_param_shape': _normalize_uc_shape(sub_param_shape),
+        'sub_param_shard_widths': sub_param_shard_widths,
         'original_shape': _normalize_uc_shape(original_shape),
         'is_bias': is_bias,
         'replicated': replicated,
@@ -64,6 +66,7 @@ def _build_param_uc_restore_meta(*,
                                  output_shape=None,
                                  sub_param_shape=None,
                                  sub_param_sizes=None,
+                                 sub_param_shard_widths=None,
                                  partition_sizes=None,
                                  target_partition_shape=None,
                                  original_shape=None,
@@ -87,6 +90,8 @@ def _build_param_uc_restore_meta(*,
         _normalize_uc_shape(sub_param_shape),
         'sub_param_sizes':
         _normalize_uc_shape(sub_param_sizes),
+        'sub_param_shard_widths':
+        sub_param_shard_widths,
         'partition_sizes':
         _normalize_uc_shape(partition_sizes),
         'target_partition_shape':
@@ -101,6 +106,7 @@ def _build_param_uc_restore_meta(*,
         _build_param_uc_conversion_meta(partition_type=partition_type,
                                         partition_dim=partition_dim,
                                         sub_param_shape=sub_param_shape,
+                                        sub_param_shard_widths=sub_param_shard_widths,
                                         original_shape=original_shape,
                                         is_bias=is_bias,
                                         replicated=replicated),
@@ -399,6 +405,7 @@ class TensorParallel_Layer(nn.Module, ABC):
                            output_shape=None,
                            sub_param_shape=None,
                            sub_param_sizes=None,
+                           sub_param_shard_widths=None,
                            partition_sizes=None,
                            target_partition_shape=None,
                            original_shape=None,
@@ -414,6 +421,7 @@ class TensorParallel_Layer(nn.Module, ABC):
                                          output_shape=output_shape,
                                          sub_param_shape=sub_param_shape,
                                          sub_param_sizes=sub_param_sizes,
+                                         sub_param_shard_widths=sub_param_shard_widths,
                                          partition_sizes=partition_sizes,
                                          target_partition_shape=target_partition_shape,
                                          original_shape=original_shape,
@@ -559,11 +567,13 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
     `target_partition_shape`, which stay on the parameter metadata object.
     """
     from deepspeed.checkpoint.constants import (ORIGINAL_VOCAB_SIZE, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-                                                PARAMETER_WITH_SUB_PARAMS, TP_REPLICATED_PARAMETER_PATTERNS,
+                                                PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHARD_WIDTHS,
+                                                TP_REPLICATED_PARAMETER_PATTERNS,
                                                 UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
                                                 VOCABULARY_PARAMETER_PATTERNS)
 
     row_parallel_patterns = []
+    sub_param_shard_widths = {}
     replicated_patterns = []
     vocabulary_patterns = []
     parameter_with_sub_params = []
@@ -607,6 +617,9 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
                     'shape': list(sub_param_shape),
                     'partition_dim': partition_dim,
                 })
+                shard_widths = conversion_meta.get('sub_param_shard_widths')
+                if shard_widths is not None:
+                    sub_param_shard_widths[pattern] = [list(widths) for widths in shard_widths]
 
     uc_info = {
         UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
@@ -615,6 +628,8 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
         VOCABULARY_PARAMETER_PATTERNS: sorted(set(vocabulary_patterns)),
         PARAMETER_WITH_SUB_PARAMS: parameter_with_sub_params,
     }
+    if sub_param_shard_widths:
+        uc_info[SUB_PARAM_SHARD_WIDTHS] = sub_param_shard_widths
     if original_vocab_size is not None:
         uc_info[ORIGINAL_VOCAB_SIZE] = original_vocab_size
     return uc_info
@@ -1233,22 +1248,36 @@ def _infer_subparam_logical_shapes(weight_shape, shape, partition_dim, name=None
     return logical_shape, output_shape, subparam_sizes, bias_partition_dim
 
 
+def _subparam_shard_widths(subparam_sizes, tp_world_size, name=None):
+    """Per-rank width of each sub-parameter, as one list per sub-parameter.
+
+    Sub-parameters follow the same deterministic split as ordinary layers, so a fused
+    attention weight lands on key/value head boundaries instead of being cut inside a head.
+    """
+    layer_label = f"AutoTP layer '{name}'" if name else "AutoTP layer"
+    widths = []
+    for size in subparam_sizes:
+        per_rank = get_shard_size_list(size, tp_world_size, name)
+        if min(per_rank) == 0:
+            raise ValueError(
+                f"{layer_label} cannot split a sub-parameter of size {size} across tp_size "
+                f"{tp_world_size}: the split {per_rank} leaves some ranks empty. A fused attention "
+                f"weight hits this when the model has fewer key/value heads than tensor parallel "
+                f"ranks, which needs the heads replicated rather than split further.")
+        widths.append(per_rank)
+    return widths
+
+
 def _partition_logical_tensor(tensor, partition_dim, tp_world_size, tp_index, name=None, subparam_sizes=None):
     if tp_world_size == 1:
         return tensor
-    layer_label = f"AutoTP layer '{name}'" if name else "AutoTP layer"
-    if subparam_sizes:
-        for size in subparam_sizes:
-            if size % tp_world_size != 0:
-                raise ValueError(f"{layer_label} sub-parameter size {size} not divisible by tp_size {tp_world_size}.")
-        sub_params = torch.split(tensor, subparam_sizes, dim=partition_dim)
-        partitioned_sub_params = [torch.chunk(sp, tp_world_size, dim=partition_dim)[tp_index] for sp in sub_params]
-        return torch.cat(partitioned_sub_params, dim=partition_dim)
-    if tensor.shape[partition_dim] % tp_world_size != 0:
-        raise ValueError(
-            f"{layer_label} partition_dim size {tensor.shape[partition_dim]} not divisible by tp_size {tp_world_size}."
-        )
-    return torch.chunk(tensor, tp_world_size, dim=partition_dim)[tp_index]
+    sizes = tuple(subparam_sizes) if subparam_sizes else (tensor.shape[partition_dim], )
+    widths = _subparam_shard_widths(sizes, tp_world_size, name)
+    sub_params = torch.split(tensor, sizes, dim=partition_dim)
+    partitioned = [sp.split(w, dim=partition_dim)[tp_index] for sp, w in zip(sub_params, widths)]
+    if len(partitioned) == 1:
+        return partitioned[0]
+    return torch.cat(partitioned, dim=partition_dim)
 
 
 def _all_gather_along_dim(tensor, partition_dim, mp_group, tp_world_size):
@@ -1266,6 +1295,29 @@ def _all_gather_along_dim(tensor, partition_dim, mp_group, tp_world_size):
     return output.permute(inv_perm).contiguous()
 
 
+def _all_gather_uneven_along_dim(tensor, partition_dim, mp_group, shard_widths):
+    """Gather shards of differing widths along ``partition_dim``.
+
+    Shards are zero padded to a common width so the uniform (and faster)
+    ``all_gather_into_tensor`` collective stays usable, and are then trimmed back.
+    """
+    tp_world_size = len(shard_widths)
+    if mp_group is None or tp_world_size == 1:
+        return tensor
+    if min(shard_widths) == max(shard_widths):
+        return _all_gather_along_dim(tensor, partition_dim, mp_group, tp_world_size)
+
+    max_width = max(shard_widths)
+    padded_shape = list(tensor.shape)
+    padded_shape[partition_dim] = max_width
+    padded = tensor.new_zeros(padded_shape)
+    padded.narrow(partition_dim, 0, tensor.shape[partition_dim]).copy_(tensor)
+
+    gathered = _all_gather_along_dim(padded, partition_dim, mp_group, tp_world_size)
+    trimmed = [gathered.narrow(partition_dim, i * max_width, w) for i, w in enumerate(shard_widths)]
+    return torch.cat(trimmed, dim=partition_dim)
+
+
 def _gather_logical_tensor(tensor,
                            logical_shape,
                            partition_dim,
@@ -1275,24 +1327,25 @@ def _gather_logical_tensor(tensor,
                            subparam_sizes=None):
     if mp_group is None or tp_world_size == 1:
         return tensor.reshape(logical_shape)
-    layer_label = f"AutoTP layer '{name}'" if name else "AutoTP layer"
-    if logical_shape[partition_dim] % tp_world_size != 0:
-        raise ValueError(
-            f"{layer_label} partition_dim size {logical_shape[partition_dim]} not divisible by tp_size {tp_world_size}."
-        )
+    sizes = tuple(subparam_sizes) if subparam_sizes else (logical_shape[partition_dim], )
+    widths = _subparam_shard_widths(sizes, tp_world_size, name)
+    # The local shard holds one piece of every sub-parameter, so its own widths decide how to
+    # unpack it before each piece is gathered back to its full size.
+    tp_index = dist.get_rank(group=mp_group)
+    local_sizes = [per_rank[tp_index] for per_rank in widths]
+
     partitioned_shape = list(logical_shape)
-    partitioned_shape[partition_dim] = logical_shape[partition_dim] // tp_world_size
+    partitioned_shape[partition_dim] = sum(local_sizes)
     tensor_view = tensor.reshape(partitioned_shape)
 
-    if subparam_sizes:
-        for size in subparam_sizes:
-            if size % tp_world_size != 0:
-                raise ValueError(f"{layer_label} sub-parameter size {size} not divisible by tp_size {tp_world_size}.")
-        partitioned_sizes = [size // tp_world_size for size in subparam_sizes]
-        sub_params = torch.split(tensor_view, partitioned_sizes, dim=partition_dim)
-        gathered_sub_params = [_all_gather_along_dim(sp, partition_dim, mp_group, tp_world_size) for sp in sub_params]
-        return torch.cat(gathered_sub_params, dim=partition_dim)
-    return _all_gather_along_dim(tensor_view, partition_dim, mp_group, tp_world_size)
+    sub_params = torch.split(tensor_view, local_sizes, dim=partition_dim)
+    gathered = [
+        _all_gather_uneven_along_dim(sp, partition_dim, mp_group, per_rank)
+        for sp, per_rank in zip(sub_params, widths)
+    ]
+    if len(gathered) == 1:
+        return gathered[0]
+    return torch.cat(gathered, dim=partition_dim)
 
 
 class SubParamLinearLayer(TensorParallel_Layer):
@@ -1319,6 +1372,10 @@ class SubParamLinearLayer(TensorParallel_Layer):
         (self._logical_shape, self._output_shape, self._subparam_sizes,
          self._bias_partition_dim) = _infer_subparam_logical_shapes(self._orig_weight_shape, self.shape,
                                                                     self.partition_dim, self.name)
+        # Resolve the per-rank widths once, for the same reason _freeze_partition_sizes does:
+        # get_shard_size_list reads process-wide globals that a later model can overwrite.
+        self._subparam_shard_widths = _subparam_shard_widths(
+            self._subparam_sizes or (self._logical_shape[self.partition_dim], ), self.tp_world_size, self.name)
         if self.bias is not None and self.bias.numel() != _shape_prod(self._output_shape):
             raise ValueError(f"AutoTP layer '{self.name}' bias size {self.bias.numel()} does not match output shape "
                              f"{self._output_shape}.")
@@ -1403,6 +1460,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                 output_shape=self._output_shape,
                                 sub_param_shape=self.shape,
                                 sub_param_sizes=self._subparam_sizes,
+                                sub_param_shard_widths=self._subparam_shard_widths,
                                 target_partition_shape=self.weight.shape,
                                 original_shape=self._orig_weight_shape)
         if self.bias is not None:
@@ -1414,6 +1472,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                 output_shape=self._output_shape,
                 sub_param_shape=self.shape if self._bias_partition_dim is not None else None,
                 sub_param_sizes=self._subparam_sizes if self._bias_partition_dim is not None else None,
+                sub_param_shard_widths=self._subparam_shard_widths if self._bias_partition_dim is not None else None,
                 target_partition_shape=self.bias.shape,
                 original_shape=self._orig_bias_shape,
                 is_bias=True,
@@ -1440,6 +1499,10 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
         (self._logical_shape, self._output_shape, self._subparam_sizes,
          self._bias_partition_dim) = _infer_subparam_logical_shapes(self._orig_weight_shape, self.shape,
                                                                     self.partition_dim, self.name)
+        # Resolve the per-rank widths once, for the same reason _freeze_partition_sizes does:
+        # get_shard_size_list reads process-wide globals that a later model can overwrite.
+        self._subparam_shard_widths = _subparam_shard_widths(
+            self._subparam_sizes or (self._logical_shape[self.partition_dim], ), self.tp_world_size, self.name)
 
         if self._should_materialize_tp_partition():
             self._tp_partition([self.weight, self.bias])
@@ -1499,6 +1562,7 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
                                 output_shape=self._output_shape,
                                 sub_param_shape=self.shape,
                                 sub_param_sizes=self._subparam_sizes,
+                                sub_param_shard_widths=self._subparam_shard_widths,
                                 target_partition_shape=self.weight.shape,
                                 original_shape=self._orig_weight_shape)
         if self.bias is not None:

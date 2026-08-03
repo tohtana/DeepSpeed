@@ -86,6 +86,11 @@ PARAMETER_WITH_ROW_PARALLELISM_PATTERNS = 'parameter_with_row_parallelism_patter
 TP_REPLICATED_PARAMETER_PATTERNS = 'tp_replicated_parameter_patterns'
 PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0 = 'parameter_with_2_sub_params_cat_dim_0'
 PARAMETER_WITH_SUB_PARAMS = 'parameter_with_sub_params'
+# Per-rank width of every sub-parameter, keyed by the same pattern used in
+# PARAMETER_WITH_SUB_PARAMS. Kept as a separate top-level key so that converters predating
+# uneven sub-parameter support simply do not see it, instead of failing to build a
+# SubparamShape from an unexpected field.
+SUB_PARAM_SHARD_WIDTHS = 'sub_param_shard_widths'
 SUB_PARAMS_SHAPE = 'sub_params_shape'
 
 #########################################

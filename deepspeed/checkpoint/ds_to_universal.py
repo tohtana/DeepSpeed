@@ -32,6 +32,7 @@ from deepspeed.checkpoint import (
     CAT_DIM,
     PARAM_N_SUB_PARAMS,
     SUB_PARAM_SHAPE,
+    SUB_PARAM_SHARD_WIDTHS,
     VOCAB_TENSOR,
     UNIVERSAL_CHECKPOINT_INFO,
     UNIVERSAL_CHECKPOINT_VERSION_KEY,
@@ -278,6 +279,7 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
     vocabulary_parameters = universal_checkpoint_info.get(VOCABULARY_PARAMETER_PATTERNS, [])
     parameters_with_2_sub_params_cat_dim_0 = universal_checkpoint_info.get(PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0, [])
     parameter_with_sub_params = universal_checkpoint_info.get(PARAMETER_WITH_SUB_PARAMS, [])
+    sub_param_shard_widths = universal_checkpoint_info.get(SUB_PARAM_SHARD_WIDTHS, {})
 
     unmatched_patterns = set(replicated_parameters + parameters_to_average + parameters_with_row_parallelism +
                              vocabulary_parameters + parameters_with_2_sub_params_cat_dim_0)
@@ -298,10 +300,10 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
             for pattern_ in subparam_shape.patterns:
                 if re.match(pattern_, name_):
                     unmatched_patterns.discard(pattern_)
-                    return subparam_shape
-        return None
+                    return subparam_shape, pattern_
+        return None, None
 
-    matched_sub_params_shape = get_matched_sub_params_pattern(name)
+    matched_sub_params_shape, matched_sub_params_pattern = get_matched_sub_params_pattern(name)
 
     step_merged = _merge_zero_shards(slice_base_path, "step", tp_degree, per_tp_shapes)
     if step_merged:
@@ -331,23 +333,35 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
             ckpt_dict[CAT_DIM] = cat_dim
             ckpt_dict[PARAM_N_SUB_PARAMS] = 2
         elif matched_sub_params_shape:
-            merged_chunks = []
             partition_dim = matched_sub_params_shape.partition_dim
 
             sub_dim_sizes = matched_sub_params_shape.shape[partition_dim]
             if not isinstance(sub_dim_sizes, tuple):
                 sub_dim_sizes = (sub_dim_sizes, )
 
-            partition_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
-            partition_shape = [d // tp_degree if i == partition_dim else d for i, d in enumerate(partition_shape)]
-            slices = [s.view(partition_shape) for s in slices]
+            # This process cannot recompute the widths: the head counts that decide them live
+            # in the model config, not in the checkpoint. Checkpoints written before the widths
+            # were recorded could only have been split evenly.
+            shard_widths = sub_param_shard_widths.get(matched_sub_params_pattern)
+            if shard_widths is None:
+                shard_widths = [[size // tp_degree] * tp_degree for size in sub_dim_sizes]
 
-            offset = 0
-            for sub_dim_size in sub_dim_sizes:
-                part_sub_dim_size = sub_dim_size // tp_degree
-                merged_chunks.append(
-                    torch.cat([s.narrow(partition_dim, offset, part_sub_dim_size) for s in slices], dim=partition_dim))
-                offset += part_sub_dim_size
+            logical_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
+            rank_views = []
+            for tp_index, tp_slice in enumerate(slices):
+                # Every rank holds one piece of each sub-parameter, so its own widths give its shape.
+                rank_shape = list(logical_shape)
+                rank_shape[partition_dim] = sum(widths[tp_index] for widths in shard_widths)
+                rank_views.append(tp_slice.view(rank_shape))
+
+            merged_chunks = []
+            offsets = [0] * len(rank_views)
+            for widths in shard_widths:
+                pieces = []
+                for tp_index, rank_view in enumerate(rank_views):
+                    pieces.append(rank_view.narrow(partition_dim, offsets[tp_index], widths[tp_index]))
+                    offsets[tp_index] += widths[tp_index]
+                merged_chunks.append(torch.cat(pieces, dim=partition_dim))
             param = torch.cat(merged_chunks, dim=partition_dim)
             ckpt_dict[SUB_PARAM_SHAPE] = matched_sub_params_shape
         else:

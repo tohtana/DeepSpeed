@@ -166,6 +166,7 @@ def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
         "partition_type": "column",
         "partition_dim": 0,
         "sub_param_shape": (3, -1),
+        "sub_param_shard_widths": None,
         "original_shape": (12, 8),
         "is_bias": False,
         "replicated": False,

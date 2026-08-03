@@ -16,7 +16,7 @@ import deepspeed
 import deepspeed.comm as dist
 from deepspeed.checkpoint.constants import (CAT_DIM, FP32_FLAT_GROUPS, FP32_WEIGHT_KEY, OPTIMIZER_STATE_DICT, PARAM,
                                             PARAM_GROUPS, PARAM_SHAPES, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-                                            PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE,
+                                            PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE, SUB_PARAM_SHARD_WIDTHS,
                                             TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO,
                                             UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
                                             VOCABULARY_PARAMETER_PATTERNS, ZERO_STAGE)
@@ -288,6 +288,39 @@ def test_merge_tp_slices_emits_subparam_shape_metadata(tmp_path):
     assert not unmatched
     assert isinstance(ckpt[SUB_PARAM_SHAPE], CheckpointSubparamShape)
     assert ckpt[SUB_PARAM_SHAPE].partition_dim == 0
+
+
+def test_merge_tp_slices_uses_uneven_sub_param_widths(tmp_path):
+    # A fused QKV with 6 query and 3 key/value heads over 2 ranks: the heads go 2/1, so
+    # rank 0 owns 4 query and 2+2 key/value rows while rank 1 owns 2 and 1+1.
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv_proj.weight"
+    shard_widths = [[4, 2], [2, 1], [2, 1]]
+
+    full = torch.arange(24, dtype=torch.float32).view(12, 2)
+    rows = {0: [0, 1, 2, 3, 6, 7, 9, 10], 1: [4, 5, 8, 11]}
+    for tp_index, row_ids in rows.items():
+        _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
+
+    uc_info = {
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [(6, 3, 3), 2],
+            "partition_dim": 0,
+        }],
+        SUB_PARAM_SHARD_WIDTHS: {
+            rf"^{param_name}$": shard_widths
+        },
+    }
+
+    merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2,
+                    (param_name, [torch.Size([8, 2]), torch.Size([4, 2])]))
+
+    ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
+    torch.testing.assert_close(ckpt[PARAM], full)
 
 
 def test_merge_tp_slices_uses_row_parallel_cat_dim(tmp_path):
