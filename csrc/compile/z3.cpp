@@ -24,7 +24,7 @@ namespace {
 
 class GatherBufferPool {
 public:
-    enum class ReleaseDisposition { Retained, ResizeByCaller, Retired };
+    enum class ReleaseDisposition { NoResizeNeeded, ResizeByCaller };
 
     at::Tensor acquire(int64_t numel,
                        at::ScalarType dtype,
@@ -88,7 +88,7 @@ public:
             auto storage_impl = storage.unsafeGetStorageImpl();
             non_retainable_storages_.erase(storage_impl);
             if (removeEntryOwnership(storage_impl, "released_zero_storage", false)) {
-                return ReleaseDisposition::Retired;
+                return ReleaseDisposition::NoResizeNeeded;
             }
             return ReleaseDisposition::ResizeByCaller;
         }
@@ -114,7 +114,7 @@ public:
             it->ready_event = ready_event;
             it->checked_out = false;
             it->last_use = ++clock_;
-            return ReleaseDisposition::Retained;
+            return ReleaseDisposition::NoResizeNeeded;
         }
 
         if (excluded || !enabled_ || pressure_recovery_in_progress_) {
@@ -140,7 +140,7 @@ public:
             high_water_bytes_ = charged_bytes_;
             logState("high_water");
         }
-        return ReleaseDisposition::Retained;
+        return ReleaseDisposition::NoResizeNeeded;
     }
 
     void setBudgetForTest(int64_t budget_bytes)
@@ -326,7 +326,7 @@ private:
         } else {
             logState(event);
         }
-        return ReleaseDisposition::Retired;
+        return ReleaseDisposition::NoResizeNeeded;
     }
 
     bool removeEntryOwnership(c10::StorageImpl* storage_impl,
@@ -566,8 +566,6 @@ public:
         pool_->excludeFromAdmission(buffers_.back());
     }
 
-    size_t size() const { return buffers_.size(); }
-
     void commit()
     {
         committed_ = true;
@@ -582,7 +580,6 @@ private:
 
 std::weak_ptr<GatherBufferPool> weak_gather_buffer_pool;
 std::optional<int64_t> gather_buffer_pool_test_budget;
-int64_t prefetch_fail_after_exclusions_for_test = 0;
 
 std::shared_ptr<GatherBufferPool> get_gather_buffer_pool()
 {
@@ -617,20 +614,11 @@ std::vector<int64_t> get_z3_gather_buffer_pool_state_for_test()
     return get_gather_buffer_pool()->stateForTest();
 }
 
-void set_z3_param_valid_for_test(long ds_id, bool valid) { param_registry->setValid(ds_id, valid); }
-
-void set_z3_prefetch_fail_after_exclusions_for_test(int64_t count)
-{
-    TORCH_CHECK(count >= 0, "prefetch exclusion failure count must be nonnegative");
-    prefetch_fail_after_exclusions_for_test = count;
-}
-
 void reset_z3_gather_buffer_pool()
 {
     if (auto pool = weak_gather_buffer_pool.lock()) { pool->reset(); }
     weak_gather_buffer_pool.reset();
     gather_buffer_pool_test_budget.reset();
-    prefetch_fail_after_exclusions_for_test = 0;
 }
 
 class Z3CustomOpExecutor : public CustomOpExecutor {
@@ -827,11 +815,6 @@ public:
             // Bind the exclusion to the selected storage so a stale ds_id generation
             // cannot admit a different demand-gather buffer into the independent pool.
             admission_exclusions.exclude(output_bufs.at(ds_id));
-            if (prefetch_fail_after_exclusions_for_test > 0 &&
-                admission_exclusions.size() >=
-                    static_cast<size_t>(prefetch_fail_after_exclusions_for_test)) {
-                throw std::runtime_error("injected prefetch preparation failure");
-            }
         }
 
         for (const auto& [ds_id, _] : invalid_params) {

@@ -447,11 +447,6 @@ def _build_release_expected(nodes: List[Node]):
     return dict(release_expected)
 
 
-def _simulate_path(tracker: _GatheredParamTracker, nodes: List[Node]):
-    peak_bytes, _ = _simulate_path_stats(tracker, nodes)
-    return peak_bytes
-
-
 def _simulate_path_stats(tracker: _GatheredParamTracker, nodes: List[Node]):
     """Return this candidate's peak and ending residency without mutating the prefix.
 

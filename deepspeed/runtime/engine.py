@@ -136,7 +136,6 @@ from ..git_version_info import version
 
 from deepspeed.profiling.flops_profiler.profiler import FlopsProfiler
 from deepspeed.utils.logging import print_dist, print_json_dist, print_configuration, set_log_level_from_string
-from deepspeed.utils.allocator_telemetry import record_empty_cache
 
 from deepspeed.accelerator import get_accelerator
 
@@ -830,12 +829,7 @@ class DeepSpeedEngine(Module):
         if optimizer is not None and hasattr(optimizer, 'destroy'):
             optimizer.destroy()
         if self.is_deepcompile_active() or getattr(self, "_deepcompile_native_initialized", False):
-            try:
-                self._cleanup_deepcompile_native()
-            finally:
-                # Native cleanup is process-global and must run only once even
-                # when destroy() is followed by __del__().
-                self._set_deepcompile_active(False)
+            self._deactivate_deepcompile()
         debug_clear_module_and_param_names()
 
         checkpoint_engine = getattr(self, "checkpoint_engine", None)
@@ -5469,7 +5463,7 @@ class DeepSpeedEngine(Module):
         if hasattr(self.optimizer, 'empty_partition_cache'):
             self.optimizer.empty_partition_cache()
             gc.collect()
-            record_empty_cache("engine.empty-partition-cache", get_accelerator().empty_cache)
+            get_accelerator().empty_cache()
 
     def get_autosp_backend(self, compile_kwargs):
         if self.compile_autosp() and self.zero_optimization_stage() not in [
@@ -5527,10 +5521,7 @@ class DeepSpeedEngine(Module):
             try:
                 resolved_backend = self.get_deepcompile_backend(backend, compile_kwargs, schedule)
             except BaseException:
-                try:
-                    self._cleanup_deepcompile_native()
-                finally:
-                    self._set_deepcompile_active(False)
+                self._deactivate_deepcompile()
                 raise
 
         return resolved_backend, schedule
@@ -5575,10 +5566,7 @@ class DeepSpeedEngine(Module):
         except BaseException:
             if is_deepspeed_compile_backend or getattr(self, "_deepcompile_native_initialized", False):
                 # Restore default hooks if compilation fails before completing.
-                try:
-                    self._cleanup_deepcompile_native()
-                finally:
-                    self._set_deepcompile_active(False)
+                self._deactivate_deepcompile()
             raise
 
         self._is_compiled = True
@@ -5601,6 +5589,12 @@ class DeepSpeedEngine(Module):
             return
         self._deepcompile_native_initialized = False
         get_deepcompile_handle().cleanup()
+
+    def _deactivate_deepcompile(self) -> None:
+        try:
+            self._cleanup_deepcompile_native()
+        finally:
+            self._set_deepcompile_active(False)
 
     def _set_deepcompile_active(self, active: bool) -> None:
         """Toggle DeepCompile runtime state and manage forward hooks accordingly."""

@@ -24,8 +24,6 @@ from .contract import PassContract, CAP_Z3_GATHER_RELEASE
 
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.utils.allocator_telemetry import enabled as allocator_telemetry_enabled
-from deepspeed.utils.allocator_telemetry import record_empty_cache, record_scheduler_decision
 
 NAME = "zero3_compile"
 # Inserts the ZeRO-3 all-gather/release ops that prefetch and selective-gather later build on.
@@ -253,21 +251,9 @@ def _log_scheduler_result(graph_id: int,
     max_live_gathered_bytes = max((entry.get("peak_gathered_bytes", 0) for entry in selected), default=0)
     rejected_candidates = diagnostics.get("budget_rejected_candidates", [])
     minimum_rejected_candidate_peak_bytes = None
-    if (scheduler_budget is not None and rejected_candidates
-            and (_scheduler_debug_enabled() or allocator_telemetry_enabled())):
+    if scheduler_budget is not None and rejected_candidates and _scheduler_debug_enabled():
         minimum_rejected_candidate_peak_bytes = min(
             scheduler_budget.max_gathered_bytes + entry.get("over_budget_bytes", 0) for entry in rejected_candidates)
-    record_scheduler_decision(
-        graph_id=graph_id,
-        backward=bwd,
-        budget_source=scheduler_budget.source if scheduler_budget is not None else None,
-        disabled_reason=disabled_reason,
-        max_gathered_bytes=scheduler_budget.max_gathered_bytes if scheduler_budget is not None else None,
-        max_live_gathered_bytes=max_live_gathered_bytes,
-        budget_rejections=diagnostics.get("budget_rejections", 0),
-        over_budget_fallbacks=len(diagnostics.get("budget_overflows", [])),
-        minimum_rejected_candidate_peak_bytes=minimum_rejected_candidate_peak_bytes,
-    )
     if scheduler_budget is None:
         _print_scheduler_debug(
             f"DeepCompile ZeRO-3 scheduler graph_id={graph_id} bwd={bwd} budget_enabled=False "
@@ -454,7 +440,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
     profiler.run(*real_inputs)
     del profiler
     gc.collect()
-    record_empty_cache("zero3-compile.forward-post-profile", get_accelerator().empty_cache)
+    get_accelerator().empty_cache()
     # Build the shared scheduling budget after the operator profile is complete
     # but before the scheduler rewrites graph order and Inductor metadata.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
@@ -511,7 +497,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
 
     del real_outputs
     gc.collect()
-    record_empty_cache("zero3-compile.backward-post-profile", get_accelerator().empty_cache)
+    get_accelerator().empty_cache()
     # The scheduler consumes only DP-group-reduced inputs, ensuring every group
     # rank emits collectives in the same order even when allocator state differs.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
