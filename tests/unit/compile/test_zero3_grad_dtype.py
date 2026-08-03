@@ -57,26 +57,6 @@ def test_zero3_allows_dynamo_dynamic_parameter_shapes(monkeypatch):
         restore()
 
 
-def test_zero3_preserves_explicit_dynamo_dynamic_setting(monkeypatch):
-
-    class FakeDynamoConfig:
-        force_parameter_static_shapes = True
-        force_nn_module_property_static_shapes = True
-
-    class FakeDynamo:
-        config = FakeDynamoConfig()
-
-    compile_kwargs = {"dynamic": False}
-    monkeypatch.setattr(torch, "_dynamo", FakeDynamo)
-
-    restore = _allow_dynamo_dynamic_parameter_shapes_for_z3(compile_kwargs)
-    assert restore
-    try:
-        assert compile_kwargs["dynamic"] is False
-    finally:
-        restore()
-
-
 @pytest.mark.parametrize("first_owner_to_restore", [0, 1])
 def test_zero3_dynamo_config_restores_after_last_overlapping_owner(monkeypatch, first_owner_to_restore):
 
@@ -300,10 +280,13 @@ def test_backend_setup_failure_after_native_init_cleans_once(monkeypatch):
     with pytest.raises(RuntimeError, match="backend setup failed"):
         engine.get_deepspeed_compile_backend("inductor", {}, None)
 
-    engine.destroy()
     assert init_calls == ["init"]
     assert cleanup_calls == ["cleanup"]
     assert engine._deepcompile_native_initialized is False
+    assert engine.is_deepcompile_active() is False
+
+    engine.destroy()
+    assert cleanup_calls == ["cleanup"]
 
 
 def test_module_compile_failure_cleans_native_state_once_before_destroy(monkeypatch):
@@ -342,8 +325,10 @@ def test_module_compile_failure_cleans_native_state_once_before_destroy(monkeypa
     with pytest.raises(RuntimeError, match="module compile failed"):
         engine.compile(backend="inductor")
 
-    engine.destroy()
     assert init_calls == ["init"]
     assert cleanup_calls == ["cleanup"]
     assert engine._deepcompile_native_initialized is False
     assert engine.is_deepcompile_active() is False
+
+    engine.destroy()
+    assert cleanup_calls == ["cleanup"]

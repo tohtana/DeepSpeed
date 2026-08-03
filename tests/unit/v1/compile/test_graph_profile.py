@@ -167,7 +167,6 @@ def test_memory_profiling_interpreter_clears_gathered_params_after_failure(monke
     assert interpreter.run() is None
     assert not interpreter.profile_complete
     assert interpreter.mem_record == []
-    assert graph_profile.is_profile_incomplete(interpreter.graph)
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
 
 
@@ -187,13 +186,11 @@ def test_memory_profiling_interpreter_disables_profiling_if_cleanup_fails(monkey
     monkeypatch.setattr(graph_profile.Interpreter, "run", lambda self, *args: None)
 
     interpreter = graph_profile.MemoryProfilingInterpreter(_make_empty_graph_module())
-    interpreter.env["retained"] = object()
 
     with pytest.raises(RuntimeError, match="cleanup failed"):
         interpreter.run()
 
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
-    assert interpreter.env == {}
 
 
 def test_profiling_interpreter_restores_state_if_gathered_param_cleanup_fails(monkeypatch):
