@@ -733,7 +733,15 @@ def _group_per_tp_shapes(slice_shapes_by_tp, pp_degree, tp_degree):
     for tp in range(tp_degree):
         tp_dict = {}
         for pp in range(pp_degree):
-            tp_dict.update(slice_shapes_by_tp[pp * tp_degree + tp])
+            stage_shapes = slice_shapes_by_tp[pp * tp_degree + tp]
+            for name in tp_dict.keys() & stage_shapes.keys():
+                # A parameter tied across pipeline stages is stored in every stage's file.
+                # The replicas must agree, otherwise the tie was partitioned inconsistently
+                # and the update below would silently keep the stage that was read last.
+                assert tp_dict[name] == stage_shapes[name], (
+                    f"Pipeline replicas of {name} on tp rank {tp} disagree on shape: "
+                    f"{tp_dict[name]} vs {stage_shapes[name]}.")
+            tp_dict.update(stage_shapes)
         per_tp.append(tp_dict)
     all_names = set()
     for d in per_tp:
