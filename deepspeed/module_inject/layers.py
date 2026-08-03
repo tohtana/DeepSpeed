@@ -580,12 +580,17 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
             marker()
 
         for param_name, param in module.named_parameters(recurse=False):
-            conversion_meta = _get_param_uc_conversion_meta(param)
-            if not conversion_meta:
-                continue
-
             full_name = f"{module_name}.{param_name}" if module_name else param_name
             pattern = rf"^{re.escape(full_name)}$"
+
+            conversion_meta = _get_param_uc_conversion_meta(param)
+            if not conversion_meta:
+                # AutoTP left this parameter untouched, so it is identical across TP
+                # ranks. Classify it as TP-replicated; otherwise it falls through to
+                # the converter's default dim-0 concat and is wrongly expanded (e.g.
+                # LayerNorm/RMSNorm weights [H] -> [H * tp_degree]).
+                replicated_patterns.append(pattern)
+                continue
 
             if conversion_meta.get('replicated'):
                 replicated_patterns.append(pattern)
@@ -714,7 +719,6 @@ class LinearAllreduce(TensorParallel_Layer):
         if weight is None:
             return
 
-        weight.data_partition = weight.data
         if self.mp_group is None or self.tp_world_size == 1:
             weight.data = weight.data.contiguous()
             return
@@ -801,7 +805,6 @@ class LinearLayer(TensorParallel_Layer):
             if param is None:
                 continue
 
-            params_list[idx].data_partition = param.data
             if self.mp_group is None or self.tp_world_size == 1:
                 params_list[idx].data = param.data.contiguous()
                 continue
@@ -1347,7 +1350,6 @@ class SubParamLinearLayer(TensorParallel_Layer):
         for idx, param in enumerate(params_list):
             if param is None:
                 continue
-            params_list[idx].data_partition = param.data
             if idx == 0:
                 full_view = _gather_logical_tensor(param,
                                                    self._logical_shape,
@@ -1466,7 +1468,6 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
             if param is None or idx > 0:
                 # don't gather bias for row parallel
                 return
-            params_list[idx].data_partition = param.data
             full_view = _gather_logical_tensor(param,
                                                self._logical_shape,
                                                self.partition_dim,

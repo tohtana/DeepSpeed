@@ -29,6 +29,13 @@ toc_label: "Contents"
 | Number of training steps to accumulate gradients before averaging and applying them. This feature is sometimes useful to improve scalability since it results in less frequent communication of gradients between steps. Another impact of this feature is the ability to train with larger batch sizes per GPU. Can be omitted if both <i>**train_batch_size**</i> and <i>**train_micro_batch_size_per_gpu**</i> are provided. | `1`     |
 
 
+<i>**managed_gradient_accumulation**</i>: [boolean]
+
+| Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Default |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| Controls how gradient accumulation boundaries are managed. When `true`, DeepSpeed tracks micro-steps and applies the optimizer step only at the accumulation boundary, so `forward`/`backward`/`step` can be called symmetrically on every micro-batch. When `false`, micro-step tracking is disabled and the client is responsible for calling `step()` at the accumulation boundary; each `step()` finalizes the locally-accumulated gradients and applies an optimizer update. The `false` setting currently supports ZeRO stage 0/1 (and DDP); ZeRO stage 2/3 and ZeRO optimizer offload are planned but not yet available (rejected at initialization). It is also incompatible with pipeline parallelism, DeepCompile, Apex AMP, and ZeRO `overlap_comm`. | `true`  |
+
+
 
 ### Optimizer Parameters
 
@@ -763,7 +770,7 @@ Configuring the asynchronous I/O module for offloading parameter and optimizer s
 | Submit requests to storage device in an overlapped fashion without waiting for completion of earlier requests. | `true`  |
 
 ### Tensor Parallel (AutoTP)
-Configure AutoTP tensor parallelism for training via the DeepSpeed config and hybrid TP + ZeRO. AutoTP supports ZeRO stages 0, 1, and 2. ZeRO stage 3 is supported only for inference (no optimizer); training with stage 3 is not yet supported. `deepspeed.tp_model_init()` remains supported for backward compatibility but is not required when `tensor_parallel` is set in the config.
+Configure AutoTP tensor parallelism for training via the DeepSpeed config and hybrid TP + ZeRO. AutoTP supports ZeRO stages 0, 1, 2, and 3, including checkpoint save/load and universal checkpoint conversion. `deepspeed.tp_model_init()` remains supported for backward compatibility but is not required when `tensor_parallel` is set in the config.
 
 When a HuggingFace model provides a built-in `tp_plan` (via `model.config.base_model_tp_plan`), DeepSpeed automatically detects and uses it. In this case, neither `preset_model` nor `partition_config` is required -- just set `autotp_size`. If `partition_config` is also provided, it takes precedence over the model's `tp_plan`.
 ```json
