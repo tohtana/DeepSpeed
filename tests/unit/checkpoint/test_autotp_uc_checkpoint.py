@@ -8,6 +8,7 @@ import os
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -566,6 +567,29 @@ def test_group_per_tp_shapes_handles_pp_local_params():
     assert result['fc.weight'] == [(3, 4), (2, 4)]
     assert result['layer0.weight'] == [(2, 4), (2, 4)]
     assert result['layer1.weight'] == [(2, 4), (2, 4)]
+
+
+def test_group_per_tp_shapes_rejects_disagreeing_pipeline_replicas():
+    # A tied parameter is stored in every PP stage's file. Replicas that disagree mean the
+    # tie was partitioned inconsistently, which must not be papered over by keeping the
+    # stage that happened to be read last.
+    slice_shapes_by_tp = [
+        {
+            'tied_modules.embed.weight': (3, 4)
+        },  # pp0_tp0
+        {
+            'tied_modules.embed.weight': (2, 4)
+        },  # pp0_tp1
+        {
+            'tied_modules.embed.weight': (1, 4)
+        },  # pp1_tp0 disagrees with pp0_tp0
+        {
+            'tied_modules.embed.weight': (2, 4)
+        },  # pp1_tp1
+    ]
+
+    with pytest.raises(AssertionError, match='disagree on shape'):
+        _group_per_tp_shapes(slice_shapes_by_tp, pp_degree=2, tp_degree=2)
 
 
 class TestRealCheckpointUniversalConversionTPxPP(DistributedTest):
