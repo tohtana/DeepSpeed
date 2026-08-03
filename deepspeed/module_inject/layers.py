@@ -612,14 +612,22 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
             sub_param_shape = conversion_meta.get('sub_param_shape')
             partition_dim = conversion_meta.get('partition_dim')
             if sub_param_shape is not None and partition_dim is not None and not conversion_meta.get('is_bias', False):
+                shard_widths = conversion_meta.get('sub_param_shard_widths')
+                published_shape = list(sub_param_shape)
+                if shard_widths is not None:
+                    # sub_param_shape is a view spec whose partition_dim entry may be the
+                    # sub-parameter *count*, as in (3, -1). Publishing that count invites a
+                    # reader to take it for a width, which is how a fused weight ends up merged
+                    # from a single narrow slice. The recorded widths already carry the real
+                    # per-sub-parameter sizes, so publish those and leave no room for the
+                    # ambiguity.
+                    published_shape[partition_dim] = tuple(sum(widths) for widths in shard_widths)
+                    sub_param_shard_widths[pattern] = [list(widths) for widths in shard_widths]
                 parameter_with_sub_params.append({
                     'patterns': [pattern],
-                    'shape': list(sub_param_shape),
+                    'shape': published_shape,
                     'partition_dim': partition_dim,
                 })
-                shard_widths = conversion_meta.get('sub_param_shard_widths')
-                if shard_widths is not None:
-                    sub_param_shard_widths[pattern] = [list(widths) for widths in shard_widths]
 
     uc_info = {
         UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,

@@ -139,8 +139,29 @@ def test_collect_uses_conversion_view_not_recovery_fields():
     subparam_entry = uc_info[PARAMETER_WITH_SUB_PARAMS][0]
 
     assert subparam_entry["partition_dim"] == 0
-    assert subparam_entry["shape"] == [3, -1]
+    # The published shape carries the physical sub-parameter sizes rather than the (3, -1)
+    # view spec, so a reader cannot mistake the sub-parameter count for a shard width.
+    assert subparam_entry["shape"] == [(4, 4, 4), -1]
 
+
+def test_collect_publishes_physical_subparam_sizes_not_the_count():
+    # shape=(3, -1) is a view spec whose partition_dim entry is the sub-parameter *count*.
+    # Publishing that count lets a converter read 3 as a shard width and merge the parameter
+    # from a single narrow slice, so the recorded widths are used to publish real sizes.
+    layer = SubParamLinearLayer(torch.nn.Linear(12, 12, bias=True),
+                                mp_group=None,
+                                shape=(3, -1),
+                                partition_dim=0,
+                                name="packed")
+    model = torch.nn.Module()
+    model.packed = layer
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+    subparam_entry = uc_info[PARAMETER_WITH_SUB_PARAMS][0]
+
+    published_sizes = subparam_entry["shape"][subparam_entry["partition_dim"]]
+    assert published_sizes == (4, 4, 4)
+    assert sum(published_sizes) == 12
 
 def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
     restore_meta = _build_param_uc_restore_meta(partition_type="column",

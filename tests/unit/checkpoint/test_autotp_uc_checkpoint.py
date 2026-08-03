@@ -194,6 +194,75 @@ def test_resolve_autotp_partition_uses_uneven_partition_sizes_for_bias():
     assert torch.equal(slice_flat, expected)
 
 
+def test_resolve_autotp_partition_prefers_resolved_subparam_sizes():
+    # Standard AutoTP records sub_param_shape as a logical view spec: the partition_dim entry
+    # is the sub-parameter *count* (3), not a width. Only sub_param_sizes carries the real
+    # widths, so reading the count as a width would restore a single row instead of six.
+    param = _make_param(
+        (6, 8), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (12, 8),
+            'output_shape': (12, ),
+            'sub_param_shape': (3, -1),
+            'sub_param_sizes': (4, 4, 4),
+            'original_shape': (12, 8),
+            'is_bias': False,
+            'replicated': False,
+        })
+    full_hp_param = torch.arange(96, dtype=torch.float32).view(12, 8)
+
+    slice_flat = _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=0, tp_world_size=2)
+
+    a, b, c = torch.split(full_hp_param, [4, 4, 4], dim=0)
+    expected = torch.cat([a.narrow(0, 0, 2), b.narrow(0, 0, 2), c.narrow(0, 0, 2)], dim=0).flatten()
+    assert torch.equal(slice_flat, expected)
+
+
+def test_resolve_autotp_partition_rejects_uneven_subparams_without_widths():
+    # Without recorded widths an even split is assumed; for uneven sub-parameters that would
+    # shift every offset and silently drop the trailing rows, so it must be refused instead.
+    param = _make_param(
+        (5, 2), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (16, 2),
+            'output_shape': (16, ),
+            'sub_param_shape': None,
+            'sub_param_sizes': (8, 4, 4),
+            'sub_param_shard_widths': None,
+            'original_shape': (16, 2),
+            'is_bias': False,
+            'replicated': False,
+        })
+    full_hp_param = torch.arange(32, dtype=torch.float32).view(16, 2)
+
+    with pytest.raises(AssertionError, match="not divisible by tp_world_size"):
+        _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=0, tp_world_size=3)
+
+
+def test_resolve_autotp_partition_rejects_uneven_without_partition_sizes():
+    # The chunk() fallback sizes blocks as ceil(size / tp) and shrinks the last one, while
+    # AutoTP gives the remainder to the low ranks. For 10/4 that is [3, 3, 3, 1] instead of
+    # [3, 3, 2, 2], so an uneven checkpoint lacking partition_sizes must not be guessed at.
+    param = _make_param(
+        (3, 2), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (10, 2),
+            'output_shape': (10, ),
+            'sub_param_shape': None,
+            'sub_param_sizes': None,
+            'partition_sizes': None,
+            'original_shape': (10, 2),
+            'is_bias': False,
+            'replicated': False,
+        })
+    full_hp_param = torch.arange(20, dtype=torch.float32).view(10, 2)
+
+    with pytest.raises(AssertionError, match="records no partition_sizes"):
+        _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=3, tp_world_size=4)
+
 def test_resolve_autotp_partition_replicated_bias():
     full_hp_param = torch.arange(8, dtype=torch.float32)
     param = _make_param(

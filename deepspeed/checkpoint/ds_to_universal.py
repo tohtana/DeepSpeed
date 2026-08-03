@@ -344,7 +344,24 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
             # were recorded could only have been split evenly.
             shard_widths = sub_param_shard_widths.get(matched_sub_params_pattern)
             if shard_widths is None:
+                # Assuming an even split for an uneven sub-parameter shifts every offset and
+                # silently drops the tail, so refuse rather than write a wrong checkpoint.
+                uneven_sizes = [size for size in sub_dim_sizes if size % tp_degree != 0]
+                assert not uneven_sizes, (
+                    f"Sub-parameter sizes {uneven_sizes} of {name} are not divisible by tp_degree {tp_degree}, "
+                    "and this checkpoint records no sub_param_shard_widths, so its uneven layout cannot be "
+                    "reconstructed.")
                 shard_widths = [[size // tp_degree] * tp_degree for size in sub_dim_sizes]
+
+            assert len(shard_widths) == len(sub_dim_sizes), (
+                f"Got {len(shard_widths)} shard width entries for {len(sub_dim_sizes)} sub-parameters of {name}.")
+            for sub_dim_size, widths in zip(sub_dim_sizes, shard_widths):
+                assert len(widths) == tp_degree, (
+                    f"Sub-parameter of size {sub_dim_size} in {name} has {len(widths)} shard widths, expected "
+                    f"one per tp rank ({tp_degree}).")
+                assert sum(widths) == sub_dim_size, (
+                    f"Shard widths {list(widths)} for a sub-parameter of {name} sum to {sum(widths)}, expected "
+                    f"{sub_dim_size}.")
 
             logical_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
             rank_views = []
