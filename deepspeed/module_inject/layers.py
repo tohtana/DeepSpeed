@@ -442,12 +442,7 @@ class TensorParallel_Layer(nn.Module, ABC):
         every later consumer -- the forward gather, the parameter gather and the checkpoint
         metadata -- reads the cached value rather than querying those globals again.
         """
-        if self.tp_world_size == 1:
-            # Nothing to split, so bypass the shard helper and its grain quantization, which
-            # would otherwise drop the tail of a dimension that is not a multiple of the grain.
-            self._partition_sizes = (total_size, )
-        else:
-            self._partition_sizes = tuple(get_shard_size_list(total_size, self.tp_world_size, self.name))
+        self._partition_sizes = tuple(get_shard_size_list(total_size, self.tp_world_size, self.name))
         return self._partition_sizes
 
     @torch.no_grad()
