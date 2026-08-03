@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+import logging
 import torch
 import re
 from deepspeed import comm as dist
@@ -11,6 +12,7 @@ from torch.nn import functional as F
 from torch.nn.parameter import Parameter
 from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
+from deepspeed.utils.logging import log_dist_once
 from deepspeed.runtime.zero.utils import is_zero_param
 from abc import ABC, abstractmethod
 from typing import Iterable, Any, Optional, List, Tuple, Dict
@@ -1262,16 +1264,20 @@ def _subparam_shard_widths(subparam_sizes, tp_world_size, name=None):
     Sub-parameters follow the same deterministic split as ordinary layers, so a fused
     attention weight lands on key/value head boundaries instead of being cut inside a head.
     """
-    layer_label = f"AutoTP layer '{name}'" if name else "AutoTP layer"
     widths = []
     for size in subparam_sizes:
         per_rank = get_shard_size_list(size, tp_world_size, name)
         if min(per_rank) == 0:
-            raise ValueError(
-                f"{layer_label} cannot split a sub-parameter of size {size} across tp_size "
-                f"{tp_world_size}: the split {per_rank} leaves some ranks empty. A fused attention "
-                f"weight hits this when the model has fewer key/value heads than tensor parallel "
-                f"ranks, which needs the heads replicated rather than split further.")
+            # Those ranks contribute zeros to the row-parallel all-reduce, so the result stays
+            # correct and this matches how separate q/k/v projections already behave. Serving
+            # them would mean replicating heads, which AutoTP does not do. The layer name is
+            # left out so the whole model reports this once rather than once per layer.
+            log_dist_once(
+                f"AutoTP: a sub-parameter of width {size} splits across tp_size {tp_world_size} as "
+                f"{per_rank}, so some ranks hold none of it and stay idle for this weight. This "
+                f"happens when there are fewer attention heads than tensor parallel ranks.",
+                ranks=[0],
+                level=logging.WARNING)
         widths.append(per_rank)
     return widths
 
