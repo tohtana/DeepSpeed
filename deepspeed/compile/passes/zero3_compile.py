@@ -18,7 +18,7 @@ from ..util import all_reduce, get_rank
 from ..fx import (add_postprocess, _make_node_meta, get_output_node, move_primals_to_head, add_end_backward,
                   replace_reduce_outputs_with_none, should_release_reduce_buckets)
 from ..profilers.graph_profile import ProfilingInterpreter, is_profile_incomplete
-from ..list_schedule import (SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, SchedulerMemoryBudget, allgather_allocation_bytes,
+from ..list_schedule import (DS_SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, SchedulerMemoryBudget, allgather_allocation_bytes,
                              fast_free_schedule, max_possible_gathered_bytes, profiled_non_gathered_peak)
 from .contract import PassContract, CAP_Z3_GATHER_RELEASE
 
@@ -29,7 +29,6 @@ NAME = "zero3_compile"
 # Inserts the ZeRO-3 all-gather/release ops that prefetch and selective-gather later build on.
 CONTRACT = PassContract(provides=frozenset({CAP_Z3_GATHER_RELEASE}))
 SCHEDULER_DEBUG_ENV = "DEEPSPEED_COMPILE_SCHEDULER_BUDGET_DEBUG"
-SCHEDULER_DEBUG_ENV_LEGACY = "DEEPSPEED_DEEPCOMPILE_SCHEDULER_DEBUG"
 
 
 def _reduce_int(value: int, op, process_group=None):
@@ -105,9 +104,7 @@ def _minimum_gather_residency_budget(graph: Graph, process_group=None):
 
 
 def _scheduler_debug_enabled():
-    return any(
-        os.environ.get(env_name, "").lower() not in ("", "0", "false", "no")
-        for env_name in (SCHEDULER_DEBUG_ENV, SCHEDULER_DEBUG_ENV_LEGACY))
+    return os.environ.get(SCHEDULER_DEBUG_ENV, "").lower() not in ("", "0", "false", "no")
 
 
 def _print_scheduler_debug(message: str, process_group=None):
@@ -246,7 +243,7 @@ def _log_scheduler_result(graph_id: int,
                           disabled_reason,
                           graph: Graph,
                           process_group=None):
-    diagnostics = getattr(graph, SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, {})
+    diagnostics = getattr(graph, DS_SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, {})
     selected = diagnostics.get("selected", [])
     max_live_gathered_bytes = max((entry.get("peak_gathered_bytes", 0) for entry in selected), default=0)
     rejected_candidates = diagnostics.get("budget_rejected_candidates", [])

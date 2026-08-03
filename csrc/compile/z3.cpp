@@ -10,9 +10,11 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -21,6 +23,18 @@ namespace dc {
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
 
 namespace {
+
+bool diagnosticEnvEnabled(const char* name)
+{
+    const char* raw_value = std::getenv(name);
+    if (raw_value == nullptr) { return false; }
+
+    std::string value(raw_value);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return !value.empty() && value != "0" && value != "false" && value != "no";
+}
 
 class GatherBufferPool {
 public:
@@ -503,7 +517,7 @@ private:
 
     void logState(const char* event) const
     {
-        if (std::getenv("DEEPSPEED_ALLOCATOR_TELEMETRY") == nullptr) { return; }
+        if (!diagnosticEnvEnabled("DEEPSPEED_ALLOCATOR_TELEMETRY")) { return; }
         size_t checked_out = 0;
         for (const auto& entry : entries_) { checked_out += entry.checked_out ? 1 : 0; }
         std::cout << "DEEPSPEED_Z3_GATHER_BUFFER_POOL event=" << event

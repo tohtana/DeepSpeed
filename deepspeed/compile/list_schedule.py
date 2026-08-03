@@ -259,7 +259,7 @@ def get_node_requirements(target_node: Node, scheduled: List[Node]):
 
 
 SCHEDULER_MEMORY_MARGIN = 0.1
-SCHEDULER_BUDGET_DIAGNOSTICS_ATTR = "_deepcompile_scheduler_budget_diagnostics"
+DS_SCHEDULER_BUDGET_DIAGNOSTICS_ATTR = "_ds_deepcompile_scheduler_budget_diagnostics"
 
 
 @dataclass(frozen=True)
@@ -816,6 +816,6 @@ def fast_free_schedule(graph: Graph,
     assert len(unscheduled) == 0, f"There are unscheduled nodes: {unscheduled}"
 
     ret_graph = make_graph_from_schedule(scheduled)
-    setattr(ret_graph, SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, diagnostics)
+    setattr(ret_graph, DS_SCHEDULER_BUDGET_DIAGNOSTICS_ATTR, diagnostics)
     ret_graph.lint()
     return ret_graph

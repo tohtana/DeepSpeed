@@ -96,6 +96,26 @@ def test_sync_memory_profile_complete_reduces_asymmetric_failure(monkeypatch):
     assert not backend_mod._sync_memory_profile_complete(True)
 
 
+def test_scheduler_debug_env_flag_values(monkeypatch):
+    monkeypatch.delenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, raising=False)
+    assert not zero3_compile_mod._scheduler_debug_enabled()
+
+    for value in ("", "0", "false", "FALSE", "no", "No"):
+        monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, value)
+        assert not zero3_compile_mod._scheduler_debug_enabled()
+
+    for value in ("1", "true", "TRUE", "yes", "debug"):
+        monkeypatch.setenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, value)
+        assert zero3_compile_mod._scheduler_debug_enabled()
+
+
+def test_unreleased_scheduler_debug_alias_is_not_supported(monkeypatch):
+    monkeypatch.delenv(zero3_compile_mod.SCHEDULER_DEBUG_ENV, raising=False)
+    monkeypatch.setenv("DEEPSPEED_DEEPCOMPILE_SCHEDULER_DEBUG", "1")
+
+    assert not zero3_compile_mod._scheduler_debug_enabled()
+
+
 def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch):
     monkeypatch.setattr(zero3_compile_mod.dist, "is_initialized", lambda: True)
 
@@ -146,10 +166,14 @@ def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch)
     assert budget.max_gathered_bytes == 200
 
 
+# The helpers below build nodes through Graph.create_node instead of Graph.call_function
+# because call_function only accepts an explicit name= on newer torch releases, while
+# create_node has supported it on every version this suite runs against.
 def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1):
     return _with_meta(
-        graph.call_function(torch.ops.dc.allgather_param.default, (arg, 0, ds_id), {"dtype": torch.float16},
-                            name=f"allgather_ds_param_{name}_{ds_id}"),
+        graph.create_node('call_function',
+                          torch.ops.dc.allgather_param.default, (arg, 0, ds_id), {"dtype": torch.float16},
+                          name=f"allgather_ds_param_{name}_{ds_id}"),
         tensor_size=tensor_size,
         device_time=device_time,
     )
@@ -157,22 +181,26 @@ def _allgather(graph, arg, ds_id, name, tensor_size=1, device_time=1):
 
 def _wait(graph, arg, ds_id, name):
     return _with_meta(
-        graph.call_function(torch.ops.dc.wait_allgather.default, (arg, 0, ds_id),
-                            name=f"wait_allgather_ds_param_{name}_{ds_id}"))
+        graph.create_node('call_function',
+                          torch.ops.dc.wait_allgather.default, (arg, 0, ds_id), {},
+                          name=f"wait_allgather_ds_param_{name}_{ds_id}"))
 
 
 def _neg(graph, arg, name, device_time=0):
-    return _with_meta(graph.call_function(operator.neg, (arg, ), name=name), device_time=device_time)
+    return _with_meta(graph.create_node('call_function', operator.neg, (arg, ), {}, name=name),
+                      device_time=device_time)
 
 
 def _add(graph, lhs, rhs, name, device_time=0):
-    return _with_meta(graph.call_function(operator.add, (lhs, rhs), name=name), device_time=device_time)
+    return _with_meta(graph.create_node('call_function', operator.add, (lhs, rhs), {}, name=name),
+                      device_time=device_time)
 
 
 def _release(graph, arg, ds_id, name):
     return _with_meta(
-        graph.call_function(torch.ops.dc.release_param.default, (arg, 0, ds_id, 1),
-                            name=f"release_ds_param_{name}_{ds_id}"))
+        graph.create_node('call_function',
+                          torch.ops.dc.release_param.default, (arg, 0, ds_id, 1), {},
+                          name=f"release_ds_param_{name}_{ds_id}"))
 
 
 def _scheduled_graph(graph, scheduler_budget=None):
@@ -184,7 +212,7 @@ def _scheduled_names(graph, scheduler_budget=None):
 
 
 def _scheduler_diagnostics(graph):
-    return getattr(graph, schedule_mod.SCHEDULER_BUDGET_DIAGNOSTICS_ATTR)
+    return getattr(graph, schedule_mod.DS_SCHEDULER_BUDGET_DIAGNOSTICS_ATTR)
 
 
 def test_fast_free_schedule_keeps_zero_free_acc_filter():
