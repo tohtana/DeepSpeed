@@ -428,17 +428,6 @@ class AutoTP():
         model_type = self._get_model_type()
         spec = self.partition_config.find_matching_spec(param_name, model_type)
 
-        if any(part in ("lm_head", "embed_out") for part in name.split('.')):
-            spec_details = None
-            if spec is not None:
-                spec_details = {
-                    "patterns": spec.patterns,
-                    "partition_type": spec.partition_type.value,
-                    "gather_output": spec.gather_output,
-                }
-            log_dist(f"AutoTP lm_head spec match: parameter={param_name!r}; matched_spec={spec_details!r}",
-                     ranks=[0])
-
         if spec is None:
             # No matching spec found
             if self.partition_config.strict_mode:
@@ -492,8 +481,6 @@ class AutoTP():
                 partition_dim=spec.get_partition_dim(),
                 name=name,
             )
-        if spec.gather_output:
-            log_dist(f"AutoTP: replacing '{name}' with LinearLayer(gather_output=True)", ranks=[0])
         return LinearLayer(module, self.mp_group, name=name, gather_output=spec.gather_output)
 
     def _configure_gathered_column_tie_fallbacks(self):
