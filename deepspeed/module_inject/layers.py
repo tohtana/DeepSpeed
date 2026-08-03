@@ -235,8 +235,8 @@ class GatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather last-dimension shards while keeping the output replicated."""
 
     @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor,
-                partition_sizes: Tuple[int, ...]) -> torch.Tensor:
+    def forward(ctx: Any, group: dist.ProcessGroup, input: torch.Tensor, partition_sizes: Tuple[int,
+                                                                                                ...]) -> torch.Tensor:
         """Gather the shards of a column parallel output described by ``partition_sizes``.
 
         The widths were resolved when the layer was built, so they need neither an extra
