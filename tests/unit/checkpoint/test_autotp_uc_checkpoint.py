@@ -14,14 +14,15 @@ import torch.nn as nn
 
 import deepspeed
 import deepspeed.comm as dist
-from deepspeed.checkpoint.constants import (CAT_DIM, FP32_FLAT_GROUPS, FP32_WEIGHT_KEY, OPTIMIZER_STATE_DICT, PARAM,
-                                            PARAM_GROUPS, PARAM_SHAPES, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-                                            PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE, SUB_PARAM_SHARD_WIDTHS,
-                                            TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO,
-                                            UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
-                                            VOCABULARY_PARAMETER_PATTERNS, ZERO_STAGE)
+import deepspeed.checkpoint.ds_to_universal as ds_to_universal
+from deepspeed.checkpoint.constants import (
+    AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS, CAT_DIM, FP32_FLAT_GROUPS, FP32_WEIGHT_KEY, OPTIMIZER_STATE_DICT, PARAM,
+    PARAM_GROUPS, PARAM_SHAPES, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHAPE,
+    SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_INFO,
+    UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE, VOCABULARY_PARAMETER_PATTERNS, ZERO_STAGE)
 from deepspeed.checkpoint.universal_checkpoint import SubparamShape as CheckpointSubparamShape
-from deepspeed.checkpoint.ds_to_universal import _group_per_tp_shapes, main as convert_to_universal, merge_tp_slices
+from deepspeed.checkpoint.ds_to_universal import (_group_per_tp_shapes, _validate_autotp_conversion_support, main as
+                                                  convert_to_universal, merge_tp_slices)
 from deepspeed.checkpoint.universal_checkpoint import (_get_param_uc_restore_meta, _resolve_autotp_partition,
                                                        load_hp_checkpoint_state)
 from deepspeed.pipe import PipelineModule
@@ -60,6 +61,40 @@ def _make_param(shape, meta=None):
     if meta is not None:
         setattr(param, 'ds_autotp_universal_checkpoint_meta', meta)
     return param
+
+
+def test_validate_autotp_conversion_support_rejects_unsupported_layout():
+    uc_info = {AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS: {r"^qkv\.weight$": "CodeGenBlock layout is interleaved"}}
+
+    with pytest.raises(ValueError, match="CodeGenBlock layout is interleaved"):
+        _validate_autotp_conversion_support(uc_info)
+
+
+def test_validate_autotp_conversion_support_accepts_legacy_schema():
+    _validate_autotp_conversion_support({})
+
+
+def test_inject_missing_state_still_validates_unsupported_layout(monkeypatch):
+    uc_info = {AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS: {r"^qkv\.weight$": "unsupported layout"}}
+
+    class FakeCheckpoint:
+
+        def get_checkpoint_info(self, key):
+            assert key == UNIVERSAL_CHECKPOINT_INFO
+            return uc_info
+
+    checkpoint = FakeCheckpoint()
+    injected = []
+    monkeypatch.setattr(ds_to_universal, "_get_optim_files", lambda _: ["optim.pt"])
+    monkeypatch.setattr(ds_to_universal, "_filter_zero3_optim_files", lambda _: [])
+    monkeypatch.setattr(ds_to_universal, "_get_zero_stage", lambda _: 1)
+    monkeypatch.setattr(ds_to_universal, "DeepSpeedCheckpoint", lambda _: checkpoint)
+    monkeypatch.setattr(ds_to_universal, "_inject_missing_state", lambda value: injected.append(value))
+    args = SimpleNamespace(input_folder="input", output_folder="output", inject_missing_state=True)
+
+    with pytest.raises(ValueError, match="unsupported layout"):
+        ds_to_universal.main(args)
+    assert injected == [checkpoint]
 
 
 def test_resolve_autotp_partition_row_parallel_weight():
@@ -390,6 +425,36 @@ def test_merge_tp_slices_emits_subparam_shape_metadata(tmp_path):
     assert not unmatched
     assert isinstance(ckpt[SUB_PARAM_SHAPE], CheckpointSubparamShape)
     assert ckpt[SUB_PARAM_SHAPE].partition_dim == 0
+
+
+def test_merge_tp_slices_decodes_legacy_subparam_count(tmp_path):
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv.weight"
+    full = torch.arange(24, dtype=torch.float32).view(12, 2)
+
+    # Legacy shape=(3, -1) means three equal Q/K/V sub-parameters, not a
+    # three-row physical width. Each TP rank stores its piece of every sub-parameter.
+    rows = {0: [0, 1, 4, 5, 8, 9], 1: [2, 3, 6, 7, 10, 11]}
+    for tp_index, row_ids in rows.items():
+        _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
+
+    uc_info = {
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [3, -1],
+            "partition_dim": 0,
+        }],
+    }
+
+    merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2,
+                    (param_name, [torch.Size([6, 2]), torch.Size([6, 2])]))
+
+    ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
+    torch.testing.assert_close(ckpt[PARAM], full)
+    assert ckpt[SUB_PARAM_SHAPE].shape == ((4, 4, 4), -1)
 
 
 def test_merge_tp_slices_uses_uneven_sub_param_widths(tmp_path):
@@ -1084,3 +1149,49 @@ class TestUnevenRowUniversalCheckpoint(DistributedTest):
         torch.testing.assert_close(restored_attn.o_proj.weight.detach().cpu(), expected_o)
 
         _train_steps(restored_engine, hidden_dim, steps=1)
+
+
+def test_merge_tp_slices_realigns_rank_that_wrote_no_fragment(tmp_path):
+    # A rank owning none of a parameter is dropped from the hp mapping and writes no fragment
+    # at all. Pairing the remaining slices with the shard widths by position would then shift
+    # rank 2 onto rank 1's widths, so the gap has to be filled back in.
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv_proj.weight"
+    shard_widths = [[2, 0, 2], [1, 0, 1], [1, 0, 1]]
+
+    full = torch.arange(16, dtype=torch.float32).view(8, 2)
+    rows = {0: [0, 1, 4, 6], 2: [2, 3, 5, 7]}
+    for tp_index, row_ids in rows.items():
+        _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
+
+    uc_info = {
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [(4, 2, 2), 2],
+            "partition_dim": 0,
+        }],
+        SUB_PARAM_SHARD_WIDTHS: {
+            rf"^{param_name}$": shard_widths
+        },
+    }
+
+    merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 3,
+                    (param_name, [torch.Size([4, 2]), torch.Size([0, 2]),
+                                  torch.Size([4, 2])]))
+
+    ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
+    torch.testing.assert_close(ckpt[PARAM], full)
+
+
+def test_merge_zero_shards_rejects_a_missing_rank_that_owns_elements(tmp_path):
+    # A rank whose recorded shape is not empty must have written a fragment. Standing in a
+    # zero-sized placeholder there would quietly drop real optimizer state.
+    param_name = "module.proj.weight"
+    _write_tp_states(tmp_path, param_name, 0, torch.zeros(4, 2))
+
+    with pytest.raises(AssertionError, match="not empty"):
+        ds_to_universal._merge_zero_shards(str(tmp_path / param_name), "fp32", 2,
+                                           [torch.Size([4, 2]), torch.Size([4, 2])])

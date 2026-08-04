@@ -44,6 +44,7 @@ from deepspeed.checkpoint import (
     PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
     PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0,
     PARAMETER_WITH_SUB_PARAMS,
+    AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS,
     AUTOEP_LAYERS_KEY,
     AUTOEP_LAYERS_KEY_LEGACY,
     EP_IS_EXPERT_PARAM,
@@ -234,11 +235,16 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shapes=None):
     # GQA sub-params -- reshape to the correct per-rank shape instead of a single shape
     # taken from one rank. None keeps each merged fragment flat.
     slices = []
+    empty_tp_indices = []
     for tp_index in range(tp_degree):
         prefix_path = os.path.join(param_base_path, str(tp_index), f"{state}")
         paths = glob.glob(f"{prefix_path}.*")
 
         if len(paths) == 0:
+            # A rank holding none of an uneven parameter writes no fragment at all. Record the
+            # gap so it can be filled below, because callers pair slices with per-rank shard
+            # widths by position and a hole would shift every later rank onto the wrong widths.
+            empty_tp_indices.append((tp_index, len(slices)))
             continue
 
         pattern = re.compile(f"{prefix_path}\\.([0-9]+)")
@@ -263,6 +269,19 @@ def _merge_zero_shards(param_base_path, state, tp_degree, slice_shapes=None):
                 slice = torch.cat(shards, dim=0).reshape(slice_shapes[tp_index])
 
         slices.append(slice)
+
+    # Only a recorded per-rank shape can describe the missing slice, and only tensor states can
+    # stand in for it, so leave step and shape-less merges as they are.
+    if empty_tp_indices and slice_shapes is not None and slices and torch.is_tensor(slices[0]):
+        for tp_index, position in reversed(empty_tp_indices):
+            missing_shape = slice_shapes[tp_index]
+            # A rank that owns real elements but wrote no fragment means the extraction lost
+            # data, which a zero-sized placeholder would hide.
+            assert math.prod(missing_shape) == 0, (
+                f"No fragment files for tp rank {tp_index} of a parameter whose recorded shape "
+                f"{tuple(missing_shape)} is not empty.")
+            slices.insert(position, torch.empty(missing_shape, dtype=slices[0].dtype))
+
     return slices
 
 
@@ -335,9 +354,27 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
         elif matched_sub_params_shape:
             partition_dim = matched_sub_params_shape.partition_dim
 
-            sub_dim_sizes = matched_sub_params_shape.shape[partition_dim]
-            if not isinstance(sub_dim_sizes, tuple):
-                sub_dim_sizes = (sub_dim_sizes, )
+            sub_dim_spec = matched_sub_params_shape.shape[partition_dim]
+            if isinstance(sub_dim_spec, tuple):
+                sub_dim_sizes = sub_dim_spec
+                normalized_subparam_shape = matched_sub_params_shape
+            else:
+                # Legacy metadata used a scalar at partition_dim as the number of equal
+                # sub-parameters (for example shape=(3, -1) for fused QKV). New metadata
+                # publishes their physical widths as a tuple. Recover the old representation
+                # from the complete dimension before applying divisibility checks.
+                num_sub_params = sub_dim_spec
+                full_partition_size = sum(tp_slice.shape[partition_dim] for tp_slice in slices)
+                assert num_sub_params > 0 and full_partition_size % num_sub_params == 0, (
+                    f"Legacy sub-parameter count {num_sub_params} for {name} does not evenly divide its full "
+                    f"partition dimension {full_partition_size}.")
+                sub_dim_size = full_partition_size // num_sub_params
+                sub_dim_sizes = (sub_dim_size, ) * num_sub_params
+                normalized_shape = list(matched_sub_params_shape.shape)
+                normalized_shape[partition_dim] = sub_dim_sizes
+                normalized_subparam_shape = SubparamShape(patterns=matched_sub_params_shape.patterns,
+                                                          shape=tuple(normalized_shape),
+                                                          partition_dim=partition_dim)
 
             # This process cannot recompute the widths: the head counts that decide them live
             # in the model config, not in the checkpoint. Checkpoints written before the widths
@@ -364,6 +401,7 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
                     f"{sub_dim_size}.")
 
             logical_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
+            logical_shape[partition_dim] = sum(sub_dim_sizes)
             # A rank that holds none of an uneven sub-parameter has an empty slice, and an empty
             # slice cannot infer a placeholder dimension. Resolve the view spec up front, from
             # the full parameter, so every rank reshapes against concrete sizes.
@@ -384,7 +422,7 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
                     offsets[tp_index] += widths[tp_index]
                 merged_chunks.append(torch.cat(pieces, dim=partition_dim))
             param = torch.cat(merged_chunks, dim=partition_dim)
-            ckpt_dict[SUB_PARAM_SHAPE] = matched_sub_params_shape
+            ckpt_dict[SUB_PARAM_SHAPE] = normalized_subparam_shape
         else:
             cat_dim = 1 if get_matched_pattern(parameters_with_row_parallelism, name) else 0
             # print(f"merge {name} with CAT DIM: {cat_dim}")
@@ -891,6 +929,14 @@ def _inject_missing_state(ds_checkpoint):
 def _check_for_required_state(ds_checkpoint):
     universal_checkpoint_info = ds_checkpoint.get_checkpoint_info(UNIVERSAL_CHECKPOINT_INFO)
     assert universal_checkpoint_info is not None, f'Required {UNIVERSAL_CHECKPOINT_INFO} state is missing in checkpoint. Verify that client creates this state.'
+    _validate_autotp_conversion_support(universal_checkpoint_info)
+
+
+def _validate_autotp_conversion_support(universal_checkpoint_info):
+    unsupported = universal_checkpoint_info.get(AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS, {})
+    if unsupported:
+        details = ", ".join(f"{pattern}: {reason}" for pattern, reason in sorted(unsupported.items()))
+        raise ValueError(f"AutoTP universal checkpoint conversion is not supported for {details}.")
 
 
 def _classify_autoep_expert_file_consolidation(autoep_metadata, expert_files):
@@ -916,8 +962,7 @@ def main(args):
         ds_checkpoint = DeepSpeedCheckpoint(args.input_folder)
         if args.inject_missing_state:
             _inject_missing_state(ds_checkpoint)
-        else:
-            _check_for_required_state(ds_checkpoint)
+        _check_for_required_state(ds_checkpoint)
 
         iteration = ds_checkpoint.get_iteration()
         #_create_latest_file(args.output_folder, iteration)
@@ -1021,6 +1066,12 @@ def main(args):
             _parse_model_states_stage3([model_files_grid[tp_index][0]]) for tp_index in range(tp_degree)
         ]
 
+        # Fail before the extraction pass so an unconvertible checkpoint does not pay the
+        # cost of loading every optimizer shard and writing fragments into temp_dir.
+        uc_info = _load_universal_checkpoint_info_stage3(model_files)
+        if tp_degree > 1:
+            _validate_autotp_conversion_support(uc_info)
+
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
         print('*** 1. Extracting ZeRO fragments')
@@ -1045,7 +1096,6 @@ def main(args):
                 dict((k, v) for sub in grid_tp for k, v in sub.items()) for grid_tp in param_shapes_grid
             ]
             slice_shapes = {name: [param_shapes_by_tp[tp][name] for tp in range(tp_degree)] for name in param_keys}
-            uc_info = _load_universal_checkpoint_info_stage3(model_files)
             _merge_tp_slice_files(args, uc_info, tp_degree, slice_shapes, temp_dir)
         else:
             # Plain ZeRO-3 (no tensor parallelism): DP-only merge, unchanged behavior.

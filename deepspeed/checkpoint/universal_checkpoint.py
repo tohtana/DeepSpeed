@@ -84,6 +84,13 @@ def _resolve_autotp_partition(current_param, ckpt_dict, full_hp_param, tp_rank, 
     partition_sizes = meta.get('partition_sizes')
     replicated = meta.get('replicated', False)
 
+    # The layer could not describe how it split this parameter, so conversion refuses it. The
+    # generic paths below would reassemble it as contiguous rank-ordered slices, which is not
+    # how a fused layout was cut, so restoring here would silently corrupt the weight.
+    unsupported_reason = meta.get('conversion', {}).get('unsupported_reason')
+    if unsupported_reason:
+        raise RuntimeError(f"Cannot restore a universal checkpoint into this AutoTP parameter: {unsupported_reason}")
+
     if replicated:
         assert partition_dim is None
         slice_tensor = full_hp_param

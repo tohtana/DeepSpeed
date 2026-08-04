@@ -6,12 +6,16 @@
 import pytest
 import torch
 
-from deepspeed.checkpoint.constants import (PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
+from deepspeed.checkpoint.constants import (AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS,
+                                            PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
                                             SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS,
                                             VOCABULARY_PARAMETER_PATTERNS, DS_AUTOTP_UC_META)
+from deepspeed.checkpoint.universal_checkpoint import _narrow_sub_params, _resolve_autotp_partition
 from deepspeed.module_inject.layers import (_build_param_uc_restore_meta, _get_param_uc_conversion_meta,
-                                            GateUpPack_LinearLayer, LinearAllreduce, LinearLayer, SubParamLinearLayer,
-                                            fused_LinearLayer, collect_autotp_universal_checkpoint_info)
+                                            _subparam_shard_widths, GateUpPack_LinearLayer, LinearAllreduce,
+                                            LinearLayer, SubParamLinearAllreduce, SubParamLinearLayer,
+                                            Yuan_LinearAllreduce, Yuan_LinearLayer, fused_LinearLayer,
+                                            collect_autotp_universal_checkpoint_info)
 
 
 def test_collect_autotp_universal_checkpoint_info_row_parallel():
@@ -231,6 +235,18 @@ def test_collect_marks_autotp_unchanged_params_as_replicated():
     assert not any("fc.bias" in p for p in replicated)
 
 
+def test_collect_does_not_treat_hidden_sharded_embeddings_as_vocabulary():
+    model = torch.nn.Module()
+    model.word_embeddings = LinearAllreduce(torch.nn.Linear(8, 32, bias=False), mp_group=None, name="word_embeddings")
+    model.position_embeddings = LinearAllreduce(torch.nn.Linear(8, 512, bias=False),
+                                                mp_group=None,
+                                                name="position_embeddings")
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    assert uc_info[VOCABULARY_PARAMETER_PATTERNS] == []
+
+
 def test_collect_publishes_sub_param_metadata_for_partitioned_bias():
     # An uneven fused bias is cut per sub-parameter just like its weight. Without sub-parameter
     # metadata the converter concatenates the rank slices end to end, which interleaves Q/K/V
@@ -273,7 +289,7 @@ def test_collect_skips_tied_parameter_aliases():
     assert not any("lm_head" in pattern for pattern in all_patterns)
 
 
-def test_collect_rejects_fused_layouts_without_a_sub_param_split():
+def test_collect_records_fused_layouts_without_a_sub_param_split():
     # codegen interleaves the Q/K/V blocks across ranks, so no per-sub-parameter description
     # exists. Publishing a plain column layout would reassemble the weight in rank order.
     class CodeGenBlock(torch.nn.Module):
@@ -288,8 +304,25 @@ def test_collect_rejects_fused_layouts_without_a_sub_param_split():
     model = torch.nn.Module()
     model.qkv_proj = layer
 
-    with pytest.raises(ValueError, match="qkv_proj.weight"):
-        collect_autotp_universal_checkpoint_info(model)
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    unsupported = uc_info[AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS]
+    assert r"^qkv_proj\.weight$" in unsupported
+    assert "interleaves" in unsupported[r"^qkv_proj\.weight$"]
+
+
+@pytest.mark.parametrize("layer_cls", [Yuan_LinearLayer, Yuan_LinearAllreduce])
+def test_collect_records_yuan_layout_as_unsupported(layer_cls):
+    model = torch.nn.Module()
+    model.proj = layer_cls(torch.nn.Linear(8, 8, bias=True), mp_group=None, name="proj")
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    unsupported = uc_info[AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS]
+    assert "noncontiguous head groups" in unsupported[r"^proj\.weight$"]
+    assert "noncontiguous head groups" in unsupported[r"^proj\.bias$"]
+    with pytest.raises(RuntimeError, match="noncontiguous head groups"):
+        model.proj.gather_params([model.proj.weight, model.proj.bias])
 
 
 def test_gate_up_pack_publishes_sub_param_metadata():
@@ -306,3 +339,96 @@ def test_gate_up_pack_publishes_sub_param_metadata():
     entry = uc_info[PARAMETER_WITH_SUB_PARAMS][0]
     assert entry["shape"] == [(6, 6), 4]
     assert uc_info[SUB_PARAM_SHARD_WIDTHS][r"^dense_h_to_4h\.weight$"] == [[3, 3], [3, 3]]
+
+
+def test_restore_refuses_layouts_conversion_rejected():
+    # Conversion refuses these layouts, but the parameter metadata still describes a plain
+    # column split. Restoring it as contiguous rank-ordered slices would silently corrupt an
+    # interleaved fused weight, so loading has to refuse it too.
+    param = torch.nn.Parameter(torch.zeros(6, 4))
+    setattr(
+        param, DS_AUTOTP_UC_META,
+        _build_param_uc_restore_meta(partition_type='column',
+                                     partition_dim=0,
+                                     logical_shape=(12, 4),
+                                     original_shape=(12, 4),
+                                     unsupported_reason="codegen interleaves the Q/K/V blocks across ranks"))
+
+    with pytest.raises(RuntimeError, match="interleaves"):
+        _resolve_autotp_partition(param, {}, torch.zeros(48), tp_rank=0, tp_world_size=2)
+
+
+@pytest.mark.parametrize("tp_world_size", [4, 8])
+def test_sub_param_shard_widths_round_trip_with_zero_width_ranks(tp_world_size):
+    # More ranks than kv heads leaves some ranks holding none of a sub-parameter. Those empty
+    # shards still have to tile the sub-parameter and survive a restore round trip.
+    sub_param_sizes = (8, 2, 2)
+    widths = _subparam_shard_widths(sub_param_sizes, tp_world_size)
+
+    assert any(width == 0 for per_rank in widths for width in per_rank)
+    for size, per_rank in zip(sub_param_sizes, widths):
+        assert sum(per_rank) == size
+
+    logical_shape = (sum(sub_param_sizes), 3)
+    full_param = torch.arange(logical_shape[0] * logical_shape[1], dtype=torch.float32)
+    full_view = full_param.view(logical_shape)
+
+    restored = [
+        _narrow_sub_params(full_view, 0, sub_param_sizes, widths, tp_rank, tp_world_size)
+        for tp_rank in range(tp_world_size)
+    ]
+
+    # Every element lands on exactly one rank, so the shards reassemble the sub-parameters.
+    assert sum(shard.numel() for shard in restored) == full_param.numel()
+    offset = 0
+    sub_views = []
+    for size in sub_param_sizes:
+        sub_views.append(full_view.narrow(0, offset, size))
+        offset += size
+    for tp_rank, shard in enumerate(restored):
+        pieces = [
+            sub_view.narrow(0, sum(per_rank[:tp_rank]), per_rank[tp_rank])
+            for sub_view, per_rank in zip(sub_views, widths)
+        ]
+        assert torch.equal(shard, torch.cat(pieces, dim=0).flatten())
+
+
+@pytest.mark.parametrize("layer_cls", [SubParamLinearLayer, SubParamLinearAllreduce])
+def test_sub_param_layer_materializes_zero_width_final_dimension(layer_cls):
+    layer = layer_cls(torch.nn.Linear(2, 4, bias=False), mp_group=None, shape=(4, 2), partition_dim=1, name="proj")
+    layer.tp_world_size = 4
+    layer.tp_index = 3
+    layer._subparam_shard_widths = [[1, 0, 0, 0], [1, 0, 0, 0]]
+
+    layer._tp_partition([layer.weight, None])
+
+    assert layer.weight.shape == (4, 0)
+    output = layer(torch.empty(2, 0))
+    assert output.shape == (2, 4)
+
+
+def test_lm_head_forward_uses_frozen_partition_sizes():
+    # The weight columns were cut when the layer was built. A second AutoTP model overwrites the
+    # process-wide tp_shard globals, so re-deriving the split in forward would slice the input
+    # differently than the weight and the row-parallel all-reduce would hide the mismatch.
+    from deepspeed.module_inject import tp_shard
+    from deepspeed.module_inject.layers import LmHeadLinearAllreduce
+
+    grain_size, kv_heads = tp_shard.tp_grain_size, tp_shard.num_kv_heads
+    try:
+        tp_shard.set_tp_grain_size(1)
+        tp_shard.set_num_kv_heads(None)
+        layer = LmHeadLinearAllreduce(torch.nn.Linear(101, 8, bias=False), mp_group=None)
+        layer.tp_world_size = 2
+        layer.tp_index = 1
+        frozen = layer._freeze_partition_sizes(101)
+        assert frozen == (51, 50)
+
+        # A later model narrows the grain, which would change a recomputed split.
+        tp_shard.set_tp_grain_size(64)
+        layer.weight.data = torch.zeros(8, frozen[1])
+
+        layer(torch.zeros(1, 1, 101))
+    finally:
+        tp_shard.set_tp_grain_size(grain_size)
+        tp_shard.set_num_kv_heads(kv_heads)
