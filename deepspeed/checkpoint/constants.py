@@ -58,6 +58,7 @@ UNIVERSAL_CHECKPOINT_VERSION_KEY = 'universal_checkpoint_version'
 UNIVERSAL_CHECKPOINT_VERSION_VALUE = 0.3
 # Attribute name used to store AutoTP universal-checkpoint metadata on torch Parameters.
 DS_AUTOTP_UC_META = "ds_autotp_universal_checkpoint_meta"
+AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS = "autotp_unsupported_parameter_patterns"
 
 # Vocabulary padding
 VOCAB_TENSOR = 'vocab_tensor'

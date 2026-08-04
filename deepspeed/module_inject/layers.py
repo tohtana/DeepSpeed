@@ -11,13 +11,13 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parameter import Parameter
 from deepspeed.accelerator import get_accelerator
-from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
+from deepspeed.module_inject.tp_shard import get_shard_size_list
 from deepspeed.utils.logging import log_dist_once
 from deepspeed.runtime.zero.utils import is_zero_param
 from abc import ABC, abstractmethod
 from typing import Iterable, Any, Optional, List, Tuple, Dict
-from .fusedqkv_utils import (shard_value_with_share_qk, shard_chunk_mlp, prepare_tp_fused_qkvw,
-                             fused_qkv_subparam_sizes)
+from .fusedqkv_utils import (shard_value_with_share_qk, prepare_tp_fused_qkvw, fused_qkv_subparam_sizes,
+                             set_fused_qkv_shard_state)
 from deepspeed.runtime.tensor_parallel import AUTOTP_MODE
 from deepspeed.checkpoint.constants import DS_AUTOTP_UC_META
 from copy import deepcopy
@@ -575,16 +575,18 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
     restore-time per-parameter details such as `sub_param_sizes` or
     `target_partition_shape`, which stay on the parameter metadata object.
     """
-    from deepspeed.checkpoint.constants import (ORIGINAL_VOCAB_SIZE, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-                                                PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHARD_WIDTHS,
-                                                TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_VERSION_KEY,
-                                                UNIVERSAL_CHECKPOINT_VERSION_VALUE, VOCABULARY_PARAMETER_PATTERNS)
+    from deepspeed.checkpoint.constants import (AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS, ORIGINAL_VOCAB_SIZE,
+                                                PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
+                                                SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS,
+                                                UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
+                                                VOCABULARY_PARAMETER_PATTERNS)
 
     row_parallel_patterns = []
     sub_param_shard_widths = {}
     replicated_patterns = []
     vocabulary_patterns = []
     parameter_with_sub_params = []
+    unsupported_parameter_patterns = {}
     original_vocab_size = None
 
     # Tied parameters are reachable under several module attributes, but the optimizer -- and
@@ -614,8 +616,8 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
 
             unsupported_reason = conversion_meta.get('unsupported_reason')
             if unsupported_reason:
-                raise ValueError(f"AutoTP cannot describe '{full_name}' for universal checkpoint conversion because "
-                                 f"{unsupported_reason}.")
+                unsupported_parameter_patterns[pattern] = unsupported_reason
+                continue
 
             if conversion_meta.get('replicated'):
                 replicated_patterns.append(pattern)
@@ -624,13 +626,14 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
                 row_parallel_patterns.append(pattern)
 
             original_shape = conversion_meta.get('original_shape')
-            if original_shape and len(original_shape) == 2 and ('embed' in full_name or 'lm_head' in full_name):
+            partition_dim = conversion_meta.get('partition_dim')
+            if (original_shape and len(original_shape) == 2 and partition_dim == 0
+                    and ('embed' in full_name or 'lm_head' in full_name)):
                 vocabulary_patterns.append(pattern)
                 if original_vocab_size is None:
                     original_vocab_size = original_shape[0]
 
             sub_param_shape = conversion_meta.get('sub_param_shape')
-            partition_dim = conversion_meta.get('partition_dim')
             if sub_param_shape is not None and partition_dim is not None:
                 shard_widths = conversion_meta.get('sub_param_shard_widths')
                 published_shape = list(sub_param_shape)
@@ -655,6 +658,7 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
         TP_REPLICATED_PARAMETER_PATTERNS: sorted(set(replicated_patterns)),
         VOCABULARY_PARAMETER_PATTERNS: sorted(set(vocabulary_patterns)),
         PARAMETER_WITH_SUB_PARAMS: parameter_with_sub_params,
+        AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS: unsupported_parameter_patterns,
     }
     if sub_param_shard_widths:
         uc_info[SUB_PARAM_SHARD_WIDTHS] = sub_param_shard_widths
@@ -938,9 +942,39 @@ class SubParamColumnParallel(LinearLayer):
         return tuple(shape_spec)
 
     @torch.no_grad()
+    def _tp_partition(self, params_list):
+        """Cut every sub-parameter at the widths frozen when the layer was built.
+
+        The helpers a subclass would otherwise call re-derive the split from the tp_shard
+        globals, which a second AutoTP model overwrites. Repartitioning after a gather would
+        then cut the weight differently than the frozen widths that the gather and the
+        checkpoint metadata describe.
+        """
+        if self._subparam_sizes is None:
+            return self._tp_partition_unsupported_layout(params_list)
+
+        for idx, param in enumerate(params_list):
+            if param is None:
+                continue
+            _partition = _partition_logical_tensor(param.data,
+                                                   0,
+                                                   self.tp_world_size,
+                                                   self.tp_index,
+                                                   self._subparam_shard_widths,
+                                                   subparam_sizes=self._subparam_sizes)
+            params_list[idx].data = self.move(_partition).detach()
+
+    @torch.no_grad()
+    def _tp_partition_unsupported_layout(self, params_list):
+        """Cut a fused layout that has no per-sub-parameter description."""
+        raise RuntimeError(self._unsupported_uc_reason)
+
+    @torch.no_grad()
     def gather_params(self, params_list):
         if self._subparam_sizes is None:
-            return super().gather_params(params_list)
+            # The inherited gather concatenates the shards in rank order, which is not how this
+            # layout was split, so it would hand back a silently wrong weight to consolidate.
+            raise RuntimeError(self._unsupported_uc_reason)
 
         for idx, param in enumerate(params_list):
             if param is None:
@@ -1024,8 +1058,15 @@ class fused_LinearLayer(SubParamColumnParallel):
                                                                tuple(module.weight.shape)), None)
         super().__init__(module, mp_group, skip_partition, **kwargs)
 
+    def _freeze_partition_sizes(self, total_size):
+        super()._freeze_partition_sizes(total_size)
+        if self._subparam_shard_widths is not None:
+            set_fused_qkv_shard_state(self.fused_module.module, self._subparam_shard_widths, self.tp_index)
+
     @torch.no_grad()
-    def _tp_partition(self, params_list):
+    def _tp_partition_unsupported_layout(self, params_list):
+        # These layouts interleave or replicate blocks, so only the original helper knows how
+        # to cut them. They cannot be gathered, so they are never repartitioned after a gather.
         for idx, param in enumerate(params_list):
             if param is None:
                 return
@@ -1063,6 +1104,9 @@ class conv_LinearLayer(LinearLayer):
 #override the subclasses related to weight splitting.
 class Yuan_LinearAllreduce(LinearAllreduce):
 
+    _unsupported_uc_reason = ("Yuan shared-QK tensor parallelism selects noncontiguous head groups that universal "
+                              "checkpoint conversion cannot currently describe")
+
     #Yuan2
     @torch.no_grad()
     def _tp_partition(self, params_list):
@@ -1072,8 +1116,31 @@ class Yuan_LinearAllreduce(LinearAllreduce):
         if bias is not None:
             params_list[1].data = bias
 
+    @torch.no_grad()
+    def gather_params(self, params_list):
+        raise RuntimeError(self._unsupported_uc_reason)
+
+    def _mark_uc_metadata(self):
+        self._set_param_uc_meta(self.weight,
+                                partition_type='row',
+                                partition_dim=1,
+                                logical_shape=self._orig_weight_shape,
+                                original_shape=self._orig_weight_shape,
+                                unsupported_reason=self._unsupported_uc_reason)
+        if self.bias is not None:
+            bias_shape = tuple(self.bias.shape)
+            self._set_param_uc_meta(self.bias,
+                                    partition_type='row',
+                                    logical_shape=bias_shape,
+                                    original_shape=bias_shape,
+                                    is_bias=True,
+                                    unsupported_reason=self._unsupported_uc_reason)
+
 
 class Yuan_LinearLayer(LinearLayer):
+    _unsupported_uc_reason = ("Yuan shared-QK tensor parallelism selects noncontiguous head groups that universal "
+                              "checkpoint conversion cannot currently describe")
+
     #Yuan2
     @torch.no_grad()
     def _tp_partition(self, params_list):
@@ -1082,6 +1149,26 @@ class Yuan_LinearLayer(LinearLayer):
         params_list[0].data = self.move(weight).detach()
         if bias is not None:
             params_list[1].data = self.move(bias).detach()
+
+    @torch.no_grad()
+    def gather_params(self, params_list):
+        raise RuntimeError(self._unsupported_uc_reason)
+
+    def _mark_uc_metadata(self):
+        self._set_param_uc_meta(self.weight,
+                                partition_type='column',
+                                partition_dim=0,
+                                logical_shape=self._orig_weight_shape,
+                                original_shape=self._orig_weight_shape,
+                                unsupported_reason=self._unsupported_uc_reason)
+        if self.bias is not None:
+            self._set_param_uc_meta(self.bias,
+                                    partition_type='column',
+                                    partition_dim=0,
+                                    logical_shape=self._orig_bias_shape,
+                                    original_shape=self._orig_bias_shape,
+                                    is_bias=True,
+                                    unsupported_reason=self._unsupported_uc_reason)
 
 
 class GateUpPack_LinearLayer(SubParamColumnParallel):
@@ -1092,13 +1179,6 @@ class GateUpPack_LinearLayer(SubParamColumnParallel):
         half = tuple(module.weight.shape)[0] // 2
         self._subparam_layout_spec = ((half, half), "mlp")
         super().__init__(module, mp_group, **kwargs)
-
-    @torch.no_grad()
-    def _tp_partition(self, params_list):
-        weight, bias = shard_chunk_mlp(params_list[0].data, params_list[1], self.tp_index, self.tp_world_size)
-        params_list[0].data = self.move(weight).detach()
-        if bias is not None:
-            params_list[1].data = self.move(bias).detach()
 
 
 class Conv_LinearALlreduce(LinearAllreduce):
@@ -1136,8 +1216,15 @@ class LmHeadLinearAllreduce(LinearAllreduce):
         super().__init__(module, mp_group, **kwargs)
 
     def forward(self, input):
-        input_shard_size = get_shard_size(input.shape[-1], self.tp_world_size, "lm_head")
-        input_shard_offset = sum(get_shard_size_list(input.shape[-1], self.tp_world_size, "lm_head")[0:self.tp_index])
+        # The weight columns were cut with the sizes frozen at construction, so the input has to
+        # be cut the same way. Recomputing the split here would read the tp_shard globals that a
+        # later model overwrites, and the row-parallel all-reduce would hide the misalignment.
+        input_shard_sizes = self._partition_sizes
+        assert sum(input_shard_sizes) == input.shape[-1], (
+            f"lm_head was partitioned for an input of {sum(input_shard_sizes)} features, but got "
+            f"{input.shape[-1]}.")
+        input_shard_size = input_shard_sizes[self.tp_index]
+        input_shard_offset = sum(input_shard_sizes[0:self.tp_index])
         output = torch.matmul(input[:, :, input_shard_offset:input_shard_offset + input_shard_size],
                               self.weight.transpose(-1, -2))
         if self.mp_group is not None:
@@ -1613,7 +1700,8 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                      self.tp_index,
                                                      self._subparam_shard_widths,
                                                      subparam_sizes=self._subparam_sizes)
-        params_list[0].data = self.move(partitioned_view.reshape(-1, partitioned_view.shape[-1])).detach()
+        leading_size = _shape_prod(partitioned_view.shape[:-1])
+        params_list[0].data = self.move(partitioned_view.reshape(leading_size, partitioned_view.shape[-1])).detach()
 
         if params_list[1] is not None:
             if self._bias_partition_dim is None:
@@ -1724,7 +1812,8 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
                                                      self.tp_index,
                                                      self._subparam_shard_widths,
                                                      subparam_sizes=self._subparam_sizes)
-        params_list[0].data = self.move(partitioned_view.reshape(-1, partitioned_view.shape[-1])).detach()
+        leading_size = _shape_prod(partitioned_view.shape[:-1])
+        params_list[0].data = self.move(partitioned_view.reshape(leading_size, partitioned_view.shape[-1])).detach()
 
         # Bias is not partitioned for row parallel (it's applied after all-reduce)
         if params_list[1] is not None:

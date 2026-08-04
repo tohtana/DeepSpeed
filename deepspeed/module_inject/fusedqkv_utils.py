@@ -83,6 +83,25 @@ def fused_qkv_subparam_sizes(module, weight_shape):
     return None
 
 
+def set_fused_qkv_shard_state(module, shard_widths, tp_index):
+    """Tell the model how wide this rank's query block is, for layouts that record it.
+
+    QWen reads ``attn.split_size`` to unpack query, key and value out of the fused projection
+    output, so it has to follow the frozen shard widths rather than the full model width.
+    """
+    if get_fused_qkv_type(module) != 'qwentype':
+        return
+    query_width = shard_widths[0][tp_index]
+    if query_width == 0:
+        # QWen unpacks three tensors from mixed_x_layer.split(self.attn.split_size), and a split
+        # size of zero yields a single tensor instead. That model code lives outside DeepSpeed,
+        # so an empty attention shard cannot be made to work here.
+        raise RuntimeError(f"AutoTP cannot shard this QWen attention across {len(shard_widths[0])} ranks: "
+                           f"rank {tp_index} would receive an empty query/key/value shard. Reduce the "
+                           f"tensor parallel size so that every rank holds at least one query column.")
+    module.attn.split_size = query_width
+
+
 def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
 
     if src is None:
@@ -95,14 +114,15 @@ def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
         #input : [3*hidden_dim, hidden_dim](weight) or [3*hidden_dim](bias)
 
         shape = input.shape
-        dst_shape = get_shard_size(shape[0], mp_size)
+        dst_shape = get_shard_size(shape[0], mp_size, rank=gpu_index)
         num_mp_blocks = input.reshape(codegen_mp_num, shape[0] // codegen_mp_num, shape[1])
 
         #num_mp_blocks : [codegen_mp_num, 3*hidden_dim/codegen_mp_num, :]
         src_split = list(torch.split(num_mp_blocks, num_mp_blocks.shape[1] // 3, dim=1))
         src_split = [x.reshape(codegen_mp_num * mp_size, -1, shape[1]) for x in src_split]
 
-        split_fusedqkv = split_by_qkvlist_and_refuse(src_split, get_shard_size(shape[0] // 3, mp_size), 0, 1)
+        split_fusedqkv = split_by_qkvlist_and_refuse(src_split, get_shard_size(shape[0] // 3, mp_size, rank=gpu_index),
+                                                     0, 1)
         tp_fuseqkv_weight = torch.cat(split_fusedqkv, dim=0).reshape(shape[0], -1)
 
         return tp_fuseqkv_weight[gpu_index * dst_shape:(gpu_index + 1) * dst_shape]
@@ -134,13 +154,6 @@ def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
 
         split_fusedqkv = input.split(get_shard_size_list(shape[0], mp_size), dim=0)
         return split_fusedqkv[gpu_index]
-
-    def _qwen_type_transpose(input, mp_size, module):
-        if not hasattr(module, "_ds_fusedqkv_entered"):
-            # Adjust splitting absolute value variables
-            setattr(module, "_ds_fusedqkv_entered", True)
-            module.attn.split_size = get_shard_size(module.attn.split_size, mp_size)
-        return _glm_type_transpose(input, mp_size)
 
     def _bigcode_type_transpose(input, mp_size):
         n_embd = get_n_embd()
@@ -178,7 +191,7 @@ def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
         elif fused_qkv_type == 'glmtype':
             return _glm_type_transpose(src, mp_size)
         elif fused_qkv_type == 'qwentype':
-            return _qwen_type_transpose(src, mp_size, module)
+            return _glm_type_transpose(src, mp_size)
         elif fused_qkv_type == 'bigcodetype':
             return _bigcode_type_transpose(src, mp_size)
         elif fused_qkv_type == 'phi3type':
@@ -247,24 +260,3 @@ def shard_value_with_share_qk(
         return torch.nn.Parameter(sharded_weight), torch.nn.Parameter(sharded_bias)
     else:
         return torch.nn.Parameter(sharded_weight), None
-
-
-# For phi3 with chunk mlp, adjust the weight order.
-def shard_chunk_mlp(
-    weight,
-    bias,
-    rank,
-    world_size,
-):
-    weight_gate, weight_states = weight.chunk(2, dim=0)
-    total_size = weight_gate.shape[0]
-    split_weight_gate = weight_gate.split(get_shard_size_list(total_size, world_size, "mlp"), dim=0)
-    split_weight_states = weight_states.split(get_shard_size_list(total_size, world_size, "mlp"), dim=0)
-    shard_weight = torch.cat((split_weight_gate[rank], split_weight_states[rank]), dim=0)
-    if bias is not None:
-        bias_gate, bias_states = bias.chunk(2, dim=0)
-        split_bias_gate = bias_gate.split(get_shard_size_list(total_size, world_size, "mlp"), dim=0)
-        split_bias_states = bias_states.split(get_shard_size_list(total_size, world_size, "mlp"), dim=0)
-        return shard_weight, torch.cat((split_bias_gate[rank], split_bias_states[rank]), dim=0)
-
-    return shard_weight, None
