@@ -27,7 +27,8 @@ from ..module_inject.policy import TransformerPolicy
 from ..module_inject.auto_tp import AutoTP
 
 from ..module_inject.replace_policy import generic_policies
-from ..module_inject.auto_tp_model_utils import build_bloom_alibi_tensor, build_mpt_atten_bias_tensor, build_mpt_alibi_tensor, get_alibi_mask
+from ..module_inject.auto_tp_model_utils import (build_bloom_alibi_tensor, build_mpt_atten_bias_tensor,
+                                                 build_mpt_alibi_tensor, get_alibi_mask, install_head_sharded_helper)
 from ..ops.transformer.inference.ds_attention import DeepSpeedSelfAttention
 from ..model_implementations.transformers.ds_transformer import DeepSpeedTransformerInference
 
@@ -214,18 +215,15 @@ class InferenceEngine(Module):
             if hasattr(self.module.transformer, 'build_alibi_tensor'):
                 self.module.transformer.build_alibi_tensor = build_bloom_alibi_tensor
             if hasattr(self.module.transformer, 'build_mpt_alibi_tensor'):
-                self.module.transformer.build_mpt_alibi_tensor_orig = self.module.transformer.build_mpt_alibi_tensor
-                self.module.transformer.__class__.build_mpt_alibi_tensor = build_mpt_alibi_tensor
+                install_head_sharded_helper(self.module.transformer, 'build_mpt_alibi_tensor', build_mpt_alibi_tensor)
         if hasattr(self.module, 'model'):
             if hasattr(self.module.model, 'get_alibi_mask'):
-                self.module.model.get_alibi_mask_orig = self.module.model.get_alibi_mask
-                self.module.model.__class__.get_alibi_mask = get_alibi_mask
+                install_head_sharded_helper(self.module.model, 'get_alibi_mask', get_alibi_mask)
 
     def build_attn_bias(self):
         if hasattr(self.module, 'transformer'):
             if hasattr(self.module.transformer, '_attn_bias'):
-                self.module.transformer._attn_bias_orig = self.module.transformer._attn_bias
-                self.module.transformer.__class__._attn_bias = build_mpt_atten_bias_tensor
+                install_head_sharded_helper(self.module.transformer, '_attn_bias', build_mpt_atten_bias_tensor)
 
     def _pre_forward_hook(self, module, *inputs, **kwargs):
         if self.use_cuda_events:

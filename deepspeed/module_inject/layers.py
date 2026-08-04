@@ -16,7 +16,8 @@ from deepspeed.utils.logging import log_dist_once
 from deepspeed.runtime.zero.utils import is_zero_param
 from abc import ABC, abstractmethod
 from typing import Iterable, Any, Optional, List, Tuple, Dict
-from .fusedqkv_utils import shard_value_with_share_qk, shard_chunk_mlp, prepare_tp_fused_qkvw
+from .fusedqkv_utils import (shard_value_with_share_qk, shard_chunk_mlp, prepare_tp_fused_qkvw,
+                             fused_qkv_subparam_sizes)
 from deepspeed.runtime.tensor_parallel import AUTOTP_MODE
 from deepspeed.checkpoint.constants import DS_AUTOTP_UC_META
 from copy import deepcopy
@@ -44,7 +45,8 @@ def _build_param_uc_conversion_meta(*,
                                     sub_param_shard_widths=None,
                                     original_shape=None,
                                     is_bias=False,
-                                    replicated=False):
+                                    replicated=False,
+                                    unsupported_reason=None):
     """Build the conversion-facing subset of parameter UC metadata.
 
     This is the only schema that should flow into model-level
@@ -58,6 +60,7 @@ def _build_param_uc_conversion_meta(*,
         'original_shape': _normalize_uc_shape(original_shape),
         'is_bias': is_bias,
         'replicated': replicated,
+        'unsupported_reason': unsupported_reason,
     }
 
 
@@ -73,7 +76,8 @@ def _build_param_uc_restore_meta(*,
                                  target_partition_shape=None,
                                  original_shape=None,
                                  is_bias=False,
-                                 replicated=False):
+                                 replicated=False,
+                                 unsupported_reason=None):
     """Build the restore-facing parameter UC metadata.
 
     Restore metadata stays on the parameter object and may include details that
@@ -111,7 +115,8 @@ def _build_param_uc_restore_meta(*,
                                         sub_param_shard_widths=sub_param_shard_widths,
                                         original_shape=original_shape,
                                         is_bias=is_bias,
-                                        replicated=replicated),
+                                        replicated=replicated,
+                                        unsupported_reason=unsupported_reason),
     }
 
 
@@ -412,7 +417,8 @@ class TensorParallel_Layer(nn.Module, ABC):
                            target_partition_shape=None,
                            original_shape=None,
                            is_bias=False,
-                           replicated=False):
+                           replicated=False,
+                           unsupported_reason=None):
         if param is None:
             return
         setattr(
@@ -428,7 +434,8 @@ class TensorParallel_Layer(nn.Module, ABC):
                                          target_partition_shape=target_partition_shape,
                                          original_shape=original_shape,
                                          is_bias=is_bias,
-                                         replicated=replicated))
+                                         replicated=replicated,
+                                         unsupported_reason=unsupported_reason))
 
     def _mark_uc_metadata(self):
         return
@@ -570,9 +577,8 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
     """
     from deepspeed.checkpoint.constants import (ORIGINAL_VOCAB_SIZE, PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
                                                 PARAMETER_WITH_SUB_PARAMS, SUB_PARAM_SHARD_WIDTHS,
-                                                TP_REPLICATED_PARAMETER_PATTERNS,
-                                                UNIVERSAL_CHECKPOINT_VERSION_KEY, UNIVERSAL_CHECKPOINT_VERSION_VALUE,
-                                                VOCABULARY_PARAMETER_PATTERNS)
+                                                TP_REPLICATED_PARAMETER_PATTERNS, UNIVERSAL_CHECKPOINT_VERSION_KEY,
+                                                UNIVERSAL_CHECKPOINT_VERSION_VALUE, VOCABULARY_PARAMETER_PATTERNS)
 
     row_parallel_patterns = []
     sub_param_shard_widths = {}
@@ -581,6 +587,11 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
     parameter_with_sub_params = []
     original_vocab_size = None
 
+    # Tied parameters are reachable under several module attributes, but the optimizer -- and
+    # therefore the checkpoint -- only knows the first of those names. Publishing a pattern for
+    # an alias would describe a parameter that has no slices to convert.
+    canonical_names = {id(param): name for name, param in model.named_parameters()}
+
     for module_name, module in model.named_modules():
         marker = getattr(module, "_mark_uc_metadata", None)
         if marker is not None:
@@ -588,6 +599,8 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
 
         for param_name, param in module.named_parameters(recurse=False):
             full_name = f"{module_name}.{param_name}" if module_name else param_name
+            if canonical_names.get(id(param), full_name) != full_name:
+                continue
             pattern = rf"^{re.escape(full_name)}$"
 
             conversion_meta = _get_param_uc_conversion_meta(param)
@@ -598,6 +611,11 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
                 # LayerNorm/RMSNorm weights [H] -> [H * tp_degree]).
                 replicated_patterns.append(pattern)
                 continue
+
+            unsupported_reason = conversion_meta.get('unsupported_reason')
+            if unsupported_reason:
+                raise ValueError(f"AutoTP cannot describe '{full_name}' for universal checkpoint conversion because "
+                                 f"{unsupported_reason}.")
 
             if conversion_meta.get('replicated'):
                 replicated_patterns.append(pattern)
@@ -613,7 +631,7 @@ def collect_autotp_universal_checkpoint_info(model: nn.Module) -> Dict[str, Any]
 
             sub_param_shape = conversion_meta.get('sub_param_shape')
             partition_dim = conversion_meta.get('partition_dim')
-            if sub_param_shape is not None and partition_dim is not None and not conversion_meta.get('is_bias', False):
+            if sub_param_shape is not None and partition_dim is not None:
                 shard_widths = conversion_meta.get('sub_param_shard_widths')
                 published_shape = list(sub_param_shape)
                 if shard_widths is not None:
@@ -887,6 +905,101 @@ class LinearLayer(TensorParallel_Layer):
         return cls(linear, skip_partition=True, gather_output=gather_output)
 
 
+class SubParamColumnParallel(LinearLayer):
+    """Column-parallel layer whose shard concatenates one piece of every sub-parameter.
+
+    ``LinearLayer`` assumes a rank owns one contiguous block of the output dimension, so its
+    gather and its checkpoint metadata would reassemble these layers in rank order and shuffle
+    the sub-parameters. Layers that cut a fused weight per sub-parameter mix in this class to
+    describe that layout instead.
+    """
+
+    # Used when a subclass reports no sub-parameter sizes, to say why its layout cannot be
+    # described. Subclasses that can hit that case override it with a specific explanation.
+    _unsupported_uc_reason = "its tensor parallel layout cannot be described per sub-parameter"
+
+    def _freeze_partition_sizes(self, total_size):
+        """Resolve the sub-parameter layout once, while the layer is built.
+
+        Subclasses describe their split by setting ``_subparam_layout_spec`` before the base
+        constructor runs. Its sizes are ``None`` for fused layouts that interleave or replicate
+        blocks rather than splitting them per sub-parameter; those have no such description.
+        """
+        super()._freeze_partition_sizes(total_size)
+        subparam_sizes, shard_name = self._subparam_layout_spec
+        self._subparam_sizes = subparam_sizes
+        self._subparam_shard_widths = None
+        if subparam_sizes is not None:
+            self._subparam_shard_widths = _subparam_shard_widths(subparam_sizes, self.tp_world_size, shard_name)
+
+    def _subparam_shape_spec(self, logical_shape):
+        shape_spec = list(logical_shape)
+        shape_spec[0] = tuple(self._subparam_sizes)
+        return tuple(shape_spec)
+
+    @torch.no_grad()
+    def gather_params(self, params_list):
+        if self._subparam_sizes is None:
+            return super().gather_params(params_list)
+
+        for idx, param in enumerate(params_list):
+            if param is None:
+                continue
+            logical_shape = self._orig_weight_shape if idx == 0 else self._orig_bias_shape
+            full_view = _gather_logical_tensor(param,
+                                               logical_shape,
+                                               0,
+                                               self.mp_group,
+                                               self.tp_world_size,
+                                               self._subparam_shard_widths,
+                                               subparam_sizes=self._subparam_sizes)
+            params_list[idx].data = full_view.reshape(logical_shape).contiguous()
+
+    def _mark_uc_metadata(self):
+        if self._subparam_sizes is None:
+            # Publishing a plain column layout here would make the converter reassemble the
+            # parameter in rank order, which is not how it was split. Record why instead, so
+            # conversion reports it rather than writing a silently wrong checkpoint.
+            self._set_param_uc_meta(self.weight,
+                                    partition_type='column',
+                                    partition_dim=0,
+                                    logical_shape=self._orig_weight_shape,
+                                    original_shape=self._orig_weight_shape,
+                                    unsupported_reason=self._unsupported_uc_reason)
+            if self.bias is not None:
+                self._set_param_uc_meta(self.bias,
+                                        partition_type='column',
+                                        partition_dim=0,
+                                        logical_shape=self._orig_bias_shape,
+                                        original_shape=self._orig_bias_shape,
+                                        is_bias=True,
+                                        unsupported_reason=self._unsupported_uc_reason)
+            return
+
+        self._set_param_uc_meta(self.weight,
+                                partition_type='column',
+                                partition_dim=0,
+                                logical_shape=self._orig_weight_shape,
+                                output_shape=(self._orig_weight_shape[0], ),
+                                sub_param_shape=self._subparam_shape_spec(self._orig_weight_shape),
+                                sub_param_sizes=self._subparam_sizes,
+                                sub_param_shard_widths=self._subparam_shard_widths,
+                                target_partition_shape=tuple(self.weight.shape),
+                                original_shape=self._orig_weight_shape)
+        if self.bias is not None:
+            self._set_param_uc_meta(self.bias,
+                                    partition_type='column',
+                                    partition_dim=0,
+                                    logical_shape=self._orig_bias_shape,
+                                    output_shape=self._orig_bias_shape,
+                                    sub_param_shape=self._subparam_shape_spec(self._orig_bias_shape),
+                                    sub_param_sizes=self._subparam_sizes,
+                                    sub_param_shard_widths=self._subparam_shard_widths,
+                                    target_partition_shape=tuple(self.bias.shape),
+                                    original_shape=self._orig_bias_shape,
+                                    is_bias=True)
+
+
 class FusedModuleWrapper:
 
     def __init__(self, fused_module: nn.Module):
@@ -896,12 +1009,19 @@ class FusedModuleWrapper:
         return self.fused_module
 
 
-class fused_LinearLayer(LinearLayer):
+class fused_LinearLayer(SubParamColumnParallel):
+
+    _unsupported_uc_reason = ("its fused qkv layout interleaves or replicates blocks across tensor parallel "
+                              "ranks, so the original parameter cannot be reassembled from the shards")
 
     def __init__(self, module, mp_group, skip_partition=False, **kwargs):
         assert kwargs.get('fused_module') is not None, "'fused_module' is required but not provided"
         # Use the warp class to avoid module circular references.
         self.fused_module = FusedModuleWrapper(kwargs.get('fused_module'))
+        # prepare_tp_fused_qkvw takes its own shard sizes without a layer name, so the widths
+        # describing its split must be resolved the same way.
+        self._subparam_layout_spec = (fused_qkv_subparam_sizes(kwargs.get('fused_module'),
+                                                               tuple(module.weight.shape)), None)
         super().__init__(module, mp_group, skip_partition, **kwargs)
 
     @torch.no_grad()
@@ -964,8 +1084,15 @@ class Yuan_LinearLayer(LinearLayer):
             params_list[1].data = self.move(bias).detach()
 
 
-class GateUpPack_LinearLayer(LinearLayer):
+class GateUpPack_LinearLayer(SubParamColumnParallel):
     # chatGLM2, chatGLM2
+
+    def __init__(self, module, mp_group=None, **kwargs):
+        # shard_chunk_mlp splits the gate and the up halves separately, under the "mlp" name.
+        half = tuple(module.weight.shape)[0] // 2
+        self._subparam_layout_spec = ((half, half), "mlp")
+        super().__init__(module, mp_group, **kwargs)
+
     @torch.no_grad()
     def _tp_partition(self, params_list):
         weight, bias = shard_chunk_mlp(params_list[0].data, params_list[1], self.tp_index, self.tp_world_size)
@@ -1258,6 +1385,21 @@ def _infer_subparam_logical_shapes(weight_shape, shape, partition_dim, name=None
     return logical_shape, output_shape, subparam_sizes, bias_partition_dim
 
 
+def _bias_subparam_shape_spec(output_shape, bias_partition_dim, subparam_sizes):
+    """View spec describing how a partitioned bias is laid out over its sub-parameters.
+
+    The weight's spec cannot be reused: it carries the input dimension the bias does not have,
+    and its partition_dim entry may be a sub-parameter *count* rather than a width. This spec is
+    fully resolved, so a reader never has to infer a dimension.
+    """
+    if bias_partition_dim is None:
+        return None
+    shape_spec = list(output_shape)
+    if subparam_sizes is not None:
+        shape_spec[bias_partition_dim] = tuple(subparam_sizes)
+    return tuple(shape_spec)
+
+
 def _subparam_shard_widths(subparam_sizes, tp_world_size, name=None):
     """Per-rank width of each sub-parameter, as one list per sub-parameter.
 
@@ -1282,11 +1424,29 @@ def _subparam_shard_widths(subparam_sizes, tp_world_size, name=None):
     return widths
 
 
-def _partition_logical_tensor(tensor, partition_dim, tp_world_size, tp_index, name=None, subparam_sizes=None):
+def _check_shard_widths(shard_widths, subparam_sizes, tp_world_size):
+    """Validate a layer's per-rank widths against the sub-parameters they describe.
+
+    Partition and gather have to agree on where every sub-parameter was cut, so both take the
+    widths the layer recorded rather than deriving their own, and this checks that what they
+    were handed actually tiles the sub-parameters.
+    """
+    assert len(shard_widths) == len(subparam_sizes), (
+        f"Got {len(shard_widths)} shard width entries for {len(subparam_sizes)} sub-parameters.")
+    for size, per_rank in zip(subparam_sizes, shard_widths):
+        assert len(per_rank) == tp_world_size, (
+            f"Sub-parameter of size {size} has {len(per_rank)} shard widths, expected one per tp rank "
+            f"({tp_world_size}).")
+        assert sum(per_rank) == size, (
+            f"Sub-parameter shard widths {list(per_rank)} sum to {sum(per_rank)}, expected {size}.")
+    return shard_widths
+
+
+def _partition_logical_tensor(tensor, partition_dim, tp_world_size, tp_index, shard_widths, subparam_sizes=None):
     if tp_world_size == 1:
         return tensor
     sizes = tuple(subparam_sizes) if subparam_sizes else (tensor.shape[partition_dim], )
-    widths = _subparam_shard_widths(sizes, tp_world_size, name)
+    widths = _check_shard_widths(shard_widths, sizes, tp_world_size)
     sub_params = torch.split(tensor, sizes, dim=partition_dim)
     partitioned = [sp.split(w, dim=partition_dim)[tp_index] for sp, w in zip(sub_params, widths)]
     if len(partitioned) == 1:
@@ -1337,12 +1497,12 @@ def _gather_logical_tensor(tensor,
                            partition_dim,
                            mp_group,
                            tp_world_size,
-                           name=None,
+                           shard_widths,
                            subparam_sizes=None):
     if mp_group is None or tp_world_size == 1:
         return tensor.reshape(logical_shape)
     sizes = tuple(subparam_sizes) if subparam_sizes else (logical_shape[partition_dim], )
-    widths = _subparam_shard_widths(sizes, tp_world_size, name)
+    widths = _check_shard_widths(shard_widths, sizes, tp_world_size)
     # The local shard holds one piece of every sub-parameter, so its own widths decide how to
     # unpack it before each piece is gathered back to its full size.
     tp_index = dist.get_rank(group=mp_group)
@@ -1390,6 +1550,8 @@ class SubParamLinearLayer(TensorParallel_Layer):
         # get_shard_size_list reads process-wide globals that a later model can overwrite.
         self._subparam_shard_widths = _subparam_shard_widths(
             self._subparam_sizes or (self._logical_shape[self.partition_dim], ), self.tp_world_size, self.name)
+        self._bias_shape_spec = _bias_subparam_shape_spec(self._output_shape, self._bias_partition_dim,
+                                                          self._subparam_sizes)
         if self.bias is not None and self.bias.numel() != _shape_prod(self._output_shape):
             raise ValueError(f"AutoTP layer '{self.name}' bias size {self.bias.numel()} does not match output shape "
                              f"{self._output_shape}.")
@@ -1422,7 +1584,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                    self.partition_dim,
                                                    self.mp_group,
                                                    self.tp_world_size,
-                                                   name=self.name,
+                                                   self._subparam_shard_widths,
                                                    subparam_sizes=self._subparam_sizes)
                 params_list[idx].data = full_view.reshape(self._orig_weight_shape)
             else:
@@ -1434,7 +1596,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                             self._bias_partition_dim,
                                                             self.mp_group,
                                                             self.tp_world_size,
-                                                            name=self.name,
+                                                            self._subparam_shard_widths,
                                                             subparam_sizes=self._subparam_sizes)
                     params_list[idx].data = full_bias_view.reshape(self._orig_bias_shape)
 
@@ -1449,7 +1611,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                      self.partition_dim,
                                                      self.tp_world_size,
                                                      self.tp_index,
-                                                     name=self.name,
+                                                     self._subparam_shard_widths,
                                                      subparam_sizes=self._subparam_sizes)
         params_list[0].data = self.move(partitioned_view.reshape(-1, partitioned_view.shape[-1])).detach()
 
@@ -1462,7 +1624,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                              self._bias_partition_dim,
                                                              self.tp_world_size,
                                                              self.tp_index,
-                                                             name=self.name,
+                                                             self._subparam_shard_widths,
                                                              subparam_sizes=self._subparam_sizes)
                 params_list[1].data = self.move(bias_partitioned.reshape(-1)).detach()
 
@@ -1484,7 +1646,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
                 partition_dim=self._bias_partition_dim,
                 logical_shape=self._output_shape,
                 output_shape=self._output_shape,
-                sub_param_shape=self.shape if self._bias_partition_dim is not None else None,
+                sub_param_shape=self._bias_shape_spec,
                 sub_param_sizes=self._subparam_sizes if self._bias_partition_dim is not None else None,
                 sub_param_shard_widths=self._subparam_shard_widths if self._bias_partition_dim is not None else None,
                 target_partition_shape=self.bias.shape,
@@ -1545,7 +1707,7 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
                                                self.partition_dim,
                                                self.mp_group,
                                                self.tp_world_size,
-                                               name=self.name,
+                                               self._subparam_shard_widths,
                                                subparam_sizes=self._subparam_sizes)
             params_list[idx].data = full_view.reshape(self._orig_weight_shape)
 
@@ -1560,7 +1722,7 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
                                                      self.partition_dim,
                                                      self.tp_world_size,
                                                      self.tp_index,
-                                                     name=self.name,
+                                                     self._subparam_shard_widths,
                                                      subparam_sizes=self._subparam_sizes)
         params_list[0].data = self.move(partitioned_view.reshape(-1, partitioned_view.shape[-1])).detach()
 

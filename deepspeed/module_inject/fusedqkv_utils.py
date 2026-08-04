@@ -26,24 +26,67 @@ def require_tp_fused_qkvw(name, mp_size):
     return False
 
 
+FUSED_QKV_TYPE_DICT = {
+    'CodeGenBlock': 'codegentype',
+    'BloomBlock': 'bloomtype',
+    'GLMBlock': 'glmtype',
+    "MPTBlock": 'glmtype',
+    "MptBlock": 'glmtype',
+    "BaichuanLayer": 'glmtype',
+    "QWenBlock": 'qwentype',
+    "FalconDecoderLayer": 'bloomtype',
+    "GPTBigCodeBlock": 'bigcodetype',
+    "DecoderLayer": 'glmtype',
+    "Phi3DecoderLayer": "phi3type"
+}
+
+
+def get_fused_qkv_type(module):
+    module_str = str(module).strip()
+    module_name_matches = [k for k in FUSED_QKV_TYPE_DICT.keys() if k in module_str]
+    if not module_name_matches:
+        return None
+    # There can be overlap with matches (e.g., "DecoderLayer" and "FalconDecoderLayer").
+    # We take the longest matching module_name
+    return FUSED_QKV_TYPE_DICT[max(module_name_matches, key=len)]
+
+
+def fused_qkv_subparam_sizes(module, weight_shape):
+    """Sizes of the sub-parameters a fused qkv weight is cut into, or None.
+
+    ``prepare_tp_fused_qkvw`` splits most layouts into q/k/v (or a single block) and
+    concatenates this rank's piece of each, which is exactly the sub-parameter layout the
+    gather and the checkpoint conversion need in order to undo the split. The remaining
+    layouts interleave or replicate blocks instead, so they have no such description and
+    return ``None``.
+    """
+    fused_type = get_fused_qkv_type(module)
+    if fused_type is None:
+        # prepare_tp_fused_qkvw falls back to the bloom layout for unrecognized modules.
+        fused_type = 'bloomtype'
+    total_size = weight_shape[0]
+    if fused_type == 'bloomtype':
+        return (total_size, )
+    if fused_type in ('glmtype', 'qwentype'):
+        if get_num_kv_heads() == 2:
+            hidden_dim = get_n_embd()
+            kv_dim = (total_size - hidden_dim) // get_num_kv_heads()
+            return (hidden_dim, kv_dim, kv_dim)
+        third = total_size // 3
+        return (third, third, third)
+    if fused_type == 'phi3type':
+        head_dim = weight_shape[1] // get_num_attention_heads()
+        kv_dim = get_num_kv_heads() * head_dim
+        return (total_size - 2 * kv_dim, kv_dim, kv_dim)
+    # codegentype interleaves blocks across ranks and bigcodetype replicates the kv block,
+    # so neither is a per-sub-parameter split.
+    return None
+
+
 def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
 
-    module_str = str(module).strip()
     if src is None:
         return
-    fused_type_dict = {
-        'CodeGenBlock': 'codegentype',
-        'BloomBlock': 'bloomtype',
-        'GLMBlock': 'glmtype',
-        "MPTBlock": 'glmtype',
-        "MptBlock": 'glmtype',
-        "BaichuanLayer": 'glmtype',
-        "QWenBlock": 'qwentype',
-        "FalconDecoderLayer": 'bloomtype',
-        "GPTBigCodeBlock": 'bigcodetype',
-        "DecoderLayer": 'glmtype',
-        "Phi3DecoderLayer": "phi3type"
-    }
 
     def _codegen_type_transpose(input, mp_size, codegen_mp_num=4):
         # codegen_mp_num defined in https://github.com/huggingface/transformers/blob/main/src/transformers/models/codegen/modeling_codegen.py
@@ -143,12 +186,8 @@ def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index):
 
         raise ValueError("unknown fused_qkv_type")
 
-    module_name_matches = [k for k in fused_type_dict.keys() if k in module_str]
-    if module_name_matches:
-        # There can be overlap with matches (e.g., "DecoderLayer" and "FalconDecoderLayer").
-        # We take the longest matching module_name
-        module_name = max(module_name_matches, key=len)
-        fused_type = fused_type_dict[module_name]
+    fused_type = get_fused_qkv_type(module)
+    if fused_type is not None:
         return _transpose_fused_qkvw(src, mp_size, fused_type, module)
     warning_once("Unrecognized fusedkqv weight type, default to using bloom type,"
                  "please check in prepare_tp_fused_qkvw() to avoid potential calculation errors")

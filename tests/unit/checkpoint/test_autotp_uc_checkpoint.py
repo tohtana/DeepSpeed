@@ -263,6 +263,7 @@ def test_resolve_autotp_partition_rejects_uneven_without_partition_sizes():
     with pytest.raises(AssertionError, match="records no partition_sizes"):
         _resolve_autotp_partition(param, {PARAM: full_hp_param}, full_hp_param, tp_rank=3, tp_world_size=4)
 
+
 def test_resolve_autotp_partition_replicated_bias():
     full_hp_param = torch.arange(8, dtype=torch.float32)
     param = _make_param(
@@ -315,6 +316,38 @@ def test_load_hp_checkpoint_state_prefers_autotp_metadata(tmp_path, monkeypatch)
     assert step is None
     expected = full_hp_param.chunk(2, dim=1)[1].flatten()
     assert torch.equal(param.data.flatten(), expected)
+
+
+def test_load_hp_checkpoint_state_keeps_tp_topology_for_single_kv_head(tmp_path, monkeypatch):
+    # MQA: a single key/value head lives entirely on tp rank 0, so that rank's local shape
+    # matches the universal tensor. The recorded per-rank widths must still be honored.
+    param = _make_param(
+        (3, 4), {
+            'partition_type': 'column',
+            'partition_dim': 0,
+            'logical_shape': (3, 4),
+            'output_shape': (3, ),
+            'sub_param_sizes': (1, 1, 1),
+            'sub_param_shard_widths': [[1, 0], [1, 0], [1, 0]],
+            'original_shape': (3, 4),
+            'is_bias': False,
+            'replicated': False,
+        })
+    param.load_hp_checkpoint_state = types.MethodType(load_hp_checkpoint_state, param)
+
+    ckpt_dir = tmp_path / "weight"
+    ckpt_dir.mkdir(parents=True)
+    full_hp_param = torch.arange(12, dtype=torch.float32).view(3, 4)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *args, **kwargs: {PARAM: full_hp_param} if str(args[0]).endswith("fp32.pt") else 0,
+    )
+    torch.save({PARAM: full_hp_param}, ckpt_dir / f"{FP32_WEIGHT_KEY}.pt")
+
+    param.load_hp_checkpoint_state(str(ckpt_dir), tp_rank=0, tp_world_size=2)
+
+    assert torch.equal(param.data.flatten(), full_hp_param.flatten())
 
 
 def _write_tp_slice(base_dir, param_name, tp_idx, state_name, tensor):
@@ -387,6 +420,71 @@ def test_merge_tp_slices_uses_uneven_sub_param_widths(tmp_path):
 
     merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2,
                     (param_name, [torch.Size([8, 2]), torch.Size([4, 2])]))
+
+    ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
+    torch.testing.assert_close(ckpt[PARAM], full)
+
+
+def test_merge_tp_slices_restores_uneven_fused_bias_order(tmp_path):
+    # The bias of a fused QKV is cut per sub-parameter exactly like its weight. Concatenating
+    # the rank slices end to end instead would interleave Q/K/V and restore a wrong bias.
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv_proj.bias"
+    shard_widths = [[4, 2], [2, 1], [2, 1]]
+
+    full = torch.arange(12, dtype=torch.float32)
+    rows = {0: [0, 1, 2, 3, 6, 7, 9, 10], 1: [4, 5, 8, 11]}
+    for tp_index, row_ids in rows.items():
+        _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
+
+    uc_info = {
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [(6, 3, 3)],
+            "partition_dim": 0,
+        }],
+        SUB_PARAM_SHARD_WIDTHS: {
+            rf"^{param_name}$": shard_widths
+        },
+    }
+
+    merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2, (param_name, [torch.Size([8]), torch.Size([4])]))
+
+    ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
+    torch.testing.assert_close(ckpt[PARAM], full)
+
+
+def test_merge_tp_slices_handles_rank_without_any_sub_param_rows(tmp_path):
+    # With more ranks than key/value heads a rank can own none of the parameter. Its slice is
+    # empty, and an empty slice cannot infer the placeholder dimension of a (n, -1) view spec.
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv_proj.weight"
+    shard_widths = [[2, 0], [1, 0], [1, 0]]
+
+    full = torch.arange(8, dtype=torch.float32).view(4, 2)
+    rows = {0: [0, 1, 2, 3], 1: []}
+    for tp_index, row_ids in rows.items():
+        _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
+
+    uc_info = {
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [(2, 1, 1), -1],
+            "partition_dim": 0,
+        }],
+        SUB_PARAM_SHARD_WIDTHS: {
+            rf"^{param_name}$": shard_widths
+        },
+    }
+
+    merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2,
+                    (param_name, [torch.Size([4, 2]), torch.Size([0, 2])]))
 
     ckpt = torch.load(output_dir / param_name / "fp32.pt", weights_only=False)
     torch.testing.assert_close(ckpt[PARAM], full)

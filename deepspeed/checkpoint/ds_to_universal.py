@@ -364,6 +364,10 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
                     f"{sub_dim_size}.")
 
             logical_shape = [sum(d) if isinstance(d, tuple) else d for d in matched_sub_params_shape.shape]
+            # A rank that holds none of an uneven sub-parameter has an empty slice, and an empty
+            # slice cannot infer a placeholder dimension. Resolve the view spec up front, from
+            # the full parameter, so every rank reshapes against concrete sizes.
+            logical_shape = _resolve_logical_shape(logical_shape, sum(s.numel() for s in slices), name)
             rank_views = []
             for tp_index, tp_slice in enumerate(slices):
                 # Every rank holds one piece of each sub-parameter, so its own widths give its shape.
@@ -400,6 +404,26 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
         _save_checkpoint(final_path, ckpt_dict)
 
     return unmatched_patterns
+
+
+def _resolve_logical_shape(logical_shape, total_numel, name):
+    """Replace any placeholder dimension in a sub-parameter view spec with its real size."""
+    placeholders = [idx for idx, dim in enumerate(logical_shape) if dim is not None and dim < 0]
+    if not placeholders:
+        return logical_shape
+    assert len(placeholders) == 1, (
+        f"Sub-parameter shape {logical_shape} of {name} has {len(placeholders)} placeholder dimensions, "
+        "so it cannot be resolved.")
+    known_product = 1
+    for idx, dim in enumerate(logical_shape):
+        if idx not in placeholders:
+            known_product *= dim
+    assert known_product > 0 and total_numel % known_product == 0, (
+        f"Sub-parameter shape {logical_shape} of {name} cannot be resolved for a parameter with "
+        f"{total_numel} elements.")
+    resolved = list(logical_shape)
+    resolved[placeholders[0]] = total_numel // known_product
+    return resolved
 
 
 def merge_zero3_slices(dp_degree, dir, slice_dir, name):

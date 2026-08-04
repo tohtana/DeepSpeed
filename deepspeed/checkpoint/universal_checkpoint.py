@@ -190,7 +190,11 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size, ep_rank=0, ep
         # implementation b.
         # this version requires no additional data passed from the client
         # if the shapes already match it must be slices that were averaged - so we just hack around those
-        if full_hp_param.shape == self.shape:
+        # AutoTP restore metadata already pins down this rank's slice of the universal tensor,
+        # including layouts where one rank owns the whole thing (e.g. a single KV head under MQA).
+        # Collapsing the TP topology here would contradict the recorded per-rank widths.
+        has_autotp_meta = _get_param_uc_restore_meta(self) is not None
+        if full_hp_param.shape == self.shape and not has_autotp_meta:
             tp_rank = 0
             tp_world_size = 1
 
@@ -200,7 +204,6 @@ def load_hp_checkpoint_state(self, folder, tp_rank, tp_world_size, ep_rank=0, ep
         # degree
         # AutoTP restore metadata already describes the exact (possibly uneven) partition layout,
         # so the legacy tp-degree-derived vocab padding must not be applied on top of it.
-        has_autotp_meta = _get_param_uc_restore_meta(self) is not None
         is_vocab_tensor = ckpt_dict.get(VOCAB_TENSOR, False) and not is_expert_param and not has_autotp_meta
         if is_vocab_tensor:
             # In the absence of data passed from the user wrt new padded vocab specific to tp degree

@@ -3,13 +3,15 @@
 
 # DeepSpeed Team
 
+import pytest
 import torch
 
 from deepspeed.checkpoint.constants import (PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
-                                            TP_REPLICATED_PARAMETER_PATTERNS, DS_AUTOTP_UC_META)
+                                            SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS,
+                                            VOCABULARY_PARAMETER_PATTERNS, DS_AUTOTP_UC_META)
 from deepspeed.module_inject.layers import (_build_param_uc_restore_meta, _get_param_uc_conversion_meta,
-                                            LinearAllreduce, LinearLayer, SubParamLinearLayer,
-                                            collect_autotp_universal_checkpoint_info)
+                                            GateUpPack_LinearLayer, LinearAllreduce, LinearLayer, SubParamLinearLayer,
+                                            fused_LinearLayer, collect_autotp_universal_checkpoint_info)
 
 
 def test_collect_autotp_universal_checkpoint_info_row_parallel():
@@ -36,7 +38,8 @@ def test_collect_autotp_universal_checkpoint_info_subparams():
 
     uc_info = collect_autotp_universal_checkpoint_info(model)
 
-    assert len(uc_info[PARAMETER_WITH_SUB_PARAMS]) == 1
+    assert [entry["patterns"] for entry in uc_info[PARAMETER_WITH_SUB_PARAMS]] == [[r"^qkv\.weight$"],
+                                                                                   [r"^qkv\.bias$"]]
     assert uc_info[PARAMETER_WITH_SUB_PARAMS][0]["partition_dim"] == 0
 
 
@@ -163,6 +166,7 @@ def test_collect_publishes_physical_subparam_sizes_not_the_count():
     assert published_sizes == (4, 4, 4)
     assert sum(published_sizes) == 12
 
+
 def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
     restore_meta = _build_param_uc_restore_meta(partition_type="column",
                                                 partition_dim=0,
@@ -191,6 +195,7 @@ def test_param_uc_restore_builder_normalizes_shapes_and_nests_conversion_view():
         "original_shape": (12, 8),
         "is_bias": False,
         "replicated": False,
+        "unsupported_reason": None,
     }
 
 
@@ -224,3 +229,80 @@ def test_collect_marks_autotp_unchanged_params_as_replicated():
     # The AutoTP-replaced column-parallel weight/bias are sharded, not replicated.
     assert not any("fc.weight" in p for p in replicated)
     assert not any("fc.bias" in p for p in replicated)
+
+
+def test_collect_publishes_sub_param_metadata_for_partitioned_bias():
+    # An uneven fused bias is cut per sub-parameter just like its weight. Without sub-parameter
+    # metadata the converter concatenates the rank slices end to end, which interleaves Q/K/V
+    # and silently restores a wrong bias.
+    layer = SubParamLinearLayer(torch.nn.Linear(2, 12, bias=True),
+                                mp_group=None,
+                                shape=((6, 3, 3), -1),
+                                partition_dim=0,
+                                name="qkv")
+    layer.tp_world_size = 2
+    layer._subparam_shard_widths = ((4, 2), (2, 1), (2, 1))
+    layer.weight.data = layer.weight.data[:8].contiguous()
+    layer.bias.data = layer.bias.data[:8].contiguous()
+    layer._mark_uc_metadata()
+    model = torch.nn.Module()
+    model.qkv = layer
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    bias_entry = next(e for e in uc_info[PARAMETER_WITH_SUB_PARAMS] if e["patterns"] == [r"^qkv\.bias$"])
+    assert bias_entry["shape"] == [(6, 3, 3)]
+    assert bias_entry["partition_dim"] == 0
+    assert uc_info[SUB_PARAM_SHARD_WIDTHS][r"^qkv\.bias$"] == [[4, 2], [2, 1], [2, 1]]
+
+
+def test_collect_skips_tied_parameter_aliases():
+    # Both names reach the same tensor, but the optimizer only knows the first one, so a
+    # pattern for the alias would describe a parameter that has no TP slices to convert.
+    layer = LinearLayer(torch.nn.Linear(8, 16, bias=False), mp_group=None, name="embed_tokens")
+    model = torch.nn.Module()
+    model.embed_tokens = layer
+    model.lm_head = torch.nn.Linear(8, 16, bias=False)
+    model.lm_head.weight = layer.weight
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    all_patterns = (uc_info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] + uc_info[TP_REPLICATED_PARAMETER_PATTERNS] +
+                    uc_info[VOCABULARY_PARAMETER_PATTERNS] +
+                    [p for entry in uc_info[PARAMETER_WITH_SUB_PARAMS] for p in entry["patterns"]])
+    assert not any("lm_head" in pattern for pattern in all_patterns)
+
+
+def test_collect_rejects_fused_layouts_without_a_sub_param_split():
+    # codegen interleaves the Q/K/V blocks across ranks, so no per-sub-parameter description
+    # exists. Publishing a plain column layout would reassemble the weight in rank order.
+    class CodeGenBlock(torch.nn.Module):
+        pass
+
+    fused_module = CodeGenBlock()
+    layer = fused_LinearLayer(torch.nn.Linear(8, 12, bias=False),
+                              mp_group=None,
+                              skip_partition=True,
+                              fused_module=fused_module,
+                              name="qkv_proj")
+    model = torch.nn.Module()
+    model.qkv_proj = layer
+
+    with pytest.raises(ValueError, match="qkv_proj.weight"):
+        collect_autotp_universal_checkpoint_info(model)
+
+
+def test_gate_up_pack_publishes_sub_param_metadata():
+    layer = GateUpPack_LinearLayer(torch.nn.Linear(4, 12, bias=False), mp_group=None, name="dense_h_to_4h")
+    layer.tp_world_size = 2
+    layer._freeze_partition_sizes(12)
+    layer.weight.data = layer.weight.data[:6].contiguous()
+    layer._mark_uc_metadata()
+    model = torch.nn.Module()
+    model.dense_h_to_4h = layer
+
+    uc_info = collect_autotp_universal_checkpoint_info(model)
+
+    entry = uc_info[PARAMETER_WITH_SUB_PARAMS][0]
+    assert entry["shape"] == [(6, 6), 4]
+    assert uc_info[SUB_PARAM_SHARD_WIDTHS][r"^dense_h_to_4h\.weight$"] == [[3, 3], [3, 3]]
