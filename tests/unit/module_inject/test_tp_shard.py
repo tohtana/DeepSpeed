@@ -6,7 +6,7 @@
 import pytest
 
 from deepspeed.module_inject import tp_shard
-from deepspeed.module_inject.tp_shard import get_shard_size_list, set_num_kv_heads, set_tp_grain_size
+from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list, set_num_kv_heads, set_tp_grain_size
 
 
 @pytest.fixture(autouse=True)
@@ -41,3 +41,19 @@ def test_kv_head_shards_tile_the_dimension():
 
     # 6 kv heads over 4 ranks gives 2/2/1/1 heads, so 384 hidden splits as 128/128/64/64.
     assert get_shard_size_list(384, 4, "layers.0.self_attn.q_proj") == [128, 128, 64, 64]
+
+
+def test_process_group_resolves_noncontiguous_group_rank(monkeypatch):
+    set_tp_grain_size(64)
+    tp_group = object()
+    monkeypatch.setattr(tp_shard.dist, "get_rank", lambda group=None: 1 if group is tp_group else 2)
+
+    shard_sizes = get_shard_size_list(50257, 2, "lm_head")
+    assert get_shard_size(50257, 2, "lm_head", mp_group=tp_group) == shard_sizes[1]
+
+
+def test_shard_size_refuses_to_guess_subgroup_rank(monkeypatch):
+    monkeypatch.setattr(tp_shard.dist, "get_world_size", lambda: 4)
+
+    with pytest.raises(ValueError, match="group-local rank or process group"):
+        get_shard_size(12, 2)
