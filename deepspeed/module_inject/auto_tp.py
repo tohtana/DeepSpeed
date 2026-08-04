@@ -19,6 +19,8 @@ from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
 from deepspeed.utils import groups
 from deepspeed.utils.logging import log_dist
 from deepspeed.module_inject.layers import is_autotp_training_mode
+from deepspeed.module_inject.layers import _build_param_uc_restore_meta
+from deepspeed.checkpoint.constants import DS_AUTOTP_UC_META
 from .autotp_config import TPLayerSpec, AutoTPConfig, PartitionType
 
 
@@ -558,21 +560,33 @@ class AutoTP():
 
         mp_replace = ReplaceWithTensorSlicing(mp_group=self.mp_group)
 
+        original_shape = tuple(child.weight.shape)
+        partition_sizes = get_shard_size_list(original_shape[1], self.mp_size, name)
         if hasattr(child.weight, 'ds_tensor'):
-            data = child.weight.ds_tensor.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size), dim=1)
+            data = child.weight.ds_tensor.data.split(partition_sizes, dim=1)
         else:
-            data = child.weight.data.split(get_shard_size_list(child.weight.shape[1], self.mp_size, name), dim=1)
+            data = child.weight.data.split(partition_sizes, dim=1)
         data = data[mp_replace.gpu_index].to(get_accelerator().current_device_name())
         data = torch.nn.parameter.Parameter(data, requires_grad=False)
 
-        new_embedding = nn.Embedding(child.weight.shape[0], get_shard_size(child.weight.shape[1], self.mp_size, name))
+        new_embedding = nn.Embedding(child.weight.shape[0], data.shape[1])
         new_embedding.weight.data.copy_(data)
+        setattr(
+            new_embedding.weight, DS_AUTOTP_UC_META,
+            _build_param_uc_restore_meta(partition_type='row',
+                                         partition_dim=1,
+                                         logical_shape=original_shape,
+                                         output_shape=original_shape,
+                                         partition_sizes=partition_sizes,
+                                         target_partition_shape=tuple(new_embedding.weight.shape),
+                                         original_shape=original_shape))
         setattr(child, "replaced", True)
         return new_embedding
 
     def update_mp_params(self, child):
         if getattr(child, "replaced", False) == True:
             return
+        tp_index = dist.get_rank(group=self.mp_group) if self.mp_group is not None else 0
         param_list = [
             "n_heads", "inner_dim", "num_heads", "num_kv", "num_attention_heads", "num_attn_heads", "all_head_size",
             "embed_dim", "hidden_size", "num_key_value_heads", "num_kv_heads", "kv_n_heads", "d_model",
@@ -583,7 +597,7 @@ class AutoTP():
                 param_list.remove('embed_dim')
             if hasattr(child, param):
                 param_val = getattr(child, param)
-                setattr(child, param, get_shard_size(param_val, self.mp_size))
+                setattr(child, param, get_shard_size(param_val, self.mp_size, rank=tp_index))
         setattr(child, "replaced", True)
 
     def update_linear_policies(self):
