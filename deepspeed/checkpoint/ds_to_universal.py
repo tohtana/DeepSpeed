@@ -414,6 +414,11 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
                 # Every rank holds one piece of each sub-parameter, so its own widths give its shape.
                 rank_shape = list(logical_shape)
                 rank_shape[partition_dim] = sum(widths[tp_index] for widths in shard_widths)
+                # The widths describe how this rank's slice was cut, so they must account for exactly
+                # the elements it holds. A mismatch means the metadata describes a different parameter.
+                assert math.prod(rank_shape) == tp_slice.numel(), (
+                    f"tp rank {tp_index} of {name} holds {tp_slice.numel()} elements, but its recorded "
+                    f"shard widths describe a shape of {tuple(rank_shape)}.")
                 rank_views.append(tp_slice.view(rank_shape))
 
             merged_chunks = []
