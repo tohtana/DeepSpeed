@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -9,13 +9,14 @@ import torch
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.compile.init_tp import AUTOTP_MIN_TORCH_VERSION
 from deepspeed.utils import groups
 from deepspeed.utils.torch import required_torch_version
 
 from unit.common import DistributedTest
 
-pytestmark = pytest.mark.skipif(not required_torch_version(min_version=2.9),
-                                reason="The AutoTP compile pass requires PyTorch >= 2.9")
+pytestmark = pytest.mark.skipif(not required_torch_version(min_version=AUTOTP_MIN_TORCH_VERSION),
+                                reason=f"The AutoTP compile pass requires PyTorch >= {AUTOTP_MIN_TORCH_VERSION}")
 
 HIDDEN_DIM = 64
 INTERMEDIATE_DIM = 128
@@ -31,7 +32,10 @@ class MLPBlock(torch.nn.Module):
         self.down_proj = torch.nn.Linear(INTERMEDIATE_DIM, HIDDEN_DIM, bias=False)
 
     def forward(self, x):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+        # The residual is what makes this block interesting for the pass: x feeds the two
+        # column-parallel matmuls and the addition, and only the matmuls may be routed through the
+        # backward all-reduce. Reducing the residual gradient too would scale it by the TP size.
+        return x + self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class MLPModel(torch.nn.Module):
@@ -39,14 +43,20 @@ class MLPModel(torch.nn.Module):
     def __init__(self, nlayers=2):
         super().__init__()
         self.layers = torch.nn.ModuleList([MLPBlock() for _ in range(nlayers)])
+        self.head = torch.nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
-        return x
+        return self.head(x)
 
 
-def build_config(tp_size, use_compile_pass):
+def build_config(tp_size, use_compile_pass, gather_output_head=False):
+    head_spec = {
+        "patterns": [".*\\.head\\.weight$"],
+        "partition_type": "column",
+        "gather_output": gather_output_head,
+    }
     config = {
         "train_micro_batch_size_per_gpu": 1,
         "optimizer": {
@@ -66,7 +76,7 @@ def build_config(tp_size, use_compile_pass):
                 }, {
                     "patterns": [".*\\.down_proj\\.weight$"],
                     "partition_type": "row",
-                }],
+                }, head_spec],
             },
         },
         "zero_optimization": {
@@ -78,14 +88,14 @@ def build_config(tp_size, use_compile_pass):
     return config
 
 
-def build_engine(tp_size, use_compile_pass):
+def build_engine(tp_size, use_compile_pass, gather_output_head=False):
     # Both engines are built from the same seed so they hold identical shards, which lets the
     # gradients be compared directly without gathering them first.
     torch.manual_seed(42)
     model = MLPModel()
     engine, _, _, _ = deepspeed.initialize(model=model,
                                            model_parameters=model.parameters(),
-                                           config=build_config(tp_size, use_compile_pass))
+                                           config=build_config(tp_size, use_compile_pass, gather_output_head))
     if use_compile_pass:
         engine.compile()
     return engine
@@ -112,10 +122,11 @@ class TestAutoTPCompileEquivalence(DistributedTest):
 
         # The TP group must see identical inputs on every rank.
         torch.manual_seed(1234)
-        x = torch.randn(1, 8, HIDDEN_DIM, device=device, dtype=torch.float32)
+        x = torch.randn(1, 8, HIDDEN_DIM, device=device, dtype=torch.float32, requires_grad=True)
+        compiled_x = x.detach().clone().requires_grad_(True)
 
         reference_out = reference_engine(x)
-        compiled_out = compiled_engine(x)
+        compiled_out = compiled_engine(compiled_x)
         assert torch.allclose(reference_out, compiled_out, atol=1e-5), \
             "AutoTP compile pass changed the forward result"
 
@@ -128,6 +139,9 @@ class TestAutoTPCompileEquivalence(DistributedTest):
                                                                 compiled_engine.module.named_parameters()):
             assert torch.allclose(reference_param.grad, compiled_param.grad, atol=1e-5), \
                 f"AutoTP compile pass changed the gradient of {name}"
+
+        assert torch.allclose(x.grad, compiled_x.grad, atol=1e-5), \
+            "AutoTP compile pass changed the gradient reaching the model input"
 
 
 class TestAutoTPCompileDataParallelGradients(DistributedTest):
@@ -168,6 +182,25 @@ class TestAutoTPCompileDataParallelGradients(DistributedTest):
             dist.all_gather(gathered, param.grad.contiguous(), group=dp_group)
             assert torch.allclose(gathered[0], gathered[-1], atol=1e-5), \
                 f"Gradient of {name} was not reduced across the data-parallel group"
+
+
+class TestAutoTPCompileRejectsGatherOutput(DistributedTest):
+    """gather_output layers must be rejected instead of silently losing a collective.
+
+    Their gather reads shard sizes back into Python, which the full graph the pass needs cannot
+    capture, so the pass can neither emit the collectives nor leave them to the module.
+    """
+
+    world_size = 2
+    non_daemonic_procs = True
+
+    @pytest.mark.sequential
+    def test_gather_output_raises(self):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("CPU does not support this test yet")
+
+        with pytest.raises(NotImplementedError, match="gather_output"):
+            build_engine(self.world_size, use_compile_pass=True, gather_output_head=True)
 
 
 class TestAutoTPCompileRejectsUnsupportedCombinations(DistributedTest):

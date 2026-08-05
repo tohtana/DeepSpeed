@@ -1,7 +1,9 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
+
+from typing import Dict, List
 
 import torch
 from torch.fx import GraphModule, Node
@@ -32,16 +34,14 @@ _MATMUL_TARGETS = {
 def defer_collectives_to_compiler(model) -> int:
     """Suppress the module-level TP collectives on layers this pass will handle in the graph.
 
-    Returns the number of layers handed over to the pass. Layers the pass does not rewrite (a
-    column-parallel layer that gathers its output, the fused sub-param variants, conv and
-    embedding layers) keep their module-level collectives and stay correct as-is.
+    Returns the number of layers handed over to the pass. Layers the pass does not rewrite (the
+    fused sub-param variants, conv and embedding layers) keep their module-level collectives and
+    stay correct as-is.
     """
     deferred = 0
-    for module in model.modules():
+    for name, module in model.named_modules():
         is_row_parallel = type(module) is ROW_PARALLEL_LAYER
-        # gather_output adds a further collective that this pass does not emit yet, so leave those
-        # layers to the module-level path.
-        is_column_parallel = type(module) is COLUMN_PARALLEL_LAYER and not module.gather_output
+        is_column_parallel = type(module) is COLUMN_PARALLEL_LAYER
         if not (is_row_parallel or is_column_parallel):
             continue
         if module.mp_group is None:
@@ -49,6 +49,14 @@ def defer_collectives_to_compiler(model) -> int:
         if type(module).tp_overlap_comm:
             raise NotImplementedError("AutoTP compile pass does not support tp_overlap_comm. Set "
                                       "'tp_overlap_comm': false to emit the collectives into the graph.")
+        # GatherFromTensorParallelRegion reads the gathered shard sizes back into Python, which the
+        # full graph this pass needs cannot capture. Leaving such a layer on the module-level path
+        # is not an option either: the pass identifies column-parallel layers by type, so it would
+        # add a second collective on top of the module's own and reduce the input gradient twice.
+        if is_column_parallel and module.gather_output:
+            raise NotImplementedError(
+                f"AutoTP compile pass does not support gather_output layers, but '{name}' is one. Partition it "
+                "without gather_output, or drop 'autotp' from the DeepCompile passes for this model.")
         module.defer_collectives_to_compiler = True
         deferred += 1
     return deferred
@@ -63,35 +71,49 @@ def _originating_layer_type(node: Node):
     return module_type
 
 
-def _insert_after(gm: GraphModule, node: Node, op) -> Node:
-    """Insert ``op(node)`` and re-point every consumer of ``node`` at the new node."""
-    with gm.graph.inserting_after(node):
-        collective_node = gm.graph.call_function(op, args=(node, ))
-    collective_node.meta["val"] = node.meta.get("val")
-    # Steal every consumer first, then hand the original back as this node's own input; doing it in
-    # the other order would leave the new node feeding itself.
-    node.replace_all_uses_with(collective_node)
-    collective_node.update_arg(0, node)
+def _insert_row_collective(gm: GraphModule, matmul: Node) -> Node:
+    """Insert g after a row-parallel matmul.
+
+    Every consumer has to read the reduced value, which is also what the module-level
+    RowParallel.apply this replaces produces.
+    """
+    with gm.graph.inserting_after(matmul):
+        collective_node = gm.graph.call_function(ROW_PARALLEL_OP, args=(matmul, ))
+    collective_node.meta["val"] = matmul.meta.get("val")
+    matmul.replace_all_uses_with(collective_node)
+    collective_node.update_arg(0, matmul)
+    return collective_node
+
+
+def _insert_column_collective(gm: GraphModule, activation: Node, consumers: List[Node]) -> Node:
+    """
+    Insert f in front of the column-parallel matmuls that share activation.
+    """
+    with gm.graph.inserting_before(consumers[0]):
+        collective_node = gm.graph.call_function(COLUMN_PARALLEL_OP, args=(activation, ))
+    collective_node.meta["val"] = activation.meta.get("val")
+    for consumer in consumers:
+        consumer.replace_input_with(activation, collective_node)
     return collective_node
 
 
 def pass_insert_tp_collectives(gm: GraphModule, real_inputs):
     """Insert the tensor-parallel collectives around the matmuls of the injected AutoTP layers."""
+    column_consumers: Dict[Node, List[Node]] = {}
+
     for node in list(gm.graph.nodes):
         if node.op != "call_function" or node.target not in _MATMUL_TARGETS:
             continue
 
         layer_type = _originating_layer_type(node)
         if layer_type is ROW_PARALLEL_LAYER:
-            _insert_after(gm, node, ROW_PARALLEL_OP)
+            _insert_row_collective(gm, node)
         elif layer_type is COLUMN_PARALLEL_LAYER:
             activation = node.args[0]
-            # Column-parallel layers that share an activation (q/k/v, gate/up) need only one
-            # collective. Inserting it already re-pointed the sibling matmuls at the new node, so
-            # finding one here means this activation has been handled.
-            if activation.op == "call_function" and activation.target is COLUMN_PARALLEL_OP:
-                continue
-            _insert_after(gm, activation, COLUMN_PARALLEL_OP)
+            column_consumers.setdefault(activation, []).append(node)
+
+    for activation, consumers in column_consumers.items():
+        _insert_column_collective(gm, activation, consumers)
 
 
 def pass_canonicalize(gm: GraphModule, real_inputs):
