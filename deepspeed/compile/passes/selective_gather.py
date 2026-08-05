@@ -13,7 +13,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import log_dist
 
-from ..util import get_deepcompile_handle, all_reduce
+from ..util import get_deepcompile_handle
 from ..graph_param import DSGraphParamManager
 from ..profilers.graph_profile import is_profile_incomplete
 from .contract import PassContract, CAP_Z3_GATHER_RELEASE
@@ -172,7 +172,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     current_available_mem = accelerator.available_memory()
     vals_to_bcast = torch.tensor([total_mem, current_available_mem],
                                  device=torch.device(get_accelerator().current_device()))
-    all_reduce(vals_to_bcast, dist.ReduceOp.MIN, process_group)
+    dist.all_reduce(vals_to_bcast, dist.ReduceOp.MIN, group=process_group)
     total_mem = vals_to_bcast[0].item()
     current_available_mem = vals_to_bcast[1].item()
 

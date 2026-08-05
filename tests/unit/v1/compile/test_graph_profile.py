@@ -126,7 +126,7 @@ def test_profiling_interpreter_wall_time_excludes_warmup(monkeypatch):
     monkeypatch.setattr(graph_profile, "is_comm_op", lambda node: False)
     monkeypatch.setattr(graph_profile, "is_release_node", lambda node: False)
     monkeypatch.setattr(graph_profile.dist, "is_initialized", lambda: False)
-    monkeypatch.setattr(graph_profile.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(graph_profile.dist, "get_rank", lambda group=None: 0)
 
     timestamps = iter(range(20))
     monkeypatch.setattr(graph_profile.time, "time", lambda: next(timestamps))

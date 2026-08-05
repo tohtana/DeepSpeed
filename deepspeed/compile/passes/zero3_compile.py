@@ -14,7 +14,6 @@ import torch
 from torch.fx import Graph, Node, GraphModule
 
 from ..util import get_input_nodes, get_param_nodes, get_index_by_graph_id, get_deepcompile_handle, get_real_uses, is_cast_op
-from ..util import all_reduce, get_rank
 from ..fx import (add_postprocess, _make_node_meta, get_output_node, move_primals_to_head, add_end_backward,
                   replace_reduce_outputs_with_none, should_release_reduce_buckets)
 from ..profilers.graph_profile import ProfilingInterpreter, is_profile_incomplete
@@ -39,7 +38,7 @@ def _reduce_int(value: int, op, process_group=None):
     value_tensor = torch.tensor([int(value)],
                                 device=torch.device(get_accelerator().current_device()),
                                 dtype=torch.int64)
-    all_reduce(value_tensor, op, process_group)
+    dist.all_reduce(value_tensor, op, group=process_group)
     return int(value_tensor.item())
 
 
@@ -63,7 +62,7 @@ def _sync_profile_complete(profile_complete: bool, process_group=None):
     complete = torch.tensor([1 if profile_complete else 0],
                             device=torch.device(get_accelerator().current_device()),
                             dtype=torch.int)
-    all_reduce(complete, dist.ReduceOp.MIN, process_group)
+    dist.all_reduce(complete, dist.ReduceOp.MIN, group=process_group)
     return bool(complete.item())
 
 
@@ -110,7 +109,7 @@ def _scheduler_debug_enabled():
 def _print_scheduler_debug(message: str, process_group=None):
     if not _scheduler_debug_enabled():
         return
-    if not dist.is_initialized() or get_rank(process_group) == 0:
+    if not dist.is_initialized() or dist.get_rank(group=process_group) == 0:
         print(message, flush=True)
 
 
@@ -178,8 +177,8 @@ def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool,
     device = torch.device(get_accelerator().current_device())
     min_fingerprint = torch.tensor([fingerprint], device=device, dtype=torch.int64)
     max_fingerprint = min_fingerprint.clone()
-    all_reduce(min_fingerprint, dist.ReduceOp.MIN, process_group)
-    all_reduce(max_fingerprint, dist.ReduceOp.MAX, process_group)
+    dist.all_reduce(min_fingerprint, dist.ReduceOp.MIN, group=process_group)
+    dist.all_reduce(max_fingerprint, dist.ReduceOp.MAX, group=process_group)
     if min_fingerprint.item() != max_fingerprint.item():
         raise RuntimeError(
             f"DeepCompile ZeRO-3 final schedule fingerprint mismatch for graph_id={graph_id} bwd={bwd}: "
@@ -442,7 +441,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
     # but before the scheduler rewrites graph order and Inductor metadata.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
 
-    rank = get_rank(process_group)
+    rank = dist.get_rank(group=process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
     if rank == 0 and debug_log:
         print(f"Fwd before scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
@@ -499,7 +498,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
     # rank emits collectives in the same order even when allocator state differs.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
 
-    rank = get_rank(process_group)
+    rank = dist.get_rank(group=process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
     if rank == 0 and debug_log:
         print(f"Bwd before scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
