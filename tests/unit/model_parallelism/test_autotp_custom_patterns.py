@@ -13,8 +13,8 @@ from torch import nn
 from unit.common import DistributedTest, preferred_dtype
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import groups
-from deepspeed.module_inject.layers import (GateUpPack_LinearLayer, LinearAllreduce, LinearLayer, SubParamLinearLayer,
-                                            fused_LinearLayer)
+from deepspeed.module_inject.layers import (GateUpPack_LinearLayer, LinearAllreduce, LinearLayer,
+                                            SubParamLinearAllreduce, SubParamLinearLayer, fused_LinearLayer)
 from deepspeed.module_inject.layers import collect_autotp_universal_checkpoint_info
 from deepspeed.checkpoint.constants import PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, TP_REPLICATED_PARAMETER_PATTERNS
 from deepspeed.module_inject.autotp_config import AutoTPConfig
@@ -736,6 +736,26 @@ class TestAutoTPFusedWeights(DistributedTest):
         torch.testing.assert_close(layer.weight.data, full_weight)
         torch.testing.assert_close(layer.bias.data, full_bias)
 
+    def test_gate_up_single_param_bias_gather_partition(self):
+        skip_on_device()
+        init_tp_engine(tp_size=2)
+
+        hidden_dim = 8
+        torch.manual_seed(43)
+        linear = nn.Linear(hidden_dim,
+                           hidden_dim * 2,
+                           bias=True,
+                           dtype=preferred_dtype(),
+                           device=get_accelerator().current_device_name())
+        full_bias = deepcopy(linear.bias.data)
+
+        layer = GateUpPack_LinearLayer(deepcopy(linear), groups.get_tensor_model_parallel_group())
+        bias_shard = layer.bias.data.clone()
+        layer.bias.gather_params([layer.bias])
+        torch.testing.assert_close(layer.bias.data, full_bias)
+        layer.bias._tp_partition([layer.bias])
+        torch.testing.assert_close(layer.bias.data, bias_shard)
+
     def test_gqa_uneven_qkv_fused_weight_partition(self):
         skip_on_device()
         init_tp_engine(tp_size=2)
@@ -761,6 +781,77 @@ class TestAutoTPFusedWeights(DistributedTest):
 
         layer.gather_params([layer.weight, layer.bias])
         torch.testing.assert_close(layer.weight.data, full_weight)
+        torch.testing.assert_close(layer.bias.data, full_bias)
+
+    def test_subparam_linear_single_param_weight_and_bias_roundtrip(self):
+        skip_on_device()
+        init_tp_engine(tp_size=2)
+
+        hidden_dim = 8
+        q_size, k_size, v_size = 8, 4, 4
+        torch.manual_seed(124)
+        linear = nn.Linear(hidden_dim,
+                           q_size + k_size + v_size,
+                           bias=True,
+                           dtype=preferred_dtype(),
+                           device=get_accelerator().current_device_name())
+        full_weight = deepcopy(linear.weight.data)
+        full_bias = deepcopy(linear.bias.data)
+
+        layer = SubParamLinearLayer(deepcopy(linear),
+                                    groups.get_tensor_model_parallel_group(),
+                                    shape=((q_size, k_size, v_size), -1),
+                                    partition_dim=0,
+                                    name="self_attn.qkv_proj")
+
+        weight_shard = layer.weight.data.clone()
+        bias_shard = layer.bias.data.clone()
+
+        layer.weight.gather_params([layer.weight])
+        torch.testing.assert_close(layer.weight.data, full_weight)
+        layer.weight._tp_partition([layer.weight])
+        torch.testing.assert_close(layer.weight.data, weight_shard)
+
+        layer.bias.gather_params([layer.bias])
+        torch.testing.assert_close(layer.bias.data, full_bias)
+        layer.bias._tp_partition([layer.bias])
+        torch.testing.assert_close(layer.bias.data, bias_shard)
+
+    def test_subparam_allreduce_single_param_weight_and_bias_roundtrip(self):
+        # engine.py hands the layer one parameter at a time, so bias has to be recognized by
+        # identity rather than by its position in the list.
+        skip_on_device()
+        init_tp_engine(tp_size=2)
+
+        out_dim = 8
+        q_size, k_size, v_size = 8, 4, 4
+        torch.manual_seed(125)
+        linear = nn.Linear(q_size + k_size + v_size,
+                           out_dim,
+                           bias=True,
+                           dtype=preferred_dtype(),
+                           device=get_accelerator().current_device_name())
+        full_weight = deepcopy(linear.weight.data)
+        full_bias = deepcopy(linear.bias.data)
+
+        layer = SubParamLinearAllreduce(deepcopy(linear),
+                                        groups.get_tensor_model_parallel_group(),
+                                        shape=(-1, (q_size, k_size, v_size)),
+                                        partition_dim=1,
+                                        name="self_attn.o_proj")
+
+        weight_shard = layer.weight.data.clone()
+        # Row parallel replicates the bias, so partitioning must leave it at full size.
+        torch.testing.assert_close(layer.bias.data, full_bias)
+
+        layer.gather_params([layer.weight])
+        torch.testing.assert_close(layer.weight.data, full_weight)
+        layer._tp_partition([layer.weight])
+        torch.testing.assert_close(layer.weight.data, weight_shard)
+
+        layer.gather_params([layer.bias])
+        torch.testing.assert_close(layer.bias.data, full_bias)
+        layer._tp_partition([layer.bias])
         torch.testing.assert_close(layer.bias.data, full_bias)
 
     def test_gather_uses_the_layers_own_shard_widths(self):

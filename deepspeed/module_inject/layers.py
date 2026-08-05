@@ -384,6 +384,10 @@ class TensorParallel_Layer(nn.Module, ABC):
             else:
                 weight.requires_grad = False
 
+    def _is_bias_param(self, param):
+        bias = getattr(self, 'bias', None)
+        return bias is not None and param is bias
+
     def config_tp_params(self, weight):
         """
         Configures the weight tensor for training with tensor parallelism. This includes enabling gradients
@@ -979,7 +983,7 @@ class SubParamColumnParallel(LinearLayer):
         for idx, param in enumerate(params_list):
             if param is None:
                 continue
-            logical_shape = self._orig_weight_shape if idx == 0 else self._orig_bias_shape
+            logical_shape = self._orig_bias_shape if self._is_bias_param(param) else self._orig_weight_shape
             full_view = _gather_logical_tensor(param,
                                                logical_shape,
                                                0,
@@ -1665,16 +1669,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
         for idx, param in enumerate(params_list):
             if param is None:
                 continue
-            if idx == 0:
-                full_view = _gather_logical_tensor(param,
-                                                   self._logical_shape,
-                                                   self.partition_dim,
-                                                   self.mp_group,
-                                                   self.tp_world_size,
-                                                   self._subparam_shard_widths,
-                                                   subparam_sizes=self._subparam_sizes)
-                params_list[idx].data = full_view.reshape(self._orig_weight_shape)
-            else:
+            if self._is_bias_param(param):
                 if self._bias_partition_dim is None:
                     params_list[idx].data = param.data
                 else:
@@ -1686,35 +1681,46 @@ class SubParamLinearLayer(TensorParallel_Layer):
                                                             self._subparam_shard_widths,
                                                             subparam_sizes=self._subparam_sizes)
                     params_list[idx].data = full_bias_view.reshape(self._orig_bias_shape)
+                continue
+
+            full_view = _gather_logical_tensor(param,
+                                               self._logical_shape,
+                                               self.partition_dim,
+                                               self.mp_group,
+                                               self.tp_world_size,
+                                               self._subparam_shard_widths,
+                                               subparam_sizes=self._subparam_sizes)
+            params_list[idx].data = full_view.reshape(self._orig_weight_shape)
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
-        weight = params_list[0]
-        if weight is None:
-            return
+        for idx, param in enumerate(params_list):
+            if param is None:
+                continue
+            if self._is_bias_param(param):
+                if self._bias_partition_dim is None:
+                    params_list[idx].data = self.move(param).detach()
+                else:
+                    bias_view = param.reshape(self._output_shape)
+                    bias_partitioned = _partition_logical_tensor(bias_view,
+                                                                 self._bias_partition_dim,
+                                                                 self.tp_world_size,
+                                                                 self.tp_index,
+                                                                 self._subparam_shard_widths,
+                                                                 subparam_sizes=self._subparam_sizes)
+                    params_list[idx].data = self.move(bias_partitioned.reshape(-1)).detach()
+                continue
 
-        weight_view = weight.reshape(self._logical_shape)
-        partitioned_view = _partition_logical_tensor(weight_view,
-                                                     self.partition_dim,
-                                                     self.tp_world_size,
-                                                     self.tp_index,
-                                                     self._subparam_shard_widths,
-                                                     subparam_sizes=self._subparam_sizes)
-        leading_size = _shape_prod(partitioned_view.shape[:-1])
-        params_list[0].data = self.move(partitioned_view.reshape(leading_size, partitioned_view.shape[-1])).detach()
-
-        if params_list[1] is not None:
-            if self._bias_partition_dim is None:
-                params_list[1].data = self.move(params_list[1]).detach()
-            else:
-                bias_view = params_list[1].reshape(self._output_shape)
-                bias_partitioned = _partition_logical_tensor(bias_view,
-                                                             self._bias_partition_dim,
-                                                             self.tp_world_size,
-                                                             self.tp_index,
-                                                             self._subparam_shard_widths,
-                                                             subparam_sizes=self._subparam_sizes)
-                params_list[1].data = self.move(bias_partitioned.reshape(-1)).detach()
+            weight_view = param.reshape(self._logical_shape)
+            partitioned_view = _partition_logical_tensor(weight_view,
+                                                         self.partition_dim,
+                                                         self.tp_world_size,
+                                                         self.tp_index,
+                                                         self._subparam_shard_widths,
+                                                         subparam_sizes=self._subparam_sizes)
+            leading_size = _shape_prod(partitioned_view.shape[:-1])
+            params_list[idx].data = self.move(partitioned_view.reshape(leading_size,
+                                                                       partitioned_view.shape[-1])).detach()
 
     def _mark_uc_metadata(self):
         self._set_param_uc_meta(self.weight,
@@ -1787,9 +1793,11 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
     def gather_params(self, params_list):
         """Gather partitioned parameters back to full size."""
         for idx, param in enumerate(params_list):
-            if param is None or idx > 0:
+            if param is None:
+                continue
+            if self._is_bias_param(param):
                 # don't gather bias for row parallel
-                return
+                continue
             full_view = _gather_logical_tensor(param,
                                                self._logical_shape,
                                                self.partition_dim,
@@ -1801,23 +1809,24 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
 
     @torch.no_grad()
     def _tp_partition(self, params_list):
-        weight = params_list[0]
-        if weight is None:
-            return
+        for idx, param in enumerate(params_list):
+            if param is None:
+                continue
+            if self._is_bias_param(param):
+                # Bias is not partitioned for row parallel (it's applied after all-reduce)
+                params_list[idx].data = self.move(param).detach()
+                continue
 
-        weight_view = weight.reshape(self._logical_shape)
-        partitioned_view = _partition_logical_tensor(weight_view,
-                                                     self.partition_dim,
-                                                     self.tp_world_size,
-                                                     self.tp_index,
-                                                     self._subparam_shard_widths,
-                                                     subparam_sizes=self._subparam_sizes)
-        leading_size = _shape_prod(partitioned_view.shape[:-1])
-        params_list[0].data = self.move(partitioned_view.reshape(leading_size, partitioned_view.shape[-1])).detach()
-
-        # Bias is not partitioned for row parallel (it's applied after all-reduce)
-        if params_list[1] is not None:
-            params_list[1].data = self.move(params_list[1]).detach()
+            weight_view = param.reshape(self._logical_shape)
+            partitioned_view = _partition_logical_tensor(weight_view,
+                                                         self.partition_dim,
+                                                         self.tp_world_size,
+                                                         self.tp_index,
+                                                         self._subparam_shard_widths,
+                                                         subparam_sizes=self._subparam_sizes)
+            leading_size = _shape_prod(partitioned_view.shape[:-1])
+            params_list[idx].data = self.move(partitioned_view.reshape(leading_size,
+                                                                       partitioned_view.shape[-1])).detach()
 
     def _mark_uc_metadata(self):
         self._set_param_uc_meta(self.weight,
