@@ -364,6 +364,9 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
                 # publishes their physical widths as a tuple. Recover the old representation
                 # from the complete dimension before applying divisibility checks.
                 num_sub_params = sub_dim_spec
+                assert all(tp_slice.dim() > partition_dim for tp_slice in slices), (
+                    f"Legacy sub-parameter metadata for {name} needs per-rank shapes to recover its "
+                    f"sub-parameter widths, but the merged slices are flat.")
                 full_partition_size = sum(tp_slice.shape[partition_dim] for tp_slice in slices)
                 assert num_sub_params > 0 and full_partition_size % num_sub_params == 0, (
                     f"Legacy sub-parameter count {num_sub_params} for {name} does not evenly divide its full "
