@@ -22,6 +22,12 @@ from .util import get_input_nodes
 from .graph_param import DSGraphParamManager
 from .partitioner import get_wrapped_partitioner
 
+# With PyTorch 2.10, Inductor was observed to generate a mix-order persistent
+# reduction for a DeepCompile ZeRO-3 backward graph, and Triton rejected the
+# kernel for exceeding the hardware's per-kernel resource limit. Setting
+# persistent_reductions=False alone is insufficient because mix-order codegen
+# passes override_persistent_reduction=True. Revisit this ZeRO-3 compile
+# workaround when PyTorch's Inductor reduction heuristics change.
 _DEEP_COMPILE_Z3_INDUCTOR_REDUCTION_CONFIG = {
     "triton.mix_order_reduction": False,
     "triton.persistent_reductions": False,
