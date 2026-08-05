@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import deepspeed.comm as dist
@@ -2044,6 +2046,27 @@ class TestUnmanagedGradientAccumulation(DistributedTest):
 class TestUnmanagedGradientAccumulationValidation(DistributedTest):
     """Unmanaged mode rejects ZeRO offload (until follow-up PR)."""
     world_size = 1
+
+    @pytest.mark.parametrize("use_scale", [False, True], ids=["tensor-backward", "engine-scale"])
+    def test_unmanaged_rejects_direct_backward_before_optimizer_prologue(self, use_scale):
+        hidden_dim = 4
+        initialize_distributed()
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(2, gradient_accumulation_steps=4, managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        loss = engine(torch.randn(1, hidden_dim, device=engine.device), torch.randn(1,
+                                                                                    hidden_dim,
+                                                                                    device=engine.device))
+        if use_scale:
+            loss = engine.scale(loss)
+
+        with patch.object(engine.optimizer, "backward_prologue", wraps=engine.optimizer.backward_prologue) as prologue:
+            with pytest.raises(RuntimeError, match=r"engine\.backward\(loss, scale_wrt_gas=False\)"):
+                loss.backward()
+            prologue.assert_not_called()
+
+        engine.destroy()
 
     def test_unmanaged_rejects_zero_offload(self):
         hidden_dim = 4
