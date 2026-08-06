@@ -29,7 +29,8 @@ from deepspeed.pipe import PipelineModule
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
-from deepspeed.utils import RepeatingLoader
+from deepspeed.utils import RepeatingLoader, groups
+from deepspeed.module_inject.tp_shard import get_shard_size_list
 
 from unit.common import DistributedTest
 
@@ -1064,20 +1065,44 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
             },
         }
 
+        from copy import deepcopy
+
         torch.manual_seed(42)
         model = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+        reference = deepcopy(model)  # unsharded, plain nn.Linear; independent source of truth
         engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
-        assert engine.module.lm_head.weight.shape[0] in (51, 50)
 
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        shard_sizes = get_shard_size_list(vocab_size, self.world_size, "lm_head")
+        assert shard_sizes == [51, 50], shard_sizes
+        assert engine.module.lm_head.weight.shape[0] == shard_sizes[tp_rank]
+
+        dev = engine.device
+        dtype = engine.module.lm_head.weight.dtype
+
+        # ====== Phase 1: sharded forward == unsharded reference, element-wise ======
+        x = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x, src=0, group=tp_group)
+        x_ref = x.detach().cpu()
+        with torch.no_grad():
+            out = engine.module.lm_head(x).cpu()
+        torch.testing.assert_close(out, reference.lm_head(x_ref), atol=1e-2, rtol=1e-2)
+
+        # ====== Phase 2: universal ckpt save -> convert -> load is lossless ======
         _train_steps(engine, hidden_dim)
         expected_weight = engine.module.lm_head.weight.detach().cpu().clone()
         expected_bias = engine.module.lm_head.bias.detach().cpu().clone()
+        # Independently all-gather the trained shards so the merged-file and restored-forward
+        # references are built without AutoTP's own gather.
+        exp_w_full = _all_gather_cat_dim0(engine.module.lm_head.weight.detach(), tp_group).cpu()
+        exp_b_full = _all_gather_cat_dim0(engine.module.lm_head.bias.detach().view(-1, 1), tp_group).view(-1).cpu()
         _save_and_convert(engine, tmpdir)
 
-        if dist.get_rank() == 0:
-            merged = torch.load(os.path.join(tmpdir, UNIVERSAL_TAG, "zero", "lm_head.weight", "fp32.pt"),
-                                weights_only=False)
-            assert tuple(merged[PARAM].shape) == (vocab_size, hidden_dim)
+        # Checked on every rank: a rank-0-only failure would leave the others hanging in
+        # the next collective instead of failing the test.
+        _assert_merged_matches(tmpdir, "lm_head.weight", exp_w_full)
+        _assert_merged_matches(tmpdir, "lm_head.bias", exp_b_full)
 
         config_dict["checkpoint"] = {"load_universal": True}
         torch.manual_seed(123)
@@ -1089,6 +1114,14 @@ class TestUnevenColumnUniversalCheckpoint(DistributedTest):
 
         torch.testing.assert_close(restored_engine.module.lm_head.weight.detach().cpu(), expected_weight)
         torch.testing.assert_close(restored_engine.module.lm_head.bias.detach().cpu(), expected_bias)
+
+        # Restored forward == F.linear with the independently gathered expected weights.
+        x2 = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x2, src=0, group=tp_group)
+        with torch.no_grad():
+            restored_out = restored_engine.module.lm_head(x2).cpu()
+        ref2 = torch.nn.functional.linear(x2.cpu(), exp_w_full, exp_b_full)
+        torch.testing.assert_close(restored_out, ref2, atol=1e-2, rtol=1e-2)
 
         # The optimizer must be usable after the restore.
         _train_steps(restored_engine, hidden_dim, steps=1)
@@ -1117,24 +1150,52 @@ class TestUnevenRowUniversalCheckpoint(DistributedTest):
             },
         }
 
+        from copy import deepcopy
+
         torch.manual_seed(42)
         model = GQAAttentionModel(hidden_dim, num_heads)
+        reference = deepcopy(model)  # unsharded, plain nn.Linear; independent source of truth
         engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
 
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
         attn = engine.module.layers[0].self_attn
         # Column and row parallelism must shard the same dimension identically.
         assert attn.q_proj.weight.shape[0] == attn.o_proj.weight.shape[1]
+        head_dim = hidden_dim // num_heads
+        head_shards = get_shard_size_list(num_heads, self.world_size, attn.q_proj.name)
+        assert head_shards == [2, 2, 1, 1], head_shards
+        dim_shards = [h * head_dim for h in head_shards]
+        assert attn.q_proj.weight.shape[0] == dim_shards[tp_rank], (attn.q_proj.weight.shape, dim_shards)
 
+        dev = engine.device
+        dtype = attn.q_proj.weight.dtype
+
+        # ====== Phase 1: sharded forward == unsharded reference, element-wise ======
+        x = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x, src=0, group=tp_group)
+        x_ref = x.detach().cpu()
+        with torch.no_grad():
+            out = attn(x).cpu()
+        ref_out = reference.layers[0].self_attn(x_ref)
+        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+        # ====== Phase 2: universal ckpt save -> convert -> load is lossless ======
         _train_steps(engine, hidden_dim)
         expected_q = attn.q_proj.weight.detach().cpu().clone()
         expected_o = attn.o_proj.weight.detach().cpu().clone()
+        # Independently all-gather the trained q/k/v (column, dim 0) and o (row, dim 1) weights
+        # so the merged-file and restored-forward references are built without AutoTP's gather.
+        exp_q = _all_gather_cat_dim0(attn.q_proj.weight.detach(), tp_group).cpu()
+        exp_k = _all_gather_cat_dim0(attn.k_proj.weight.detach(), tp_group).cpu()
+        exp_v = _all_gather_cat_dim0(attn.v_proj.weight.detach(), tp_group).cpu()
+        exp_o = _all_gather_cat_dim1(attn.o_proj.weight.detach(), tp_group).cpu()
         _save_and_convert(engine, tmpdir)
 
-        if dist.get_rank() == 0:
-            merged = torch.load(os.path.join(tmpdir, UNIVERSAL_TAG, "zero", "layers.0.self_attn.o_proj.weight",
-                                             "fp32.pt"),
-                                weights_only=False)
-            assert tuple(merged[PARAM].shape) == (hidden_dim, hidden_dim)
+        # Checked on every rank: a rank-0-only failure would leave the others hanging in
+        # the next collective instead of failing the test.
+        _assert_merged_matches(tmpdir, "layers.0.self_attn.q_proj.weight", exp_q)
+        _assert_merged_matches(tmpdir, "layers.0.self_attn.o_proj.weight", exp_o)
 
         config_dict["checkpoint"] = {"load_universal": True}
         torch.manual_seed(123)
@@ -1147,6 +1208,17 @@ class TestUnevenRowUniversalCheckpoint(DistributedTest):
         restored_attn = restored_engine.module.layers[0].self_attn
         torch.testing.assert_close(restored_attn.q_proj.weight.detach().cpu(), expected_q)
         torch.testing.assert_close(restored_attn.o_proj.weight.detach().cpu(), expected_o)
+
+        # Restored forward == F.linear attention with the independently gathered weights.
+        x2 = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x2, src=0, group=tp_group)
+        with torch.no_grad():
+            restored_out = restored_attn(x2).cpu()
+        x2c = x2.cpu()
+        ref2 = torch.nn.functional.linear(
+            torch.nn.functional.linear(x2c, exp_q) + torch.nn.functional.linear(x2c, exp_k) +
+            torch.nn.functional.linear(x2c, exp_v), exp_o)
+        torch.testing.assert_close(restored_out, ref2, atol=1e-2, rtol=1e-2)
 
         _train_steps(restored_engine, hidden_dim, steps=1)
 
@@ -1195,3 +1267,271 @@ def test_merge_zero_shards_rejects_a_missing_rank_that_owns_elements(tmp_path):
     with pytest.raises(AssertionError, match="not empty"):
         ds_to_universal._merge_zero_shards(str(tmp_path / param_name), "fp32", 2,
                                            [torch.Size([4, 2]), torch.Size([4, 2])])
+
+
+def _all_gather_cat_dim0(local, group):
+    """Plain all_gather of uneven shards along dim 0, auto-discovering per-rank widths.
+
+    Independent of AutoTP's gather_params: a bug in the gather under test cannot hide
+    behind a buggy expected value.
+    """
+    world = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    local_rows = torch.tensor([local.shape[0]], device=local.device, dtype=torch.long)
+    row_counts = [torch.empty(1, dtype=torch.long, device=local.device) for _ in range(world)]
+    dist.all_gather(row_counts, local_rows, group=group)
+    sizes = [int(c.item()) for c in row_counts]
+    max_rows = max(sizes)
+    pad = max_rows - local.shape[0]
+    if pad > 0:
+        local_padded = torch.cat(
+            [local, torch.zeros(pad, *local.shape[1:], dtype=local.dtype, device=local.device)], dim=0)
+    else:
+        local_padded = local
+    gathered = [torch.empty_like(local_padded) for _ in range(world)]
+    dist.all_gather(gathered, local_padded.contiguous(), group=group)
+    return torch.cat([gathered[r][:sizes[r]] for r in range(world)], dim=0)
+
+
+def _all_gather_cat_dim1(local, group):
+    """Same as _all_gather_cat_dim0, but for row-parallel weights sharded along dim 1."""
+    return _all_gather_cat_dim0(local.t().contiguous(), group).t().contiguous()
+
+
+def _assert_merged_matches(tmpdir, param_name, expected):
+    """The merged universal slice for `param_name` must equal `expected` element-wise."""
+    merged = torch.load(os.path.join(tmpdir, UNIVERSAL_TAG, "zero", param_name, "fp32.pt"), weights_only=False)
+    assert merged[PARAM].shape == expected.shape, (param_name, merged[PARAM].shape, expected.shape)
+    torch.testing.assert_close(merged[PARAM].cpu().float(), expected.float())
+
+
+class TestUnevenTp3TrainingAndUniversalCheckpoint(DistributedTest):
+    """tp=3 training must not change numerics vs an unsharded reference, and a universal
+    checkpoint round-trip must preserve both the weights and the forward output."""
+
+    world_size = 3
+    reuse_dist_env = False
+
+    def test_strict_correctness(self, tmpdir):
+        hidden_dim = 12
+        vocab_size = 10  # 10 / 3 -> [4, 3, 3]
+
+        torch.manual_seed(42)
+        reference = nn.Linear(hidden_dim, vocab_size)
+        model = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+        with torch.no_grad():
+            model.lm_head.weight.copy_(reference.weight)
+            model.lm_head.bias.copy_(reference.bias)
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size,
+                "partition_config": {
+                    "use_default_specs":
+                    False,
+                    "layer_specs": [{
+                        "patterns": [r".*lm_head\.weight$"],
+                        "partition_type": "column",
+                        "gather_output": True,
+                    }],
+                },
+            },
+            "zero_optimization": {
+                "stage": 1
+            },
+        }
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        shard_sizes = get_shard_size_list(vocab_size, self.world_size, "lm_head")
+        assert sum(shard_sizes) == vocab_size, shard_sizes
+        assert shard_sizes == [4, 3, 3], shard_sizes
+        assert engine.module.lm_head.weight.shape[0] == shard_sizes[tp_rank]
+
+        dev = engine.device
+        dtype = engine.module.lm_head.weight.dtype
+        off = sum(shard_sizes[:tp_rank])
+        w = shard_sizes[tp_rank]
+
+        # ====== Phase 1: runtime correctness via a STANDALONE LinearLayer ======
+        # The engine's optimizer owns .grad after engine.backward(), so gradient
+        # correctness is checked on an independent LinearLayer (same pattern as
+        # run_tp_layer_fwd_bwd), which leaves .grad on the parameter. The unsharded
+        # nn.Linear `reference` is the independent source of truth for both output
+        # and gradients.
+        from copy import deepcopy
+        from deepspeed.module_inject.layers import LinearLayer
+        x = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x, src=0, group=tp_group)
+        x_ref = x.detach().cpu()
+
+        linear = LinearLayer(deepcopy(reference).to(device=dev, dtype=dtype), tp_group, gather_output=True)
+        out = linear(x)
+        torch.testing.assert_close(out.detach().cpu(), reference(x_ref).detach(), atol=1e-2, rtol=1e-2)
+
+        out.sum().backward()
+        reference(x_ref).sum().backward()
+        torch.testing.assert_close(linear.weight.grad.detach().cpu(),
+                                   reference.weight.grad[off:off + w],
+                                   atol=1e-3,
+                                   rtol=1e-3)
+        torch.testing.assert_close(linear.bias.grad.detach().cpu(),
+                                   reference.bias.grad[off:off + w],
+                                   atol=1e-3,
+                                   rtol=1e-3)
+
+        # ====== Phase 2: universal ckpt save -> convert -> load is lossless ======
+        _train_steps(engine, hidden_dim, steps=3)
+        exp_w_shard = engine.module.lm_head.weight.detach().cpu().clone()
+        exp_b_shard = engine.module.lm_head.bias.detach().cpu().clone()
+        exp_w_full = _all_gather_cat_dim0(engine.module.lm_head.weight.detach(), tp_group).cpu()
+        exp_b_full = _all_gather_cat_dim0(engine.module.lm_head.bias.detach().view(-1, 1), tp_group).view(-1).cpu()
+
+        _save_and_convert(engine, tmpdir)
+
+        _assert_merged_matches(tmpdir, "lm_head.weight", exp_w_full)
+        _assert_merged_matches(tmpdir, "lm_head.bias", exp_b_full)
+
+        config_dict["checkpoint"] = {"load_universal": True}
+        torch.manual_seed(123)
+        restored_model = UnevenVocabLmHeadModel(hidden_dim, vocab_size)
+        restored_engine, _, _, _ = deepspeed.initialize(model=restored_model,
+                                                        model_parameters=restored_model.parameters(),
+                                                        config=config_dict)
+        restored_engine.load_checkpoint(tmpdir, tag=UNIVERSAL_TAG, load_optimizer_states=True)
+
+        # 2a: restored per-rank shards == pre-save shards
+        torch.testing.assert_close(restored_engine.module.lm_head.weight.detach().cpu(), exp_w_shard)
+        torch.testing.assert_close(restored_engine.module.lm_head.bias.detach().cpu(), exp_b_shard)
+
+        # 2b: restored forward (gathered) == F.linear with independently all-gathered expected weights
+        x2 = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x2, src=0, group=tp_group)
+        with torch.no_grad():
+            restored_out = restored_engine.module.lm_head(x2).cpu()
+        ref2 = torch.nn.functional.linear(x2.cpu(), exp_w_full, exp_b_full)
+        torch.testing.assert_close(restored_out, ref2, atol=1e-2, rtol=1e-2)
+
+        # 2c: optimizer state usable
+        _train_steps(restored_engine, hidden_dim, steps=1)
+
+
+class TestUnevenTp3RowParallelGQA(DistributedTest):
+    """tp=3 row-parallel (GQA-style attention) must not change numerics vs an unsharded
+    reference, and a universal checkpoint round-trip must preserve both the column-side
+    (q/k/v) and row-side (o_proj) uneven shards.
+
+    num_heads=4 over tp=3 shards heads as [2, 1, 1], so with head_dim=3 the q/k/v
+    column shards and the o_proj row shard all become [6, 3, 3] on dim 0/1. This is the
+    commit 847c4e4 scenario (column output dim == following row input dim must agree per
+    rank) at a non-power-of-two tp_size.
+    """
+
+    world_size = 3
+    reuse_dist_env = False
+
+    def test_strict_correctness(self, tmpdir):
+        from copy import deepcopy
+
+        hidden_dim = 12
+        num_heads = 4  # 4 / 3 -> [2, 1, 1] heads -> dim shards [6, 3, 3]
+
+        torch.manual_seed(42)
+        model = GQAAttentionModel(hidden_dim, num_heads)
+        reference = deepcopy(model)  # unsharded, plain nn.Linear; independent source of truth
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "optimizer": {
+                "type": "Adam",
+                "params": {
+                    "lr": 1e-3
+                }
+            },
+            "tensor_parallel": {
+                "autotp_size": self.world_size,
+            },
+            "zero_optimization": {
+                "stage": 1
+            },
+        }
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config_dict)
+
+        tp_group = groups.get_tensor_model_parallel_group()
+        tp_rank = groups.get_tensor_model_parallel_rank()
+        attn = engine.module.layers[0].self_attn
+
+        # Column q/k/v output dim must equal row o_proj input dim on every rank, otherwise
+        # the row matmul shape-mismatches at runtime (the original 847c4e4 bug).
+        assert attn.q_proj.weight.shape[0] == attn.o_proj.weight.shape[1], (attn.q_proj.weight.shape,
+                                                                            attn.o_proj.weight.shape)
+        head_dim = hidden_dim // num_heads
+        head_shards = get_shard_size_list(num_heads, self.world_size, attn.q_proj.name)
+        assert head_shards == [2, 1, 1], head_shards
+        dim_shards = [h * head_dim for h in head_shards]
+        assert attn.q_proj.weight.shape[0] == dim_shards[tp_rank], (attn.q_proj.weight.shape, dim_shards)
+
+        dev = engine.device
+        dtype = attn.q_proj.weight.dtype
+
+        # ====== Phase 1: forward == unsharded reference, element-wise ======
+        x = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x, src=0, group=tp_group)
+        x_ref = x.detach().cpu()
+        with torch.no_grad():
+            out = engine.module.layers[0].self_attn(x).cpu()
+        ref_out = reference.layers[0].self_attn(x_ref)
+        torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+        # ====== Phase 2: universal ckpt save -> convert -> load is lossless ======
+        _train_steps(engine, hidden_dim, steps=3)
+
+        # Independently all-gather the trained q/k/v (column, dim 0) and o (row, dim 1)
+        # weights so Phase 2b's reference is built from plain F.linear, not AutoTP.
+        exp_q = _all_gather_cat_dim0(attn.q_proj.weight.detach(), tp_group).cpu()
+        exp_k = _all_gather_cat_dim0(attn.k_proj.weight.detach(), tp_group).cpu()
+        exp_v = _all_gather_cat_dim0(attn.v_proj.weight.detach(), tp_group).cpu()
+        exp_o = _all_gather_cat_dim1(attn.o_proj.weight.detach(), tp_group).cpu()
+        # Per-rank expected shards for the restore-fidelity check.
+        exp_q_shard = attn.q_proj.weight.detach().cpu().clone()
+        exp_o_shard = attn.o_proj.weight.detach().cpu().clone()
+
+        _save_and_convert(engine, tmpdir)
+
+        _assert_merged_matches(tmpdir, "layers.0.self_attn.q_proj.weight", exp_q)
+        _assert_merged_matches(tmpdir, "layers.0.self_attn.o_proj.weight", exp_o)
+
+        config_dict["checkpoint"] = {"load_universal": True}
+        torch.manual_seed(123)
+        restored_model = GQAAttentionModel(hidden_dim, num_heads)
+        restored_engine, _, _, _ = deepspeed.initialize(model=restored_model,
+                                                        model_parameters=restored_model.parameters(),
+                                                        config=config_dict)
+        restored_engine.load_checkpoint(tmpdir, tag=UNIVERSAL_TAG, load_optimizer_states=True)
+        restored_attn = restored_engine.module.layers[0].self_attn
+
+        # 2a: restored per-rank q_proj (column) and o_proj (row) shards == pre-save shards.
+        torch.testing.assert_close(restored_attn.q_proj.weight.detach().cpu(), exp_q_shard)
+        torch.testing.assert_close(restored_attn.o_proj.weight.detach().cpu(), exp_o_shard)
+
+        # 2b: restored forward == F.linear attention with independently-gathered weights.
+        x2 = torch.randn(2, hidden_dim, device=dev, dtype=dtype)
+        dist.broadcast(x2, src=0, group=tp_group)
+        with torch.no_grad():
+            restored_out = restored_engine.module.layers[0].self_attn(x2).cpu()
+        x2c = x2.cpu()
+        ref2 = torch.nn.functional.linear(
+            torch.nn.functional.linear(x2c, exp_q) + torch.nn.functional.linear(x2c, exp_k) +
+            torch.nn.functional.linear(x2c, exp_v), exp_o)
+        torch.testing.assert_close(restored_out, ref2, atol=1e-2, rtol=1e-2)
+
+        # 2c: optimizer state usable.
+        _train_steps(restored_engine, hidden_dim, steps=1)
