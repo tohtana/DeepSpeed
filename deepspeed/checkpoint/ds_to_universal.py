@@ -1076,8 +1076,8 @@ def main(args):
 
         # Fail before the extraction pass so an unconvertible checkpoint does not pay the
         # cost of loading every optimizer shard and writing fragments into temp_dir.
-        uc_info = _load_universal_checkpoint_info_stage3(model_files)
         if tp_degree > 1:
+            uc_info = _load_universal_checkpoint_info_stage3(model_files)
             _validate_autotp_conversion_support(uc_info)
 
         temp_dir = os.path.join(args.output_folder, 'tmp')
