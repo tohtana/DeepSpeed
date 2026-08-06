@@ -2879,11 +2879,14 @@ class DeepSpeedEngine(Module):
                 continue
             reduce_autoep_folding_gradient(folding_spec, param, param.grad, tp_group=tp_group, param_name=param_name)
 
-    def _backward_prologue(self):
+    def _raise_if_unmanaged_direct_backward(self):
         if not self.managed_gradient_accumulation() and not self._running_engine_backward:
             raise RuntimeError("Direct calls to tensor.backward() are not supported with "
                                "managed_gradient_accumulation=False. "
                                "Please use engine.backward(loss, scale_wrt_gas=False) instead.")
+
+    def _backward_prologue(self):
+        self._raise_if_unmanaged_direct_backward()
         if is_functorch_transforming():
             return
         self._start_timers(self.engine_timers.backward_timers)
@@ -2944,6 +2947,7 @@ class DeepSpeedEngine(Module):
         self._stop_timers(self.engine_timers.backward_timers)
 
     def _backward_prologue_per_tensor(self, grad):
+        self._raise_if_unmanaged_direct_backward()
         if is_functorch_transforming():
             return grad
         # Only scale gradients if scale_wrt_gas is True, consistent with backward() parameter

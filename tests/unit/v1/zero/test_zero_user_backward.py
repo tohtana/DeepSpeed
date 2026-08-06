@@ -2068,6 +2068,30 @@ class TestUnmanagedGradientAccumulationValidation(DistributedTest):
 
         engine.destroy()
 
+    def test_unmanaged_rejects_direct_backward_on_retained_graph(self):
+        hidden_dim = 4
+        initialize_distributed()
+        torch.manual_seed(42)
+        model = SimpleModel(hidden_dim=hidden_dim, nlayers=2)
+        config = build_managed_gas_config(2, gradient_accumulation_steps=4, managed_gradient_accumulation=False)
+        engine, _, _, _ = deepspeed.initialize(config=config, model=model, model_parameters=model.parameters())
+        loss = engine(torch.randn(1, hidden_dim, device=engine.device), torch.randn(1,
+                                                                                    hidden_dim,
+                                                                                    device=engine.device))
+
+        with patch.object(engine.optimizer, "backward_prologue", wraps=engine.optimizer.backward_prologue) as prologue:
+            engine.backward(loss, retain_graph=True, scale_wrt_gas=False)
+            prologue_call_count = prologue.call_count
+            assert prologue_call_count == 1
+            assert engine._unmanaged_backward_count == 1
+
+            with pytest.raises(RuntimeError, match=r"engine\.backward\(loss, scale_wrt_gas=False\)"):
+                loss.backward()
+            assert prologue.call_count == prologue_call_count
+            assert engine._unmanaged_backward_count == 1
+
+        engine.destroy()
+
     def test_unmanaged_rejects_zero_offload(self):
         hidden_dim = 4
         initialize_distributed()
