@@ -948,9 +948,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         see_memory_usage("End ipg_epilogue")
 
     def finalize_gradient_accumulation_boundary(self):
-        # Unmanaged mode: grads were reduced/accumulated into all_grad_tensors each backward; finalize averaged_gradients for step().
-        assert not self.cpu_offload, "unmanaged gradient accumulation does not support ZeRO optimizer state offload"
+        # Unmanaged mode: grads accumulated each backward; finalize for step() (averaged_gradients or offload fp32 copy).
         self.is_gradient_accumulation_boundary = True
+        if self.cpu_offload:
+            self._finalize_cpu_offload_gradient_accumulation()
+            return
         for i, _ in enumerate(self.bit16_groups):
             self.averaged_gradients[i] = self.get_flat_partition(self.params_in_partition[i],
                                                                  self.first_offset[i],
@@ -960,6 +962,38 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                                                                  param_group_idx=i,
                                                                  return_tensor_list=True)
             self.all_grad_tensors[i] = None
+
+    def _finalize_cpu_offload_gradient_accumulation(self):
+        # Deferred boundary work: restore CPU-accumulated grads and copy norms/fp32 buffers as managed boundary would.
+        for group in self.params_in_partition:
+            for param in group:
+                if not param.requires_grad:
+                    continue
+                param_id = self.get_param_id(param)
+                if param_id in self.accumulated_grads_in_cpu:
+                    self._restore_cpu_offload_grad_to_gpu(param)
+                elif self.get_param_gradient_attribute(param) is None:
+                    continue
+                self.set_norm_for_param_grad_in_gpu(param)
+                self.update_offload_overflow_tracker_for_param_grad(param)
+                self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+
+    def _restore_cpu_offload_grad_to_gpu(self, param):
+        # Last non-boundary epilogue cleared param.grad; reload accumulated CPU grads for boundary helpers.
+        param_id = self.get_param_id(param)
+        [_, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+        dest_buffer = self.temp_grad_buffer_for_gpu_offload.view(-1).narrow(0, 0, param.numel())
+        if not self.low_precision_master_weights_and_grads:
+            dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
+        else:
+            dest_buffer.narrow(0, source_offset, num_elements).copy_(self.accumulated_grads_in_cpu[param_id].view(-1),
+                                                                     non_blocking=True)
+        # Clone so the shared temp buffer can be reused for the next parameter.
+        restored = dest_buffer.view_as(param).clone()
+        if self.use_grad_accum_attribute:
+            param.grad_accum = restored
+        else:
+            param.grad = restored
 
     def clear_backward_seen_flag(self):
         """Clear the backward seen flag and do deferred cleanup.
