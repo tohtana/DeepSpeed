@@ -4,6 +4,7 @@
 // DeepSpeed Team
 
 #include "deepcompile.h"
+#include "z3.h"
 
 #define USE_C10D_NCCL
 
@@ -85,6 +86,7 @@ void reset()
 void cleanup()
 {
     reset();
+    reset_z3_gather_buffer_pool();
     if (reduce_buckets) {
         reduce_buckets->clear();
         reduce_buckets.reset();
