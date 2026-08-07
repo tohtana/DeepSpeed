@@ -230,7 +230,7 @@ Example of <i>**scheduler**</i>
 
 | Description                                                                                                                                                                                            | Default  |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- |
-| Select `"mean"` to average gradients across data-parallel workers or `"sum"` to keep the unscaled sum. `"sum"` supports ZeRO stages 0, 1, and 2 without ZenFlow; ZeRO stage 3 and ZenFlow reject this setting. | `"mean"` |
+| Select `"mean"` to average gradients across data-parallel workers or `"sum"` to keep the unscaled sum. `"sum"` supports ZeRO stages 0, 1, and 2 without ZenFlow or DeepCompile; ZeRO stage 3, ZenFlow, and DeepCompile with ZeRO stages 1 or 2 reject this setting. | `"mean"` |
 
 <i>**prescale_gradients**</i>: [boolean]
 
