@@ -986,6 +986,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if not self.low_precision_master_weights_and_grads:
             dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
         else:
+            dest_buffer.zero_()
             dest_buffer.narrow(0, source_offset, num_elements).copy_(self.accumulated_grads_in_cpu[param_id].view(-1),
                                                                      non_blocking=True)
         # Clone so the shared temp buffer can be reused for the next parameter.
@@ -1529,7 +1530,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if param_id not in self.accumulated_grads_in_cpu:
             self.accumulated_grads_in_cpu[param_id] = buffer_to_accumulate_to_in_cpu()
 
-        if self.micro_step_id > 0:
+        if param_id in self._offload_accumulated_param_ids:
             accumulate_gradients()
         copy_gradients_to_cpu()
 
@@ -1623,14 +1624,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     ############################################################################################
     def copy_grads_in_partition(self, param):
         if self.cpu_offload:
+            param_id = self.get_param_id(param)
             # Accumulate when there were prior backwards in this step (restore from
             # CPU buffer) or more will follow (save to CPU buffer). Skipping only
             # the lone backward of a step preserves the existing fast path for
             # ga_steps=1 + single backward.
             if self.micro_step_id > 0 or not self.is_gradient_accumulation_boundary:
                 self.async_accumulate_grad_in_cpu_via_gpu(param)
-                # Record active param so unmanaged finalize skips params unused this window.
-                self._offload_accumulated_param_ids.add(self.get_param_id(param))
+
+            # Record every active parameter, including the GAS=1 fast path, so
+            # step() can clear stale optimizer-gradient slices for inactive params.
+            self._offload_accumulated_param_ids.add(param_id)
 
             if self.is_gradient_accumulation_boundary:
                 self.set_norm_for_param_grad_in_gpu(param)
@@ -2193,6 +2197,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.norm_for_param_grads = {}
         self.local_overflow = False
 
+    def _clear_inactive_cpu_offload_gradients(self):
+        for group in self.params_in_partition:
+            for param in group:
+                param_id = self.get_param_id(param)
+                if param_id in self._offload_accumulated_param_ids:
+                    continue
+                if param_id in self.accumulated_grads_in_cpu:
+                    self.accumulated_grads_in_cpu[param_id].zero_()
+                i, _, dest_offset, num_elements = self.grad_position[param_id]
+                self.single_partition_of_fp32_groups[i].grad.view(-1).narrow(0, dest_offset, num_elements).zero_()
+
     def set_lr(self, lr):
         """Set the learning rate."""
         for param_group in self.optimizer.param_groups:
@@ -2257,6 +2272,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         self.micro_step_id = INITIAL_MICRO_STEP_ID
         if self.cpu_offload:
+            self._clear_inactive_cpu_offload_gradients()
             self._offload_accumulated_param_ids = set()
 
         see_memory_usage("In step before checking overflow")

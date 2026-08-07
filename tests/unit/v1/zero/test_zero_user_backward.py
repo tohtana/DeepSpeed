@@ -2255,6 +2255,95 @@ class TestUnmanagedGradientAccumulationOffloadInactiveParams(DistributedTest):
         managed_engine.destroy()
         unmanaged_engine.destroy()
 
+    def test_inactive_then_late_first_use(self, zero_stage):
+        hidden_dim = 4
+        gradient_accumulation_steps = 2
+        learning_rate = 0.1
+        # Head A is active immediately before its first use at micro 1, then it
+        # is fully inactive in the following window.
+        window_patterns = [[True, True], [False, True], [False, False]]
+
+        device, rank, _ = initialize_distributed()
+
+        def offload_config(managed):
+            config = _build_unmanaged_offload_config(zero_stage, gradient_accumulation_steps, managed=managed)
+            config["zero_optimization"]["ignore_unused_parameters"] = True
+            config["optimizer"] = {"type": "SGD", "params": {"lr": learning_rate}}
+            config["zero_allow_untested_optimizer"] = True
+            return config
+
+        torch.manual_seed(123)
+        model_ddp = _TwoHeadModel(hidden_dim).to(device)
+        model_ddp = DDP(model_ddp, device_ids=[rank], output_device=rank)
+        optimizer_ddp = torch.optim.SGD(model_ddp.parameters(), lr=learning_rate)
+
+        torch.manual_seed(123)
+        model_managed = _TwoHeadModel(hidden_dim)
+        managed_engine, _, _, _ = deepspeed.initialize(config=offload_config(True),
+                                                       model=model_managed,
+                                                       model_parameters=model_managed.parameters())
+
+        torch.manual_seed(123)
+        model_unmanaged = _TwoHeadModel(hidden_dim)
+        unmanaged_engine, _, _, _ = deepspeed.initialize(config=offload_config(False),
+                                                         model=model_unmanaged,
+                                                         model_parameters=model_unmanaged.parameters())
+
+        batches = list(
+            random_dataloader(model=managed_engine,
+                              total_samples=sum(map(len, window_patterns)),
+                              hidden_dim=hidden_dim,
+                              device=device,
+                              dtype=torch.float32))
+
+        batch_index = 0
+        for window_index, pattern in enumerate(window_patterns):
+            first_batch = batch_index
+            ddp_before = collect_ddp_parameters(model_ddp)
+            managed_before = collect_deepspeed_parameters(managed_engine, zero_stage)
+            unmanaged_before = collect_deepspeed_parameters(unmanaged_engine, zero_stage)
+
+            optimizer_ddp.zero_grad(set_to_none=True)
+            for micro_index, use_a in enumerate(pattern):
+                batch = batches[first_batch + micro_index]
+                model_ddp.module.use_a = use_a
+                (model_ddp(batch[0], batch[1]) / gradient_accumulation_steps).backward()
+            optimizer_ddp.step()
+
+            for micro_index, use_a in enumerate(pattern):
+                batch = batches[first_batch + micro_index]
+                managed_engine.module.use_a = use_a
+                managed_engine.backward(managed_engine(batch[0], batch[1]))
+                managed_engine.step()
+
+            for micro_index, use_a in enumerate(pattern):
+                batch = batches[first_batch + micro_index]
+                unmanaged_engine.module.use_a = use_a
+                unmanaged_engine.backward(unmanaged_engine(batch[0], batch[1]))
+            unmanaged_engine.step()
+            batch_index += len(pattern)
+
+            ddp_after = collect_ddp_parameters(model_ddp)
+            managed_after = collect_deepspeed_parameters(managed_engine, zero_stage)
+            unmanaged_after = collect_deepspeed_parameters(unmanaged_engine, zero_stage)
+            if not any(pattern):
+                torch.testing.assert_close(ddp_before["head_a.weight"], ddp_after["head_a.weight"], rtol=0, atol=0)
+                torch.testing.assert_close(managed_before["head_a.weight"],
+                                           managed_after["head_a.weight"],
+                                           rtol=0,
+                                           atol=0)
+                torch.testing.assert_close(unmanaged_before["head_a.weight"],
+                                           unmanaged_after["head_a.weight"],
+                                           rtol=0,
+                                           atol=0)
+            compare_parameters(ddp_after, managed_after,
+                               f"late first use DDP vs managed (stage {zero_stage}, window {window_index})")
+            compare_parameters(ddp_after, unmanaged_after,
+                               f"late first use DDP vs unmanaged (stage {zero_stage}, window {window_index})")
+
+        managed_engine.destroy()
+        unmanaged_engine.destroy()
+
 
 @pytest.mark.parametrize("zero_stage", [0, 1])
 class TestUnmanagedGradientAccumulationOverlapCommValidation(DistributedTest):
