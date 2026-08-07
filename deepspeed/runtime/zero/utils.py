@@ -8,6 +8,7 @@ import gc
 from typing import List, Tuple
 
 import torch
+from torch import distributed as torch_dist
 from deepspeed import comm as dist
 from deepspeed.utils import logger
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -20,6 +21,14 @@ from deepspeed.runtime.utils import get_only_unique_item
 
 # ensure we only warn once, otherwise every iteration will trigger a warning
 warned = False
+_phantora_gloo_group = None
+
+
+def _get_phantora_gloo_group():
+    global _phantora_gloo_group
+    if _phantora_gloo_group is None:
+        _phantora_gloo_group = torch_dist.new_group(backend="gloo")
+    return _phantora_gloo_group
 
 
 def _initialize_parameter_parallel_groups(parameter_parallel_size=None):
@@ -71,14 +80,21 @@ def is_zero_supported_optimizer(optimizer):
 
 @instrument_w_nvtx
 def assert_lst_len_same_as_other_ranks(lst: List[int]) -> None:
-    rank0_len_tensor = torch.tensor(
-        len(lst) if dist.get_rank() == 0 else -1,
-        dtype=int,
-        device=torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"])),
-        requires_grad=False,
-    )
+    if os.environ.get("PHANTORA") == "1":
+        rank0_len_tensor = torch.tensor(len(lst) if dist.get_rank() == 0 else -1,
+                                        dtype=torch.int64,
+                                        device="cpu",
+                                        requires_grad=False)
+        torch_dist.broadcast(rank0_len_tensor, src=0, group=_get_phantora_gloo_group(), async_op=False)
+    else:
+        rank0_len_tensor = torch.tensor(
+            len(lst) if dist.get_rank() == 0 else -1,
+            dtype=int,
+            device=torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"])),
+            requires_grad=False,
+        )
+        dist.broadcast(rank0_len_tensor, src=0, async_op=False)
     local_list_length = len(lst)
-    dist.broadcast(rank0_len_tensor, src=0, async_op=False)
     rank0_list_length = rank0_len_tensor.cpu().item()
     if rank0_list_length != local_list_length:
         raise RuntimeError(f"Detected a disagreement on list length between rank0 and rank{dist.get_rank()}: "
@@ -91,13 +107,20 @@ def get_lst_from_rank0(lst: List[int]) -> None:
     NOTE: creates both communication and synchronization overhead so should be used
     sparingly
     """
-    lst_tensor = torch.tensor(
-        lst if dist.get_rank() == 0 else [-1] * len(lst),
-        dtype=int,
-        device=torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"])),
-        requires_grad=False,
-    )
-    dist.broadcast(lst_tensor, src=0, async_op=False)
+    if os.environ.get("PHANTORA") == "1":
+        lst_tensor = torch.tensor(lst if dist.get_rank() == 0 else [-1] * len(lst),
+                                  dtype=torch.int64,
+                                  device="cpu",
+                                  requires_grad=False)
+        torch_dist.broadcast(lst_tensor, src=0, group=_get_phantora_gloo_group(), async_op=False)
+    else:
+        lst_tensor = torch.tensor(
+            lst if dist.get_rank() == 0 else [-1] * len(lst),
+            dtype=int,
+            device=torch.device(get_accelerator().device_name(os.environ["LOCAL_RANK"])),
+            requires_grad=False,
+        )
+        dist.broadcast(lst_tensor, src=0, async_op=False)
 
     return [t.item() for t in lst_tensor.cpu()]
 

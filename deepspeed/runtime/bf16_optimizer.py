@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 from collections import OrderedDict
+import math
+import os
 import torch
 import sys
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -12,9 +14,10 @@ from deepspeed.runtime.constants import PIPE_REPLICATED
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from packaging import version as pkg_version
 from deepspeed.git_version_info import version
-from deepspeed.runtime.utils import (get_global_norm_of_tensors, clip_tensors_by_global_norm, DummyOptim,
-                                     align_dense_tensors, all_gather_dp_groups, is_model_parallel_parameter,
-                                     see_memory_usage, graph_process, get_norm_with_moe_layers)
+from deepspeed.runtime.utils import (get_global_norm_of_tensors as _native_get_global_norm_of_tensors,
+                                     clip_tensors_by_global_norm, DummyOptim, align_dense_tensors,
+                                     all_gather_dp_groups, is_model_parallel_parameter, see_memory_usage,
+                                     graph_process, get_norm_with_moe_layers as _native_get_norm_with_moe_layers)
 from deepspeed.utils import link_hp_params, lazy_init_hp_params_optimizer_state, fragment_address, groups
 from deepspeed.moe.utils import is_moe_param, is_moe_param_group
 from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
@@ -26,6 +29,21 @@ from deepspeed.checkpoint.constants import (DS_VERSION, PARTITION_COUNT, BASE_OP
                                             PARAM_SLICE_MAPPINGS)
 
 setattr(sys.modules[__name__], 'fragment_address', fragment_address)
+
+
+def _sanitize_phantora_norm(norm):
+    if os.environ.get("PHANTORA") != "1":
+        return norm
+    value = float(norm.item()) if hasattr(norm, "item") else float(norm)
+    return norm if value > 0.0 and math.isfinite(value) else 1.0
+
+
+def get_global_norm_of_tensors(*args, **kwargs):
+    return _sanitize_phantora_norm(_native_get_global_norm_of_tensors(*args, **kwargs))
+
+
+def get_norm_with_moe_layers(*args, **kwargs):
+    return _sanitize_phantora_norm(_native_get_norm_with_moe_layers(*args, **kwargs))
 
 
 def print_rank_0(message, debug=False, force=False):
