@@ -374,6 +374,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.postscale_gradients = postscale_gradients
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.micro_step_id = 0
+        # ds_ids reduced since the last step(); used to finalize only active params in unmanaged offload mode.
+        self._offload_boundary_param_ids = set()
         self.reduce_bucket_size = int(reduce_bucket_size)
 
         if self.all2all_process_group is not None:
@@ -1380,15 +1382,14 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                                       gradient_tensors=offload_fp32_gradients[i])
 
     def _finalize_offload_gradient_accumulation(self):
-        # Deferred boundary work for unmanaged mode after grads have accumulated across backwards.
+        # Deferred boundary work for params reduced this window (matches managed offload; skips inactive params).
         offload_fp32_gradients = {}
         offload_fp32_offsets = {}
         for param_group in self.fp16_groups:
             for param in param_group:
-                if not param.requires_grad or param.ds_id not in self.__param_id_to_grad_partition:
+                if param.ds_id not in self._offload_boundary_param_ids:
                     continue
-                contains_real_data = param.partition_numel() * self._get_param_partition_rank(param) < param.ds_numel
-                if not contains_real_data:
+                if param.ds_id not in self.__param_id_to_grad_partition:
                     continue
                 grad_buffer = self.__param_id_to_grad_partition[param.ds_id]
                 if not get_accelerator().on_accelerator(grad_buffer):
@@ -1869,6 +1870,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 param.grad = None
                 continue
 
+            # Record active param so unmanaged offload finalize skips params unused this window.
+            self._offload_boundary_param_ids.add(param.ds_id)
+
             # move or accumulate gradient partition to target buffer
             grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
             buffers.append(grad_buffer)
@@ -2335,6 +2339,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
     def _pre_step(self):
         self.micro_step_id = 0
+        self._offload_boundary_param_ids = set()
         # Also reset the epilogue flag so the next iteration starts fresh.
         # Without this, the flag from the last backward before step() would cause
         # an increment in the next forward(), which is wrong.

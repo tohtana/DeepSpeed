@@ -579,6 +579,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.norm_for_param_grads = {}
             self.local_overflow = False
             self.grad_position = {}
+            # Param ids reduced since the last step(); used to finalize only active params in unmanaged mode.
+            self._offload_accumulated_param_ids = set()
             self.temp_grad_buffer_for_cpu_offload = torch.zeros(largest_param_numel,
                                                                 device=self.device,
                                                                 dtype=self.dtype)
@@ -964,16 +966,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self.all_grad_tensors[i] = None
 
     def _finalize_cpu_offload_gradient_accumulation(self):
-        # Deferred boundary work: restore CPU-accumulated grads and copy norms/fp32 buffers as managed boundary would.
+        # Deferred boundary work for params reduced this window (matches managed offload; skips inactive params).
         for group in self.params_in_partition:
             for param in group:
                 if not param.requires_grad:
                     continue
-                param_id = self.get_param_id(param)
-                if param_id in self.accumulated_grads_in_cpu:
-                    self._restore_cpu_offload_grad_to_gpu(param)
-                elif self.get_param_gradient_attribute(param) is None:
+                if self.get_param_id(param) not in self._offload_accumulated_param_ids:
                     continue
+                self._restore_cpu_offload_grad_to_gpu(param)
                 self.set_norm_for_param_grad_in_gpu(param)
                 self.update_offload_overflow_tracker_for_param_grad(param)
                 self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
@@ -1629,6 +1629,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # ga_steps=1 + single backward.
             if self.micro_step_id > 0 or not self.is_gradient_accumulation_boundary:
                 self.async_accumulate_grad_in_cpu_via_gpu(param)
+                # Record active param so unmanaged finalize skips params unused this window.
+                self._offload_accumulated_param_ids.add(self.get_param_id(param))
 
             if self.is_gradient_accumulation_boundary:
                 self.set_norm_for_param_grad_in_gpu(param)
@@ -2254,6 +2256,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         Not supporting closure.
         """
         self.micro_step_id = INITIAL_MICRO_STEP_ID
+        if self.cpu_offload:
+            self._offload_accumulated_param_ids = set()
 
         see_memory_usage("In step before checking overflow")
 

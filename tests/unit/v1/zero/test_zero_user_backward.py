@@ -2176,6 +2176,86 @@ class TestUnmanagedGradientAccumulationParamOffload(DistributedTest):
         unmanaged_engine.destroy()
 
 
+class _TwoHeadModel(torch.nn.Module):
+    """Two independent heads; only one is exercised per window so the other receives no gradient."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.head_a = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.head_b = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
+        self.use_a = True
+
+    def forward(self, x, y):
+        out = self.head_a(x) if self.use_a else self.head_b(x)
+        return self.cross_entropy_loss(out, y)
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2, 3])
+class TestUnmanagedGradientAccumulationOffloadInactiveParams(DistributedTest):
+    """Unmanaged optimizer offload must skip params that receive no gradient in a window (matches managed)."""
+    world_size = 2
+
+    def test_unmanaged_matches_managed_inactive_params(self, zero_stage):
+        hidden_dim = 4
+        gradient_accumulation_steps = 2
+        # One head is exclusively active per window, so the other head is inactive that whole window.
+        window_use_a = [True, False, True]
+
+        device, _, _ = initialize_distributed()
+
+        def offload_config(managed):
+            config = _build_unmanaged_offload_config(zero_stage, gradient_accumulation_steps, managed=managed)
+            config["zero_optimization"]["ignore_unused_parameters"] = True
+            return config
+
+        torch.manual_seed(123)
+        model_managed = _TwoHeadModel(hidden_dim)
+        managed_engine, _, _, _ = deepspeed.initialize(config=offload_config(True),
+                                                       model=model_managed,
+                                                       model_parameters=model_managed.parameters())
+
+        torch.manual_seed(123)
+        model_unmanaged = _TwoHeadModel(hidden_dim)
+        unmanaged_engine, _, _, _ = deepspeed.initialize(config=offload_config(False),
+                                                         model=model_unmanaged,
+                                                         model_parameters=model_unmanaged.parameters())
+
+        total_samples = len(window_use_a) * gradient_accumulation_steps
+        batches = list(
+            random_dataloader(model=managed_engine,
+                              total_samples=total_samples,
+                              hidden_dim=hidden_dim,
+                              device=device,
+                              dtype=torch.float32))
+
+        # Managed: symmetric forward/backward/step; optimizer applies on each GAS boundary.
+        for w, use_a in enumerate(window_use_a):
+            managed_engine.module.use_a = use_a
+            for micro in range(gradient_accumulation_steps):
+                batch = batches[w * gradient_accumulation_steps + micro]
+                loss = managed_engine(batch[0], batch[1])
+                managed_engine.backward(loss)
+                managed_engine.step()
+
+        # Unmanaged: N backwards then one step() per window.
+        for w, use_a in enumerate(window_use_a):
+            unmanaged_engine.module.use_a = use_a
+            for micro in range(gradient_accumulation_steps):
+                batch = batches[w * gradient_accumulation_steps + micro]
+                loss = unmanaged_engine(batch[0], batch[1])
+                unmanaged_engine.backward(loss)
+            unmanaged_engine.step()
+
+        managed_params = collect_deepspeed_parameters(managed_engine, zero_stage)
+        unmanaged_params = collect_deepspeed_parameters(unmanaged_engine, zero_stage)
+        compare_parameters(managed_params, unmanaged_params,
+                           f"unmanaged vs managed offload inactive params (stage {zero_stage})")
+
+        managed_engine.destroy()
+        unmanaged_engine.destroy()
+
+
 @pytest.mark.parametrize("zero_stage", [0, 1])
 class TestUnmanagedGradientAccumulationOverlapCommValidation(DistributedTest):
     """Unmanaged mode rejects ZeRO overlap_comm for stage 0/1 (reduction is deferred to step())."""
