@@ -312,16 +312,18 @@ class BF16_Optimizer(ZeROOptimizer):
             raise NotImplementedError(f'{self.__class__} does not support closure.')
 
         non_expert_grads_for_norm, expert_grads_for_norm = self.get_grads_for_norm()
-        non_expert_groups_norm = get_global_norm_of_tensors(input_tensors=non_expert_grads_for_norm,
-                                                            mpu=self.mpu,
-                                                            norm_type=self.norm_type,
-                                                            use_graph=self.graph_harvesting)
+        non_expert_groups_norm = _native_get_global_norm_of_tensors(input_tensors=non_expert_grads_for_norm,
+                                                                    mpu=self.mpu,
+                                                                    norm_type=self.norm_type,
+                                                                    use_graph=self.graph_harvesting)
         all_groups_norm = non_expert_groups_norm
         if self.has_moe_layers:
             all_groups_norm = get_norm_with_moe_layers(non_expert_groups_norm,
                                                        mpu=self.mpu,
                                                        expert_tensors=expert_grads_for_norm,
                                                        norm_type=self.norm_type)
+        else:
+            all_groups_norm = _sanitize_phantora_norm(all_groups_norm)
 
         self._global_grad_norm = all_groups_norm
 

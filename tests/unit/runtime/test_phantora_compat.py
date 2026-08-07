@@ -3,7 +3,9 @@
 
 # DeepSpeed Team
 
+import importlib
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,16 +17,26 @@ import deepspeed.utils.nvtx as nvtx
 
 class MockGloo:
 
-    def __init__(self, rank0_length, rank0_values):
+    def __init__(self, rank0_length, rank0_values, rank=1, world_size=2):
         self.rank0_length = rank0_length
         self.rank0_values = rank0_values
+        self.rank = rank
+        self.world_size = world_size
         self.group = object()
         self.new_group_calls = 0
+        self.new_group_ranks = None
         self.broadcast_calls = []
 
-    def new_group(self, *, backend):
+    def get_rank(self):
+        return self.rank
+
+    def get_world_size(self):
+        return self.world_size
+
+    def new_group(self, ranks, backend=None):
         assert backend == "gloo"
         self.new_group_calls += 1
+        self.new_group_ranks = ranks
         return self.group
 
     def broadcast(self, tensor, *, src, group, async_op):
@@ -58,7 +70,7 @@ def test_zero3_validation_uses_native_path_unless_exactly_enabled(monkeypatch, v
     monkeypatch.setattr(zero_utils, "get_accelerator", lambda: type("Accelerator", (), {
         "device_name": lambda self, _rank: "cpu"
     })())
-    monkeypatch.setattr(zero_utils.torch_dist, "new_group",
+    monkeypatch.setattr(zero_utils.dist, "new_group",
                         lambda **_kwargs: pytest.fail("Phantora Gloo group must stay disabled"))
 
     zero_utils.assert_lst_len_same_as_other_ranks([1])
@@ -70,11 +82,11 @@ def test_zero3_validation_uses_native_path_unless_exactly_enabled(monkeypatch, v
 
 def test_zero3_validation_uses_cached_cpu_gloo_and_keeps_mismatch_checks(monkeypatch):
     monkeypatch.setenv("PHANTORA", "1")
-    monkeypatch.setattr(zero_utils.dist, "get_rank", lambda: 1)
     gloo = MockGloo(rank0_length=3, rank0_values=[10, 20, 30])
-    monkeypatch.setattr(zero_utils, "torch_dist", gloo)
-    monkeypatch.setattr(zero_utils.dist, "broadcast",
-                        lambda *_args, **_kwargs: pytest.fail("Phantora must not use the native broadcast"))
+    monkeypatch.setattr(zero_utils.dist, "get_rank", gloo.get_rank)
+    monkeypatch.setattr(zero_utils.dist, "get_world_size", gloo.get_world_size)
+    monkeypatch.setattr(zero_utils.dist, "new_group", gloo.new_group)
+    monkeypatch.setattr(zero_utils.dist, "broadcast", gloo.broadcast)
     monkeypatch.setattr(zero_utils, "get_accelerator",
                         lambda: pytest.fail("Phantora validation tensors must stay on CPU"))
 
@@ -84,6 +96,7 @@ def test_zero3_validation_uses_cached_cpu_gloo_and_keeps_mismatch_checks(monkeyp
         zero_utils.assert_ints_same_as_other_ranks([10, 99, 30])
 
     assert gloo.new_group_calls == 1
+    assert gloo.new_group_ranks == [0, 1]
     assert gloo.broadcast_calls == [1, 3, 1, 3]
 
     gloo.rank0_length = 0
@@ -128,3 +141,51 @@ def test_bf16_norm_helpers_preserve_positive_native_object(monkeypatch, helper_n
     monkeypatch.setenv("PHANTORA", "1")
 
     assert getattr(bf16_optimizer, helper_name)() is positive_norm
+
+
+def test_bf16_moe_combines_native_partial_norm_before_sanitizing(monkeypatch):
+    optimizer = object.__new__(bf16_optimizer.BF16_Optimizer)
+    optimizer.mpu = None
+    optimizer.norm_type = 2
+    optimizer.graph_harvesting = False
+    optimizer.has_moe_layers = True
+    optimizer.clip_grad = 0.0
+    optimizer.fp32_groups_flat_partition = []
+    optimizer.fp32_groups_gradient_flat_partition = []
+    optimizer.grad_acc_dtype = torch.float32
+    optimizer.optimizer = SimpleNamespace(step=lambda: None)
+    optimizer.get_grads_for_norm = lambda: ([], {"expert": [torch.tensor(0.5)]})
+    optimizer._lazy_init_hp_params_optimizer_state = lambda: None
+    optimizer.update_lp_params = lambda: None
+    optimizer.clear_hp_grads = lambda: None
+
+    monkeypatch.setattr(bf16_optimizer, "_native_get_global_norm_of_tensors", lambda **_kwargs: 0.0)
+
+    def combine_norms(non_expert_norm, **_kwargs):
+        assert non_expert_norm == 0.0
+        return 0.5
+
+    monkeypatch.setattr(bf16_optimizer, "_native_get_norm_with_moe_layers", combine_norms)
+    monkeypatch.setenv("PHANTORA", "1")
+
+    bf16_optimizer.BF16_Optimizer.step(optimizer)
+
+    assert optimizer._global_grad_norm == 0.5
+
+
+def test_deepspeed_comm_forwards_explicit_group_backend(monkeypatch):
+    comm = importlib.import_module("deepspeed.comm.comm")
+    torch_backend = importlib.import_module("deepspeed.comm.torch")
+    calls = []
+
+    def new_group(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "gloo-group"
+
+    monkeypatch.setattr(getattr(torch_backend.torch, "distributed"), "new_group", new_group)
+    backend = object.__new__(torch_backend.TorchBackend)
+    backend.is_initialized = lambda: True
+    monkeypatch.setattr(comm, "cdb", backend)
+
+    assert comm.new_group([0, 1], backend="gloo") == "gloo-group"
+    assert calls == [(([0, 1], ), {"backend": "gloo"})]
