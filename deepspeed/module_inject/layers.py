@@ -748,7 +748,14 @@ class LinearLayer(TensorParallel_Layer):
             output = AsyncColumnParallel.apply(self.mp_group, input, self.weight, self.bias)
 
         if self.gather_output:
-            output = GatherFromTensorParallelRegion.apply(self.mp_group, output)
+            if self.defer_collectives_to_compiler:
+                # The gather changes the activation's width, so downstream ops (e.g. a depthwise
+                # conv sized for the full width) only trace correctly if it happens inline. The
+                # custom op is graph-capturable, unlike GatherFromTensorParallelRegion, which
+                # reads gathered shard sizes back into Python.
+                output = torch.ops.autotp.gather_from_tp_region(output)
+            else:
+                output = GatherFromTensorParallelRegion.apply(self.mp_group, output)
 
         return output
 

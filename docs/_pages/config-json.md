@@ -2165,9 +2165,31 @@ DeepSpeed provides compiler-based optimization passes through the `compile` conf
 
 <i>**passes**</i>: [array of strings]
 
-| Description                                                              | Default |
-| ------------------------------------------------------------------------ | ------- |
-| List of compiler passes to apply. Currently supported: `["autosp"]`.     | `[]`    |
+| Description                                                                       | Default |
+| ----------------------------------------------------------------------------------- | ------- |
+| List of compiler passes to apply. Currently supported: `["autosp", "autotp"]`.    | `[]`    |
+
+### AutoTP options
+
+The `autotp` pass emits AutoTP's tensor-parallel collectives into the compiled graph instead of
+running them from inside the injected `LinearLayer` / `LinearAllreduce` modules. The model is
+partitioned by the regular AutoTP path, so `tensor_parallel.autotp_size` must be greater than 1
+and the pass reuses the same tensor-parallel group.
+
+```json
+{
+    "zero_optimization": {"stage": 0},
+    "tensor_parallel": {"autotp_size": 4},
+    "compile": {
+        "deepcompile": true,
+        "passes": ["autotp"],
+    }
+}
+```
+
+The pass compiles the module with `fullgraph=True`, because a graph break would leave part of the
+model without the collectives it suppressed at the module level. It cannot yet be combined with the
+ZeRO passes (`z1`, `z3`) or with `autosp`, and it does not support `tensor_parallel.tp_overlap_comm`.
 
 ### Data Type options
 

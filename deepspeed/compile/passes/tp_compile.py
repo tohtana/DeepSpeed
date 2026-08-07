@@ -8,18 +8,29 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
-from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer
+from deepspeed.module_inject.layers import (LinearAllreduce, LinearLayer, LmHeadLinearAllreduce,
+                                            SubParamLinearAllreduce, SubParamLinearLayer, TensorParallel_Layer)
 
 from ..custom_ops import tp_collectives  # noqa: F401
 
 COLUMN_PARALLEL_OP = torch.ops.autotp.copy_to_tp_region.default
 ROW_PARALLEL_OP = torch.ops.autotp.reduce_from_tp_region.default
+GATHER_OUTPUT_OP = torch.ops.autotp.gather_from_tp_region.default
 
 # AutoTP replaces nn.Linear with these layers and shards their weights, so the injected layer type
 # already records the partitioning decision the pass needs. Reading it back is more robust than
 # re-deriving column/row from parameter-name patterns.
-COLUMN_PARALLEL_LAYER = LinearLayer
-ROW_PARALLEL_LAYER = LinearAllreduce
+#
+# The families are matched by subclass rather than by exact type. AutoTP injects several variants
+# per family (fused QKV, conv, packed gate/up, Yuan), and they either inherit the base forward or
+# repeat its shape, so the pass rewrites all of them identically. Matching exact types instead
+# leaves the variants on the module-level path, which is not merely unoptimized but wrong: see the
+# comment in defer_collectives_to_compiler.
+COLUMN_PARALLEL_LAYERS = (LinearLayer, SubParamLinearLayer)
+ROW_PARALLEL_LAYERS = (LinearAllreduce, SubParamLinearAllreduce)
+# LmHeadLinearAllreduce subclasses LinearAllreduce but slices its own input and reduces with
+# inference_all_reduce rather than going through RowParallel, so the pass cannot stand in for it.
+UNSUPPORTED_LAYERS = (LmHeadLinearAllreduce, )
 
 # The injected layers compute their matmul with torch.matmul; the plain nn.Linear spelling is
 # accepted too so the pass keeps working if a layer is lowered differently.
@@ -31,35 +42,45 @@ _MATMUL_TARGETS = {
 }
 
 
-def defer_collectives_to_compiler(model) -> int:
+def _is_column_parallel(layer_type) -> bool:
+    return _in_family(layer_type, COLUMN_PARALLEL_LAYERS)
+
+
+def _is_row_parallel(layer_type) -> bool:
+    return _in_family(layer_type, ROW_PARALLEL_LAYERS)
+
+
+def _in_family(layer_type, family) -> bool:
+    if not isinstance(layer_type, type) or issubclass(layer_type, UNSUPPORTED_LAYERS):
+        return False
+    return issubclass(layer_type, family)
+
+
+def defer_collectives_to_compiler(model) -> None:
     """Suppress the module-level TP collectives on layers this pass will handle in the graph.
 
-    Returns the number of layers handed over to the pass. Layers the pass does not rewrite (the
-    fused sub-param variants, conv and embedding layers) keep their module-level collectives and
-    stay correct as-is.
+    Any tensor-parallel layer the pass cannot rewrite is rejected rather than left on the
+    module-level path. That path looks like the safe fallback but is not: the pass compiles with
+    fullgraph=True, and ColumnParallel's forward is a plain identity, so tracing folds it away and
+    takes its backward all-reduce with it. The forward still matches and only the gradients are
+    wrong, which is the worst way for this to fail.
     """
-    deferred = 0
     for name, module in model.named_modules():
-        is_row_parallel = type(module) is ROW_PARALLEL_LAYER
-        is_column_parallel = type(module) is COLUMN_PARALLEL_LAYER
-        if not (is_row_parallel or is_column_parallel):
+        if not isinstance(module, TensorParallel_Layer) or module.mp_group is None:
             continue
-        if module.mp_group is None:
-            continue
-        if type(module).tp_overlap_comm:
+
+        layer_type = type(module)
+        is_column_parallel = _is_column_parallel(layer_type)
+        if not (is_column_parallel or _is_row_parallel(layer_type)):
+            raise NotImplementedError(
+                f"AutoTP compile pass cannot rewrite '{name}' ({layer_type.__name__}), and leaving it on the "
+                "module-level path under a full graph would silently drop its backward collective. Drop "
+                "'autotp' from the DeepCompile passes for this model.")
+        if layer_type.tp_overlap_comm:
             raise NotImplementedError("AutoTP compile pass does not support tp_overlap_comm. Set "
                                       "'tp_overlap_comm': false to emit the collectives into the graph.")
-        # GatherFromTensorParallelRegion reads the gathered shard sizes back into Python, which the
-        # full graph this pass needs cannot capture. Leaving such a layer on the module-level path
-        # is not an option either: the pass identifies column-parallel layers by type, so it would
-        # add a second collective on top of the module's own and reduce the input gradient twice.
-        if is_column_parallel and module.gather_output:
-            raise NotImplementedError(
-                f"AutoTP compile pass does not support gather_output layers, but '{name}' is one. Partition it "
-                "without gather_output, or drop 'autotp' from the DeepCompile passes for this model.")
+
         module.defer_collectives_to_compiler = True
-        deferred += 1
-    return deferred
 
 
 def _originating_layer_type(node: Node):
@@ -98,7 +119,12 @@ def _insert_column_collective(gm: GraphModule, activation: Node, consumers: List
 
 
 def pass_insert_tp_collectives(gm: GraphModule, real_inputs):
-    """Insert the tensor-parallel collectives around the matmuls of the injected AutoTP layers."""
+    """Insert the tensor-parallel collectives around the matmuls of the injected AutoTP layers.
+
+    Only f and g are inserted here. The output gather of a gather_output layer is emitted by the
+    layer's own forward (see LinearLayer.forward): it changes the activation's width, so the ops
+    downstream of it only trace correctly if it is already present during graph capture.
+    """
     column_consumers: Dict[Node, List[Node]] = {}
 
     for node in list(gm.graph.nodes):
@@ -106,9 +132,9 @@ def pass_insert_tp_collectives(gm: GraphModule, real_inputs):
             continue
 
         layer_type = _originating_layer_type(node)
-        if layer_type is ROW_PARALLEL_LAYER:
+        if _is_row_parallel(layer_type):
             _insert_row_collective(gm, node)
-        elif layer_type is COLUMN_PARALLEL_LAYER:
+        elif _is_column_parallel(layer_type):
             activation = node.args[0]
             column_consumers.setdefault(activation, []).append(node)
 
@@ -131,7 +157,8 @@ AUTOTP_PASSES = [
 def apply_autotp(gm: GraphModule, real_inputs, passes=None):
     """Apply the AutoTP transformation passes to the graph.
 
-    The collectives are shape-preserving, so unlike AutoSP this needs no shape re-propagation.
+    The inserted collectives are shape-preserving (the shape-changing gather is emitted by the
+    layer forwards during capture), so unlike AutoSP this needs no shape re-propagation.
     """
     for opt_pass in passes or AUTOTP_PASSES:
         opt_pass(gm, real_inputs)

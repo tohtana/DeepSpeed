@@ -50,6 +50,37 @@ def reduce_from_tp_region_fake(input: torch.Tensor):
     return torch.empty_like(input)
 
 
+@torch.library.custom_op("autotp::gather_from_tp_region", mutates_args=())
+def gather_from_tp_region(input: torch.Tensor) -> torch.Tensor:
+    """All-gather the last dimension in the forward pass, take this rank's slice in the backward.
+
+    This is inserted after a column-parallel matmul whose layer asks for ``gather_output``, so that
+    every rank leaves the layer holding the full output rather than its own shard. AutoTP only
+    builds such a layer when the output dimension divides evenly by the TP size, so every shard has
+    the same width and the sizes are known statically.
+    """
+    group = get_tp_group()
+    world_size = dist.get_world_size(group=group)
+    if world_size == 1:
+        return input.clone()
+
+    local_shard = input.contiguous()
+    flat_gathered = torch.empty((world_size * local_shard.shape[0], *local_shard.shape[1:]),
+                                dtype=local_shard.dtype,
+                                device=local_shard.device)
+    dist.all_gather_into_tensor(flat_gathered, local_shard, group=group)
+    # The gather stacks whole shards along dim 0, but the partitioning split the last dimension,
+    # so the shards are re-joined there in rank order to rebuild the unpartitioned output.
+    shards = flat_gathered.view(world_size, *local_shard.shape)
+    return torch.cat(shards.unbind(0), dim=-1)
+
+
+@torch.library.register_fake("autotp::gather_from_tp_region")
+def gather_from_tp_region_fake(input: torch.Tensor):
+    world_size = dist.get_world_size(group=get_tp_group())
+    return input.new_empty((*input.shape[:-1], input.shape[-1] * world_size))
+
+
 def _copy_to_tp_region_backward(ctx, grad):
     # f and g are duals, so f's backward is simply g.
     return reduce_from_tp_region(grad.contiguous())
@@ -59,8 +90,21 @@ def _reduce_from_tp_region_backward(ctx, grad):
     return grad
 
 
+def _gather_from_tp_region_backward(ctx, grad):
+    # The forward concatenated the shards in rank order, so each rank owns a contiguous slice of
+    # the gradient and no communication is needed to recover it.
+    group = get_tp_group()
+    world_size = dist.get_world_size(group=group)
+    if world_size == 1:
+        return grad
+    shard_width = grad.shape[-1] // world_size
+    shard_start = dist.get_rank(group=group) * shard_width
+    return grad.narrow(-1, shard_start, shard_width).contiguous()
+
+
 def _setup_context_without_saved_tensors(ctx, inputs, output):
-    # Both collectives are shape-preserving and stateless, so their backwards need nothing saved.
+    # The collectives are stateless and their shapes are fixed by the TP size, so their backwards
+    # need nothing saved.
     pass
 
 
@@ -69,4 +113,7 @@ torch.library.register_autograd("autotp::copy_to_tp_region",
                                 setup_context=_setup_context_without_saved_tensors)
 torch.library.register_autograd("autotp::reduce_from_tp_region",
                                 _reduce_from_tp_region_backward,
+                                setup_context=_setup_context_without_saved_tensors)
+torch.library.register_autograd("autotp::gather_from_tp_region",
+                                _gather_from_tp_region_backward,
                                 setup_context=_setup_context_without_saved_tensors)
