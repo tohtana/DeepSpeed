@@ -53,7 +53,7 @@ class MLPModel(torch.nn.Module):
 
 def build_config(tp_size, use_compile_pass, gather_output_head=False):
     head_spec = {
-        "patterns": [".*\\.head\\.weight$"],
+        "patterns": ["(.*\\.)?head\\.weight$"],
         "partition_type": "column",
         "gather_output": gather_output_head,
     }
@@ -112,13 +112,14 @@ class TestAutoTPCompileEquivalence(DistributedTest):
     non_daemonic_procs = True
 
     @pytest.mark.sequential
-    def test_matches_module_injection(self):
+    @pytest.mark.parametrize("gather_output_head", [False, True])
+    def test_matches_module_injection(self, gather_output_head):
         if get_accelerator().device_name() == "cpu":
             pytest.skip("CPU does not support this test yet")
 
         device = torch.device(get_accelerator().current_device_name())
-        reference_engine = build_engine(self.world_size, use_compile_pass=False)
-        compiled_engine = build_engine(self.world_size, use_compile_pass=True)
+        reference_engine = build_engine(self.world_size, use_compile_pass=False, gather_output_head=gather_output_head)
+        compiled_engine = build_engine(self.world_size, use_compile_pass=True, gather_output_head=gather_output_head)
 
         # The TP group must see identical inputs on every rank.
         torch.manual_seed(1234)
@@ -129,6 +130,12 @@ class TestAutoTPCompileEquivalence(DistributedTest):
         compiled_out = compiled_engine(compiled_x)
         assert torch.allclose(reference_out, compiled_out, atol=1e-5), \
             "AutoTP compile pass changed the forward result"
+
+        # Comparing the two paths cannot catch a gather that both of them dropped, so the width of
+        # the head output is checked against the partitioning it was configured with.
+        expected_head_width = HIDDEN_DIM if gather_output_head else HIDDEN_DIM // self.world_size
+        assert compiled_out.shape[-1] == expected_head_width, \
+            f"Expected a head output of width {expected_head_width}, got {compiled_out.shape[-1]}"
 
         reference_engine.backward(reference_out.sum())
         compiled_engine.backward(compiled_out.sum())
@@ -142,6 +149,209 @@ class TestAutoTPCompileEquivalence(DistributedTest):
 
         assert torch.allclose(x.grad, compiled_x.grad, atol=1e-5), \
             "AutoTP compile pass changed the gradient reaching the model input"
+
+
+class FusedQKVBlock(torch.nn.Module):
+    """Attention-shaped block whose column-parallel projection is a shaped sub-param layer.
+
+    AutoTP injects a fused QKV projection as SubParamLinearLayer rather than LinearLayer, which is
+    the case an exact-type check in the pass would miss.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.qkv_proj = torch.nn.Linear(HIDDEN_DIM, 3 * HIDDEN_DIM, bias=False)
+        self.o_proj = torch.nn.Linear(HIDDEN_DIM, HIDDEN_DIM, bias=False)
+
+    def forward(self, x):
+        query, key, value = self.qkv_proj(x).chunk(3, dim=-1)
+        return x + self.o_proj(query * key + value)
+
+
+class FusedQKVModel(torch.nn.Module):
+
+    def __init__(self, nlayers=2):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([FusedQKVBlock() for _ in range(nlayers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+def build_fused_qkv_engine(tp_size, use_compile_pass):
+    config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "optimizer": {
+            "type": "Adam",
+            "params": {
+                "lr": 1e-6
+            }
+        },
+        "tensor_parallel": {
+            "autotp_size": tp_size,
+            "partition_config": {
+                "use_default_specs":
+                False,
+                "layer_specs": [{
+                    "patterns": [".*\\.qkv_proj\\.weight$"],
+                    "partition_type": "column",
+                    "shape": [3, -1],
+                    "partition_dim": 0,
+                }, {
+                    "patterns": [".*\\.o_proj\\.weight$"],
+                    "partition_type": "row",
+                }],
+            },
+        },
+        "zero_optimization": {
+            "stage": 0
+        },
+    }
+    if use_compile_pass:
+        config["compile"] = {"deepcompile": True, "passes": ["autotp"]}
+
+    torch.manual_seed(42)
+    model = FusedQKVModel()
+    engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+    if use_compile_pass:
+        engine.compile()
+    return engine
+
+
+class TestAutoTPCompileLayerVariants(DistributedTest):
+    """Every injected tensor-parallel layer variant has to be rewritten, not just the base classes.
+
+    AutoTP injects a family of variants per partitioning style (fused QKV, conv, packed gate/up,
+    Yuan, shaped sub-params). A variant left on the module-level path is not merely unoptimized:
+    the pass compiles with fullgraph=True, and ColumnParallel's forward is an identity, so tracing
+    folds it away and drops its backward all-reduce. The forward still matches and only the
+    gradients are wrong.
+    """
+
+    world_size = 2
+    non_daemonic_procs = True
+
+    @pytest.mark.sequential
+    def test_fused_qkv_matches_module_injection(self):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("CPU does not support this test yet")
+
+        device = torch.device(get_accelerator().current_device_name())
+        reference_engine = build_fused_qkv_engine(self.world_size, use_compile_pass=False)
+        compiled_engine = build_fused_qkv_engine(self.world_size, use_compile_pass=True)
+
+        from deepspeed.module_inject.layers import SubParamLinearLayer
+        qkv = compiled_engine.module.layers[0].qkv_proj
+        assert isinstance(qkv, SubParamLinearLayer), f"expected a shaped sub-param layer, got {type(qkv).__name__}"
+        assert qkv.defer_collectives_to_compiler, "the fused QKV layer was left on the module-level path"
+
+        torch.manual_seed(1234)
+        x = torch.randn(1, 8, HIDDEN_DIM, device=device, dtype=torch.float32, requires_grad=True)
+        compiled_x = x.detach().clone().requires_grad_(True)
+
+        reference_out = reference_engine(x)
+        compiled_out = compiled_engine(compiled_x)
+        assert torch.allclose(reference_out, compiled_out, atol=1e-5)
+
+        reference_engine.backward(reference_out.sum())
+        compiled_engine.backward(compiled_out.sum())
+
+        for (name, reference_param), (_, compiled_param) in zip(reference_engine.module.named_parameters(),
+                                                                compiled_engine.module.named_parameters()):
+            assert torch.allclose(reference_param.grad, compiled_param.grad, atol=1e-5), \
+                f"AutoTP compile pass changed the gradient of {name}"
+
+        assert torch.allclose(x.grad, compiled_x.grad, atol=1e-5), \
+            "AutoTP compile pass changed the gradient reaching the model input"
+
+
+class TestAutoTPCompileMoE(DistributedTest):
+    """A mixture-of-experts model must survive the pass.
+
+    MoE models are the reason the tp_plan converter has to skip unknown styles per entry rather
+    than discard the plan: their expert and router entries use styles AutoTP does not implement,
+    while their attention entries are ordinary colwise/rowwise. The experts themselves stay
+    replicated, so the pass only has to leave them alone and rewrite the attention projections.
+    """
+
+    world_size = 2
+    non_daemonic_procs = True
+
+    @pytest.mark.sequential
+    def test_mixtral_matches_module_injection(self):
+        if get_accelerator().device_name() == "cpu":
+            pytest.skip("CPU does not support this test yet")
+        transformers = pytest.importorskip("transformers")
+        if not hasattr(transformers, "MixtralForCausalLM"):
+            pytest.skip("transformers build has no Mixtral")
+
+        def build(use_compile_pass):
+            config = transformers.MixtralConfig(vocab_size=256,
+                                                hidden_size=HIDDEN_DIM,
+                                                intermediate_size=INTERMEDIATE_DIM,
+                                                num_hidden_layers=2,
+                                                num_attention_heads=8,
+                                                num_key_value_heads=8,
+                                                num_local_experts=4,
+                                                num_experts_per_tok=2,
+                                                max_position_embeddings=64,
+                                                use_cache=False,
+                                                tie_word_embeddings=False)
+            config._attn_implementation = "sdpa"
+            # The default eager experts route tokens with data-dependent indexing, which a full
+            # graph cannot capture; batched_mm is the static-shape implementation.
+            config._experts_implementation = "batched_mm"
+            torch.manual_seed(42)
+            model = transformers.MixtralForCausalLM(config)
+            ds_config = {
+                "train_micro_batch_size_per_gpu": 1,
+                "optimizer": {
+                    "type": "Adam",
+                    "params": {
+                        "lr": 1e-6
+                    }
+                },
+                "tensor_parallel": {
+                    "autotp_size": self.world_size
+                },
+                "zero_optimization": {
+                    "stage": 0
+                },
+            }
+            if use_compile_pass:
+                ds_config["compile"] = {"deepcompile": True, "passes": ["autotp"]}
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+            if use_compile_pass:
+                engine.compile()
+            return engine
+
+        device = torch.device(get_accelerator().current_device_name())
+        reference_engine = build(False)
+        compiled_engine = build(True)
+
+        torch.manual_seed(1234)
+        input_ids = torch.randint(0, 256, (1, 16), device=device)
+        labels = torch.randint(0, 256, (1, 16), device=device)
+
+        def step(engine):
+            logits = engine(input_ids=input_ids, use_cache=False).logits
+            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 256).float(), labels.reshape(-1))
+            engine.backward(loss)
+            return loss
+
+        reference_loss = step(reference_engine)
+        compiled_loss = step(compiled_engine)
+        assert torch.allclose(reference_loss, compiled_loss, atol=1e-5), \
+            f"MoE loss changed: {reference_loss.item()} vs {compiled_loss.item()}"
+
+        for (name, reference_param), (_, compiled_param) in zip(reference_engine.module.named_parameters(),
+                                                                compiled_engine.module.named_parameters()):
+            if reference_param.grad is None or compiled_param.grad is None:
+                continue
+            assert torch.allclose(reference_param.grad, compiled_param.grad, atol=1e-5), \
+                f"AutoTP compile pass changed the gradient of {name}"
 
 
 class TestAutoTPCompileDataParallelGradients(DistributedTest):
@@ -182,25 +392,6 @@ class TestAutoTPCompileDataParallelGradients(DistributedTest):
             dist.all_gather(gathered, param.grad.contiguous(), group=dp_group)
             assert torch.allclose(gathered[0], gathered[-1], atol=1e-5), \
                 f"Gradient of {name} was not reduced across the data-parallel group"
-
-
-class TestAutoTPCompileRejectsGatherOutput(DistributedTest):
-    """gather_output layers must be rejected instead of silently losing a collective.
-
-    Their gather reads shard sizes back into Python, which the full graph the pass needs cannot
-    capture, so the pass can neither emit the collectives nor leave them to the module.
-    """
-
-    world_size = 2
-    non_daemonic_procs = True
-
-    @pytest.mark.sequential
-    def test_gather_output_raises(self):
-        if get_accelerator().device_name() == "cpu":
-            pytest.skip("CPU does not support this test yet")
-
-        with pytest.raises(NotImplementedError, match="gather_output"):
-            build_engine(self.world_size, use_compile_pass=True, gather_output_head=True)
 
 
 class TestAutoTPCompileRejectsUnsupportedCombinations(DistributedTest):

@@ -69,10 +69,9 @@ class TestTPPlanConverter:
         assert specs[0].patterns[0].endswith(r"\.weight$")
 
     def test_empty_plan(self):
-        hf_plan = {}
-        specs = TPPlanConverter.convert(hf_plan)
-
-        assert len(specs) == 0
+        """An empty plan has nothing to convert, so the caller should fall back rather than
+        silently partition nothing."""
+        assert TPPlanConverter.convert({}) is None
 
     def test_multiple_patterns(self):
         hf_plan = {
@@ -109,11 +108,25 @@ class TestTPPlanConverter:
 
         assert re.match(down_pattern.patterns[0], "model.layers.5.mlp.down_proj.weight")
 
-    def test_unsupported_style_returns_none(self):
-        """Unsupported styles cause convert() to return None for fallback."""
+    def test_unsupported_style_is_skipped_not_fatal(self):
+        """One unknown style must not discard the entries next to it.
+
+        Dropping the whole plan sends the model down the heuristic path, which shards by name
+        alone and has no notion of the modules the plan deliberately excluded. On Llama4 that
+        wraps the MoE router, whose forward returns a tuple, and breaks the model outright.
+        """
         hf_plan = {"layers.*.q_proj": "local_colwise", "layers.*.o_proj": "rowwise"}
-        result = TPPlanConverter.convert(hf_plan)
-        assert result is None
+        specs = TPPlanConverter.convert(hf_plan)
+
+        assert specs is not None
+        by_type = {spec.partition_type for spec in specs}
+        assert PartitionType.ROW in by_type, "the supported entry should still be applied"
+        assert PartitionType.SKIP in by_type, "the unsupported entry should be left unpartitioned"
+
+    def test_all_styles_unsupported_returns_none(self):
+        """With nothing convertible there is no plan to apply, so fall back."""
+        hf_plan = {"layers.*.q_proj": "local_colwise", "layers.*.experts": "moe_tp_experts"}
+        assert TPPlanConverter.convert(hf_plan) is None
 
     def test_alternate_prefixes(self):
         """Test tp_plan with non-layers prefix"""
