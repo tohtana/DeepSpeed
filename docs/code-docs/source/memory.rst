@@ -298,8 +298,7 @@ Host Memory Pinning
 DeepSpeed page-locks (pins) host memory so DMA engines can move data efficiently
 between CPU RAM and accelerators or NVMe. Host tensors can be pinned either with
 PyTorch / the accelerator hook, or with the standalone DeepSpeed ``pin_memory``
-operator (``posix_memalign`` + ``mlock``), which does not require ``libaio`` or
-``async_io`` worker threads.
+operator (``posix_memalign`` + ``mlock``).
 
 Accelerator API (torch path)
 ============================
@@ -337,10 +336,9 @@ Allocate and free page-locked host tensors through ``PinMemoryBuilder`` /
 * ``is_pinned(tensor)`` — ``True`` for torch-pinned buffers and for tensors whose
   storage falls inside a DeepSpeed-managed locked range (slices/views included)
 
-The same three methods remain available on ``aio_handle`` / ``gds_handle`` as thin
-wrappers. Buffers allocated via ``pin_handle`` and via an I/O handle share one
-process-wide pin manager, so DeepNVMe bounce-buffer skipping stays consistent
-across both paths.
+The same three methods remain available on DeepNVMe I/O handles as thin wrappers.
+Buffers allocated via ``pin_handle`` and via an I/O handle share one process-wide
+pin manager, so DeepNVMe bounce-buffer skipping stays consistent across both paths.
 
 .. list-table:: Differences between torch pinning and the DeepSpeed ``pin_memory`` op
    :header-rows: 1
@@ -354,13 +352,10 @@ across both paths.
      - ``posix_memalign`` + ``mlock`` via ``PinMemoryBuilder`` / ``pin_handle``
    * - Build dependency
      - None beyond the active accelerator / PyTorch
-     - DeepSpeed **pin_memory** op must build and load (no ``libaio`` required)
-   * - AIO / GDS worker threads
-     - Not involved
-     - Not required (unlike allocating through ``aio_handle`` alone)
+     - DeepSpeed **pin_memory** op must build and load
    * - Visible to DeepNVMe
-     - Yes (``aio_handle.is_pinned`` / bounce-buffer skip)
-     - Yes (same process-wide manager as ``async_io`` / ``gds``)
+     - Yes (``is_pinned`` / bounce-buffer skip on I/O handles)
+     - Yes (same process-wide pin manager)
    * - ``is_pinned``
      - Torch pinned status (``tensor.is_pinned()``)
      - Torch-pinned **or** DeepSpeed-managed locked range (slices/views included)
@@ -374,10 +369,7 @@ across both paths.
 Requirements
 ============
 
-* The DeepSpeed **pin_memory** op must build and load successfully. When
-  ``async_io`` / ``gds`` are precompiled, ``setup.py`` also precompiles
-  ``pin_memory`` so deployments without a runtime compiler still get the shared
-  manager.
+* The DeepSpeed **pin_memory** op must build and load successfully.
 * The process must be allowed to lock the requested host memory (see
   ``ulimit -l`` / ``memlock`` limits). Large ZeRO CPU-offload or DeepNVMe
   footprints can otherwise hit the memlock ceiling.
