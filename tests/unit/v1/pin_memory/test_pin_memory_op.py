@@ -24,3 +24,15 @@ def test_pin_handle_alloc_free_and_is_pinned():
         assert not handle.is_pinned(torch.empty(NUM_ELEMS, dtype=torch.float))
     finally:
         assert handle.free_cpu_locked_tensor(buffer) is True
+
+
+def test_pin_handle_non_cpu_example_returns_cpu_tensor():
+    handle = PinMemoryBuilder().load().pin_handle()
+    example = torch.empty(0, dtype=torch.float, device='meta')
+    buffer = handle.new_cpu_locked_tensor(NUM_ELEMS, example)
+    try:
+        assert buffer.device.type == 'cpu'
+        assert buffer.dtype == example.dtype
+        assert handle.is_pinned(buffer)
+    finally:
+        assert handle.free_cpu_locked_tensor(buffer) is True

@@ -14,7 +14,7 @@ struct deepspeed_pin_handle_t {
 
     torch::Tensor new_cpu_locked_tensor(const int64_t num_elem, const torch::Tensor& example_tensor)
     {
-        return _pinned_tensor_mgr->alloc(num_elem, example_tensor.options());
+        return _pinned_tensor_mgr->alloc(num_elem, example_tensor.scalar_type());
     }
 
     bool free_cpu_locked_tensor(torch::Tensor& locked_tensor)
