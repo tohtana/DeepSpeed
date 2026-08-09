@@ -72,6 +72,48 @@ def test_parser_multinode():
     assert (ret == {'worker-0': [2, 3], 'worker-1': [0, 1, 2]})
 
 
+def test_parse_inclusion_exclusion():
+    '''parse_inclusion_exclusion() maps a slot-count pool onto parse_resource_filter().
+
+    The pool holds slot counts rather than slot lists, so this is the only place the
+    real slots are known; the tests above all hand parse_resource_filter() a correct
+    dict directly and so never cover this.
+    '''
+    pool = {'worker-0': 4, 'worker-1': 4}
+
+    # no filtering
+    ret = dsrun.parse_inclusion_exclusion(pool, '', '')
+    assert (ret == {'worker-0': [0, 1, 2, 3], 'worker-1': [0, 1, 2, 3]})
+
+    # a bare hostname means every slot on that node, as parse_resource_filter documents
+    ret = dsrun.parse_inclusion_exclusion(pool, 'worker-0', '')
+    assert (ret == {'worker-0': [0, 1, 2, 3]})
+
+    # the example from parse_resource_filter's own docstring
+    ret = dsrun.parse_inclusion_exclusion(pool, 'worker-0@worker-1:0,2', '')
+    assert (ret == {'worker-0': [0, 1, 2, 3], 'worker-1': [0, 2]})
+
+    ret = dsrun.parse_inclusion_exclusion(pool, 'worker-1:0,2', '')
+    assert (ret == {'worker-1': [0, 2]})
+
+    ret = dsrun.parse_inclusion_exclusion(pool, '', 'worker-0:1')
+    assert (ret == {'worker-0': [0, 2, 3], 'worker-1': [0, 1, 2, 3]})
+
+
+def test_parse_inclusion_exclusion_errors():
+    '''An out-of-range slot has to be rejected for --include, not just --exclude.'''
+    pool = {'worker-0': 4}
+
+    for spec in ('worker-0:4', 'worker-0:99', 'worker-0:0,4'):
+        with pytest.raises(ValueError):
+            dsrun.parse_inclusion_exclusion(pool, spec, '')
+        with pytest.raises(ValueError):
+            dsrun.parse_inclusion_exclusion(pool, '', spec)
+
+    with pytest.raises(ValueError):
+        dsrun.parse_inclusion_exclusion(pool, 'jeff', '')
+
+
 def test_parser_errors():
     '''Ensure we catch errors. '''
     hosts = {'worker-0': [0, 1, 2, 3], 'worker-1': [0, 1, 2, 3]}
