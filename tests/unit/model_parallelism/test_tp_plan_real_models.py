@@ -9,6 +9,7 @@ import deepspeed.comm as dist
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.layers import LinearLayer
+from deepspeed.module_inject.tp_plan_converter import TPPlanConverter
 from deepspeed.module_inject.tp_shard import get_shard_size_list
 from deepspeed.runtime.tensor_parallel.config import _get_hf_tp_plan
 from deepspeed.utils import groups
@@ -284,3 +285,79 @@ class TestTPPlanRealHFModels(DistributedTest):
         loss = output.mean()
         engine.backward(loss)
         engine.step()
+
+
+class TestTPPlanRealHFModelUnevenHeads(DistributedTest):
+    """Exercise head-aligned direct-plan sharding when TP does not divide the heads."""
+
+    world_size = 4
+
+    @pytest.mark.parametrize("route", ("hf", "custom"))
+    def test_qwen2_tp_plan_with_uneven_heads(self, route):
+        skip_on_device()
+
+        try:
+            from transformers import AutoModelForCausalLM, Qwen2Config
+        except ImportError:
+            pytest.skip("transformers not installed")
+
+        config = Qwen2Config(
+            vocab_size=257,
+            hidden_size=384,
+            intermediate_size=768,
+            num_hidden_layers=1,
+            num_attention_heads=6,
+            num_key_value_heads=6,
+            tie_word_embeddings=False,
+        )
+        model = AutoModelForCausalLM.from_config(config)
+        if route == "hf":
+            hf_tp_plan = _get_hf_tp_plan(model)
+            assert hf_tp_plan
+            assert TPPlanConverter.convert(hf_tp_plan) is not None
+
+        tensor_parallel = {
+            "autotp_size": self.world_size,
+            "tp": {
+                "tp_grain_size": 64,
+            },
+        }
+        if route == "custom":
+            tensor_parallel["partition_config"] = {
+                "use_default_specs":
+                False,
+                "layer_specs": [
+                    {
+                        "patterns": [r".*\.self_attn\.[qkv]_proj\.weight$"],
+                        "partition_type": "column",
+                    },
+                    {
+                        "patterns": [r".*\.self_attn\.o_proj\.weight$"],
+                        "partition_type": "row",
+                    },
+                ],
+            }
+        ds_config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "tensor_parallel": tensor_parallel,
+            "zero_optimization": {
+                "stage": 0,
+            },
+        }
+
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
+
+        q_proj = engine.module.model.layers[0].self_attn.q_proj
+        o_proj = engine.module.model.layers[0].self_attn.o_proj
+        assert isinstance(q_proj, LinearLayer)
+        assert q_proj._partition_sizes == (128, 128, 64, 64)
+        assert o_proj._partition_sizes == q_proj._partition_sizes
+
+        input_ids = torch.arange(8, device=get_accelerator().current_device_name()).reshape(1, 8) % config.vocab_size
+        dist.broadcast(
+            input_ids,
+            src=groups.get_tensor_model_parallel_src_rank(),
+            group=groups.get_tensor_model_parallel_group(),
+        )
+        outputs = engine(input_ids)
+        assert outputs.logits.shape == (1, 8, config.vocab_size)
