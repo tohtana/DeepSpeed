@@ -2163,12 +2163,6 @@ DeepSpeed provides compiler-based optimization passes through the `compile` conf
 }
 ```
 
-<i>**passes**</i>: [array of strings]
-
-| Description                                                                       | Default |
-| ----------------------------------------------------------------------------------- | ------- |
-| List of compiler passes to apply. Currently supported: `["autosp", "autotp"]`.    | `[]`    |
-
 ### AutoTP options
 
 The `autotp` pass emits AutoTP's tensor-parallel collectives into the compiled graph instead of
@@ -2187,9 +2181,13 @@ and the pass reuses the same tensor-parallel group.
 }
 ```
 
-The pass compiles the module with `fullgraph=True`, because a graph break would leave part of the
-model without the collectives it suppressed at the module level. It cannot yet be combined with the
-ZeRO passes (`z1`, `z3`) or with `autosp`, and it does not support `tensor_parallel.tp_overlap_comm`.
+<i>**passes**</i>: [array of strings]
+
+| Description                                                                       | Default |
+| ----------------------------------------------------------------------------------- | ------- |
+| List of compiler passes to apply. Currently supported: `["autosp", "autotp"]`.    | `[]`    |
+
+
 
 ### Data Type options
 

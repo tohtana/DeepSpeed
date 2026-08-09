@@ -305,9 +305,6 @@ class TensorParallel_Layer(nn.Module, ABC):
         """
         super().__init__()
         self.support_training: bool = False
-        # DeepCompile's AutoTP pass emits the tensor-parallel collectives as graph nodes so the
-        # scheduler and profiler can see them. The module-level collectives are suppressed in that
-        # mode, but mp_group is still needed for parameter gathering and checkpointing.
         self.defer_collectives_to_compiler: bool = False
         self.mp_group = mp_group
         if mp_group is not None:

@@ -18,22 +18,14 @@ ROW_PARALLEL_OP = torch.ops.autotp.reduce_from_tp_region.default
 GATHER_OUTPUT_OP = torch.ops.autotp.gather_from_tp_region.default
 
 # AutoTP replaces nn.Linear with these layers and shards their weights, so the injected layer type
-# already records the partitioning decision the pass needs. Reading it back is more robust than
-# re-deriving column/row from parameter-name patterns.
-#
-# The families are matched by subclass rather than by exact type. AutoTP injects several variants
-# per family (fused QKV, conv, packed gate/up, Yuan), and they either inherit the base forward or
-# repeat its shape, so the pass rewrites all of them identically. Matching exact types instead
-# leaves the variants on the module-level path, which is not merely unoptimized but wrong: see the
-# comment in defer_collectives_to_compiler.
+# already records the partitioning decision the pass needs. 
+
 COLUMN_PARALLEL_LAYERS = (LinearLayer, SubParamLinearLayer)
 ROW_PARALLEL_LAYERS = (LinearAllreduce, SubParamLinearAllreduce)
 # LmHeadLinearAllreduce subclasses LinearAllreduce but slices its own input and reduces with
 # inference_all_reduce rather than going through RowParallel, so the pass cannot stand in for it.
 UNSUPPORTED_LAYERS = (LmHeadLinearAllreduce, )
 
-# The injected layers compute their matmul with torch.matmul; the plain nn.Linear spelling is
-# accepted too so the pass keeps working if a layer is lowered differently.
 _MATMUL_TARGETS = {
     torch.matmul,
     torch.ops.aten.matmul.default,
@@ -60,10 +52,7 @@ def defer_collectives_to_compiler(model) -> None:
     """Suppress the module-level TP collectives on layers this pass will handle in the graph.
 
     Any tensor-parallel layer the pass cannot rewrite is rejected rather than left on the
-    module-level path. That path looks like the safe fallback but is not: the pass compiles with
-    fullgraph=True, and ColumnParallel's forward is a plain identity, so tracing folds it away and
-    takes its backward all-reduce with it. The forward still matches and only the gradients are
-    wrong, which is the worst way for this to fail.
+    module-level path.
     """
     for name, module in model.named_modules():
         if not isinstance(module, TensorParallel_Layer) or module.mp_group is None:
@@ -107,9 +96,7 @@ def _insert_row_collective(gm: GraphModule, matmul: Node) -> Node:
 
 
 def _insert_column_collective(gm: GraphModule, activation: Node, consumers: List[Node]) -> Node:
-    """
-    Insert f in front of the column-parallel matmuls that share activation.
-    """
+    """Insert f in front of the column-parallel matmuls that share activation."""
     with gm.graph.inserting_before(consumers[0]):
         collective_node = gm.graph.call_function(COLUMN_PARALLEL_OP, args=(activation, ))
     collective_node.meta["val"] = activation.meta.get("val")
@@ -155,11 +142,7 @@ AUTOTP_PASSES = [
 
 
 def apply_autotp(gm: GraphModule, real_inputs, passes=None):
-    """Apply the AutoTP transformation passes to the graph.
-
-    The inserted collectives are shape-preserving (the shape-changing gather is emitted by the
-    layer forwards during capture), so unlike AutoSP this needs no shape re-propagation.
-    """
+    """Apply the AutoTP transformation passes to the graph."""
     for opt_pass in passes or AUTOTP_PASSES:
         opt_pass(gm, real_inputs)
     return gm

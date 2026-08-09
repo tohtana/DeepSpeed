@@ -9,11 +9,7 @@ from deepspeed.utils import groups
 
 
 def get_tp_group():
-    """Return the tensor-parallel group created by the existing AutoTP setup.
-
-    The AutoTP pass reuses the groups that ``TpTrainingManager`` already builds, so the compiled
-    collectives always communicate over the same group as the module-level ones they replace.
-    """
+    """Return the tensor-parallel group created by the existing AutoTP setup."""
     return groups.get_tensor_model_parallel_group()
 
 
@@ -21,7 +17,7 @@ def get_tp_group():
 def copy_to_tp_region(input: torch.Tensor) -> torch.Tensor:
     """Identity in the forward pass, all-reduce in the backward pass.
 
-    This is Megatron's ``f``. It is inserted before a column-parallel matmul: the activation is
+    Inserted before a column-parallel matmul: the activation is
     already replicated across the tensor-parallel group, so nothing has to happen in the forward
     pass, while each rank contributes a partial gradient that must be summed in the backward pass.
     """
@@ -36,8 +32,8 @@ def copy_to_tp_region_fake(input: torch.Tensor):
 @torch.library.custom_op("autotp::reduce_from_tp_region", mutates_args=())
 def reduce_from_tp_region(input: torch.Tensor) -> torch.Tensor:
     """All-reduce in the forward pass, identity in the backward pass.
-
-    This is Megatron's ``g``. It is inserted after a row-parallel matmul, whose output is only a
+    
+    Inserted after a row-parallel matmul, whose output is only a
     partial sum because each rank holds a slice of the input dimension.
     """
     output = input.contiguous().clone()
@@ -54,10 +50,8 @@ def reduce_from_tp_region_fake(input: torch.Tensor):
 def gather_from_tp_region(input: torch.Tensor) -> torch.Tensor:
     """All-gather the last dimension in the forward pass, take this rank's slice in the backward.
 
-    This is inserted after a column-parallel matmul whose layer asks for ``gather_output``, so that
-    every rank leaves the layer holding the full output rather than its own shard. AutoTP only
-    builds such a layer when the output dimension divides evenly by the TP size, so every shard has
-    the same width and the sizes are known statically.
+    Inserted after a column-parallel matmul whose layer asks for gather_output, so that
+    every rank leaves the layer holding the full output rather than its own shard.
     """
     group = get_tp_group()
     world_size = dist.get_world_size(group=group)
@@ -69,8 +63,6 @@ def gather_from_tp_region(input: torch.Tensor) -> torch.Tensor:
                                 dtype=local_shard.dtype,
                                 device=local_shard.device)
     dist.all_gather_into_tensor(flat_gathered, local_shard, group=group)
-    # The gather stacks whole shards along dim 0, but the partitioning split the last dimension,
-    # so the shards are re-joined there in rank order to rebuild the unpartitioned output.
     shards = flat_gathered.view(world_size, *local_shard.shape)
     return torch.cat(shards.unbind(0), dim=-1)
 
@@ -82,7 +74,8 @@ def gather_from_tp_region_fake(input: torch.Tensor):
 
 
 def _copy_to_tp_region_backward(ctx, grad):
-    # f and g are duals, so f's backward is simply g.
+    # copy_to_tp_region and reduce_from_tp_region are duals, 
+    # so copy_to_tp_region's backward is simply reduce_from_tp_region.
     return reduce_from_tp_region(grad.contiguous())
 
 
@@ -91,8 +84,6 @@ def _reduce_from_tp_region_backward(ctx, grad):
 
 
 def _gather_from_tp_region_backward(ctx, grad):
-    # The forward concatenated the shards in rank order, so each rank owns a contiguous slice of
-    # the gradient and no communication is needed to recover it.
     group = get_tp_group()
     world_size = dist.get_world_size(group=group)
     if world_size == 1:
@@ -103,8 +94,6 @@ def _gather_from_tp_region_backward(ctx, grad):
 
 
 def _setup_context_without_saved_tensors(ctx, inputs, output):
-    # The collectives are stateless and their shapes are fixed by the TP size, so their backwards
-    # need nothing saved.
     pass
 
 
