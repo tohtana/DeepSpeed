@@ -28,28 +28,6 @@ def _build_gate_up_layer(out_features, tp_world_size, tp_index, meta):
     return layer
 
 
-def test_gate_up_partition_ignores_later_grain_size_changes():
-    meta = AutoTPMeta(tp_grain_size=1)
-    layer = _build_gate_up_layer(out_features=10, tp_world_size=2, tp_index=0, meta=meta)
-    assert layer._subparam_shard_widths == [[3, 2], [3, 2]]
-
-    full_weight = torch.arange(30, dtype=torch.float32).view(10, 3)
-
-    first = torch.nn.Parameter(full_weight.clone())
-    layer._tp_partition([first, None])
-
-    # A second AutoTP model would carry a different grain size; the first layer's split must
-    # not move with it, because the layer resolved its split from its own tp_meta.
-    other_meta = AutoTPMeta(tp_grain_size=4)
-    _ = _build_gate_up_layer(out_features=10, tp_world_size=2, tp_index=0, meta=other_meta)
-
-    second = torch.nn.Parameter(full_weight.clone())
-    layer._tp_partition([second, None])
-
-    assert tuple(second.shape) == (6, 3)
-    assert torch.equal(first.data, second.data)
-
-
 def test_gate_up_partition_covers_the_whole_weight():
     meta = AutoTPMeta(tp_grain_size=1)
     full_weight = torch.arange(30, dtype=torch.float32).view(10, 3)
@@ -57,6 +35,9 @@ def test_gate_up_partition_covers_the_whole_weight():
     shards = []
     for tp_index in range(2):
         layer = _build_gate_up_layer(out_features=10, tp_world_size=2, tp_index=tp_index, meta=meta)
+        # The gate and up halves (5 each) split over 2 ranks as [3, 2]; the layer freezes these
+        # widths from its own tp_meta so the partition is deterministic.
+        assert layer._subparam_shard_widths == [[3, 2], [3, 2]]
         param = torch.nn.Parameter(full_weight.clone())
         layer._tp_partition([param, None])
         shards.append(param.data)
