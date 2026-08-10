@@ -12,6 +12,7 @@ from deepspeed.checkpoint.constants import (AUTOTP_UNSUPPORTED_PARAMETER_PATTERN
                                             VOCABULARY_PARAMETER_PATTERNS, DS_AUTOTP_UC_META,
                                             UNIVERSAL_CHECKPOINT_VERSION_VALUE)
 from deepspeed.checkpoint.universal_checkpoint import _narrow_sub_params, _resolve_autotp_partition
+from deepspeed.module_inject.tp_shard import AutoTPMeta
 from deepspeed.module_inject.layers import (_build_param_uc_restore_meta, _get_param_uc_conversion_meta,
                                             _subparam_shard_widths, GateUpPack_LinearLayer, LinearAllreduce,
                                             LinearLayer, SubParamLinearAllreduce, SubParamLinearLayer,
@@ -403,7 +404,7 @@ def test_sub_param_shard_widths_round_trip_with_zero_width_ranks(tp_world_size):
     # More ranks than kv heads leaves some ranks holding none of a sub-parameter. Those empty
     # shards still have to tile the sub-parameter and survive a restore round trip.
     sub_param_sizes = (8, 2, 2)
-    widths = _subparam_shard_widths(sub_param_sizes, tp_world_size)
+    widths = _subparam_shard_widths(sub_param_sizes, tp_world_size, AutoTPMeta())
 
     assert any(width == 0 for per_rank in widths for width in per_rank)
     for size, per_rank in zip(sub_param_sizes, widths):
@@ -474,27 +475,22 @@ def test_sub_param_layer_materializes_zero_width_final_dimension(layer_cls):
 
 
 def test_lm_head_forward_uses_frozen_partition_sizes():
-    # The weight columns were cut when the layer was built. A second AutoTP model overwrites the
-    # process-wide tp_shard globals, so re-deriving the split in forward would slice the input
-    # differently than the weight and the row-parallel all-reduce would hide the mismatch.
-    from deepspeed.module_inject import tp_shard
+    # The weight columns were cut when the layer was built; forward must slice the input with
+    # the same frozen partition sizes rather than re-derive them.
     from deepspeed.module_inject.layers import LmHeadLinearAllreduce
+    from deepspeed.module_inject.tp_shard import AutoTPMeta
 
-    grain_size, kv_heads = tp_shard.tp_grain_size, tp_shard.num_kv_heads
-    try:
-        tp_shard.set_tp_grain_size(1)
-        tp_shard.set_num_kv_heads(None)
-        layer = LmHeadLinearAllreduce(torch.nn.Linear(101, 8, bias=False), mp_group=None)
-        layer.tp_world_size = 2
-        layer.tp_index = 1
-        frozen = layer._freeze_partition_sizes(101)
-        assert frozen == (51, 50)
+    layer = LmHeadLinearAllreduce(torch.nn.Linear(101, 8, bias=False),
+                                  mp_group=None,
+                                  tp_meta=AutoTPMeta(tp_grain_size=1))
+    layer.tp_world_size = 2
+    layer.tp_index = 1
+    frozen = layer._freeze_partition_sizes(101)
+    assert frozen == (51, 50)
 
-        # A later model narrows the grain, which would change a recomputed split.
-        tp_shard.set_tp_grain_size(64)
-        layer.weight.data = torch.zeros(8, frozen[1])
+    # A later model carries a different grain; this layer's split is frozen from its own meta.
+    other_meta = AutoTPMeta(tp_grain_size=64)
+    assert other_meta.tp_grain_size != layer.tp_meta.tp_grain_size
+    layer.weight.data = torch.zeros(8, frozen[1])
 
-        layer(torch.zeros(1, 1, 101))
-    finally:
-        tp_shard.set_tp_grain_size(grain_size)
-        tp_shard.set_num_kv_heads(kv_heads)
+    layer(torch.zeros(1, 1, 101))
