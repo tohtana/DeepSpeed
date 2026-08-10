@@ -114,6 +114,39 @@ def test_parse_inclusion_exclusion_errors():
         dsrun.parse_inclusion_exclusion(pool, 'jeff', '')
 
 
+def test_visible_devices_preserve_physical_ids(monkeypatch):
+
+    class FakeAccelerator:
+
+        def visible_devices_envs(self):
+            return ['CUDA_VISIBLE_DEVICES']
+
+        def device_count(self):
+            return 2
+
+    class FakeProcess:
+        returncode = 0
+
+        def wait(self):
+            pass
+
+    captured_world_info = {}
+
+    def capture_world_info(world_info):
+        captured_world_info.update(world_info)
+        return 'encoded'
+
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '0,2')
+    monkeypatch.setattr(dsrun, 'fetch_hostfile', lambda _: None)
+    monkeypatch.setattr(dsrun, 'get_accelerator', lambda: FakeAccelerator())
+    monkeypatch.setattr(dsrun, 'encode_world_info', capture_world_info)
+    monkeypatch.setattr(dsrun.subprocess, 'Popen', lambda *args, **kwargs: FakeProcess())
+
+    dsrun.main(args=['dummy.py'])
+
+    assert captured_world_info == {'localhost': [0, 2]}
+
+
 def test_parser_errors():
     '''Ensure we catch errors. '''
     hosts = {'worker-0': [0, 1, 2, 3], 'worker-1': [0, 1, 2, 3]}

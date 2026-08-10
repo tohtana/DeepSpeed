@@ -450,6 +450,7 @@ def main(args=None):
     # respect VISIBLE_DEVICES for a single node and no explicit resource filters
     visible_devices_env = get_accelerator().visible_devices_envs()[0]
     visible_devices = os.environ.get(visible_devices_env, "")
+    include_from_visible_devices = False
     if not resource_pool and len(visible_devices):
         detected_str = f"Detected VISIBLE_DEVICES={visible_devices}"
         if len(args.include) or len(args.exclude) or args.num_nodes > 1 or args.num_gpus > 0:
@@ -458,6 +459,7 @@ def main(args=None):
             )
         else:
             args.include = f"localhost:{visible_devices}"
+            include_from_visible_devices = True
             print(f"{detected_str}: setting --include={args.include}")
         del os.environ[visible_devices_env]
 
@@ -478,7 +480,11 @@ def main(args=None):
     if not multi_node_exec and args.num_nodes > 1:
         raise ValueError("Num nodes is >1 but no extra nodes available via hostfile")
 
-    active_resources = parse_inclusion_exclusion(resource_pool, args.include, args.exclude)
+    if include_from_visible_devices:
+        # These are physical IDs and may be sparse even when device_count is mask-reduced.
+        active_resources = collections.OrderedDict([('localhost', [int(x) for x in visible_devices.split(',')])])
+    else:
+        active_resources = parse_inclusion_exclusion(resource_pool, args.include, args.exclude)
     env = os.environ.copy()
 
     # validate that passwordless-ssh is workly properly with this hostfile
