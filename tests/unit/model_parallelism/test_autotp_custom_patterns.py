@@ -563,8 +563,7 @@ class TestAutoTPAlibiHelpers(DistributedTest):
         install_head_sharded_helper(transformer,
                                     'build_mpt_alibi_tensor',
                                     build_mpt_alibi_tensor,
-                                    num_heads=num_heads,
-                                    num_kv_heads=num_heads)
+                                    meta=AutoTPMeta(num_attention_heads=num_heads, num_kv_heads=num_heads))
 
         alibi = transformer.build_mpt_alibi_tensor(num_heads, 3)
 
@@ -594,8 +593,7 @@ class TestAutoTPAlibiHelpers(DistributedTest):
         install_head_sharded_helper(first,
                                     'build_mpt_alibi_tensor',
                                     build_mpt_alibi_tensor,
-                                    num_heads=num_heads,
-                                    num_kv_heads=num_heads)
+                                    meta=AutoTPMeta(num_attention_heads=num_heads, num_kv_heads=num_heads))
         expected = first.build_mpt_alibi_tensor(num_heads, 3)
 
         # Injecting a second model of the same architecture must not make either of them
@@ -604,8 +602,7 @@ class TestAutoTPAlibiHelpers(DistributedTest):
         install_head_sharded_helper(second,
                                     'build_mpt_alibi_tensor',
                                     build_mpt_alibi_tensor,
-                                    num_heads=num_heads,
-                                    num_kv_heads=num_heads)
+                                    meta=AutoTPMeta(num_attention_heads=num_heads, num_kv_heads=num_heads))
         torch.testing.assert_close(second.build_mpt_alibi_tensor(num_heads, 3), expected)
         torch.testing.assert_close(first.build_mpt_alibi_tensor(num_heads, 3), expected)
 
@@ -618,8 +615,7 @@ class TestAutoTPAlibiHelpers(DistributedTest):
         install_head_sharded_helper(derived,
                                     'build_mpt_alibi_tensor',
                                     build_mpt_alibi_tensor,
-                                    num_heads=num_heads,
-                                    num_kv_heads=num_heads)
+                                    meta=AutoTPMeta(num_attention_heads=num_heads, num_kv_heads=num_heads))
         torch.testing.assert_close(derived.build_mpt_alibi_tensor(num_heads, 3), expected)
 
     def test_head_sharded_helper_freezes_the_models_split(self):
@@ -636,8 +632,7 @@ class TestAutoTPAlibiHelpers(DistributedTest):
         install_head_sharded_helper(transformer,
                                     'build_mpt_alibi_tensor',
                                     build_mpt_alibi_tensor,
-                                    num_heads=num_heads,
-                                    num_kv_heads=3)
+                                    meta=AutoTPMeta(num_attention_heads=num_heads, num_kv_heads=3))
 
         # The helper freezes the [4, 2] split from this model's own num_kv_heads at install
         # time.
@@ -684,7 +679,10 @@ class TestAutoTPAlibiHelpers(DistributedTest):
                                     dtype=torch.float32).view(-1, 1, 1).expand(-1, sequence_length, sequence_length)
 
         model = AlibiModel()
-        install_head_sharded_helper(model, 'get_alibi_mask', get_alibi_mask, num_heads=5, num_kv_heads=5)
+        install_head_sharded_helper(model,
+                                    'get_alibi_mask',
+                                    get_alibi_mask,
+                                    meta=AutoTPMeta(num_attention_heads=5, num_kv_heads=5))
 
         shard_sizes = [3, 2]
         model.n_head = shard_sizes[dist.get_rank()]
