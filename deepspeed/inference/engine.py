@@ -25,6 +25,7 @@ from ..moe.utils import has_moe_layers
 from ..module_inject import LinearAllreduce, LinearLayer, Normalize, ReplaceWithTensorSlicing
 from deepspeed.accelerator import get_accelerator
 from ..module_inject.policy import TransformerPolicy
+from deepspeed.module_inject.tp_shard import _attention_head_count_from, _kv_head_count_from
 from ..module_inject.auto_tp import AutoTP
 
 from ..module_inject.replace_policy import generic_policies
@@ -249,20 +250,18 @@ class InferenceEngine(Module):
         for source in (module, getattr(module, "config", None), getattr(self.module, "config", None)):
             if source is None:
                 continue
-            for name in ("num_heads", "n_heads", "n_head", "num_attention_heads"):
-                value = getattr(source, name, None)
-                if value is not None:
-                    return value
+            value = _attention_head_count_from(source)
+            if value is not None:
+                return value
         raise ValueError(f"Cannot determine the attention head count for {module.__class__.__name__}.")
 
     def _get_model_kv_head_count(self, module, num_heads):
         for source in (module, getattr(module, "config", None), getattr(self.module, "config", None)):
             if source is None:
                 continue
-            for name in ("num_key_value_heads", "num_kv_heads", "n_head_kv", "kv_n_heads"):
-                value = getattr(source, name, None)
-                if value is not None:
-                    return value
+            value = _kv_head_count_from(source)
+            if value is not None:
+                return value
         return num_heads
 
     def _pre_forward_hook(self, module, *inputs, **kwargs):

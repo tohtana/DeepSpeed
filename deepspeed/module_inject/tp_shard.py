@@ -8,6 +8,43 @@ from typing import Optional
 
 from deepspeed import comm as dist
 
+# Attribute names that carry the key/value head count, in probe order. Modern canonical names
+# first, then legacy aliases kept for older configs / checkpoints, then the query-head names as
+# an implicit "kv == q heads" default for plain (non-GQA) transformers. Shared by AutoTP and the
+# inference engine so the two never diverge on which model families they recognize.
+_KV_HEAD_ATTRS = (
+    'num_key_value_heads',  # llama-class, mistral, qwen2, gemma, phi3, dbrx top-level, ...
+    'num_kv_heads',  # falcon, qwen3_moe
+    'multi_query_group_num',  # chatglm2 / chatglm3 (not in stock transformers)
+    'n_head_kv',  # legacy Falcon custom-code; deprecated after transformers 4.33 (-> num_kv_heads)
+    'kv_n_heads',  # dbrx nested attn_config; top-level config exposes num_key_value_heads (>= transformers 4.40)
+    'num_attention_heads',  # plain transformer: kv == q heads
+    'n_heads',
+    'attention_heads',
+)
+
+
+def _kv_head_count_from(config) -> Optional[int]:
+    """First non-None kv-head count found on ``config`` via :data:`_KV_HEAD_ATTRS`, else ``None``."""
+    for name in _KV_HEAD_ATTRS:
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+# Attribute names that carry the (query) attention head count, in probe order.
+_ATTN_HEAD_ATTRS = ('num_attention_heads', 'num_heads', 'n_heads', 'n_head', 'attention_heads')
+
+
+def _attention_head_count_from(config) -> Optional[int]:
+    """First non-None attention head count found on ``config`` via :data:`_ATTN_HEAD_ATTRS`, else ``None``."""
+    for name in _ATTN_HEAD_ATTRS:
+        value = getattr(config, name, None)
+        if value is not None:
+            return value
+    return None
+
 
 @dataclass(frozen=True)
 class AutoTPMeta:
@@ -31,21 +68,14 @@ class AutoTPMeta:
         """
         if model_config is None:
             return cls(tp_grain_size=tp_grain_size)
-        # multi_query_group_num is for chatglm2 & chatglm3
-        num_kv_heads = None
-        for name in ('multi_query_group_num', 'num_kv_heads', 'num_key_value_heads', 'num_attention_heads', 'n_heads',
-                     'attention_heads'):
-            if hasattr(model_config, name):
-                num_kv_heads = getattr(model_config, name)
-                if num_kv_heads is not None:
-                    break
+        num_kv_heads = _kv_head_count_from(model_config)
         n_embd = None
         for name in ('n_embd', 'hidden_size'):
             if hasattr(model_config, name):
                 n_embd = getattr(model_config, name)
             if n_embd is not None:
                 break
-        num_attention_heads = getattr(model_config, 'num_attention_heads', None)
+        num_attention_heads = _attention_head_count_from(model_config)
         return cls(num_kv_heads=num_kv_heads,
                    num_attention_heads=num_attention_heads,
                    n_embd=n_embd,
