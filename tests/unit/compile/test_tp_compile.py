@@ -152,10 +152,12 @@ class TestAutoTPCompileEquivalence(DistributedTest):
 
 
 class FusedQKVBlock(torch.nn.Module):
-    """Attention-shaped block whose column-parallel projection is a shaped sub-param layer.
+    """Attention-shaped block whose projections are both shaped sub-param layers.
 
     AutoTP injects a fused QKV projection as SubParamLinearLayer rather than LinearLayer, which is
-    the case an exact-type check in the pass would miss.
+    the case an exact-type check in the pass would miss. The output projection is likewise given a
+    shape so it is injected as SubParamLinearAllreduce, whose forward must give up its module-level
+    all-reduce once the pass emits one into the graph — keeping both would reduce twice.
     """
 
     def __init__(self):
@@ -194,15 +196,22 @@ def build_fused_qkv_engine(tp_size, use_compile_pass):
             "partition_config": {
                 "use_default_specs":
                 False,
-                "layer_specs": [{
-                    "patterns": [".*\\.qkv_proj\\.weight$"],
-                    "partition_type": "column",
-                    "shape": [3, -1],
-                    "partition_dim": 0,
-                }, {
-                    "patterns": [".*\\.o_proj\\.weight$"],
-                    "partition_type": "row",
-                }],
+                "layer_specs": [
+                    {
+                        "patterns": [".*\\.qkv_proj\\.weight$"],
+                        "partition_type": "column",
+                        "shape": [3, -1],
+                        "partition_dim": 0,
+                    },
+                    {
+                        # A single sub-param spanning the input dim shards exactly like the plain row
+                        # split; the shape's only effect is injecting SubParamLinearAllreduce.
+                        "patterns": [".*\\.o_proj\\.weight$"],
+                        "partition_type": "row",
+                        "shape": [-1, 1],
+                        "partition_dim": 1,
+                    }
+                ],
             },
         },
         "zero_optimization": {
@@ -242,10 +251,13 @@ class TestAutoTPCompileLayerVariants(DistributedTest):
         reference_engine = build_fused_qkv_engine(self.world_size, use_compile_pass=False)
         compiled_engine = build_fused_qkv_engine(self.world_size, use_compile_pass=True)
 
-        from deepspeed.module_inject.layers import SubParamLinearLayer
+        from deepspeed.module_inject.layers import SubParamLinearAllreduce, SubParamLinearLayer
         qkv = compiled_engine.module.layers[0].qkv_proj
         assert isinstance(qkv, SubParamLinearLayer), f"expected a shaped sub-param layer, got {type(qkv).__name__}"
         assert qkv.defer_collectives_to_compiler, "the fused QKV layer was left on the module-level path"
+        o_proj = compiled_engine.module.layers[0].o_proj
+        assert isinstance(o_proj, SubParamLinearAllreduce), f"expected a shaped row layer, got {type(o_proj).__name__}"
+        assert o_proj.defer_collectives_to_compiler, "the shaped row layer was left on the module-level path"
 
         torch.manual_seed(1234)
         x = torch.randn(1, 8, HIDDEN_DIM, device=device, dtype=torch.float32, requires_grad=True)
@@ -270,10 +282,11 @@ class TestAutoTPCompileLayerVariants(DistributedTest):
 class TestAutoTPCompileMoE(DistributedTest):
     """A mixture-of-experts model must survive the pass.
 
-    MoE models are the reason the tp_plan converter has to skip unknown styles per entry rather
-    than discard the plan: their expert and router entries use styles AutoTP does not implement,
-    while their attention entries are ordinary colwise/rowwise. The experts themselves stay
-    replicated, so the pass only has to leave them alone and rewrite the attention projections.
+    Mixtral's expert and router entries use tp_plan styles AutoTP does not implement, and the
+    converter rejects a plan containing any unsupported style rather than applying it partially,
+    so the attention sharding is spelled out as an explicit partition config. The experts, router
+    and lm_head stay replicated, so the pass only has to leave them alone and rewrite the
+    attention projections.
     """
 
     world_size = 2
@@ -286,6 +299,10 @@ class TestAutoTPCompileMoE(DistributedTest):
         transformers = pytest.importorskip("transformers")
         if not hasattr(transformers, "MixtralForCausalLM"):
             pytest.skip("transformers build has no Mixtral")
+        # transformers 5.x wraps model forwards in a decorator that inspects __code__.co_varnames,
+        # which dynamo traces under fullgraph in torch 2.8
+        if not required_torch_version(min_version=2.8):
+            pytest.skip("tracing the transformers input-check wrapper requires torch >= 2.8")
 
         def build(use_compile_pass):
             config = transformers.MixtralConfig(vocab_size=256,
@@ -314,7 +331,23 @@ class TestAutoTPCompileMoE(DistributedTest):
                     }
                 },
                 "tensor_parallel": {
-                    "autotp_size": self.world_size
+                    "autotp_size": self.world_size,
+                    "partition_config": {
+                        "use_default_specs":
+                        False,
+                        "layer_specs": [{
+                            "patterns": [
+                                ".*\\.self_attn\\.q_proj\\.weight$",
+                                ".*\\.self_attn\\.k_proj\\.weight$",
+                                ".*\\.self_attn\\.v_proj\\.weight$",
+                            ],
+                            "partition_type":
+                            "column",
+                        }, {
+                            "patterns": [".*\\.self_attn\\.o_proj\\.weight$"],
+                            "partition_type": "row",
+                        }],
+                    },
                 },
                 "zero_optimization": {
                     "stage": 0
@@ -392,6 +425,36 @@ class TestAutoTPCompileDataParallelGradients(DistributedTest):
             dist.all_gather(gathered, param.grad.contiguous(), group=dp_group)
             assert torch.allclose(gathered[0], gathered[-1], atol=1e-5), \
                 f"Gradient of {name} was not reduced across the data-parallel group"
+
+
+def _make_tp_layer(cls):
+    # Only the flag logic is under test, so the layer is built without weights or a process group.
+    layer = cls.__new__(cls)
+    torch.nn.Module.__init__(layer)
+    layer.mp_group = object()
+    layer.defer_collectives_to_compiler = False
+    return layer
+
+
+def test_defer_collectives_is_all_or_nothing():
+    """A rejected layer must leave every other layer's collectives untouched.
+
+    If the rejection is raised after some flags are already set and a caller catches it to fall
+    back to eager execution, the flagged layers would silently skip their collectives.
+    """
+    from deepspeed.compile.passes.tp_compile import defer_collectives_to_compiler
+    from deepspeed.module_inject.layers import LinearAllreduce, LinearLayer, LmHeadLinearAllreduce
+
+    model = torch.nn.Module()
+    model.column = _make_tp_layer(LinearLayer)
+    model.row = _make_tp_layer(LinearAllreduce)
+    model.head = _make_tp_layer(LmHeadLinearAllreduce)
+
+    with pytest.raises(NotImplementedError, match="cannot rewrite"):
+        defer_collectives_to_compiler(model)
+
+    assert not model.column.defer_collectives_to_compiler
+    assert not model.row.defer_collectives_to_compiler
 
 
 class TestAutoTPCompileRejectsUnsupportedCombinations(DistributedTest):

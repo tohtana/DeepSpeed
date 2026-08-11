@@ -3,11 +3,8 @@
 
 # DeepSpeed Team
 
-import logging
 from typing import List, Dict, Optional
 from .autotp_config import TPLayerSpec, PartitionType
-
-logger = logging.getLogger(__name__)
 
 SUPPORTED_STYLES = {"colwise", "colwise_rep", "colwise_gather_output", "rowwise", "replicated_with_grad_allreduce"}
 # `colwise_rep` was renamed to `colwise_gather_output` in huggingface/transformers#42809.
@@ -30,15 +27,17 @@ class TPPlanConverter:
         Returns None only when no entry is convertible, so the caller can fall back to the
         existing AutoTP path for models whose plan gives us nothing to work with.
         """
+        if not hf_tp_plan:
+            return None
+
         unsupported = {style for style in hf_tp_plan.values() if style.lower() not in SUPPORTED_STYLES}
         if unsupported:
-            logger.warning(
-                "HuggingFace tp_plan contains unsupported partition style(s): %s. "
-                "Layers with these styles are left unpartitioned; the remaining entries are still applied.",
-                sorted(unsupported))
+            raise ValueError(f"HuggingFace tp_plan contains unsupported partition style(s): {sorted(unsupported)}. "
+                             "Applying only the supported entries could shard one half of a column/row pair, so the "
+                             "plan is rejected as a whole. Provide an explicit 'tensor_parallel.partition_config' "
+                             "for this model instead.")
 
         layer_specs = []
-        convertible_entries = 0
 
         for pattern, partition in hf_tp_plan.items():
             regex_pattern = TPPlanConverter._wildcard_to_regex(pattern)
@@ -49,17 +48,12 @@ class TPPlanConverter:
             if partition_style in ("colwise", "colwise_rep", "colwise_gather_output"):
                 partition_type = PartitionType.COLUMN
                 gather_output = partition_style != "colwise"
-                convertible_entries += 1
             elif partition_style == "rowwise":
                 partition_type = PartitionType.ROW
-                convertible_entries += 1
-            elif partition_style == "replicated_with_grad_allreduce":
+            else:  # replicated_with_grad_allreduce, the only other supported style
                 # The parameter stays whole; only its gradient needs summing across the group.
                 partition_type = PartitionType.SKIP
                 grad_allreduce = True
-                convertible_entries += 1
-            else:
-                partition_type = PartitionType.SKIP
 
             # Only add .weight suffix if not already present
             if not regex_pattern.endswith(r"\.weight"):
@@ -74,11 +68,6 @@ class TPPlanConverter:
                     gather_output=gather_output,
                     grad_allreduce=grad_allreduce,
                 ))
-
-        if convertible_entries == 0:
-            logger.warning("HuggingFace tp_plan has no convertible entries; styles=%s.",
-                           sorted(set(hf_tp_plan.values())))
-            return None
 
         return layer_specs
 

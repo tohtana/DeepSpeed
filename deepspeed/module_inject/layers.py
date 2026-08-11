@@ -1305,7 +1305,7 @@ class SubParamLinearLayer(TensorParallel_Layer):
         self._mark_uc_metadata()
 
     def forward(self, input):
-        if getattr(self, 'mp_group', None) is not None:
+        if getattr(self, 'mp_group', None) is not None and not self.defer_collectives_to_compiler:
             input = ColumnParallel.apply(self.mp_group, input)
         output = torch.matmul(input, self.weight.transpose(-1, -2))
         if self.bias is not None:
@@ -1425,7 +1425,8 @@ class SubParamLinearAllreduce(TensorParallel_Layer):
 
     def forward(self, input):
         output = torch.matmul(input, self.weight.transpose(-1, -2))
-        output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
+        if not self.defer_collectives_to_compiler:
+            output = RowParallel.apply(self.mp_group, output, not self.is_training_mode())
         if self.bias is not None:
             output = add_bias(output, self.bias)
         return output

@@ -32,7 +32,7 @@ def copy_to_tp_region_fake(input: torch.Tensor):
 @torch.library.custom_op("autotp::reduce_from_tp_region", mutates_args=())
 def reduce_from_tp_region(input: torch.Tensor) -> torch.Tensor:
     """All-reduce in the forward pass, identity in the backward pass.
-    
+
     Inserted after a row-parallel matmul, whose output is only a
     partial sum because each rank holds a slice of the input dimension.
     """
@@ -74,7 +74,7 @@ def gather_from_tp_region_fake(input: torch.Tensor):
 
 
 def _copy_to_tp_region_backward(ctx, grad):
-    # copy_to_tp_region and reduce_from_tp_region are duals, 
+    # copy_to_tp_region and reduce_from_tp_region are duals,
     # so copy_to_tp_region's backward is simply reduce_from_tp_region.
     return reduce_from_tp_region(grad.contiguous())
 

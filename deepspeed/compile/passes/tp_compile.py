@@ -18,7 +18,7 @@ ROW_PARALLEL_OP = torch.ops.autotp.reduce_from_tp_region.default
 GATHER_OUTPUT_OP = torch.ops.autotp.gather_from_tp_region.default
 
 # AutoTP replaces nn.Linear with these layers and shards their weights, so the injected layer type
-# already records the partitioning decision the pass needs. 
+# already records the partitioning decision the pass needs.
 
 COLUMN_PARALLEL_LAYERS = (LinearLayer, SubParamLinearLayer)
 ROW_PARALLEL_LAYERS = (LinearAllreduce, SubParamLinearAllreduce)
@@ -49,11 +49,8 @@ def _in_family(layer_type, family) -> bool:
 
 
 def defer_collectives_to_compiler(model) -> None:
-    """Suppress the module-level TP collectives on layers this pass will handle in the graph.
-
-    Any tensor-parallel layer the pass cannot rewrite is rejected rather than left on the
-    module-level path.
-    """
+    """Suppress the module-level TP collectives on layers this pass will handle in the graph."""
+    tp_modules = []
     for name, module in model.named_modules():
         if not isinstance(module, TensorParallel_Layer) or module.mp_group is None:
             continue
@@ -69,6 +66,9 @@ def defer_collectives_to_compiler(model) -> None:
             raise NotImplementedError("AutoTP compile pass does not support tp_overlap_comm. Set "
                                       "'tp_overlap_comm': false to emit the collectives into the graph.")
 
+        tp_modules.append(module)
+
+    for module in tp_modules:
         module.defer_collectives_to_compiler = True
 
 
