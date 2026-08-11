@@ -359,6 +359,7 @@ def test_load_hp_checkpoint_state_keeps_tp_topology_for_single_kv_head(tmp_path,
     # matches the universal tensor. The recorded per-rank widths must still be honored.
     param = _make_param(
         (3, 4), {
+            UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
             'partition_type': 'column',
             'partition_dim': 0,
             'logical_shape': (3, 4),
@@ -428,6 +429,33 @@ def test_merge_tp_slices_emits_subparam_shape_metadata(tmp_path):
     assert ckpt[SUB_PARAM_SHAPE].partition_dim == 0
 
 
+def test_merge_tp_slices_rejects_current_version_without_shard_widths(tmp_path):
+    # A checkpoint declaring the current version always records the widths, so a missing entry
+    # means inconsistent metadata rather than an old checkpoint. Falling back to an even split
+    # there would silently reshuffle an uneven fused weight.
+    slice_dir = tmp_path / "slices"
+    output_dir = tmp_path / "out"
+    param_name = "module.qkv.weight"
+
+    _write_tp_states(slice_dir, param_name, 0, torch.zeros(3, 4))
+    _write_tp_states(slice_dir, param_name, 1, torch.zeros(3, 4))
+
+    uc_info = {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
+        TP_REPLICATED_PARAMETER_PATTERNS: [],
+        PARAMETER_WITH_SUB_PARAMS: [{
+            "patterns": [rf"^{param_name}$"],
+            "shape": [(2, 2, 2), 4],
+            "partition_dim": 0,
+        }],
+    }
+
+    with pytest.raises(AssertionError, match="records no sub_param_shard_widths"):
+        merge_tp_slices(uc_info, str(output_dir), str(slice_dir), 2,
+                        (param_name, [torch.Size([3, 4]), torch.Size([3, 4])]))
+
+
 def test_merge_tp_slices_decodes_legacy_subparam_count(tmp_path):
     slice_dir = tmp_path / "slices"
     output_dir = tmp_path / "out"
@@ -472,6 +500,7 @@ def test_merge_tp_slices_uses_uneven_sub_param_widths(tmp_path):
         _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
 
     uc_info = {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
         TP_REPLICATED_PARAMETER_PATTERNS: [],
         PARAMETER_WITH_SUB_PARAMS: [{
@@ -505,6 +534,7 @@ def test_merge_tp_slices_restores_uneven_fused_bias_order(tmp_path):
         _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
 
     uc_info = {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
         TP_REPLICATED_PARAMETER_PATTERNS: [],
         PARAMETER_WITH_SUB_PARAMS: [{
@@ -537,6 +567,7 @@ def test_merge_tp_slices_handles_rank_without_any_sub_param_rows(tmp_path):
         _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
 
     uc_info = {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
         TP_REPLICATED_PARAMETER_PATTERNS: [],
         PARAMETER_WITH_SUB_PARAMS: [{
@@ -1238,6 +1269,7 @@ def test_merge_tp_slices_realigns_rank_that_wrote_no_fragment(tmp_path):
         _write_tp_states(slice_dir, param_name, tp_index, full[row_ids].contiguous())
 
     uc_info = {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY: UNIVERSAL_CHECKPOINT_VERSION_VALUE,
         PARAMETER_WITH_ROW_PARALLELISM_PATTERNS: [],
         TP_REPLICATED_PARAMETER_PATTERNS: [],
         PARAMETER_WITH_SUB_PARAMS: [{

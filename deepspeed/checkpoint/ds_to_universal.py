@@ -300,6 +300,7 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
     parameters_with_2_sub_params_cat_dim_0 = universal_checkpoint_info.get(PARAMETER_WITH_2_SUB_PARAMS_CAT_DIM_0, [])
     parameter_with_sub_params = universal_checkpoint_info.get(PARAMETER_WITH_SUB_PARAMS, [])
     sub_param_shard_widths = universal_checkpoint_info.get(SUB_PARAM_SHARD_WIDTHS, {})
+    uc_version = universal_checkpoint_info.get(UNIVERSAL_CHECKPOINT_VERSION_KEY, 0.0)
 
     unmatched_patterns = set(replicated_parameters + parameters_to_average + parameters_with_row_parallelism +
                              vocabulary_parameters + parameters_with_2_sub_params_cat_dim_0)
@@ -356,42 +357,48 @@ def merge_tp_slices(uc_info, dir, slice_dir, tp_degree, name_and_shapes):
             partition_dim = matched_sub_params_shape.partition_dim
 
             sub_dim_spec = matched_sub_params_shape.shape[partition_dim]
-            if isinstance(sub_dim_spec, tuple):
+            if uc_version >= 0.4:
                 sub_dim_sizes = sub_dim_spec
                 normalized_subparam_shape = matched_sub_params_shape
+                # This process cannot recompute the widths: the head counts that decide them live
+                # in the model config, not in the checkpoint.
+                assert matched_sub_params_pattern in sub_param_shard_widths, (
+                    f"Universal checkpoint version {uc_version} records no {SUB_PARAM_SHARD_WIDTHS} for {name}, "
+                    f"whose pattern {matched_sub_params_pattern} declares sub-parameters.")
+                shard_widths = sub_param_shard_widths[matched_sub_params_pattern]
             else:
-                # Legacy metadata used a scalar at partition_dim as the number of equal
-                # sub-parameters (for example shape=(3, -1) for fused QKV). New metadata
-                # publishes their physical widths as a tuple. Recover the old representation
-                # from the complete dimension before applying divisibility checks.
-                num_sub_params = sub_dim_spec
-                assert all(tp_slice.dim() > partition_dim for tp_slice in slices), (
-                    f"Legacy sub-parameter metadata for {name} needs per-rank shapes to recover its "
-                    f"sub-parameter widths, but the merged slices are flat.")
-                full_partition_size = sum(tp_slice.shape[partition_dim] for tp_slice in slices)
-                assert num_sub_params > 0 and full_partition_size % num_sub_params == 0, (
-                    f"Legacy sub-parameter count {num_sub_params} for {name} does not evenly divide its full "
-                    f"partition dimension {full_partition_size}.")
-                sub_dim_size = full_partition_size // num_sub_params
-                sub_dim_sizes = (sub_dim_size, ) * num_sub_params
-                normalized_shape = list(matched_sub_params_shape.shape)
-                normalized_shape[partition_dim] = sub_dim_sizes
-                normalized_subparam_shape = SubparamShape(patterns=matched_sub_params_shape.patterns,
-                                                          shape=tuple(normalized_shape),
-                                                          partition_dim=partition_dim)
+                # Metadata written before UCP version 0.4 used a scalar at partition_dim as the
+                # number of equal sub-parameters (for example shape=(3, -1) for fused QKV). Newer
+                # metadata publishes their physical widths as a tuple. Recover the old
+                # representation before applying divisibility checks.
+                if isinstance(sub_dim_spec, tuple):
+                    sub_dim_sizes = sub_dim_spec
+                    normalized_subparam_shape = matched_sub_params_shape
+                else:
+                    num_sub_params = sub_dim_spec
+                    assert all(tp_slice.dim() > partition_dim for tp_slice in slices), (
+                        f"Legacy sub-parameter metadata for {name} needs per-rank shapes to recover its "
+                        f"sub-parameter widths, but the merged slices are flat.")
+                    full_partition_size = sum(tp_slice.shape[partition_dim] for tp_slice in slices)
+                    assert num_sub_params > 0 and full_partition_size % num_sub_params == 0, (
+                        f"Legacy sub-parameter count {num_sub_params} for {name} does not evenly divide its full "
+                        f"partition dimension {full_partition_size}.")
+                    sub_dim_size = full_partition_size // num_sub_params
+                    sub_dim_sizes = (sub_dim_size, ) * num_sub_params
+                    normalized_shape = list(matched_sub_params_shape.shape)
+                    normalized_shape[partition_dim] = sub_dim_sizes
+                    normalized_subparam_shape = SubparamShape(patterns=matched_sub_params_shape.patterns,
+                                                              shape=tuple(normalized_shape),
+                                                              partition_dim=partition_dim)
 
-            # This process cannot recompute the widths: the head counts that decide them live
-            # in the model config, not in the checkpoint. Checkpoints written before the widths
-            # were recorded could only have been split evenly.
-            shard_widths = sub_param_shard_widths.get(matched_sub_params_pattern)
-            if shard_widths is None:
+                # Such a checkpoint records no widths and could only have been split evenly.
                 # Assuming an even split for an uneven sub-parameter shifts every offset and
                 # silently drops the tail, so refuse rather than write a wrong checkpoint.
                 uneven_sizes = [size for size in sub_dim_sizes if size % tp_degree != 0]
                 assert not uneven_sizes, (
                     f"Sub-parameter sizes {uneven_sizes} of {name} are not divisible by tp_degree {tp_degree}, "
-                    "and this checkpoint records no sub_param_shard_widths, so its uneven layout cannot be "
-                    "reconstructed.")
+                    f"and universal checkpoint version {uc_version} predates {SUB_PARAM_SHARD_WIDTHS}, so its "
+                    "uneven layout cannot be reconstructed.")
                 shard_widths = [[size // tp_degree] * tp_degree for size in sub_dim_sizes]
 
             assert len(shard_widths) == len(sub_dim_sizes), (

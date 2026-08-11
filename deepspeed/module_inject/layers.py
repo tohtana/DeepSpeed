@@ -19,7 +19,8 @@ from typing import Iterable, Any, Optional, List, Tuple, Dict
 from .fusedqkv_utils import (shard_value_with_share_qk, prepare_tp_fused_qkvw, fused_qkv_subparam_sizes,
                              set_fused_qkv_shard_state)
 from deepspeed.runtime.tensor_parallel import AUTOTP_MODE
-from deepspeed.checkpoint.constants import DS_AUTOTP_UC_META
+from deepspeed.checkpoint.constants import (DS_AUTOTP_UC_META, UNIVERSAL_CHECKPOINT_VERSION_KEY,
+                                            UNIVERSAL_CHECKPOINT_VERSION_VALUE)
 from copy import deepcopy
 from typing import Union
 
@@ -84,6 +85,8 @@ def _build_param_uc_restore_meta(*,
     are intentionally omitted from model-level conversion schema.
     """
     return {
+        UNIVERSAL_CHECKPOINT_VERSION_KEY:
+        UNIVERSAL_CHECKPOINT_VERSION_VALUE,
         'partition_type':
         partition_type,
         'partition_dim':

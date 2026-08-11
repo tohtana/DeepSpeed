@@ -10,7 +10,7 @@ import types
 from typing import List, Tuple, Union
 from dataclasses import dataclass
 from .constants import (FP32_WEIGHT_KEY, PARAM, VOCAB_TENSOR, CAT_DIM, PARAM_N_SUB_PARAMS, SUB_PARAM_SHAPE,
-                        EP_IS_EXPERT_PARAM, EP_NUM_EXPERTS, DS_AUTOTP_UC_META)
+                        EP_IS_EXPERT_PARAM, EP_NUM_EXPERTS, DS_AUTOTP_UC_META, UNIVERSAL_CHECKPOINT_VERSION_KEY)
 
 
 @dataclass
@@ -31,25 +31,25 @@ def _get_param_uc_restore_meta(param):
     return getattr(param, DS_AUTOTP_UC_META, None)
 
 
-def _narrow_sub_params(full_view, partition_dim, sub_dim_sizes, shard_widths, tp_rank, tp_world_size):
+def _narrow_sub_params(full_view, partition_dim, sub_dim_sizes, shard_widths, tp_rank, tp_world_size, uc_version):
     """Take this rank's piece of every sub-parameter and concatenate them back together.
 
     ``shard_widths`` gives the per-rank width of each sub-parameter, so a fused attention
-    weight is cut on key/value head boundaries. Checkpoints written before uneven
-    sub-parameters were supported carry no widths and can only have been split evenly.
+    weight is cut on key/value head boundaries. Metadata written before UCP version 0.4 carries
+    no widths and can only have been split evenly.
     """
     assert sum(sub_dim_sizes) == full_view.shape[partition_dim], (
         f"Sub-parameter sizes {list(sub_dim_sizes)} sum to {sum(sub_dim_sizes)}, but dimension {partition_dim} "
         f"of the parameter is {full_view.shape[partition_dim]}. The metadata describes a different parameter.")
 
-    if shard_widths is None:
+    if uc_version < 0.4:
         # An even split is the only layout recoverable without recorded widths. Assuming it for
         # an uneven sub-parameter shifts every offset and silently drops the trailing elements,
         # so refuse rather than restore wrong weights.
         uneven = [size for size in sub_dim_sizes if size % tp_world_size != 0]
         assert not uneven, (
             f"Sub-parameter sizes {uneven} are not divisible by tp_world_size {tp_world_size}, and this "
-            "checkpoint records no sub_param_shard_widths, so its uneven layout cannot be reconstructed.")
+            "metadata records no sub_param_shard_widths, so its uneven layout cannot be reconstructed.")
         shard_widths = [[size // tp_world_size] * tp_world_size for size in sub_dim_sizes]
 
     assert len(shard_widths) == len(sub_dim_sizes), (
@@ -83,6 +83,7 @@ def _resolve_autotp_partition(current_param, ckpt_dict, full_hp_param, tp_rank, 
     sub_param_shard_widths = meta.get('sub_param_shard_widths')
     partition_sizes = meta.get('partition_sizes')
     replicated = meta.get('replicated', False)
+    uc_version = meta.get(UNIVERSAL_CHECKPOINT_VERSION_KEY, 0.0)
 
     # The layer could not describe how it split this parameter, so conversion refuses it. The
     # generic paths below would reassemble it as contiguous rank-ordered slices, which is not
@@ -124,7 +125,7 @@ def _resolve_autotp_partition(current_param, ckpt_dict, full_hp_param, tp_rank, 
             sub_dim_sizes = (sub_dim_sizes, )
 
         return _narrow_sub_params(full_view, partition_dim, sub_dim_sizes, sub_param_shard_widths, tp_rank,
-                                  tp_world_size)
+                                  tp_world_size, uc_version)
 
     if partition_sizes is not None:
         shard_offset = sum(partition_sizes[:tp_rank])
