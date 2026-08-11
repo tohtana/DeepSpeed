@@ -299,6 +299,10 @@ class TestAutoTPCompileMoE(DistributedTest):
         transformers = pytest.importorskip("transformers")
         if not hasattr(transformers, "MixtralForCausalLM"):
             pytest.skip("transformers build has no Mixtral")
+        # transformers 5.x wraps model forwards in a decorator that inspects __code__.co_varnames,
+        # which dynamo traces under fullgraph in torch 2.8
+        if not required_torch_version(min_version=2.8):
+            pytest.skip("tracing the transformers input-check wrapper requires torch >= 2.8")
 
         def build(use_compile_pass):
             config = transformers.MixtralConfig(vocab_size=256,
