@@ -8,7 +8,7 @@ import functools
 from deepspeed import comm as dist
 import torch
 from typing import Optional
-from deepspeed.module_inject.tp_shard import get_num_kv_heads, get_shard_size_list
+from deepspeed.module_inject.tp_shard import get_shard_size_list
 
 
 class _HeadCountProxy:
@@ -29,15 +29,11 @@ class _HeadCountProxy:
 
 def get_head_shard_sizes(num_heads, mp_group=None, num_kv_heads=None):
     tp_world_size = dist.get_world_size(group=mp_group)
-    if num_kv_heads is None:
-        num_kv_heads = get_num_kv_heads()
-    if num_kv_heads is not None and num_heads % num_kv_heads == 0:
-        heads_per_kv = num_heads // num_kv_heads
-        kv_shard_sizes = [
-            num_kv_heads // tp_world_size + (rank < num_kv_heads % tp_world_size) for rank in range(tp_world_size)
-        ]
-        return [size * heads_per_kv for size in kv_shard_sizes]
-    return get_shard_size_list(num_heads, tp_world_size)
+    return get_shard_size_list(
+        num_heads,
+        tp_world_size,
+        num_kv_heads=num_kv_heads,
+    )
 
 
 def install_head_sharded_helper(module, name, wrapper, mp_group=None, num_heads=None, num_kv_heads=None):

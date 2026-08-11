@@ -57,3 +57,35 @@ def test_shard_size_refuses_to_guess_subgroup_rank(monkeypatch):
 
     with pytest.raises(ValueError, match="group-local rank or process group"):
         get_shard_size(12, 2)
+
+
+def test_explicit_num_kv_heads_is_used():
+    assert get_shard_size_list(
+        384,
+        4,
+        "self_attn.q_proj",
+        num_kv_heads=6,
+    ) == [128, 128, 64, 64]
+
+
+def test_explicit_num_kv_heads_matches_global_value():
+    set_num_kv_heads(6)
+    expected = get_shard_size_list(384, 4, "self_attn.q_proj")
+
+    actual = get_shard_size_list(
+        384,
+        4,
+        "self_attn.q_proj",
+        num_kv_heads=6,
+    )
+
+    assert actual == expected
+
+
+def test_uneven_shards_without_grain_quantization_no_kv_heads_used():
+    assert get_shard_size_list(
+        101,
+        2,
+        "lm_head",
+        num_kv_heads=None,
+    ) == [51, 50]
