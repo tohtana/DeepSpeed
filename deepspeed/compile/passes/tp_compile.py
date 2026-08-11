@@ -18,7 +18,7 @@ ROW_PARALLEL_OP = torch.ops.autotp.reduce_from_tp_region.default
 GATHER_OUTPUT_OP = torch.ops.autotp.gather_from_tp_region.default
 
 # AutoTP replaces nn.Linear with these layers and shards their weights, so the injected layer type
-# already records the partitioning decision the pass needs. 
+# already records the partitioning decision the pass needs.
 
 COLUMN_PARALLEL_LAYERS = (LinearLayer, SubParamLinearLayer)
 ROW_PARALLEL_LAYERS = (LinearAllreduce, SubParamLinearAllreduce)
