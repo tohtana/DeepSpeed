@@ -3,6 +3,8 @@
 
 # DeepSpeed Team
 
+import pytest
+
 from deepspeed.module_inject.tp_plan_converter import TPPlanConverter
 from deepspeed.module_inject.autotp_config import AutoTPConfig, PartitionType
 
@@ -108,25 +110,21 @@ class TestTPPlanConverter:
 
         assert re.match(down_pattern.patterns[0], "model.layers.5.mlp.down_proj.weight")
 
-    def test_unsupported_style_is_skipped_not_fatal(self):
-        """One unknown style must not discard the entries next to it.
+    def test_unsupported_style_rejects_whole_plan(self):
+        """Any unknown style must reject the plan outright, not skip the entry.
 
-        Dropping the whole plan sends the model down the heuristic path, which shards by name
-        alone and has no notion of the modules the plan deliberately excluded. On Llama4 that
-        wraps the MoE router, whose forward returns a tuple, and breaks the model outright.
+        The converter has no notion of which entries pair with which, so applying the supported
+        subset can shard one half of a column/row pair — here o_proj would be row-sharded while
+        the q_proj feeding it stays whole — and break the model. Failing loudly also keeps the
+        model off the heuristic path, which breaks models like Llama4 by wrapping its MoE router.
         """
         hf_plan = {"layers.*.q_proj": "local_colwise", "layers.*.o_proj": "rowwise"}
-        specs = TPPlanConverter.convert(hf_plan)
+        with pytest.raises(ValueError, match="local_colwise"):
+            TPPlanConverter.convert(hf_plan)
 
-        assert specs is not None
-        by_type = {spec.partition_type for spec in specs}
-        assert PartitionType.ROW in by_type, "the supported entry should still be applied"
-        assert PartitionType.SKIP in by_type, "the unsupported entry should be left unpartitioned"
-
-    def test_all_styles_unsupported_returns_none(self):
-        """With nothing convertible there is no plan to apply, so fall back."""
         hf_plan = {"layers.*.q_proj": "local_colwise", "layers.*.experts": "moe_tp_experts"}
-        assert TPPlanConverter.convert(hf_plan) is None
+        with pytest.raises(ValueError, match="unsupported partition style"):
+            TPPlanConverter.convert(hf_plan)
 
     def test_alternate_prefixes(self):
         """Test tp_plan with non-layers prefix"""
