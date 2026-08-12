@@ -17,8 +17,9 @@ on the expert MLP hot path.
 share the same shape and dtype. All math is accumulated in float32 for numerical
 stability and cast back to the input dtype on store.
 
-When Triton is unavailable the public :func:`swiglu` falls back to the eager
-PyTorch expression so callers on non-Triton builds keep working unchanged.
+When Triton is unavailable or the inputs are not on a Triton-capable device,
+the public :func:`swiglu` falls back to the eager PyTorch expression so callers
+on unsupported devices keep working unchanged.
 """
 
 from __future__ import annotations
@@ -113,6 +114,20 @@ def _swiglu_eager(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+def _can_use_triton(tensor: torch.Tensor) -> bool:
+    """Return whether ``tensor`` is on the active Triton-capable accelerator."""
+    if not _TRITON_AVAILABLE:
+        return False
+
+    # Import lazily so importing this module does not initialize an accelerator.
+    from deepspeed.accelerator import get_accelerator
+
+    accelerator = get_accelerator()
+    if tensor.device.type != accelerator.device_name():
+        return False
+    return accelerator.is_triton_supported()
+
+
 def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Fused SwiGLU activation: ``silu(gate) * up``.
 
@@ -130,8 +145,10 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
                          f"and {tuple(up.shape)}")
     if gate.dtype != up.dtype:
         raise ValueError(f"swiglu expects gate and up to have the same dtype, got {gate.dtype} and {up.dtype}")
+    if gate.device != up.device:
+        raise ValueError(f"swiglu expects gate and up to be on the same device, got {gate.device} and {up.device}")
 
-    if not _TRITON_AVAILABLE:
+    if not _can_use_triton(gate):
         return _swiglu_eager(gate, up)
 
     return _SwiGLUFn.apply(gate, up)
