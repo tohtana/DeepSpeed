@@ -9,7 +9,8 @@ import torch
 from deepspeed.checkpoint.constants import (AUTOTP_UNSUPPORTED_PARAMETER_PATTERNS,
                                             PARAMETER_WITH_ROW_PARALLELISM_PATTERNS, PARAMETER_WITH_SUB_PARAMS,
                                             SUB_PARAM_SHARD_WIDTHS, TP_REPLICATED_PARAMETER_PATTERNS,
-                                            VOCABULARY_PARAMETER_PATTERNS, DS_AUTOTP_UC_META)
+                                            VOCABULARY_PARAMETER_PATTERNS, DS_AUTOTP_UC_META,
+                                            UNIVERSAL_CHECKPOINT_VERSION_VALUE)
 from deepspeed.checkpoint.universal_checkpoint import _narrow_sub_params, _resolve_autotp_partition
 from deepspeed.module_inject.layers import (_build_param_uc_restore_meta, _get_param_uc_conversion_meta,
                                             _subparam_shard_widths, GateUpPack_LinearLayer, LinearAllreduce,
@@ -374,8 +375,8 @@ def test_sub_param_shard_widths_round_trip_with_zero_width_ranks(tp_world_size):
     full_view = full_param.view(logical_shape)
 
     restored = [
-        _narrow_sub_params(full_view, 0, sub_param_sizes, widths, tp_rank, tp_world_size)
-        for tp_rank in range(tp_world_size)
+        _narrow_sub_params(full_view, 0, sub_param_sizes, widths, tp_rank, tp_world_size,
+                           UNIVERSAL_CHECKPOINT_VERSION_VALUE) for tp_rank in range(tp_world_size)
     ]
 
     # Every element lands on exactly one rank, so the shards reassemble the sub-parameters.
@@ -390,6 +391,32 @@ def test_sub_param_shard_widths_round_trip_with_zero_width_ranks(tp_world_size):
             sub_view.narrow(0, sum(per_rank[:tp_rank]), per_rank[tp_rank])
             for sub_view, per_rank in zip(sub_views, widths)
         ]
+        assert torch.equal(shard, torch.cat(pieces, dim=0).flatten())
+
+
+@pytest.mark.parametrize("tp_world_size", [2, 4])
+def test_sub_param_shard_widths_legacy_version_uses_even_split(tp_world_size):
+    # UCP < 0.4 has no recorded sub-parameter widths, so restore must fall back to even splits.
+    sub_param_sizes = (8, 4, 4)
+    logical_shape = (sum(sub_param_sizes), 3)
+    full_param = torch.arange(logical_shape[0] * logical_shape[1], dtype=torch.float32)
+    full_view = full_param.view(logical_shape)
+
+    restored = [
+        _narrow_sub_params(full_view, 0, sub_param_sizes, None, tp_rank, tp_world_size, 0.3)
+        for tp_rank in range(tp_world_size)
+    ]
+
+    assert sum(shard.numel() for shard in restored) == full_param.numel()
+    offset = 0
+    sub_views = []
+    for size in sub_param_sizes:
+        sub_views.append(full_view.narrow(0, offset, size))
+        offset += size
+
+    even_widths = [size // tp_world_size for size in sub_param_sizes]
+    for tp_rank, shard in enumerate(restored):
+        pieces = [sub_view.narrow(0, tp_rank * width, width) for sub_view, width in zip(sub_views, even_widths)]
         assert torch.equal(shard, torch.cat(pieces, dim=0).flatten())
 
 
