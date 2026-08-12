@@ -166,17 +166,27 @@ def test_builtin_default_schedules_validate(builtin_registry):
 def test_offload_targets_conflict(builtin_registry):
     # init_z3 rejects this combination only while building its own schedule, so a user-supplied
     # schedule reaches the passes unchecked without a contract.
-    with pytest.raises(PassContractError, match="conflicts"):
-        validate_schedule([(0, [zero3_compile.NAME, offload_parameters.NAME, offload_adam_states.NAME])],
-                          builtin_registry)
-    with pytest.raises(PassContractError, match="conflicts"):
-        validate_schedule([(0, [zero3_compile.NAME, offload_adam_states.NAME_SYNC, offload_parameters.NAME])],
-                          builtin_registry)
+    for offload_opt_state_pass in (offload_adam_states.NAME, offload_adam_states.NAME_SYNC):
+        with pytest.raises(PassContractError, match="conflicts"):
+            validate_schedule([(0, [
+                offload_adam_states.NAME_FOR_INIT, zero3_compile.NAME, offload_parameters.NAME, offload_opt_state_pass
+            ])], builtin_registry)
+
+
+def test_offload_adam_states_requires_for_init(builtin_registry):
+    # Both variants plan against profiled peaks, which are only meaningful once for_init has taken
+    # the optimizer state off the accelerator.
+    for name in (offload_adam_states.NAME, offload_adam_states.NAME_SYNC):
+        with pytest.raises(PassContractError, match="requires"):
+            validate_schedule([(0, [zero3_compile.NAME, name])], builtin_registry)
+        validate_schedule([(0, [offload_adam_states.NAME_FOR_INIT, zero3_compile.NAME, name])], builtin_registry)
 
 
 def test_offload_adam_states_variants_conflict(builtin_registry):
     with pytest.raises(PassContractError, match="conflicts"):
-        validate_schedule([(0, [offload_adam_states.NAME, offload_adam_states.NAME_SYNC])], builtin_registry)
+        validate_schedule(
+            [(0, [offload_adam_states.NAME_FOR_INIT, offload_adam_states.NAME, offload_adam_states.NAME_SYNC])],
+            builtin_registry)
 
 
 def test_offload_parameters_requires_zero3(builtin_registry):
@@ -194,8 +204,8 @@ def test_zero1_and_zero3_conflict(builtin_registry):
 def test_schedule_written_with_callables_is_validated(builtin_registry):
     # Schedules are normally written with the pass callables, which resolve back to their names.
     schedule = [(0, [
-        zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd,
-        offload_adam_states.move_opt_states
+        offload_adam_states.offload_adam_states_for_init, zero3_compile.add_z3_gather_release,
+        offload_parameters.offload_parameter_fwd, offload_adam_states.move_opt_states
     ])]
     with pytest.raises(PassContractError, match="conflicts"):
         validate_schedule(schedule, builtin_registry)

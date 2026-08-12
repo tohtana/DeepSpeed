@@ -28,20 +28,22 @@ except ImportError:
 from ..profilers import ProfilingResult
 from ..graph_param import DSGraphParamManager
 from ..fx import move_primals_to_head
-from .contract import PassContract
+from .contract import CAP_OPT_STATES_EVICTED, PassContract
 
 import deepspeed.comm as dist
 
 NAME = "offload_adam_states"
 NAME_SYNC = "offload_adam_states_sync"
 NAME_FOR_INIT = "offload_adam_states_for_init"
-# Offloading optimizer state does not depend on the graph-rewriting passes, but DeepSpeed supports
-# one offload target per run, so it cannot share a schedule with offload_parameters.
-CONTRACT = PassContract(conflicts_with=frozenset({"offload_parameters"}))
-# The synchronous variant replaces move_opt_states rather than running alongside it.
-CONTRACT_SYNC = PassContract(conflicts_with=frozenset({"offload_parameters", NAME}))
-# Empties the optimizer state before profiling; move_opt_states adapts to whether it ran.
-CONTRACT_FOR_INIT = PassContract()
+# Both variants plan against the profiled per-node peaks, which only reflect the memory the run
+# needs if the optimizer state was already off the accelerator when the profilers ran. DeepSpeed
+# also supports one offload target per run, so neither may share a schedule with
+# offload_parameters, and the synchronous variant replaces move_opt_states rather than joining it.
+CONTRACT = PassContract(requires=frozenset({CAP_OPT_STATES_EVICTED}), conflicts_with=frozenset({"offload_parameters"}))
+CONTRACT_SYNC = PassContract(requires=frozenset({CAP_OPT_STATES_EVICTED}),
+                             conflicts_with=frozenset({"offload_parameters", NAME}))
+# Empties the optimizer state before the profilers run, which is what makes those peaks usable.
+CONTRACT_FOR_INIT = PassContract(provides=frozenset({CAP_OPT_STATES_EVICTED}))
 
 
 def print_r0(msg):

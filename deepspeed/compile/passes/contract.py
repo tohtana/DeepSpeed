@@ -9,6 +9,9 @@ from typing import Dict, FrozenSet, List, Optional, Tuple
 # Capability tags produced and consumed by the built-in DeepCompile passes. Keeping the tags
 # in one place lets passes declare dependencies on each other without hard-coding pass names.
 CAP_Z3_GATHER_RELEASE = "z3_gather_release"
+# Optimizer state has been moved off the accelerator, so the profiling that follows measures memory
+# without it and a pass may plan its offloading against those numbers.
+CAP_OPT_STATES_EVICTED = "opt_states_evicted"
 
 
 @dataclass(frozen=True)
