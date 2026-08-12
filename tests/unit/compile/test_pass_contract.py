@@ -6,15 +6,15 @@
 import pytest
 
 from deepspeed.compile.passes import (contract as contract_mod, offload_adam_states, offload_parameters, prefetch,
-                                      selective_gather, zero1_compile, zero3_compile)
+                                      selective_gather, zero_1_and_2_compile, zero3_compile)
 from deepspeed.compile.passes.contract import (PassContract, PassContractError, register_pass_contract,
                                                get_pass_contract, validate_schedule)
 
 # Mirrors the registration in DeepSpeedEngine.__init__ so the built-in contracts can be exercised
 # without building an engine.
 BUILTIN_PASSES = {
-    zero1_compile.NAME: (zero1_compile.add_z1_reduce, zero1_compile.CONTRACT),
-    zero1_compile.NAME_Z2: (zero1_compile.add_z2_reduce, zero1_compile.CONTRACT_Z2),
+    zero_1_and_2_compile.NAME_Z1: (zero_1_and_2_compile.add_z1_reduce, zero_1_and_2_compile.CONTRACT_Z1),
+    zero_1_and_2_compile.NAME_Z2: (zero_1_and_2_compile.add_z2_reduce, zero_1_and_2_compile.CONTRACT_Z2),
     zero3_compile.NAME: (zero3_compile.add_z3_gather_release, zero3_compile.CONTRACT),
     prefetch.NAME: (prefetch.schedule_prefetch, prefetch.CONTRACT),
     selective_gather.NAME: (selective_gather.selective_gather, selective_gather.CONTRACT),
@@ -153,8 +153,8 @@ def test_builtin_conflicts_name_registered_passes(builtin_registry):
 
 
 def test_builtin_default_schedules_validate(builtin_registry):
-    # The schedules init_z1 and init_z3 build when the user supplies none.
-    validate_schedule([(0, [zero1_compile.NAME])], builtin_registry)
+    # The schedules init_z1_and_2 and init_z3 build when the user supplies none.
+    validate_schedule([(0, [zero_1_and_2_compile.NAME_Z1])], builtin_registry)
     validate_schedule([(0, [zero3_compile.NAME]), (5, [zero3_compile.NAME, prefetch.NAME, selective_gather.NAME])],
                       builtin_registry)
     validate_schedule([(0, [zero3_compile.NAME, offload_parameters.NAME])], builtin_registry)
@@ -196,9 +196,9 @@ def test_offload_parameters_requires_zero3(builtin_registry):
 
 def test_zero1_and_zero3_conflict(builtin_registry):
     with pytest.raises(PassContractError, match="conflicts"):
-        validate_schedule([(0, [zero3_compile.NAME, zero1_compile.NAME])], builtin_registry)
+        validate_schedule([(0, [zero3_compile.NAME, zero_1_and_2_compile.NAME_Z1])], builtin_registry)
     with pytest.raises(PassContractError, match="conflicts"):
-        validate_schedule([(0, [zero1_compile.NAME_Z2, zero3_compile.NAME])], builtin_registry)
+        validate_schedule([(0, [zero_1_and_2_compile.NAME_Z2, zero3_compile.NAME])], builtin_registry)
 
 
 def test_schedule_written_with_callables_is_validated(builtin_registry):
