@@ -5,11 +5,12 @@
 
 import pytest
 import torch
+from packaging.version import Version
 
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
-from deepspeed.compile.init_tp import AUTOTP_MIN_TORCH_VERSION
+from deepspeed.compile.init_tp import AUTOTP_MIN_TORCH_VERSION, BROKEN_TRANSFORMERS_MOE_VERSIONS
 from deepspeed.utils import groups
 from deepspeed.utils.torch import required_torch_version
 
@@ -299,13 +300,15 @@ class TestAutoTPCompileMoE(DistributedTest):
         transformers = pytest.importorskip("transformers")
         if not hasattr(transformers, "MixtralForCausalLM"):
             pytest.skip("transformers build has no Mixtral")
-        # Only transformers 5.x offers the static-shape batched_mm experts implementation; the 4.x
-        # eager experts route tokens through .nonzero(), a dynamic-shape op no full graph can
-        # capture (verified: 4.57 fails, 5.15 passes).
-        if int(transformers.__version__.split(".")[0]) < 5:
-            pytest.skip("the static-shape experts implementation requires transformers >= 5")
-        # transformers 5.x wraps model forwards in a decorator that inspects __code__.co_varnames,
-        # which dynamo only traces under fullgraph from torch 2.7 (verified: 2.6 fails, 2.7 passes).
+        tf_version = Version(transformers.__version__)
+        # The 4.x eager experts route tokens through .nonzero(), a dynamic-shape op no full graph
+        # can capture; the static-shape batched_mm implementation exists from 5.0.
+        if tf_version.major < 5:
+            pytest.skip("the static-shape batched_mm experts implementation requires transformers >= 5")
+        first_broken, first_fixed = BROKEN_TRANSFORMERS_MOE_VERSIONS
+        if Version(first_broken) <= tf_version < Version(first_fixed):
+            pytest.skip(f"transformers {first_broken}..{first_fixed} mutate the MoE routing tensor in place "
+                        "(huggingface/transformers#45621, fixed by #45634)")
         if not required_torch_version(min_version=2.7):
             pytest.skip("tracing the transformers input-check wrapper requires torch >= 2.7")
 
@@ -460,6 +463,29 @@ def test_defer_collectives_is_all_or_nothing():
 
     assert not model.column.defer_collectives_to_compiler
     assert not model.row.defer_collectives_to_compiler
+
+
+def test_broken_transformers_moe_raises(monkeypatch):
+    """On an affected transformers release the pass must reject MoE models up front, with a
+    pointer to the fix, while leaving dense models untouched."""
+    transformers = pytest.importorskip("transformers")
+    from deepspeed.compile.init_tp import _check_broken_transformers_moe
+
+    first_broken, first_fixed = BROKEN_TRANSFORMERS_MOE_VERSIONS
+    monkeypatch.setattr(transformers, "__version__", first_broken)
+
+    moe_model = torch.nn.Module()
+    moe_model.experts = torch.nn.Module()
+    # The markers transformers' experts-implementation decorator leaves on a wrapped module.
+    moe_model.experts._apply_gate = lambda x: x
+    moe_model.experts.is_concatenated = True
+    with pytest.raises(RuntimeError, match="45634"):
+        _check_broken_transformers_moe(moe_model)
+
+    _check_broken_transformers_moe(torch.nn.Module())
+
+    monkeypatch.setattr(transformers, "__version__", first_fixed)
+    _check_broken_transformers_moe(moe_model)
 
 
 class TestAutoTPCompileRejectsUnsupportedCombinations(DistributedTest):
