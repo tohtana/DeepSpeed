@@ -299,10 +299,15 @@ class TestAutoTPCompileMoE(DistributedTest):
         transformers = pytest.importorskip("transformers")
         if not hasattr(transformers, "MixtralForCausalLM"):
             pytest.skip("transformers build has no Mixtral")
+        # Only transformers 5.x offers the static-shape batched_mm experts implementation; the 4.x
+        # eager experts route tokens through .nonzero(), a dynamic-shape op no full graph can
+        # capture (verified: 4.57 fails, 5.15 passes).
+        if int(transformers.__version__.split(".")[0]) < 5:
+            pytest.skip("the static-shape experts implementation requires transformers >= 5")
         # transformers 5.x wraps model forwards in a decorator that inspects __code__.co_varnames,
-        # which dynamo traces under fullgraph in torch 2.8
-        if not required_torch_version(min_version=2.8):
-            pytest.skip("tracing the transformers input-check wrapper requires torch >= 2.8")
+        # which dynamo only traces under fullgraph from torch 2.7 (verified: 2.6 fails, 2.7 passes).
+        if not required_torch_version(min_version=2.7):
+            pytest.skip("tracing the transformers input-check wrapper requires torch >= 2.7")
 
         def build(use_compile_pass):
             config = transformers.MixtralConfig(vocab_size=256,
