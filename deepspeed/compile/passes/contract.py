@@ -37,6 +37,9 @@ class PassContractError(ValueError):
 
 _pass_contracts: Dict[str, PassContract] = {}
 
+# Stands in for a pass with no registered contract: unconstrained, but still visible to conflicts.
+_UNCONSTRAINED = PassContract()
+
 
 def register_pass_contract(name: str, contract: Optional[PassContract]) -> None:
     # ``contract=None`` clears any contract previously registered under ``name`` so a pass that is
@@ -75,10 +78,10 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
     it before names are converted to callables so the pass identity the user selected is preserved.
     Each entry in ``passes`` is normally a registered pass name; a raw callable is resolved back to
     its name through ``name_registry`` (the ``{name: fn}`` registry) by object identity, and a
-    callable registered under more than one name must instead be referenced by name. Passes with no
-    registered contract are treated as unconstrained and skipped, so mixed schedules of contracted
-    and ad-hoc passes remain valid. Raises :class:`PassContractError` on the first unmet requirement
-    or conflict.
+    callable registered under more than one name must instead be referenced by name. A pass with no
+    registered contract is unconstrained: it requires and provides nothing, so mixed schedules of
+    contracted and ad-hoc passes remain valid; it is still checked against conflicts that other
+    passes declare. Raises :class:`PassContractError` on the first unmet requirement or conflict.
 
     Each step is validated independently: DeepCompile resets Dynamo and recompiles from the
     original graph at every launched step (see ``launch_compile_passes``), so capabilities a pass
@@ -94,9 +97,7 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
             if name is None:
                 continue
 
-            contract = _pass_contracts.get(name)
-            if contract is None:
-                continue
+            contract = _pass_contracts.get(name, _UNCONSTRAINED)
 
             missing = contract.requires - provided
             if missing:

@@ -33,8 +33,15 @@ from .contract import PassContract
 import deepspeed.comm as dist
 
 NAME = "offload_adam_states"
-# Offloads optimizer state and does not depend on the graph-rewriting passes.
-CONTRACT = PassContract()
+NAME_SYNC = "offload_adam_states_sync"
+NAME_FOR_INIT = "offload_adam_states_for_init"
+# Offloading optimizer state does not depend on the graph-rewriting passes, but DeepSpeed supports
+# one offload target per run, so it cannot share a schedule with offload_parameters.
+CONTRACT = PassContract(conflicts_with=frozenset({"offload_parameters"}))
+# The synchronous variant replaces move_opt_states rather than running alongside it.
+CONTRACT_SYNC = PassContract(conflicts_with=frozenset({"offload_parameters", NAME}))
+# Empties the optimizer state before profiling; move_opt_states adapts to whether it ran.
+CONTRACT_FOR_INIT = PassContract()
 
 
 def print_r0(msg):

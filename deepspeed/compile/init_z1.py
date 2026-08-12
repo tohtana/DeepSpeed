@@ -182,7 +182,7 @@ def init_z1(engine, backend, compile_config, compile_kwargs, schedule=None, use_
         for opt in schedule:
             # avoid typical misconfiguration
             if zero3_compile.add_z3_gather_release in opt[1]:
-                raise ValueError("A pass for ZeRO3 is not specified though ZeRO1 is enabled")
+                raise ValueError("The schedule contains a ZeRO-3 pass though ZeRO stage 1 or 2 is enabled")
 
     init_schedule(schedule)
 
