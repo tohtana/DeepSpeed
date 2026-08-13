@@ -113,7 +113,7 @@ def test_conflict_with_uncontracted_pass(clean_registry):
     validate_schedule([(0, ["a"]), (10, ["custom"])])
 
 
-def test_uncontracted_passes_are_skipped(clean_registry):
+def test_uncontracted_passes_are_unconstrained(clean_registry):
     _register_zero3_and_prefetch()
     # An ad-hoc pass with no registered contract must not break validation of the rest.
     validate_schedule([(0, ["zero3", "ad_hoc_pass", "prefetch"])])
@@ -146,7 +146,7 @@ def test_ambiguous_callable_requires_explicit_name(clean_registry):
         validate_schedule([(0, [shared_fn])], name_registry)
 
 
-def test_builtin_conflicts_name_registered_passes(builtin_registry):
+def test_builtin_conflicts_name_registered_passes():
     # conflicts_with holds pass names, so a rename must not silently disable the check.
     for name, (_, contract) in BUILTIN_PASSES.items():
         assert contract.conflicts_with <= set(BUILTIN_PASSES), name
@@ -155,6 +155,7 @@ def test_builtin_conflicts_name_registered_passes(builtin_registry):
 def test_builtin_default_schedules_validate(builtin_registry):
     # The schedules init_z1_and_2 and init_z3 build when the user supplies none.
     validate_schedule([(0, [zero_1_and_2_compile.NAME_Z1])], builtin_registry)
+    validate_schedule([(0, [zero_1_and_2_compile.NAME_Z2])], builtin_registry)
     validate_schedule([(0, [zero3_compile.NAME]), (5, [zero3_compile.NAME, prefetch.NAME, selective_gather.NAME])],
                       builtin_registry)
     validate_schedule([(0, [zero3_compile.NAME, offload_parameters.NAME])], builtin_registry)
@@ -164,22 +165,32 @@ def test_builtin_default_schedules_validate(builtin_registry):
 
 
 def test_offload_targets_conflict(builtin_registry):
-    # init_z3 rejects this combination only while building its own schedule, so a user-supplied
-    # schedule reaches the passes unchecked without a contract.
-    for offload_opt_state_pass in (offload_adam_states.NAME, offload_adam_states.NAME_SYNC):
+    # DeepSpeed supports one offload target per run. init_z3 rejects the pair only while building
+    # its own schedule, so a user-supplied schedule needs the contract to catch it.
+    z3, params, for_init = zero3_compile.NAME, offload_parameters.NAME, offload_adam_states.NAME_FOR_INIT
+    for passes in ([z3, params, for_init], [for_init, z3, params,
+                                            offload_adam_states.NAME], [z3, params, offload_adam_states.NAME_SYNC]):
         with pytest.raises(PassContractError, match="conflicts"):
-            validate_schedule([(0, [
-                offload_adam_states.NAME_FOR_INIT, zero3_compile.NAME, offload_parameters.NAME, offload_opt_state_pass
-            ])], builtin_registry)
+            validate_schedule([(0, passes)], builtin_registry)
+
+
+def test_offload_opt_states_conflict_with_zero1_and_2(builtin_registry):
+    # These passes act on optimizer state that only init_z3 registers, so under ZeRO-1/2 the
+    # module-level optimizer is never set and they fail at runtime rather than at schedule time.
+    for reduce_pass in (zero_1_and_2_compile.NAME_Z1, zero_1_and_2_compile.NAME_Z2):
+        for offload_pass in (offload_adam_states.NAME_FOR_INIT, offload_adam_states.NAME_SYNC):
+            with pytest.raises(PassContractError, match="conflicts"):
+                validate_schedule([(0, [reduce_pass, offload_pass])], builtin_registry)
 
 
 def test_offload_adam_states_requires_for_init(builtin_registry):
-    # Both variants plan against profiled peaks, which are only meaningful once for_init has taken
-    # the optimizer state off the accelerator.
-    for name in (offload_adam_states.NAME, offload_adam_states.NAME_SYNC):
-        with pytest.raises(PassContractError, match="requires"):
-            validate_schedule([(0, [zero3_compile.NAME, name])], builtin_registry)
-        validate_schedule([(0, [offload_adam_states.NAME_FOR_INIT, zero3_compile.NAME, name])], builtin_registry)
+    # move_opt_states plans from the profiled peaks, so for_init must have evicted the state first.
+    with pytest.raises(PassContractError, match="requires"):
+        validate_schedule([(0, [zero3_compile.NAME, offload_adam_states.NAME])], builtin_registry)
+    validate_schedule([(0, [offload_adam_states.NAME_FOR_INIT, zero3_compile.NAME, offload_adam_states.NAME])],
+                      builtin_registry)
+    # The synchronous variant reads no profile, so it carries no such requirement.
+    validate_schedule([(0, [zero3_compile.NAME, offload_adam_states.NAME_SYNC])], builtin_registry)
 
 
 def test_offload_adam_states_variants_conflict(builtin_registry):

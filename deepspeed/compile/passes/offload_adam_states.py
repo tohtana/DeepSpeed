@@ -35,15 +35,18 @@ import deepspeed.comm as dist
 NAME = "offload_adam_states"
 NAME_SYNC = "offload_adam_states_sync"
 NAME_FOR_INIT = "offload_adam_states_for_init"
-# Both variants plan against the profiled per-node peaks, which only reflect the memory the run
-# needs if the optimizer state was already off the accelerator when the profilers ran. DeepSpeed
-# also supports one offload target per run, so neither may share a schedule with
-# offload_parameters, and the synchronous variant replaces move_opt_states rather than joining it.
-CONTRACT = PassContract(requires=frozenset({CAP_OPT_STATES_EVICTED}), conflicts_with=frozenset({"offload_parameters"}))
-CONTRACT_SYNC = PassContract(requires=frozenset({CAP_OPT_STATES_EVICTED}),
-                             conflicts_with=frozenset({"offload_parameters", NAME}))
-# Empties the optimizer state before the profilers run, which is what makes those peaks usable.
-CONTRACT_FOR_INIT = PassContract(provides=frozenset({CAP_OPT_STATES_EVICTED}))
+# All three act on optimizer state that only init_z3 registers, and DeepSpeed supports a single
+# offload target per run, so none of them may share a schedule with offload_parameters or with the
+# ZeRO-1/2 reduce passes.
+_INCOMPATIBLE = frozenset({"offload_parameters", "zero1_compile", "zero2_compile"})
+# move_opt_states plans from the profiled per-node peaks, which describe the run only if the
+# optimizer state was already off the accelerator when the profilers ran.
+CONTRACT = PassContract(requires=frozenset({CAP_OPT_STATES_EVICTED}), conflicts_with=_INCOMPATIBLE)
+# The synchronous variant needs no such profile: it offloads everything at the head of the first
+# graph and reloads at the tail of the last, so it takes no requires. It replaces move_opt_states
+# rather than running alongside it.
+CONTRACT_SYNC = PassContract(conflicts_with=_INCOMPATIBLE | {NAME})
+CONTRACT_FOR_INIT = PassContract(provides=frozenset({CAP_OPT_STATES_EVICTED}), conflicts_with=_INCOMPATIBLE)
 
 
 def print_r0(msg):

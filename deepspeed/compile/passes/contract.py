@@ -110,8 +110,8 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
             # Conflicts are treated symmetrically: either pass may declare the incompatibility.
             conflicts = set(contract.conflicts_with.intersection(applied))
             for prev_name in applied:
-                prev_contract = _pass_contracts.get(prev_name)
-                if prev_contract is not None and name in prev_contract.conflicts_with:
+                prev_contract = _pass_contracts.get(prev_name, _UNCONSTRAINED)
+                if name in prev_contract.conflicts_with:
                     conflicts.add(prev_name)
             if conflicts:
                 raise PassContractError(f"Pass '{name}' (step {step}) conflicts with already-scheduled pass(es) "
