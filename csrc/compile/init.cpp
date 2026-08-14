@@ -13,7 +13,7 @@ TORCH_LIBRARY(dc, m)
     m.def("allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor");
     m.def(
         "prefetch_params_fused(int graph_id, Tensor[] params, int[] ids,"
-        "                      ScalarType[]? dtypes = None) -> ()");
+        "                      ScalarType[]? dtypes = None, int arena_plan_id = -1) -> ()");
     m.def("wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)");
     m.def("release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)");
     m.def("reduce_grad(Tensor a, int graph_id, int id) -> Tensor");
@@ -114,6 +114,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_z3_gather_buffer_pool_state_for_test",
           &dc::get_z3_gather_buffer_pool_state_for_test,
           "Inspect ZeRO-3 gather-buffer-pool accounting for tests");
+    m.def("configure_z3_prefetch_arena",
+          &dc::configure_z3_prefetch_arena,
+          "Configure a fixed ZeRO-3 prefetch arena plan");
+    m.def("get_z3_prefetch_arena_state_for_test",
+          &dc::get_z3_prefetch_arena_state_for_test,
+          "Inspect ZeRO-3 prefetch arena accounting for tests");
     m.def("start_forward", &dc::start_forward, "Start forward pass");
     m.def("end_forward", &dc::end_forward, "End forward pass");
     m.def("start_backward", &dc::start_backward, "Start backward pass");

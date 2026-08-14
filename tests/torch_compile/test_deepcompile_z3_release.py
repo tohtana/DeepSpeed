@@ -12,6 +12,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.compile.config import CompileConfig
 from deepspeed.compile.util import get_deepcompile_handle, is_deepcompile_supported
+from torch._subclasses.fake_tensor import FakeTensorMode
 from unit.common import DistributedTest
 
 pytestmark = pytest.mark.skipif(not is_deepcompile_supported(),
@@ -71,6 +72,330 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
                 "idle_pressure_score", "pressure_recovery_complete", "pressure_recovery_budget",
                 "pressure_recovery_pending_entries", "pressure_recovery_in_progress")
         return dict(zip(keys, dc.get_z3_gather_buffer_pool_state_for_test()))
+
+    def _arena_state(self, dc, graph_id):
+        keys = ("enabled", "phases", "capacity", "planned_max_live", "backing_allocations", "request_bytes",
+                "reuse_bytes", "fallback_bytes", "active_bytes", "high_water_bytes", "active_leases",
+                "high_water_slices", "event_waits", "overlaps", "pointer_stable", "rank_consistency_checks",
+                "rank_plan_mismatches", "relocations", "stale_registry_releases")
+        return dict(zip(keys, dc.get_z3_prefetch_arena_state_for_test(graph_id)))
+
+    def _configure_arena(self, dc, graph_id, plan_ids, ds_ids, offsets, request_bytes, capacity=512, phase=0):
+        dc.configure_z3_prefetch_arena(graph_id, phase, capacity, capacity, 12345 + phase, plan_ids, ds_ids, offsets,
+                                       request_bytes)
+
+    def _prefetch(self, shards, graph_id, ds_ids, plan_id, dtypes=None):
+        torch.ops.dc.prefetch_params_fused.default(graph_id, shards, ds_ids, dtypes, plan_id)
+
+    def test_prefetch_arena_distinct_slices_retrieval_and_stable_backing(self):
+        graph_id, first_id, second_id = 9200, 9201, 9202
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [3], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+            # The optimization pass registers this metadata while Dynamo's
+            # FakeTensorMode is active.  Registration must not allocate or
+            # inspect the real CUDA backing in that context.
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                self._configure_arena(dc, graph_id, [10, 10], [first_id, second_id], [0, 256], [16, 32])
+
+            before = self._arena_state(dc, graph_id)
+            self._prefetch([first, second], graph_id, [first_id, second_id], 10)
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+
+            assert first_storage.data_ptr() + 256 == second_view.data_ptr()
+            assert first_storage.data_ptr() == second_storage.data_ptr()
+            assert torch.allclose(first_view.sum(), self._expected_view_sum([3]))
+            assert torch.allclose(second_view.sum(), self._expected_view_sum([5]))
+            self._release(first_view, graph_id, first_id, 1)
+            self._release(second_view, graph_id, second_id, 1)
+            after = self._arena_state(dc, graph_id)
+            # Python graph compilation only registers immutable plan metadata;
+            # the real CUDA backing is materialized by the first native fused
+            # prefetch after cross-rank consensus.
+            assert before["backing_allocations"] == 0
+            assert after["backing_allocations"] == 1
+            assert after["pointer_stable"] == 1
+            assert after["fallback_bytes"] == 0
+            assert after["active_leases"] == after["overlaps"] == 0
+            assert first_storage.nbytes() == second_storage.nbytes() == 512
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_final_release_reuses_slice_after_consumer_stream(self):
+        graph_id, first_id, second_id = 9210, 9211, 9212
+        if not hasattr(torch.cuda, "_sleep"):  #ignore-cuda
+            pytest.skip("CUDA sleep helper is unavailable")
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [4097], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [2049], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+            first_bytes = first.numel() * dist.get_world_size() * first.element_size()
+            second_bytes = second.numel() * dist.get_world_size() * second.element_size()
+            capacity = math.ceil(max(first_bytes, second_bytes) / 256) * 256
+            self._configure_arena(dc,
+                                  graph_id, [10, 11], [first_id, second_id], [0, 0], [first_bytes, second_bytes],
+                                  capacity=capacity)
+
+            self._prefetch([first], graph_id, [first_id], 10)
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            result = torch.empty((), device=self._device(), dtype=first_view.dtype)
+            consumer_stream = get_accelerator().Stream()
+            with get_accelerator().stream(consumer_stream):
+                torch.cuda._sleep(int(1e8))  #ignore-cuda
+                result.copy_(first_view.sum())
+                self._release(first_view, graph_id, first_id, 1, synchronize=False)
+
+            self._prefetch([second], graph_id, [second_id], 11)
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+            get_accelerator().synchronize()
+
+            assert second_storage.data_ptr() == first_storage.data_ptr()
+            assert torch.allclose(result, self._expected_view_sum([4097]))
+            assert torch.allclose(second_view.sum(), self._expected_view_sum([2049]))
+            self._release(second_view, graph_id, second_id, 1)
+            state = self._arena_state(dc, graph_id)
+            assert state["reuse_bytes"] == second_bytes
+            assert state["event_waits"] == 1
+            assert state["active_leases"] == 0
+            assert first_storage.nbytes() == capacity
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_shares_one_backing_across_forward_and_backward_phases(self):
+        graph_id, forward_id, backward_id = 9213, 9214, 9215
+        dc = self._init_dc()
+        try:
+            forward = self._register_param(dc, graph_id, forward_id, [3], register_graph=False)
+            backward = self._register_param(dc, graph_id, backward_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [forward_id, backward_id])
+            self._configure_arena(dc, graph_id, [10], [forward_id], [0], [16], capacity=512, phase=0)
+            self._configure_arena(dc, graph_id, [1_000_010], [backward_id], [0], [32], capacity=256, phase=1)
+
+            self._prefetch([forward], graph_id, [forward_id], 10)
+            forward_view, forward_storage = self._gather_view_and_storage(forward, graph_id, forward_id)
+            self._release(forward_view, graph_id, forward_id, 1)
+
+            self._prefetch([backward], graph_id, [backward_id], 1_000_010)
+            backward_view, backward_storage = self._gather_view_and_storage(backward, graph_id, backward_id)
+            self._release(backward_view, graph_id, backward_id, 1)
+
+            state = self._arena_state(dc, graph_id)
+            assert state["phases"] == 2
+            assert state["capacity"] == 512
+            assert state["planned_max_live"] == 512
+            assert state["backing_allocations"] == 1
+            assert state["fallback_bytes"] == 0
+            assert state["active_leases"] == state["overlaps"] == 0
+            assert state["pointer_stable"] == 1
+            assert forward_storage.data_ptr() == backward_storage.data_ptr()
+            assert forward_storage.nbytes() == backward_storage.nbytes() == 512
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_relocates_when_compiler_advances_prefetch(self):
+        graph_id, first_id, second_id = 9221, 9222, 9223
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [3], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+            self._configure_arena(dc, graph_id, [10, 11], [first_id, second_id], [0, 0], [16, 32], capacity=512)
+
+            self._prefetch([first], graph_id, [first_id], 10)
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            self._prefetch([second], graph_id, [second_id], 11)
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+
+            assert first_storage.data_ptr() + 256 == second_view.data_ptr()
+            assert first_storage.data_ptr() == second_storage.data_ptr()
+            assert torch.allclose(first_view.sum(), self._expected_view_sum([3]))
+            assert torch.allclose(second_view.sum(), self._expected_view_sum([5]))
+            self._release(first_view, graph_id, first_id, 1)
+            self._release(second_view, graph_id, second_id, 1)
+            state = self._arena_state(dc, graph_id)
+            assert state["relocations"] == 1
+            assert state["overlaps"] == 0
+            assert state["fallback_bytes"] == 0
+            assert state["active_leases"] == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_stale_release_preserves_newer_registry_generation(self):
+        arena_graph_id, newer_graph_id, ds_id = 9218, 9219, 9220
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, arena_graph_id, ds_id, [5], register_graph=False)
+            dc.register_graph_z3(arena_graph_id, [ds_id])
+            dc.register_graph_z3(newer_graph_id, [ds_id])
+            self._configure_arena(dc, arena_graph_id, [10], [ds_id], [0], [32])
+
+            self._prefetch([shard], arena_graph_id, [ds_id], 10)
+            arena_view, arena_storage = self._gather_view_and_storage(shard, arena_graph_id, ds_id)
+
+            # Profiling owns this global invalidation API. A nested/newer graph
+            # can then install another gathered tensor before the arena graph's
+            # release node executes.
+            dc.invalidate_gathered_param(ds_id)
+            newer_view, newer_storage = self._gather_view_and_storage(shard, newer_graph_id, ds_id)
+            assert newer_storage.data_ptr() != arena_storage.data_ptr()
+
+            self._release(arena_view, arena_graph_id, ds_id, 1)
+            latest_view, latest_storage = self._gather_view_and_storage(shard, newer_graph_id, ds_id)
+            assert latest_storage.data_ptr() == newer_storage.data_ptr()
+            assert torch.allclose(latest_view.sum(), self._expected_view_sum([5]))
+
+            state = self._arena_state(dc, arena_graph_id)
+            assert state["active_leases"] == 0
+            assert state["stale_registry_releases"] == 1
+            assert arena_storage.nbytes() == 512
+            self._release(newer_view, newer_graph_id, ds_id, 1)
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_capacity_exhaustion_falls_back_without_leasing_overlap(self):
+        graph_id, first_id, second_id = 9218, 9219, 9220
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [3], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+            self._configure_arena(dc, graph_id, [10, 11], [first_id, second_id], [0, 0], [16, 32], capacity=256)
+
+            self._prefetch([first], graph_id, [first_id], 10)
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            self._prefetch([second], graph_id, [second_id], 11)
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+
+            assert first_storage.data_ptr() != second_storage.data_ptr()
+            assert torch.allclose(first_view.sum(), self._expected_view_sum([3]))
+            assert torch.allclose(second_view.sum(), self._expected_view_sum([5]))
+            self._release(first_view, graph_id, first_id, 1)
+            self._release(second_view, graph_id, second_id, 1)
+            state = self._arena_state(dc, graph_id)
+            assert state["relocations"] == 0
+            assert state["overlaps"] == 0
+            assert state["fallback_bytes"] == second.numel() * dist.get_world_size() * second.element_size()
+            assert state["active_leases"] == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_dtype_mismatch_falls_back_without_resizing_backing(self):
+        graph_id, ds_id = 9220, 9221
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [5])
+            self._configure_arena(dc, graph_id, [10], [ds_id], [0], [32])
+
+            self._prefetch([shard], graph_id, [ds_id], 10, [torch.float16])
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, torch.float16)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+            fallback_storage = gathered.untyped_storage()
+            self._release(gathered, graph_id, ds_id, 1)
+
+            state = self._arena_state(dc, graph_id)
+            assert state["fallback_bytes"] == shard.numel() * dist.get_world_size() * 2
+            assert state["active_leases"] == 0
+            assert state["capacity"] == 512
+            assert state["pointer_stable"] == 1
+            assert fallback_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_capacity_overflow_falls_back_without_resizing_backing(self):
+        graph_id, ds_id = 9225, 9226
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [5])
+            self._configure_arena(dc, graph_id, [10], [ds_id], [0], [16])
+
+            self._prefetch([shard], graph_id, [ds_id], 10)
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+            fallback_storage = gathered.untyped_storage()
+            self._release(gathered, graph_id, ds_id, 1)
+
+            state = self._arena_state(dc, graph_id)
+            assert state["fallback_bytes"] == shard.numel() * dist.get_world_size() * shard.element_size()
+            assert state["active_leases"] == 0
+            assert state["capacity"] == 512
+            assert state["pointer_stable"] == 1
+            assert fallback_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_rank_plan_mismatch_falls_back_on_every_rank(self):
+        graph_id, ds_id = 9227, 9228
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [5])
+            dc.configure_z3_prefetch_arena(graph_id, 0, 512, 512, 12345 + dist.get_rank(), [10], [ds_id], [0], [32])
+
+            self._prefetch([shard], graph_id, [ds_id], 10)
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+            fallback_storage = gathered.untyped_storage()
+            self._release(gathered, graph_id, ds_id, 1)
+
+            state = self._arena_state(dc, graph_id)
+            assert state["enabled"] == 0
+            assert state["rank_consistency_checks"] == 1
+            assert state["rank_plan_mismatches"] == 1
+            assert state["active_leases"] == 0
+            assert fallback_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_missing_plan_on_one_rank_falls_back_on_every_rank(self):
+        graph_id, ds_id = 9229, 9230
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [5])
+            rank = dist.get_rank()
+            if rank == 0:
+                self._configure_arena(dc, graph_id, [10], [ds_id], [0], [32])
+
+            # The fused graph carries the same plan ID on every rank even if
+            # rank-local metadata prevented one executor from configuring the
+            # plan. Both ranks must still enter runtime consensus and disable
+            # the arena before the gather.
+            self._prefetch([shard], graph_id, [ds_id], 10)
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+            fallback_storage = gathered.untyped_storage()
+            self._release(gathered, graph_id, ds_id, 1)
+
+            state = self._arena_state(dc, graph_id)
+            assert state["enabled"] == 0
+            assert state["rank_consistency_checks"] == 1
+            assert state["rank_plan_mismatches"] == 1
+            assert state["active_leases"] == 0
+            assert fallback_storage.nbytes() == 0
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_reset_requires_zero_leases(self):
+        graph_id, ds_id = 9230, 9231
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [3])
+            self._configure_arena(dc, graph_id, [10], [ds_id], [0], [16])
+            self._prefetch([shard], graph_id, [ds_id], 10)
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+
+            with pytest.raises(RuntimeError, match="active leases"):
+                dc.reset()
+            assert self._arena_state(dc, graph_id)["active_leases"] == 1
+
+            self._release(gathered, graph_id, ds_id, 1)
+            assert self._arena_state(dc, graph_id)["active_leases"] == 0
+            dc.reset()
+        finally:
+            dc.cleanup()
 
     def test_storage_reused_after_release_single_use(self):
         graph_id, ds_id, next_ds_id = 9010, 9011, 9012

@@ -10,10 +10,13 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -592,8 +595,626 @@ private:
     bool committed_ = false;
 };
 
+struct PrefetchArenaPlanKey {
+    long plan_id;
+    long ds_id;
+
+    bool operator==(const PrefetchArenaPlanKey& other) const
+    {
+        return plan_id == other.plan_id && ds_id == other.ds_id;
+    }
+};
+
+struct PrefetchArenaPlanKeyHash {
+    size_t operator()(const PrefetchArenaPlanKey& key) const
+    {
+        const auto lhs = std::hash<long>{}(key.plan_id);
+        const auto rhs = std::hash<long>{}(key.ds_id);
+        return lhs ^ (rhs + 0x9e3779b9 + (lhs << 6) + (lhs >> 2));
+    }
+};
+
+class PrefetchArena {
+public:
+    enum class ReleaseDisposition { NoLease, ReleasedCurrentRegistry, ReleasedStaleRegistry };
+
+    PrefetchArena(long graph_id, uint64_t generation, int rank, at::cuda::CUDAStream ag_stream)
+        : graph_id_(graph_id), generation_(generation), rank_(rank), ag_stream_(ag_stream)
+    {
+    }
+
+    ~PrefetchArena() noexcept
+    {
+        try {
+            logState("destruction");
+        } catch (...) {
+        }
+    }
+
+    void configure(long phase,
+                   int64_t capacity_bytes,
+                   int64_t max_live_bytes,
+                   int64_t digest,
+                   const std::vector<long>& plan_ids,
+                   const std::vector<long>& ds_ids,
+                   const std::vector<int64_t>& offsets,
+                   const std::vector<int64_t>& request_bytes)
+    {
+        TORCH_CHECK(capacity_bytes > 0, "prefetch arena capacity must be positive");
+        TORCH_CHECK(max_live_bytes > 0 && max_live_bytes <= capacity_bytes,
+                    "prefetch arena max-live bytes must fit capacity");
+        TORCH_CHECK(plan_ids.size() == ds_ids.size() && plan_ids.size() == offsets.size() &&
+                        plan_ids.size() == request_bytes.size(),
+                    "prefetch arena plan vectors must have equal length");
+
+        auto existing = phases_.find(phase);
+        if (existing != phases_.end()) {
+            if (!sameConfiguration(existing->second,
+                                   capacity_bytes,
+                                   max_live_bytes,
+                                   digest,
+                                   plan_ids,
+                                   ds_ids,
+                                   offsets,
+                                   request_bytes)) {
+                existing->second.disabled = true;
+                rank_consistency_checked_ = false;
+                noteFallback("reconfigure_mismatch", capacity_bytes);
+                logState("reconfigure_mismatch");
+            } else {
+                logState("configure_idempotent");
+            }
+            return;
+        }
+
+        Phase configured;
+        configured.capacity_bytes = capacity_bytes;
+        configured.max_live_bytes = max_live_bytes;
+        configured.digest = digest;
+        for (size_t index = 0; index < plan_ids.size(); ++index) {
+            TORCH_CHECK(offsets[index] >= 0 && offsets[index] % kAlignment == 0,
+                        "prefetch arena slice offsets must be aligned");
+            TORCH_CHECK(request_bytes[index] > 0, "prefetch arena request bytes must be positive");
+            const int64_t span_bytes = alignUp(request_bytes[index]);
+            TORCH_CHECK(offsets[index] + span_bytes <= capacity_bytes,
+                        "prefetch arena slice exceeds backing capacity");
+            PrefetchArenaPlanKey key{plan_ids[index], ds_ids[index]};
+            SlicePlan plan{phase, offsets[index], request_bytes[index], span_bytes};
+            const auto [_, inserted] = configured.plans.emplace(key, plan);
+            TORCH_CHECK(inserted, "duplicate prefetch arena plan entry");
+            configured.ordered_entries.push_back(
+                {plan_ids[index], ds_ids[index], offsets[index], request_bytes[index]});
+        }
+
+        phases_.emplace(phase, std::move(configured));
+        // This method is called by the Python optimization pass while
+        // FakeTensorMode may be active.  Keep it metadata-only: allocating or
+        // inspecting a CUDA tensor here would either create a fake backing or
+        // attempt to read a FakeTensor data pointer.  The first native fused
+        // prefetch materializes the backing after rank consensus instead.
+        enabled_ = false;
+        rank_consistency_checked_ = false;
+        logState("plan_configured");
+    }
+
+    void ensureRankConsistent(ncclComm_t nccl_comm)
+    {
+        if (rank_consistency_checked_) { return; }
+
+        std::vector<long> phase_ids;
+        phase_ids.reserve(phases_.size());
+        for (const auto& [phase_id, _] : phases_) { phase_ids.push_back(phase_id); }
+        std::sort(phase_ids.begin(), phase_ids.end());
+
+        int64_t total_capacity = 0;
+        int64_t total_max_live = 0;
+        int64_t disabled_phases = 0;
+        uint64_t aggregate_digest = 1469598103934665603ULL;
+        const auto mix = [&aggregate_digest](uint64_t value) {
+            aggregate_digest ^= value;
+            aggregate_digest *= 1099511628211ULL;
+        };
+        for (long phase_id : phase_ids) {
+            const auto& phase = phases_.at(phase_id);
+            total_capacity += phase.capacity_bytes;
+            total_max_live += phase.max_live_bytes;
+            disabled_phases += phase.disabled ? 1 : 0;
+            mix(static_cast<uint64_t>(phase_id));
+            mix(static_cast<uint64_t>(phase.capacity_bytes));
+            mix(static_cast<uint64_t>(phase.max_live_bytes));
+            mix(static_cast<uint64_t>(phase.digest));
+            mix(static_cast<uint64_t>(phase.ordered_entries.size()));
+        }
+
+        const std::vector<int64_t> host_signature = {
+            static_cast<int64_t>(phases_.size()),
+            total_capacity,
+            total_max_live,
+            disabled_phases,
+            static_cast<int64_t>(aggregate_digest & std::numeric_limits<int64_t>::max()),
+        };
+        at::Tensor minimum;
+        at::Tensor maximum;
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            auto local = torch::tensor(host_signature, at::TensorOptions().dtype(at::kLong))
+                             .to(at::TensorOptions().dtype(at::kLong).device(at::kCUDA));
+            minimum = local.clone();
+            maximum = local.clone();
+            const auto min_result = ncclAllReduce(minimum.data_ptr(),
+                                                  minimum.data_ptr(),
+                                                  minimum.numel(),
+                                                  ncclInt64,
+                                                  ncclMin,
+                                                  nccl_comm,
+                                                  ag_stream_);
+            TORCH_CHECK(min_result == ncclSuccess,
+                        "prefetch arena rank-consistency MIN reduction failed: ",
+                        ncclGetErrorString(min_result));
+            const auto max_result = ncclAllReduce(maximum.data_ptr(),
+                                                  maximum.data_ptr(),
+                                                  maximum.numel(),
+                                                  ncclInt64,
+                                                  ncclMax,
+                                                  nccl_comm,
+                                                  ag_stream_);
+            TORCH_CHECK(max_result == ncclSuccess,
+                        "prefetch arena rank-consistency MAX reduction failed: ",
+                        ncclGetErrorString(max_result));
+        }
+        at::cuda::stream_synchronize(ag_stream_);
+
+        rank_consistency_checks_++;
+        rank_consistency_checked_ = true;
+        if (!minimum.cpu().equal(maximum.cpu())) {
+            enabled_ = false;
+            rank_plan_mismatches_++;
+            for (auto& [_, phase] : phases_) { phase.disabled = true; }
+            noteFallback("rank_plan_mismatch", 0);
+            logState("rank_plan_mismatch");
+            return;
+        }
+
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            int64_t shared_capacity_bytes = 0;
+            for (const auto& [_, phase] : phases_) {
+                shared_capacity_bytes = std::max(shared_capacity_bytes, phase.capacity_bytes);
+            }
+            if (!shared_backing_.defined()) {
+                shared_backing_ =
+                    torch::empty({shared_capacity_bytes},
+                                 at::TensorOptions().dtype(at::kByte).device(at::kCUDA));
+                shared_backing_pointer_ = reinterpret_cast<uintptr_t>(shared_backing_.data_ptr());
+                shared_storage_identity_ = shared_backing_.storage().unsafeGetStorageImpl();
+                shared_capacity_bytes_ = shared_capacity_bytes;
+                backing_allocation_count_++;
+            }
+            TORCH_CHECK(shared_capacity_bytes_ == shared_capacity_bytes,
+                        "prefetch arena shared backing capacity changed");
+            for (auto& [_, phase] : phases_) {
+                if (phase.backing.defined()) { continue; }
+                phase.backing = shared_backing_;
+                phase.backing_pointer = shared_backing_pointer_;
+                phase.storage_identity = shared_storage_identity_;
+                phase.backing_allocation_count = 1;
+            }
+        }
+        enabled_ = !phases_.empty();
+        logState("rank_plan_consistent");
+    }
+
+    at::Tensor acquire(long plan_id,
+                       long ds_id,
+                       int64_t numel,
+                       at::ScalarType dtype,
+                       const c10::Device& device)
+    {
+        const int64_t requested_bytes = numel * c10::elementSize(dtype);
+        request_bytes_ += requested_bytes;
+        if (!enabled_) {
+            noteFallback("not_configured", requested_bytes);
+            return at::Tensor();
+        }
+
+        const PrefetchArenaPlanKey key{plan_id, ds_id};
+        Phase* phase = nullptr;
+        const SlicePlan* plan = nullptr;
+        for (auto& [_, candidate] : phases_) {
+            auto it = candidate.plans.find(key);
+            if (it != candidate.plans.end()) {
+                phase = &candidate;
+                plan = &it->second;
+                break;
+            }
+        }
+        if (phase == nullptr || plan == nullptr) {
+            noteFallback("plan_miss", requested_bytes);
+            return at::Tensor();
+        }
+        if (phase->disabled) {
+            noteFallback("phase_disabled", requested_bytes);
+            return at::Tensor();
+        }
+        verifyBacking(*phase);
+        if (device.type() != c10::kCUDA || phase->backing.device() != device) {
+            noteFallback("device_mismatch", requested_bytes);
+            return at::Tensor();
+        }
+        // The scheduled size is a byte-capacity reservation, not an exact
+        // native-request shape.  A smaller typed request can safely use the
+        // same stable slice as long as it starts at a valid element boundary.
+        if (requested_bytes > plan->request_bytes) {
+            noteFallback("capacity_overflow", requested_bytes);
+            return at::Tensor();
+        }
+        if (plan->offset % c10::elementSize(dtype) != 0) {
+            noteFallback("dtype_alignment_mismatch", requested_bytes);
+            return at::Tensor();
+        }
+        if (hasKey(active_leases_, ds_id)) {
+            overlap_count_++;
+            TORCH_CHECK(false, "prefetch arena ds_id already has an active lease");
+        }
+        const auto lease_offset =
+            findAvailableOffset(phase->capacity_bytes, plan->offset, plan->span_bytes);
+        if (!lease_offset) {
+            noteFallback("runtime_capacity", requested_bytes);
+            return at::Tensor();
+        }
+        if (lease_offset.value() != plan->offset) {
+            // Inductor is free to move a side-effecting fused prefetch earlier
+            // than the FX node order used by the static lifetime planner.  If
+            // the preferred slice is consequently still live, keep the fixed
+            // backing allocation and place this lease in another free aligned
+            // slice.  Exhausting the arena is a normal per-request fallback,
+            // not a reason to corrupt an active slice or fail the graph.
+            relocation_count_++;
+        }
+
+        for (auto it = pending_fences_.begin(); it != pending_fences_.end();) {
+            if (overlaps(lease_offset.value(), plan->span_bytes, it->offset, it->span_bytes)) {
+                it->ready_event->block(ag_stream_);
+                event_wait_count_++;
+                it = pending_fences_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        if (ever_acquired_.count(lease_offset.value()) > 0) { reuse_bytes_ += requested_bytes; }
+        ever_acquired_.insert(lease_offset.value());
+        active_leases_.emplace(
+            ds_id,
+            Lease{
+                plan->phase, plan_id, lease_offset.value(), plan->request_bytes, plan->span_bytes});
+        active_bytes_ += plan->span_bytes;
+        high_water_bytes_ = std::max(high_water_bytes_, active_bytes_);
+        high_water_slices_ = std::max(high_water_slices_, active_leases_.size());
+
+        at::Tensor result = torch::empty({0}, at::TensorOptions().dtype(dtype).device(device));
+        result.set_(
+            phase->backing.storage(), lease_offset.value() / c10::elementSize(dtype), {numel}, {1});
+        return result;
+    }
+
+    ReleaseDisposition release(long ds_id, const at::Tensor& gathered_param)
+    {
+        auto lease_it = active_leases_.find(ds_id);
+        if (lease_it == active_leases_.end()) { return ReleaseDisposition::NoLease; }
+        auto phase_it = phases_.find(lease_it->second.phase);
+        TORCH_CHECK(phase_it != phases_.end(), "prefetch arena lease references a missing phase");
+        verifyBacking(phase_it->second);
+        const bool tensor_defined = gathered_param.defined();
+        const auto* actual_storage =
+            tensor_defined ? gathered_param.storage().unsafeGetStorageImpl() : nullptr;
+        const int64_t actual_offset =
+            tensor_defined ? gathered_param.storage_offset() * gathered_param.element_size() : -1;
+        const bool registry_matches_lease = tensor_defined &&
+                                            actual_storage == phase_it->second.storage_identity &&
+                                            actual_offset == lease_it->second.offset;
+        if (!registry_matches_lease) {
+            stale_registry_release_count_++;
+            if (diagnosticEnvEnabled("DEEPSPEED_COMPILE_PREFETCH_ARENA")) {
+                std::cout << "DEEPSPEED_Z3_PREFETCH_ARENA event=stale_registry_release"
+                          << " rank=" << rank_ << " generation=" << generation_
+                          << " graph_id=" << graph_id_ << " ds_id=" << ds_id
+                          << " lease_plan_id=" << lease_it->second.plan_id
+                          << " expected_storage_identity="
+                          << reinterpret_cast<uintptr_t>(phase_it->second.storage_identity)
+                          << " actual_storage_identity="
+                          << reinterpret_cast<uintptr_t>(actual_storage)
+                          << " expected_offset=" << lease_it->second.offset
+                          << " actual_offset=" << actual_offset << " actual_storage_bytes="
+                          << (tensor_defined ? gathered_param.storage().nbytes() : 0) << std::endl;
+            }
+        }
+
+        const auto consumer_stream = at::cuda::getCurrentCUDAStream();
+        phase_it->second.backing.record_stream(consumer_stream);
+        auto ready_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+        ready_event->record(consumer_stream);
+        pending_fences_.push_back({lease_it->second.phase,
+                                   lease_it->second.offset,
+                                   lease_it->second.span_bytes,
+                                   std::move(ready_event)});
+        active_bytes_ -= lease_it->second.span_bytes;
+        active_leases_.erase(lease_it);
+        return registry_matches_lease ? ReleaseDisposition::ReleasedCurrentRegistry
+                                      : ReleaseDisposition::ReleasedStaleRegistry;
+    }
+
+    void cancelAcquire(long ds_id)
+    {
+        auto lease_it = active_leases_.find(ds_id);
+        if (lease_it == active_leases_.end()) { return; }
+        auto phase_it = phases_.find(lease_it->second.phase);
+        TORCH_CHECK(phase_it != phases_.end(), "prefetch arena lease references a missing phase");
+        phase_it->second.backing.record_stream(ag_stream_);
+        auto ready_event = std::make_shared<at::cuda::CUDAEvent>(cudaEventDisableTiming);
+        ready_event->record(ag_stream_);
+        pending_fences_.push_back({lease_it->second.phase,
+                                   lease_it->second.offset,
+                                   lease_it->second.span_bytes,
+                                   std::move(ready_event)});
+        active_bytes_ -= lease_it->second.span_bytes;
+        active_leases_.erase(lease_it);
+    }
+
+    void recordFallback(const std::string& reason, int64_t bytes)
+    {
+        request_bytes_ += std::max<int64_t>(bytes, 0);
+        noteFallback(reason, bytes);
+    }
+
+    void prepareForReset()
+    {
+        logState("reset");
+        TORCH_CHECK(active_leases_.empty(),
+                    "prefetch arena reset attempted with active leases graph_id=",
+                    graph_id_,
+                    " active_leases=",
+                    active_leases_.size());
+    }
+
+    std::vector<int64_t> stateForTest() const
+    {
+        int64_t total_capacity = shared_capacity_bytes_;
+        int64_t planned_max_live = 0;
+        int64_t pointer_stable = 1;
+        for (const auto& [_, phase] : phases_) {
+            planned_max_live = std::max(planned_max_live, phase.max_live_bytes);
+            if (phase.backing.defined() &&
+                (reinterpret_cast<uintptr_t>(phase.backing.data_ptr()) != phase.backing_pointer ||
+                 phase.backing.storage().unsafeGetStorageImpl() != phase.storage_identity)) {
+                pointer_stable = 0;
+            }
+        }
+        return {enabled_ ? 1 : 0,
+                static_cast<int64_t>(phases_.size()),
+                total_capacity,
+                planned_max_live,
+                static_cast<int64_t>(backing_allocation_count_),
+                request_bytes_,
+                reuse_bytes_,
+                fallback_bytes_,
+                active_bytes_,
+                high_water_bytes_,
+                static_cast<int64_t>(active_leases_.size()),
+                static_cast<int64_t>(high_water_slices_),
+                static_cast<int64_t>(event_wait_count_),
+                static_cast<int64_t>(overlap_count_),
+                pointer_stable,
+                static_cast<int64_t>(rank_consistency_checks_),
+                static_cast<int64_t>(rank_plan_mismatches_),
+                static_cast<int64_t>(relocation_count_),
+                static_cast<int64_t>(stale_registry_release_count_)};
+    }
+
+private:
+    static constexpr int64_t kAlignment = 256;
+
+    struct SlicePlan {
+        long phase;
+        int64_t offset;
+        int64_t request_bytes;
+        int64_t span_bytes;
+    };
+
+    struct Phase {
+        at::Tensor backing;
+        int64_t capacity_bytes = 0;
+        int64_t max_live_bytes = 0;
+        int64_t digest = 0;
+        uintptr_t backing_pointer = 0;
+        c10::StorageImpl* storage_identity = nullptr;
+        size_t backing_allocation_count = 0;
+        bool disabled = false;
+        std::unordered_map<PrefetchArenaPlanKey, SlicePlan, PrefetchArenaPlanKeyHash> plans;
+        std::vector<std::array<int64_t, 4>> ordered_entries;
+    };
+
+    struct Lease {
+        long phase;
+        long plan_id;
+        int64_t offset;
+        int64_t request_bytes;
+        int64_t span_bytes;
+    };
+
+    struct Fence {
+        long phase;
+        int64_t offset;
+        int64_t span_bytes;
+        std::shared_ptr<at::cuda::CUDAEvent> ready_event;
+    };
+
+    static int64_t alignUp(int64_t value)
+    {
+        return ((value + kAlignment - 1) / kAlignment) * kAlignment;
+    }
+
+    static bool overlaps(int64_t lhs_offset, int64_t lhs_size, int64_t rhs_offset, int64_t rhs_size)
+    {
+        return lhs_offset < rhs_offset + rhs_size && rhs_offset < lhs_offset + lhs_size;
+    }
+
+    std::optional<int64_t> findAvailableOffset(int64_t capacity_bytes,
+                                               int64_t preferred_offset,
+                                               int64_t span_bytes) const
+    {
+        const auto available = [&](int64_t offset) {
+            if (offset < 0 || offset + span_bytes > capacity_bytes) { return false; }
+            for (const auto& [_, lease] : active_leases_) {
+                if (overlaps(offset, span_bytes, lease.offset, lease.span_bytes)) { return false; }
+            }
+            return true;
+        };
+        if (available(preferred_offset)) { return preferred_offset; }
+
+        std::vector<std::pair<int64_t, int64_t>> occupied;
+        for (const auto& [_, lease] : active_leases_) {
+            occupied.emplace_back(lease.offset, lease.span_bytes);
+        }
+        std::sort(occupied.begin(), occupied.end());
+        int64_t cursor = 0;
+        for (const auto& [offset, size] : occupied) {
+            if (cursor + span_bytes <= offset) { return cursor; }
+            cursor = std::max(cursor, offset + size);
+        }
+        if (cursor + span_bytes <= capacity_bytes) { return cursor; }
+        return std::nullopt;
+    }
+
+    static bool sameConfiguration(const Phase& phase,
+                                  int64_t capacity_bytes,
+                                  int64_t max_live_bytes,
+                                  int64_t digest,
+                                  const std::vector<long>& plan_ids,
+                                  const std::vector<long>& ds_ids,
+                                  const std::vector<int64_t>& offsets,
+                                  const std::vector<int64_t>& request_bytes)
+    {
+        if (phase.capacity_bytes != capacity_bytes || phase.max_live_bytes != max_live_bytes ||
+            phase.digest != digest || phase.ordered_entries.size() != plan_ids.size()) {
+            return false;
+        }
+        for (size_t index = 0; index < plan_ids.size(); ++index) {
+            if (phase.ordered_entries[index] !=
+                std::array<int64_t, 4>{
+                    plan_ids[index], ds_ids[index], offsets[index], request_bytes[index]}) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void verifyBacking(const Phase& phase) const
+    {
+        TORCH_CHECK(phase.backing.defined() &&
+                        phase.backing.storage().nbytes() == shared_capacity_bytes_ &&
+                        phase.capacity_bytes <= shared_capacity_bytes_,
+                    "prefetch arena backing storage size changed");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(phase.backing.data_ptr()) == phase.backing_pointer,
+                    "prefetch arena backing pointer changed");
+        TORCH_CHECK(phase.backing.storage().unsafeGetStorageImpl() == phase.storage_identity,
+                    "prefetch arena backing storage identity changed");
+        TORCH_CHECK(phase.backing_allocation_count == 1,
+                    "prefetch arena backing allocation count changed");
+    }
+
+    void noteFallback(const std::string& reason, int64_t bytes)
+    {
+        fallback_bytes_ += std::max<int64_t>(bytes, 0);
+        fallback_reasons_[reason]++;
+    }
+
+    void logState(const char* event) const
+    {
+        if (!diagnosticEnvEnabled("DEEPSPEED_COMPILE_PREFETCH_ARENA")) { return; }
+        if (phases_.empty() && rank_consistency_checks_ == 0 && request_bytes_ == 0 &&
+            fallback_bytes_ == 0) {
+            return;
+        }
+        int64_t total_capacity = shared_capacity_bytes_;
+        int64_t planned_max_live = 0;
+        for (const auto& [phase_id, phase] : phases_) {
+            planned_max_live = std::max(planned_max_live, phase.max_live_bytes);
+            if (!phase.backing.defined()) { continue; }
+            std::ostringstream backing_record;
+            backing_record << "DEEPSPEED_Z3_PREFETCH_ARENA_BACKING event=" << event
+                           << " rank=" << rank_
+                           << " device=" << static_cast<int>(phase.backing.device().index())
+                           << " generation=" << generation_ << " graph_id=" << graph_id_
+                           << " phase=" << phase_id << " capacity_bytes=" << phase.capacity_bytes
+                           << " max_live_bytes=" << phase.max_live_bytes
+                           << " pointer=" << phase.backing_pointer << " storage_identity="
+                           << reinterpret_cast<uintptr_t>(phase.storage_identity)
+                           << " digest=" << phase.digest
+                           << " backing_allocation_count=" << phase.backing_allocation_count
+                           << " disabled=" << (phase.disabled ? 1 : 0);
+            std::cout << backing_record.str() << std::endl;
+        }
+        std::ostringstream record;
+        record << "DEEPSPEED_Z3_PREFETCH_ARENA event=" << event << " rank=" << rank_
+               << " enabled=" << (enabled_ ? 1 : 0) << " generation=" << generation_
+               << " graph_id=" << graph_id_ << " capacity_bytes=" << total_capacity
+               << " planned_max_live_bytes=" << planned_max_live
+               << " backing_allocation_count=" << backing_allocation_count_
+               << " request_bytes=" << request_bytes_ << " reuse_bytes=" << reuse_bytes_
+               << " fallback_bytes=" << fallback_bytes_ << " active_bytes=" << active_bytes_
+               << " high_water_bytes=" << high_water_bytes_
+               << " active_slices=" << active_leases_.size()
+               << " high_water_slices=" << high_water_slices_
+               << " free_bytes=" << (total_capacity - active_bytes_)
+               << " internal_fragmentation_bytes=" << (total_capacity - planned_max_live)
+               << " event_waits=" << event_wait_count_ << " overlaps=" << overlap_count_
+               << " relocations=" << relocation_count_
+               << " stale_registry_releases=" << stale_registry_release_count_
+               << " pending_fences=" << pending_fences_.size()
+               << " active_leases=" << active_leases_.size()
+               << " rank_consistency_checked=" << (rank_consistency_checked_ ? 1 : 0)
+               << " rank_consistency_checks=" << rank_consistency_checks_
+               << " rank_plan_mismatches=" << rank_plan_mismatches_;
+        for (const auto& [reason, count] : fallback_reasons_) {
+            record << " fallback_" << reason << "=" << count;
+        }
+        std::cout << record.str() << std::endl;
+    }
+
+    long graph_id_;
+    uint64_t generation_;
+    int rank_;
+    at::cuda::CUDAStream ag_stream_;
+    bool enabled_ = false;
+    std::unordered_map<long, Phase> phases_;
+    at::Tensor shared_backing_;
+    int64_t shared_capacity_bytes_ = 0;
+    uintptr_t shared_backing_pointer_ = 0;
+    c10::StorageImpl* shared_storage_identity_ = nullptr;
+    std::unordered_map<long, Lease> active_leases_;
+    std::vector<Fence> pending_fences_;
+    std::set<int64_t> ever_acquired_;
+    std::unordered_map<std::string, size_t> fallback_reasons_;
+    size_t backing_allocation_count_ = 0;
+    int64_t request_bytes_ = 0;
+    int64_t reuse_bytes_ = 0;
+    int64_t fallback_bytes_ = 0;
+    int64_t active_bytes_ = 0;
+    int64_t high_water_bytes_ = 0;
+    size_t high_water_slices_ = 0;
+    size_t event_wait_count_ = 0;
+    size_t overlap_count_ = 0;
+    size_t relocation_count_ = 0;
+    size_t stale_registry_release_count_ = 0;
+    bool rank_consistency_checked_ = false;
+    size_t rank_consistency_checks_ = 0;
+    size_t rank_plan_mismatches_ = 0;
+};
+
 std::weak_ptr<GatherBufferPool> weak_gather_buffer_pool;
 std::optional<int64_t> gather_buffer_pool_fixed_budget_for_test;
+uint64_t z3_executor_generation = 0;
 
 std::shared_ptr<GatherBufferPool> get_gather_buffer_pool()
 {
@@ -643,6 +1264,8 @@ public:
                        std::shared_ptr<DSParamRegistry> param_registry,
                        std::shared_ptr<DoubleBufferedReduceBucket> reduce_buckets,
                        std::shared_ptr<GatherBufferPool> gather_buffer_pool,
+                       long graph_id,
+                       uint64_t generation,
                        std::vector<long> ds_ids,
                        ncclComm_t nccl_comm,
                        at::cuda::CUDAStream ag_stream,
@@ -662,7 +1285,11 @@ public:
           gather_buffer_pool_(gather_buffer_pool),
           ag_stream_(ag_stream),
           offload_stream_(offload_stream),
-          reload_stream_(reload_stream)
+          reload_stream_(reload_stream),
+          prefetch_arena_(std::make_shared<PrefetchArena>(graph_id,
+                                                          generation,
+                                                          process_group->getRank(),
+                                                          ag_stream))
     {
         for (long ds_id : ds_ids_) {
             ag_comm_done_events_[ds_id] =
@@ -674,6 +1301,32 @@ public:
         }
     }
     ~Z3CustomOpExecutor() {}
+
+    void prepareForReset() override { prefetch_arena_->prepareForReset(); }
+
+    void configurePrefetchArena(long phase,
+                                int64_t capacity_bytes,
+                                int64_t max_live_bytes,
+                                int64_t digest,
+                                const std::vector<long>& plan_ids,
+                                const std::vector<long>& ds_ids,
+                                const std::vector<int64_t>& offsets,
+                                const std::vector<int64_t>& request_bytes)
+    {
+        prefetch_arena_->configure(phase,
+                                   capacity_bytes,
+                                   max_live_bytes,
+                                   digest,
+                                   plan_ids,
+                                   ds_ids,
+                                   offsets,
+                                   request_bytes);
+    }
+
+    std::vector<int64_t> getPrefetchArenaStateForTest() const
+    {
+        return prefetch_arena_->stateForTest();
+    }
 
     void endBackward() override
     {
@@ -796,59 +1449,99 @@ public:
 
     void prefetchParamsFused(const std::vector<long>& ds_ids,
                              const std::optional<std::vector<at::ScalarType>> dtypes,
+                             long arena_plan_id,
                              c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
     {
+        // All ranks execute a fused-prefetch node in graph order after
+        // compilation.  Verify the complete locally configured plan there, on
+        // the same NCCL communicator and stream as the following gathers,
+        // before any slice can be leased.  Memory profiling is itself part of
+        // asynchronous per-rank compilation, so it must never enter this
+        // collective.
+        if (diagnosticEnvEnabled("DEEPSPEED_COMPILE_PREFETCH_ARENA") && !profile) {
+            prefetch_arena_->ensureRankConsistent(nccl_comm_);
+        }
+
         std::vector<std::tuple<long, std::optional<at::ScalarType>>> invalid_params;
+        std::unordered_set<long> seen_ds_ids;
         for (int i = 0; i < ds_ids.size(); i++) {
-            if (!param_registry_->isValid(ds_ids[i])) {
+            if (!param_registry_->isValid(ds_ids[i]) && seen_ds_ids.insert(ds_ids[i]).second) {
                 auto dtype = dtypes ? dtypes.value()[i] : std::optional<at::ScalarType>();
                 invalid_params.push_back(std::make_tuple(ds_ids[i], dtype));
             }
         }
 
         std::unordered_map<long, at::Tensor> output_bufs;
+        std::unordered_set<long> arena_leases;
         AdmissionExclusionRollback admission_exclusions(gather_buffer_pool_);
-        for (const auto& [ds_id, dtype] : invalid_params) {
-            const DSParam& param = param_registry_->getParam(ds_id);
-            const at::Tensor& ds_tensor = param.getDSTensor();
-            const int world_size = process_group_->getSize();
-            const int64_t shard_elems = ds_tensor.numel();
-            const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+        try {
+            for (const auto& [ds_id, dtype] : invalid_params) {
+                const DSParam& param = param_registry_->getParam(ds_id);
+                const at::Tensor& ds_tensor = param.getDSTensor();
+                const int world_size = process_group_->getSize();
+                const int64_t shard_elems = ds_tensor.numel();
+                const int64_t padded_numel = static_cast<int64_t>(world_size) * shard_elems;
+                const auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
 
-            if (param_registry_->hasGatheredParam(ds_id)) {
-                auto existing = param_registry_->getGatheredParam(ds_id);
-                if (existing.defined() && existing.numel() == padded_numel) {
-                    output_bufs[ds_id] = existing;
+                if (param_registry_->hasGatheredParam(ds_id)) {
+                    auto existing = param_registry_->getGatheredParam(ds_id);
+                    if (existing.defined() && existing.numel() == padded_numel &&
+                        existing.scalar_type() == target_dtype) {
+                        output_bufs[ds_id] = existing;
+                    }
+                }
+                if (!hasKey(output_bufs, ds_id) && !profile && !param.isPersistent() &&
+                    arena_plan_id >= 0) {
+                    if (target_dtype != ds_tensor.scalar_type()) {
+                        prefetch_arena_->recordFallback(
+                            "dtype_mismatch", padded_numel * c10::elementSize(target_dtype));
+                    } else {
+                        auto arena_buffer = prefetch_arena_->acquire(
+                            arena_plan_id, ds_id, padded_numel, target_dtype, ds_tensor.device());
+                        if (arena_buffer.defined()) {
+                            output_bufs[ds_id] = arena_buffer;
+                            arena_leases.insert(ds_id);
+                        }
+                    }
+                }
+                if (!hasKey(output_bufs, ds_id) && !profile && param.isPersistent() &&
+                    arena_plan_id >= 0) {
+                    prefetch_arena_->recordFallback("persistent",
+                                                    padded_numel * c10::elementSize(target_dtype));
+                }
+                if (!hasKey(output_bufs, ds_id)) {
+                    at::cuda::CUDAStreamGuard guard(ag_stream_);
+                    output_bufs[ds_id] =
+                        torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+                }
+                if (arena_leases.find(ds_id) == arena_leases.end()) {
+                    // Prefetch lifetimes are already controlled by the memory-aware scheduler.
+                    // Bind the exclusion to the selected storage so a stale ds_id generation
+                    // cannot admit a different demand-gather buffer into the independent pool.
+                    admission_exclusions.exclude(output_bufs.at(ds_id));
                 }
             }
-            if (!hasKey(output_bufs, ds_id)) {
-                auto target_dtype = dtype ? dtype.value() : ds_tensor.scalar_type();
-                at::cuda::CUDAStreamGuard guard(ag_stream_);
-                output_bufs[ds_id] =
-                    torch::empty({padded_numel}, ds_tensor.options().dtype(target_dtype));
+
+            for (const auto& [ds_id, _] : invalid_params) {
+                ag_comp_done_events_[ds_id]->record();
+                ag_comp_done_events_[ds_id]->block(ag_stream_);
             }
-            // Prefetch lifetimes are already controlled by the memory-aware scheduler.
-            // Bind the exclusion to the selected storage so a stale ds_id generation
-            // cannot admit a different demand-gather buffer into the independent pool.
-            admission_exclusions.exclude(output_bufs.at(ds_id));
-        }
 
-        for (const auto& [ds_id, _] : invalid_params) {
-            ag_comp_done_events_[ds_id]->record();
-            ag_comp_done_events_[ds_id]->block(ag_stream_);
-        }
+            ncclGroupStart();
+            for (const auto& [ds_id, _] : invalid_params) {
+                assert(hasKey(output_bufs, ds_id));
+                launchAllGather(output_bufs.at(ds_id), ds_id, symm_mem);
+            }
+            ncclGroupEnd();
 
-        ncclGroupStart();
-        for (const auto& [ds_id, _] : invalid_params) {
-            assert(hasKey(output_bufs, ds_id));
-            launchAllGather(output_bufs.at(ds_id), ds_id, symm_mem);
+            for (const auto& [ds_id, _] : invalid_params) {
+                ag_comm_done_events_[ds_id]->record(ag_stream_);
+            }
+            admission_exclusions.commit();
+        } catch (...) {
+            for (long ds_id : arena_leases) { prefetch_arena_->cancelAcquire(ds_id); }
+            throw;
         }
-        ncclGroupEnd();
-
-        for (const auto& [ds_id, _] : invalid_params) {
-            ag_comm_done_events_[ds_id]->record(ag_stream_);
-        }
-        admission_exclusions.commit();
     }
 
     void releaseParam(long ds_id, long n_users)
@@ -860,18 +1553,33 @@ public:
         param_use_count_[ds_id]--;
 
         if (param_use_count_[ds_id] == 0 && !param.isPersistent()) {
-            at::Tensor gathered_param = param_registry_->getGatheredParam(ds_id);
+            const bool registry_has_param = param_registry_->hasGatheredParam(ds_id);
+            at::Tensor gathered_param =
+                registry_has_param ? param_registry_->getGatheredParam(ds_id) : at::Tensor();
+            const auto arena_release = prefetch_arena_->release(ds_id, gathered_param);
+
+            // The registry is shared by all graph executors. During nested or
+            // checkpoint compilation, profiling may invalidate this graph's
+            // gathered tensor and a newer graph may install another tensor for
+            // the same ds_id before this release executes. Retire this
+            // executor's exact arena lease, but leave the newer registry
+            // generation untouched for its own consumers and release nodes.
+            if (arena_release == PrefetchArena::ReleaseDisposition::ReleasedStaleRegistry) {
+                return;
+            }
 
             if (gathered_param.defined()) {  // gathered param is undefined while profiling
                 auto storage = gathered_param.storage();
                 if (storage.nbytes() > 0) {
-                    // Demand gathers may enter the byte-bounded pool. Prefetched gathers
-                    // keep the scheduler's ownership boundary and use the original
-                    // resize-to-zero path after their final consumer.
-                    const auto release_disposition = gather_buffer_pool_->release(gathered_param);
-                    if (release_disposition ==
-                        GatherBufferPool::ReleaseDisposition::ResizeByCaller) {
-                        at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
+                    if (arena_release == PrefetchArena::ReleaseDisposition::NoLease) {
+                        // Demand gathers may enter the byte-bounded pool. Standalone
+                        // prefetch fallbacks preserve the original resize-to-zero path.
+                        const auto release_disposition =
+                            gather_buffer_pool_->release(gathered_param);
+                        if (release_disposition ==
+                            GatherBufferPool::ReleaseDisposition::ResizeByCaller) {
+                            at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
+                        }
                     }
                 }
 
@@ -880,7 +1588,7 @@ public:
                 gathered_param.set_data(empty_buffer);
             }
 
-            param_registry_->unregisterGatheredParam(ds_id);
+            if (registry_has_param) { param_registry_->unregisterGatheredParam(ds_id); }
         }
     }
 
@@ -1067,6 +1775,7 @@ private:
     at::cuda::CUDAStream ag_stream_;
     at::cuda::CUDAStream offload_stream_;
     at::cuda::CUDAStream reload_stream_;
+    std::shared_ptr<PrefetchArena> prefetch_arena_;
 
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comp_done_events_;
     std::unordered_map<long, std::shared_ptr<at::cuda::CUDAEvent>> ag_comm_done_events_;
@@ -1120,6 +1829,8 @@ void register_graph_z3(long graph_id, const std::vector<long>& ds_ids)
                                                                param_registry,
                                                                reduce_buckets,
                                                                get_gather_buffer_pool(),
+                                                               graph_id,
+                                                               ++z3_executor_generation,
                                                                ds_ids,
                                                                nccl_comm,
                                                                get_ag_stream(),
@@ -1219,17 +1930,40 @@ void set_persistent(long ds_id)
 void prefetch_params_fused(long graph_id,
                            const std::vector<at::Tensor>& params,
                            const std::vector<long>& ds_ids,
-                           const std::optional<std::vector<at::ScalarType>>& dtypes)
+                           const std::optional<std::vector<at::ScalarType>>& dtypes,
+                           long arena_plan_id)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
-    executor->prefetchParamsFused(ds_ids, dtypes, symm_mem);
+    executor->prefetchParamsFused(ds_ids, dtypes, arena_plan_id, symm_mem);
 }
 
 void prefetch_params_fused_meta(long graph_id,
                                 const std::vector<at::Tensor>& params,
                                 const std::vector<long>& ds_ids,
-                                const std::optional<std::vector<at::ScalarType>>& dtypes)
+                                const std::optional<std::vector<at::ScalarType>>& dtypes,
+                                long arena_plan_id)
 {
+}
+
+void configure_z3_prefetch_arena(long graph_id,
+                                 long phase,
+                                 int64_t capacity_bytes,
+                                 int64_t max_live_bytes,
+                                 int64_t digest,
+                                 const std::vector<long>& plan_ids,
+                                 const std::vector<long>& ds_ids,
+                                 const std::vector<int64_t>& offsets,
+                                 const std::vector<int64_t>& request_bytes)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    executor->configurePrefetchArena(
+        phase, capacity_bytes, max_live_bytes, digest, plan_ids, ds_ids, offsets, request_bytes);
+}
+
+std::vector<int64_t> get_z3_prefetch_arena_state_for_test(long graph_id)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    return executor->getPrefetchArenaStateForTest();
 }
 
 // for profiling

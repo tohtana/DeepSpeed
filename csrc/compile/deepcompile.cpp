@@ -78,6 +78,7 @@ ncclDataType_t get_nccl_data_type(at::ScalarType scalar_type)
 
 void reset()
 {
+    for (auto& [_, executor] : executors) { executor->prepareForReset(); }
     executors.clear();
     // We keep the buckets for memory estimation
     // reduce_buckets->clear();

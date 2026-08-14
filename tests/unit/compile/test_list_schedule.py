@@ -26,9 +26,11 @@ _DC_LIBRARIES = []
 def _define_dc_ops():
     try:
         torch.ops.dc.allgather_param.default
+        torch.ops.dc.prefetch_params_fused.default
         torch.ops.dc.wait_allgather.default
         torch.ops.dc.release_param.default
         torch.ops.dc.reduce_grad.default
+        torch.ops.dc.reload_parameter.default
         return
     except AttributeError:
         pass
@@ -36,9 +38,11 @@ def _define_dc_ops():
     lib = torch.library.Library("dc", "DEF")
     for schema in (
             "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
+            "prefetch_params_fused(int graph_id, Tensor[] params, int[] ids, ScalarType[]? dtypes = None, int arena_plan_id = -1) -> ()",
             "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
             "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
             "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
+            "reload_parameter(Tensor a, int graph_id, int id) -> ()",
             "free_tensors(Tensor[] tensors) -> ()",
             "end_backward(Tensor[] tensors, int graph_id, bool release_reduce_buckets = True) -> ()",
     ):
@@ -201,6 +205,272 @@ def _release(graph, arg, ds_id, name):
         graph.create_node('call_function',
                           torch.ops.dc.release_param.default, (arg, 0, ds_id, 1), {},
                           name=f"release_ds_param_{name}_{ds_id}"))
+
+
+def _arena_prefetch(graph, params, ds_ids, plan_id, sizes):
+    node = graph.create_node('call_function',
+                             torch.ops.dc.prefetch_params_fused.default, (0, params, ds_ids, None, plan_id), {},
+                             name=f"prefetch_arena_{plan_id}")
+    node.meta["prefetch_arena_eligible_ds_ids"] = tuple(dict.fromkeys(ds_ids))
+    node.meta["prefetch_arena_bytes_by_ds_id"] = tuple(zip(ds_ids, sizes))
+    return node
+
+
+def _fake_arena_param_manager(params):
+    return SimpleNamespace(
+        params={
+            name: SimpleNamespace(shape=torch.Size(shape), dtype=dtype, param=SimpleNamespace(ds_persist=False))
+            for name, _, shape, dtype in params
+        },
+        ds_ids={
+            name: ds_id
+            for name, ds_id, _, _ in params
+        },
+    )
+
+
+def test_prefetch_arena_interval_packing_alignment_and_reuse():
+    packed, reason = prefetch_mod._pack_prefetch_intervals([
+        {
+            "ds_id": 1,
+            "start": 0,
+            "end": 2,
+            "bytes": 257,
+            "requests": [(10, 1)]
+        },
+        {
+            "ds_id": 2,
+            "start": 1,
+            "end": 3,
+            "bytes": 255,
+            "requests": [(11, 2)]
+        },
+        {
+            "ds_id": 3,
+            "start": 4,
+            "end": 5,
+            "bytes": 256,
+            "requests": [(12, 3)]
+        },
+    ])
+
+    assert reason is None
+    by_ds_id = {interval["ds_id"]: interval for interval in packed["intervals"]}
+    assert by_ds_id[1]["size"] == 512
+    assert by_ds_id[2]["size"] == 256
+    assert by_ds_id[1]["offset"] != by_ds_id[2]["offset"]
+    assert by_ds_id[3]["offset"] == by_ds_id[1]["offset"]
+    assert packed["max_live_bytes"] == 768
+    assert packed["capacity"] == 768
+
+
+def test_prefetch_arena_plan_uses_final_padded_bytes_and_coalesces_repeated_ids():
+    graph = Graph()
+    first = graph.placeholder("first")
+    second = graph.placeholder("second")
+    _arena_prefetch(graph, [first, first, second], [1, 1, 2], 10, [12, 12, 16])
+    release_first = _release(graph, first, 1, "arena_first")
+    release_second = _release(graph, second, 2, "arena_second")
+    graph.output((release_first, release_second))
+    manager = _fake_arena_param_manager([
+        ("first", 1, (5, ), torch.float16),
+        ("second", 2, (8, ), torch.float16),
+    ])
+
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+
+    assert reason is None
+    assert [(entry["plan_id"], entry["ds_id"], entry["bytes"]) for entry in plan["entries"]] == [(10, 1, 12),
+                                                                                                 (10, 2, 16)]
+    assert plan["capacity"] == 512
+    assert plan["max_live_bytes"] == 512
+    assert all(entry["offset"] % prefetch_mod.PREFETCH_ARENA_ALIGNMENT == 0 for entry in plan["entries"])
+
+
+def test_prefetch_arena_reuse_adds_release_ordering_dependencies():
+    graph = Graph()
+    first = graph.placeholder("first")
+    second = graph.placeholder("second")
+    demand_only = graph.placeholder("demand_only")
+    first_prefetch = _arena_prefetch(graph, [first], [1], 10, [16])
+    first_release = _release(graph, first, 1, "arena_first")
+    _release(graph, demand_only, 3, "demand_only")
+    second_release = _release(graph, second, 2, "arena_second")
+    second_prefetch = _arena_prefetch(graph, [second], [2], 11, [16])
+    graph.output((first_prefetch, second_prefetch))
+
+    prefetch_mod._add_prefetch_arena_release_dependencies(graph)
+    graph.lint()
+
+    assert first_prefetch.args[1] == [first]
+    assert second_prefetch.args[1] == [second, first_release, second_release]
+    assert second_prefetch.args[2] == [2]
+    assert second_prefetch.meta["prefetch_arena_ordering_dependencies"] == (
+        first_release.name,
+        second_release.name,
+    )
+
+
+def test_prefetch_arena_plan_reuses_nonoverlapping_slice_but_not_overlapping_slice():
+    graph = Graph()
+    first = graph.placeholder("first")
+    second = graph.placeholder("second")
+    third = graph.placeholder("third")
+    _arena_prefetch(graph, [first], [1], 10, [256])
+    release_first = _release(graph, first, 1, "arena_first")
+    _arena_prefetch(graph, [second, third], [2, 3], 11, [256, 256])
+    release_second = _release(graph, second, 2, "arena_second")
+    release_third = _release(graph, third, 3, "arena_third")
+    graph.output((release_first, release_second, release_third))
+    manager = _fake_arena_param_manager([
+        ("first", 1, (128, ), torch.float16),
+        ("second", 2, (128, ), torch.float16),
+        ("third", 3, (128, ), torch.float16),
+    ])
+
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=True)
+
+    assert reason is None
+    offsets = {entry["ds_id"]: entry["offset"] for entry in plan["entries"]}
+    assert offsets[1] == offsets[2]
+    assert offsets[2] != offsets[3]
+    assert plan["phase"] == 1
+    assert plan["capacity"] == plan["max_live_bytes"] == 512
+
+
+def test_prefetch_arena_plan_reuses_slice_for_sequential_repeated_id():
+    graph = Graph()
+    param = graph.placeholder("param")
+    _arena_prefetch(graph, [param], [1], 10, [256])
+    first_release = _release(graph, param, 1, "arena_first")
+    _arena_prefetch(graph, [param], [1], 11, [256])
+    second_release = _release(graph, param, 1, "arena_second")
+    graph.output((first_release, second_release))
+    manager = _fake_arena_param_manager([("param", 1, (128, ), torch.float16)])
+
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+
+    assert reason is None
+    assert [(entry["plan_id"], entry["offset"]) for entry in plan["entries"]] == [(10, 0), (11, 0)]
+    assert plan["capacity"] == plan["max_live_bytes"] == 256
+
+
+@pytest.mark.parametrize("missing", ["release", "scheduled_bytes"])
+def test_prefetch_arena_plan_falls_back_on_incomplete_metadata(missing):
+    graph = Graph()
+    param = graph.placeholder("param")
+    prefetch = _arena_prefetch(graph, [param], [1], 10, [12])
+    if missing == "scheduled_bytes":
+        prefetch.meta["prefetch_arena_bytes_by_ds_id"] = ()
+    if missing != "release":
+        release = _release(graph, param, 1, "arena_param")
+        graph.output((release, ))
+    else:
+        graph.output((param, ))
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+
+    assert plan is None
+    assert reason == ("incomplete_release" if missing == "release" else "missing_scheduled_bytes")
+
+
+def test_prefetch_arena_plan_falls_back_on_dynamic_shape():
+    graph = Graph()
+    param = graph.placeholder("param")
+    _arena_prefetch(graph, [param], [1], 10, [12])
+    release = _release(graph, param, 1, "arena_param")
+    graph.output((release, ))
+    manager = SimpleNamespace(
+        params={"param": SimpleNamespace(shape=(object(), ), dtype=torch.float16)},
+        ds_ids={"param": 1},
+    )
+
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+
+    assert plan is None
+    assert reason == "dynamic_shape"
+
+
+@pytest.mark.parametrize("arena_enabled", [False, True])
+def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypatch, arena_enabled):
+    graph = Graph()
+    param = _placeholder(graph, "param")
+    ag = _allgather(graph, param, 1, "arena", tensor_size=12)
+    ag.meta["allgather_allocation_bytes"] = 12
+    wait = _wait(graph, ag, 1, "arena")
+    use = _neg(graph, wait, "arena_use")
+    release = _release(graph, use, 1, "arena")
+    graph.output((release, ))
+    graph.lint()
+
+    records = [(node.name, 0, 0, 0) for node in graph.nodes]
+    times = [(node.name, 1, 1) for node in graph.nodes]
+    sizes = [(node.name, int(node.meta.get("tensor_size", 0))) for node in graph.nodes]
+    profile = ProfilingResult(fwd_graph=graph,
+                              fwd_mem=records,
+                              fwd_time=times,
+                              fwd_tensor_sizes=sizes,
+                              process_group="test-group")
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    configured = []
+    reductions = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1 << 20
+
+        def available_memory(self):
+            return 1 << 20
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    if arena_enabled:
+        monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
+    else:
+        monkeypatch.delenv(prefetch_mod.PREFETCH_ARENA_ENV, raising=False)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
+    monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(prefetch_mod.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(prefetch_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda *args, **kwargs: reductions.append(args))
+    monkeypatch.setattr(prefetch_mod, "get_deepcompile_handle",
+                        lambda: SimpleNamespace(configure_z3_prefetch_arena=lambda *args: configured.append(args)))
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    result = prefetch_mod.schedule_prefetch(gm,
+                                            graph_id=0,
+                                            graph_order=[(0, False)],
+                                            profiling_results={0: profile},
+                                            create_inputs_fn=lambda: (),
+                                            mem_budget=0,
+                                            param_manager={0: manager},
+                                            bwd=False)
+
+    prefetch_nodes = [node for node in result.graph.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    # The scheduler's existing memory-budget reduction remains, but arena-plan
+    # consensus is deferred to native execution where graph order is stable.
+    assert len(reductions) == 1
+    assert len(prefetch_nodes) == 1
+    if arena_enabled:
+        assert prefetch_nodes[0].args[4] == 0
+        assert prefetch_nodes[0].meta["prefetch_arena_eligible_ds_ids"] == (1, )
+        assert len(configured) == 1
+        assert configured[0][:4] == (0, 0, 256, 256)
+        assert configured[0][4] > 0
+        assert configured[0][5:] == ([0], [1], [0], [12])
+    else:
+        assert len(prefetch_nodes[0].args) == 3
+        assert configured == []
 
 
 def _scheduled_graph(graph, scheduler_budget=None):

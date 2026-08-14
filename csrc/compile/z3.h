@@ -36,11 +36,23 @@ void set_persistent(long ds_id);
 void prefetch_params_fused(long graph_id,
                            const std::vector<at::Tensor>& params,
                            const std::vector<long>& ds_ids,
-                           const std::optional<std::vector<at::ScalarType>>& dtypes);
+                           const std::optional<std::vector<at::ScalarType>>& dtypes,
+                           long arena_plan_id);
 void prefetch_params_fused_meta(long graph_id,
                                 const std::vector<at::Tensor>& params,
                                 const std::vector<long>& ds_ids,
-                                const std::optional<std::vector<at::ScalarType>>& dtypes);
+                                const std::optional<std::vector<at::ScalarType>>& dtypes,
+                                long arena_plan_id);
+void configure_z3_prefetch_arena(long graph_id,
+                                 long phase,
+                                 int64_t capacity_bytes,
+                                 int64_t max_live_bytes,
+                                 int64_t digest,
+                                 const std::vector<long>& plan_ids,
+                                 const std::vector<long>& ds_ids,
+                                 const std::vector<int64_t>& offsets,
+                                 const std::vector<int64_t>& request_bytes);
+std::vector<int64_t> get_z3_prefetch_arena_state_for_test(long graph_id);
 // for profiling
 void invalidate_gathered_param(long ds_id);
 void clear_all_gathered_params();
