@@ -594,8 +594,7 @@ def test_training_session_budget_subtracts_only_profiled_pool_charge():
     assert credited["backward_pool_reclaimable_bytes"] == 450
 
 
-@pytest.mark.parametrize("arena_enabled", [False, True])
-def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypatch, arena_enabled):
+def test_schedule_prefetch_configures_arena_by_default_from_final_graph(monkeypatch):
     graph = Graph()
     param = _placeholder(graph, "param")
     ag = _allgather(graph, param, 1, "arena", tensor_size=12)
@@ -637,10 +636,7 @@ def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypat
         def max_memory_allocated(self):
             return 0
 
-    if arena_enabled:
-        monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
-    else:
-        monkeypatch.delenv(prefetch_mod.PREFETCH_ARENA_ENV, raising=False)
+    monkeypatch.delenv("DEEPSPEED_COMPILE_PREFETCH_ARENA", raising=False)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
     monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
@@ -665,16 +661,12 @@ def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypat
     # consensus is deferred to native execution where graph order is stable.
     assert len(reductions) == 1
     assert len(prefetch_nodes) == 1
-    if arena_enabled:
-        assert prefetch_nodes[0].args[4] == 0
-        assert prefetch_nodes[0].meta["prefetch_arena_eligible_ds_ids"] == (1, )
-        assert len(configured) == 1
-        assert configured[0][:5] == (0, 0, False, 256, 256)
-        assert configured[0][5] > 0
-        assert configured[0][6:] == ([0], [1], [0], [12])
-    else:
-        assert len(prefetch_nodes[0].args) == 3
-        assert configured == []
+    assert prefetch_nodes[0].args[4] == 0
+    assert prefetch_nodes[0].meta["prefetch_arena_eligible_ds_ids"] == (1, )
+    assert len(configured) == 1
+    assert configured[0][:5] == (0, 0, False, 256, 256)
+    assert configured[0][5] > 0
+    assert configured[0][6:] == ([0], [1], [0], [12])
 
 
 def test_schedule_prefetch_shared_budget_rejection_restores_original_call_shape(monkeypatch):
@@ -722,7 +714,6 @@ def test_schedule_prefetch_shared_budget_rejection_restores_original_call_shape(
         def max_memory_allocated(self):
             return 0
 
-    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
     monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
@@ -791,7 +782,6 @@ def test_schedule_prefetch_training_forward_registers_pending_session_plan(monke
         def max_memory_allocated(self):
             return 0
 
-    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
     monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
@@ -881,7 +871,6 @@ def test_schedule_prefetch_training_backward_decides_pending_session(monkeypatch
         def max_memory_allocated(self):
             return 0
 
-    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
     monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
@@ -952,7 +941,6 @@ def test_schedule_prefetch_missing_reserved_profile_restores_original_call_shape
         def max_memory_allocated(self):
             return 0
 
-    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
     monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)

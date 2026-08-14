@@ -1695,7 +1695,7 @@ public:
         // before any slice can be leased.  Memory profiling is itself part of
         // asynchronous per-rank compilation, so it must never enter this
         // collective.
-        if (diagnosticEnvEnabled("DEEPSPEED_COMPILE_PREFETCH_ARENA") && !profile) {
+        if (!profile && arena_plan_id >= 0) {
             prefetch_arena_->ensureRankConsistent(nccl_comm_, gather_buffer_pool_);
         }
 

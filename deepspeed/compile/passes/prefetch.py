@@ -5,7 +5,6 @@
 
 import hashlib
 import math
-import os
 from typing import Dict, List, Tuple
 
 import torch
@@ -31,13 +30,7 @@ MAX_BUFFERED_SIZE = 4e9
 
 run_prefetch_pass = False
 
-PREFETCH_ARENA_ENV = "DEEPSPEED_COMPILE_PREFETCH_ARENA"
 PREFETCH_ARENA_ALIGNMENT = 256
-
-
-def _env_enabled(name: str) -> bool:
-    value = os.environ.get(name, "").strip().lower()
-    return value not in ("", "0", "false", "no")
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -556,8 +549,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
         assert ag_tensor_size_sum >= 0
 
-    arena_enabled = _env_enabled(PREFETCH_ARENA_ENV)
-    graph_param_manager = param_manager[graph_id] if arena_enabled else None
+    graph_param_manager = param_manager[graph_id]
     phase_plan_base = 1_000_000 if bwd else 0
     fused_group_index = 0
     new_graph = Graph()
@@ -572,120 +564,112 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
             param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
 
             ds_ids = [get_ds_id(ag_node) for ag_node in node]
-            if arena_enabled:
-                plan_id = phase_plan_base + fused_group_index
-                prefetch_node = new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
-                                                        args=(graph_id, param_nodes_copy, ds_ids, None, plan_id))
-                eligible_ds_ids = []
-                arena_bytes_by_ds_id = []
-                for ag_node, param_node, ds_id in zip(node, param_nodes, ds_ids):
-                    param = graph_param_manager.params.get(param_node.name)
-                    requested_dtype = ag_node.kwargs.get("dtype")
-                    persistent = param is None or bool(getattr(param.param, "ds_persist", False))
-                    if param is not None and not persistent and (requested_dtype is None
-                                                                 or requested_dtype == param.dtype):
-                        eligible_ds_ids.append(ds_id)
-                        arena_bytes_by_ds_id.append((ds_id, int(ag_node.meta.get("allgather_allocation_bytes", 0))))
-                prefetch_node.meta["prefetch_arena_eligible_ds_ids"] = tuple(eligible_ds_ids)
-                prefetch_node.meta["prefetch_arena_bytes_by_ds_id"] = tuple(arena_bytes_by_ds_id)
-                fused_group_index += 1
-            else:
-                new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
-                                        args=(graph_id, param_nodes_copy, ds_ids))
+            plan_id = phase_plan_base + fused_group_index
+            prefetch_node = new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
+                                                    args=(graph_id, param_nodes_copy, ds_ids, None, plan_id))
+            eligible_ds_ids = []
+            arena_bytes_by_ds_id = []
+            for ag_node, param_node, ds_id in zip(node, param_nodes, ds_ids):
+                param = graph_param_manager.params.get(param_node.name)
+                requested_dtype = ag_node.kwargs.get("dtype")
+                persistent = param is None or bool(getattr(param.param, "ds_persist", False))
+                if param is not None and not persistent and (requested_dtype is None
+                                                             or requested_dtype == param.dtype):
+                    eligible_ds_ids.append(ds_id)
+                    arena_bytes_by_ds_id.append((ds_id, int(ag_node.meta.get("allgather_allocation_bytes", 0))))
+            prefetch_node.meta["prefetch_arena_eligible_ds_ids"] = tuple(eligible_ds_ids)
+            prefetch_node.meta["prefetch_arena_bytes_by_ds_id"] = tuple(arena_bytes_by_ds_id)
+            fused_group_index += 1
     arena_plan = None
-    if arena_enabled:
-        if not dist.is_initialized():
-            arena_reason = "distributed_uninitialized"
+    if not dist.is_initialized():
+        arena_reason = "distributed_uninitialized"
+    else:
+        arena_plan, arena_reason = _build_prefetch_arena_plan(new_graph, graph_param_manager,
+                                                              dist.get_world_size(group=process_group), bwd)
+    if arena_plan is not None:
+        if len(reserved_mem_dict) != len(list(profile_graph.nodes)):
+            arena_plan = None
+            arena_reason = "incomplete_reserved_profile"
         else:
-            arena_plan, arena_reason = _build_prefetch_arena_plan(new_graph, graph_param_manager,
-                                                                  dist.get_world_size(group=process_group), bwd)
-        if arena_plan is not None:
-            if len(reserved_mem_dict) != len(list(profile_graph.nodes)):
-                arena_plan = None
-                arena_reason = "incomplete_reserved_profile"
-            else:
-                admission = _prefetch_arena_budget_admission(new_graph, arena_plan, mem_dict, reserved_mem_dict,
-                                                             max_mem, pool_reclaimable_dict)
-        if arena_plan is not None:
-            print_rank_0(f"prefetch_arena_admission graph_id={graph_id} "
-                         f"phase={'bwd' if bwd else 'fwd'} accepted={int(admission['accepted'])} "
-                         f"max_mem={admission['max_mem']} capacity={admission['capacity']} "
-                         f"original_allocated_peak={admission['original_allocated_peak']} "
-                         f"arena_allocated_peak={admission['arena_allocated_peak']} "
-                         f"original_modeled_peak={admission['original_modeled_peak']} "
-                         f"arena_modeled_peak={admission['arena_modeled_peak']} "
-                         f"original_reserved_peak={admission['original_reserved_peak']} "
-                         f"arena_reserved_peak={admission['arena_reserved_peak']} "
-                         f"incremental_peak={admission['incremental_peak']} "
-                         f"limiting_node={admission['limiting_node']} "
-                         f"limiting_metric={admission['limiting_metric']} "
-                         f"pool_reclaimable_bytes={admission['limiting_pool_reclaimable_bytes']}")
-            if not admission["accepted"]:
-                if require_backward and not bwd:
-                    profile.prefetch_arena_session_accepted = False
-                    profile.prefetch_arena_session_reason = "shared_budget"
+            admission = _prefetch_arena_budget_admission(new_graph, arena_plan, mem_dict, reserved_mem_dict, max_mem,
+                                                         pool_reclaimable_dict)
+    if arena_plan is not None:
+        print_rank_0(f"prefetch_arena_admission graph_id={graph_id} "
+                     f"phase={'bwd' if bwd else 'fwd'} accepted={int(admission['accepted'])} "
+                     f"max_mem={admission['max_mem']} capacity={admission['capacity']} "
+                     f"original_allocated_peak={admission['original_allocated_peak']} "
+                     f"arena_allocated_peak={admission['arena_allocated_peak']} "
+                     f"original_modeled_peak={admission['original_modeled_peak']} "
+                     f"arena_modeled_peak={admission['arena_modeled_peak']} "
+                     f"original_reserved_peak={admission['original_reserved_peak']} "
+                     f"arena_reserved_peak={admission['arena_reserved_peak']} "
+                     f"incremental_peak={admission['incremental_peak']} "
+                     f"limiting_node={admission['limiting_node']} "
+                     f"limiting_metric={admission['limiting_metric']} "
+                     f"pool_reclaimable_bytes={admission['limiting_pool_reclaimable_bytes']}")
+        if not admission["accepted"]:
+            if require_backward and not bwd:
+                profile.prefetch_arena_session_accepted = False
+                profile.prefetch_arena_session_reason = "shared_budget"
+            arena_plan = None
+            arena_reason = "shared_budget"
+    if arena_plan is not None and require_backward:
+        if not bwd:
+            # The optimized backward does not exist yet.  Keep the final
+            # forward plan as native metadata, but native execution will
+            # deliberately use the normal gather pool until the backward
+            # compiler registers its plan and decides the shared budget.
+            profile.prefetch_arena_forward_graph = new_graph
+            profile.prefetch_arena_forward_plan = arena_plan
+            profile.prefetch_arena_forward_mem = dict(mem_dict)
+            profile.prefetch_arena_forward_reserved_mem = dict(reserved_mem_dict)
+            profile.prefetch_arena_forward_pool_reclaimable = dict(pool_reclaimable_dict)
+            profile.prefetch_arena_session_accepted = None
+            profile.prefetch_arena_session_capacity_bound = 0
+            profile.prefetch_arena_session_reason = None
+            print_rank_0(f"prefetch_arena_session_pending graph_id={graph_id} "
+                         f"forward_capacity={arena_plan['capacity']}")
+        elif profile.prefetch_arena_session_accepted is False:
+            arena_plan = None
+            arena_reason = profile.prefetch_arena_session_reason or "session_not_admitted"
+        elif (profile.prefetch_arena_forward_graph is None or profile.prefetch_arena_forward_plan is None
+              or profile.prefetch_arena_forward_mem is None or profile.prefetch_arena_forward_reserved_mem is None
+              or profile.prefetch_arena_forward_pool_reclaimable is None):
+            arena_plan = None
+            arena_reason = "incomplete_forward_arena_profile"
+        else:
+            session_admission = _training_session_budget_admission(
+                profile.prefetch_arena_forward_graph, profile.prefetch_arena_forward_plan,
+                profile.prefetch_arena_forward_mem, profile.prefetch_arena_forward_reserved_mem, new_graph, arena_plan,
+                mem_dict, reserved_mem_dict, max_mem, profile.prefetch_arena_forward_pool_reclaimable,
+                pool_reclaimable_dict)
+            profile.prefetch_arena_session_accepted = bool(session_admission["accepted"])
+            profile.prefetch_arena_session_capacity_bound = int(session_admission["capacity_bound"])
+            profile.prefetch_arena_session_reason = (None if session_admission["accepted"] else "shared_budget")
+            print_rank_0(f"prefetch_arena_session_admission graph_id={graph_id} "
+                         f"accepted={int(session_admission['accepted'])} "
+                         f"max_mem={session_admission['max_mem']} "
+                         f"capacity_bound={session_admission['capacity_bound']} "
+                         f"forward_original_peak={session_admission['forward_original_peak']} "
+                         f"forward_arena_peak={session_admission['forward_arena_peak']} "
+                         f"backward_original_peak={session_admission['backward_original_peak']} "
+                         f"backward_arena_peak={session_admission['backward_arena_peak']} "
+                         f"forward_pool_reclaimable_bytes={session_admission['forward_pool_reclaimable_bytes']} "
+                         f"backward_pool_reclaimable_bytes={session_admission['backward_pool_reclaimable_bytes']}")
+            if not session_admission["accepted"]:
                 arena_plan = None
                 arena_reason = "shared_budget"
-        if arena_plan is not None and require_backward:
-            if not bwd:
-                # The optimized backward does not exist yet.  Keep the final
-                # forward plan as native metadata, but native execution will
-                # deliberately use the normal gather pool until the backward
-                # compiler registers its plan and decides the shared budget.
-                profile.prefetch_arena_forward_graph = new_graph
-                profile.prefetch_arena_forward_plan = arena_plan
-                profile.prefetch_arena_forward_mem = dict(mem_dict)
-                profile.prefetch_arena_forward_reserved_mem = dict(reserved_mem_dict)
-                profile.prefetch_arena_forward_pool_reclaimable = dict(pool_reclaimable_dict)
-                profile.prefetch_arena_session_accepted = None
-                profile.prefetch_arena_session_capacity_bound = 0
-                profile.prefetch_arena_session_reason = None
-                print_rank_0(f"prefetch_arena_session_pending graph_id={graph_id} "
-                             f"forward_capacity={arena_plan['capacity']}")
-            elif profile.prefetch_arena_session_accepted is False:
-                arena_plan = None
-                arena_reason = profile.prefetch_arena_session_reason or "session_not_admitted"
-            elif (profile.prefetch_arena_forward_graph is None or profile.prefetch_arena_forward_plan is None
-                  or profile.prefetch_arena_forward_mem is None or profile.prefetch_arena_forward_reserved_mem is None
-                  or profile.prefetch_arena_forward_pool_reclaimable is None):
-                arena_plan = None
-                arena_reason = "incomplete_forward_arena_profile"
-            else:
-                session_admission = _training_session_budget_admission(
-                    profile.prefetch_arena_forward_graph, profile.prefetch_arena_forward_plan,
-                    profile.prefetch_arena_forward_mem, profile.prefetch_arena_forward_reserved_mem, new_graph,
-                    arena_plan, mem_dict, reserved_mem_dict, max_mem, profile.prefetch_arena_forward_pool_reclaimable,
-                    pool_reclaimable_dict)
-                profile.prefetch_arena_session_accepted = bool(session_admission["accepted"])
-                profile.prefetch_arena_session_capacity_bound = int(session_admission["capacity_bound"])
-                profile.prefetch_arena_session_reason = (None if session_admission["accepted"] else "shared_budget")
-                print_rank_0(f"prefetch_arena_session_admission graph_id={graph_id} "
-                             f"accepted={int(session_admission['accepted'])} "
-                             f"max_mem={session_admission['max_mem']} "
-                             f"capacity_bound={session_admission['capacity_bound']} "
-                             f"forward_original_peak={session_admission['forward_original_peak']} "
-                             f"forward_arena_peak={session_admission['forward_arena_peak']} "
-                             f"backward_original_peak={session_admission['backward_original_peak']} "
-                             f"backward_arena_peak={session_admission['backward_arena_peak']} "
-                             f"forward_pool_reclaimable_bytes="
-                             f"{session_admission['forward_pool_reclaimable_bytes']} "
-                             f"backward_pool_reclaimable_bytes="
-                             f"{session_admission['backward_pool_reclaimable_bytes']}")
-                if not session_admission["accepted"]:
-                    arena_plan = None
-                    arena_reason = "shared_budget"
-        if arena_plan is None:
-            print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if bwd else 'fwd'} "
-                         f"fallback={arena_reason}")
-            _disable_prefetch_arena(new_graph)
-            # Forward may already have registered a pending training-session
-            # plan.  A later backward rejection must invalidate that native
-            # metadata as one session decision, not leave a forward-only arena
-            # available on a subsequent compile/execution.
-            if bwd and require_backward:
-                get_deepcompile_handle().disable_z3_prefetch_arena(graph_id, arena_reason)
-        else:
-            _add_prefetch_arena_release_dependencies(new_graph)
+    if arena_plan is None:
+        print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if bwd else 'fwd'} fallback={arena_reason}")
+        _disable_prefetch_arena(new_graph)
+        # Forward may already have registered a pending training-session plan. A
+        # later backward rejection must invalidate that native metadata as one
+        # session decision, not leave a forward-only arena available on a
+        # subsequent compile/execution.
+        if bwd and require_backward:
+            get_deepcompile_handle().disable_z3_prefetch_arena(graph_id, arena_reason)
+    else:
+        _add_prefetch_arena_release_dependencies(new_graph)
     new_graph.lint()
     gm.graph = new_graph
 
