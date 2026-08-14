@@ -34,6 +34,7 @@ class ProfilingResult:
     prefetch_arena_forward_plan: Any = None
     prefetch_arena_forward_mem: Any = None
     prefetch_arena_forward_reserved_mem: Any = None
+    prefetch_arena_forward_pool_reclaimable: Any = None
     prefetch_arena_session_accepted: Any = None
     prefetch_arena_session_capacity_bound: int = 0
     prefetch_arena_session_reason: Any = None

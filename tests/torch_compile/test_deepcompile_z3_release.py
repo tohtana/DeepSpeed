@@ -70,7 +70,8 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
     def _pool_state(self, dc):
         keys = ("budget", "charged", "high_water", "entries", "checked_out", "retries", "enabled", "initialized",
                 "idle_pressure_score", "pressure_recovery_complete", "pressure_recovery_budget",
-                "pressure_recovery_pending_entries", "pressure_recovery_in_progress")
+                "pressure_recovery_pending_entries", "pressure_recovery_in_progress", "arena_transition_started",
+                "arena_transition_flush_complete")
         return dict(zip(keys, dc.get_z3_gather_buffer_pool_state_for_test()))
 
     def _arena_state(self, dc, graph_id):
@@ -206,12 +207,20 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             dc.cleanup()
 
     def test_training_prefetch_arena_waits_for_backward_phase_before_allocating(self):
-        graph_id, forward_id, backward_id = 9233, 9234, 9235
+        graph_id, forward_id, backward_id, pooled_id = 9233, 9234, 9235, 9236
         dc = self._init_dc()
         try:
             forward = self._register_param(dc, graph_id, forward_id, [3], register_graph=False)
             backward = self._register_param(dc, graph_id, backward_id, [5], register_graph=False)
-            dc.register_graph_z3(graph_id, [forward_id, backward_id])
+            pooled = self._register_param(dc, graph_id, pooled_id, [7], register_graph=False)
+            dc.register_graph_z3(graph_id, [forward_id, backward_id, pooled_id])
+
+            pooled_view, pooled_storage = self._gather_view_and_storage(pooled, graph_id, pooled_id)
+            self._release(pooled_view, graph_id, pooled_id, 1)
+            before_transition = self._pool_state(dc)
+            assert before_transition["charged"] > 0
+            assert pooled_storage.nbytes() > 0
+
             self._configure_arena(dc,
                                   graph_id, [10], [forward_id], [0], [16],
                                   capacity=512,
@@ -239,12 +248,19 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert active["phases"] == 2
             assert active["backing_allocations"] == 1
             assert forward_storage.data_ptr() != backward_storage.data_ptr()
+            after_transition = self._pool_state(dc)
+            assert after_transition["charged"] == 0
+            assert after_transition["entries"] == 0
+            assert after_transition["enabled"] == 0
+            assert after_transition["arena_transition_started"] == 1
+            assert after_transition["arena_transition_flush_complete"] == 1
+            assert pooled_storage.nbytes() == 0
             self._release(backward_view, graph_id, backward_id, 1)
         finally:
             dc.cleanup()
 
     def test_training_prefetch_arena_session_disable_prevents_forward_only_backing(self):
-        graph_id, ds_id = 9236, 9237
+        graph_id, ds_id = 9237, 9238
         dc = self._init_dc()
         try:
             shard = self._register_param(dc, graph_id, ds_id, [5])
@@ -495,6 +511,36 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             self._release(gathered, graph_id, ds_id, 1)
             assert self._arena_state(dc, graph_id)["active_leases"] == 0
             dc.reset()
+        finally:
+            dc.cleanup()
+
+    def test_gather_pool_reclaimable_credit_counts_only_idle_storage(self):
+        graph_id, first_id, second_id = 9241, 9242, 9243
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [4097], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [2049], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            self._release(first_view, graph_id, first_id, 1)
+            idle_credit = dc.get_z3_gather_buffer_pool_reclaimable_bytes()
+            assert idle_credit == first_storage.nbytes() > 0
+
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+            checked_out = self._pool_state(dc)
+            assert second_storage.data_ptr() == first_storage.data_ptr()
+            assert checked_out["charged"] == idle_credit
+            assert checked_out["checked_out"] == 1
+            assert dc.get_z3_gather_buffer_pool_reclaimable_bytes() == 0
+            assert dc.get_z3_gather_buffer_pool_transition_reclaimable_bytes() == idle_credit
+
+            self._release(second_view, graph_id, second_id, 1)
+            returned = self._pool_state(dc)
+            assert returned["charged"] == idle_credit
+            assert returned["checked_out"] == 0
+            assert dc.get_z3_gather_buffer_pool_reclaimable_bytes() == idle_credit
+            assert dc.get_z3_gather_buffer_pool_transition_reclaimable_bytes() == idle_credit
         finally:
             dc.cleanup()
 

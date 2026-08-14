@@ -114,6 +114,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("get_z3_gather_buffer_pool_state_for_test",
           &dc::get_z3_gather_buffer_pool_state_for_test,
           "Inspect ZeRO-3 gather-buffer-pool accounting for tests");
+    m.def("get_z3_gather_buffer_pool_reclaimable_bytes",
+          &dc::get_z3_gather_buffer_pool_reclaimable_bytes,
+          "Read immediately reclaimable idle bytes in the ZeRO-3 gather-buffer pool");
+    m.def("get_z3_gather_buffer_pool_transition_reclaimable_bytes",
+          &dc::get_z3_gather_buffer_pool_transition_reclaimable_bytes,
+          "Read pool-owned bytes retired before a ZeRO-3 prefetch arena takes ownership");
     m.def("configure_z3_prefetch_arena",
           &dc::configure_z3_prefetch_arena,
           "Configure a fixed ZeRO-3 prefetch arena plan");

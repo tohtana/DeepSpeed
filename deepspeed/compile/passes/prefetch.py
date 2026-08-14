@@ -84,15 +84,15 @@ def _pack_prefetch_intervals(intervals: List[Dict], alignment: int = PREFETCH_AR
         active = still_active
 
         offset = None
-        for index, (block_offset, block_size) in enumerate(free_blocks):
-            if block_size < size:
-                continue
+        fitting_blocks = [(block_size, block_offset, index)
+                          for index, (block_offset, block_size) in enumerate(free_blocks) if block_size >= size]
+        if fitting_blocks:
+            block_size, block_offset, index = min(fitting_blocks)
             offset = block_offset
             if block_size == size:
                 free_blocks.pop(index)
             else:
                 free_blocks[index] = (block_offset + size, block_size - size)
-            break
         if offset is None:
             offset = capacity
             capacity += size
@@ -246,15 +246,21 @@ def _add_prefetch_arena_release_dependencies(graph: Graph) -> None:
         pending_releases.clear()
 
 
-def _prefetch_arena_budget_admission(graph: Graph, plan: Dict, mem_dict: Dict[str, Tuple[int, int]],
-                                     reserved_mem_dict: Dict[str, int], max_mem: int):
+def _prefetch_arena_budget_admission(graph: Graph,
+                                     plan: Dict,
+                                     mem_dict: Dict[str, Tuple[int, int]],
+                                     reserved_mem_dict: Dict[str, int],
+                                     max_mem: int,
+                                     pool_reclaimable_dict: Dict[str, int] = None):
     """Check the fixed backing against the same profiled peaks as prefetch.
 
     The existing scheduler charges each gathered tensor only while it is live.
     A flat arena instead keeps its full aligned capacity from the first arena
     prefetch through graph completion.  Admission therefore replaces the live
     eligible-gather charge with the fixed capacity; it must not add capacity on
-    top of those same live bytes.
+    top of those same live bytes. Native execution also retires the old gather
+    pool and flushes allocator cache before allocating the backing, so the
+    projected allocated peak removes the pool charge measured at each node.
     """
     intervals = plan["intervals"]
     previous_peak = 0
@@ -266,13 +272,18 @@ def _prefetch_arena_budget_admission(graph: Graph, plan: Dict, mem_dict: Dict[st
     arena_modeled_peak = 0
     limiting_node = None
     limiting_metric = None
+    limiting_pool_reclaimable_bytes = 0
     previous_reserved_peak = 0
+    previous_pool_reclaimable = 0
+    pool_reclaimable_dict = pool_reclaimable_dict or {}
 
     for index, node in enumerate(graph.nodes):
         if node.name in mem_dict:
             previous_peak = int(mem_dict[node.name][1])
         if node.name in reserved_mem_dict:
             previous_reserved_peak = int(reserved_mem_dict[node.name])
+        if node.name in pool_reclaimable_dict:
+            previous_pool_reclaimable = int(pool_reclaimable_dict[node.name])
         live_gather_bytes = sum(
             int(interval["bytes"]) for interval in intervals if interval["start"] <= index <= interval["end"])
         # Keep the scheduler's existing conservative model: the profiled peak
@@ -282,22 +293,31 @@ def _prefetch_arena_budget_admission(graph: Graph, plan: Dict, mem_dict: Dict[st
         # Native backing survives executor reuse and is shared by forward and
         # backward, so after warmup it is resident for the complete graph, not
         # merely between the first and last interval in this invocation.
-        arena_at_node = previous_peak + int(plan["capacity"])
+        # The optimized graph inserts fused-prefetch nodes that do not exist in
+        # the profiling graph. Carry the most recent profiled pool charge over
+        # such nodes just as the existing memory projection carries its peak.
+        pool_reclaimable_at_node = min(previous_peak, previous_pool_reclaimable)
+        arena_at_node = previous_peak - pool_reclaimable_at_node + int(plan["capacity"])
         original_allocated_peak = max(original_allocated_peak, original_at_node)
         original_reserved_at_node = previous_reserved_peak
-        # Cached fragmentation and every unrelated reservation remain charged.
-        # Do not assume that fragmented cached blocks can satisfy the arena's
-        # single contiguous backing allocation.
+        # Keep the pre-transition reserved projection for diagnostics. Arena
+        # execution has a stronger runtime contract: it retires the old gather
+        # pool and performs one allocator-cache flush before allocating the
+        # fixed backing. Admission must therefore not add the arena to unused
+        # cache that the transition has guaranteed to release. The existing
+        # 10% max_mem margin remains available for non-releasable fragmentation
+        # and unrelated allocator growth.
         arena_reserved_at_node = previous_reserved_peak + int(plan["capacity"])
         original_reserved_peak = max(original_reserved_peak, original_reserved_at_node)
         arena_reserved_peak = max(arena_reserved_peak, arena_reserved_at_node)
         original_modeled_peak = max(original_modeled_peak, original_at_node, original_reserved_at_node)
         arena_allocated_peak = max(arena_allocated_peak, arena_at_node)
-        effective_arena_peak = max(arena_at_node, arena_reserved_at_node)
+        effective_arena_peak = arena_at_node
         if effective_arena_peak > arena_modeled_peak:
             arena_modeled_peak = effective_arena_peak
             limiting_node = node.name
-            limiting_metric = "reserved" if arena_reserved_at_node >= arena_at_node else "allocated"
+            limiting_metric = "allocated_after_pool_drain_and_empty_cache"
+            limiting_pool_reclaimable_bytes = pool_reclaimable_at_node
 
     return {
         "accepted": arena_modeled_peak <= int(max_mem),
@@ -312,15 +332,21 @@ def _prefetch_arena_budget_admission(graph: Graph, plan: Dict, mem_dict: Dict[st
         "incremental_peak": arena_modeled_peak - original_modeled_peak,
         "limiting_node": limiting_node,
         "limiting_metric": limiting_metric,
+        "limiting_pool_reclaimable_bytes": limiting_pool_reclaimable_bytes,
     }
 
 
-def _training_session_budget_admission(forward_graph: Graph, forward_plan: Dict, forward_mem_dict: Dict[str,
-                                                                                                        Tuple[int,
-                                                                                                              int]],
-                                       forward_reserved_mem_dict: Dict[str, int], backward_graph: Graph,
-                                       backward_plan: Dict, backward_mem_dict: Dict[str, Tuple[int, int]],
-                                       backward_reserved_mem_dict: Dict[str, int], max_mem: int):
+def _training_session_budget_admission(forward_graph: Graph,
+                                       forward_plan: Dict,
+                                       forward_mem_dict: Dict[str, Tuple[int, int]],
+                                       forward_reserved_mem_dict: Dict[str, int],
+                                       backward_graph: Graph,
+                                       backward_plan: Dict,
+                                       backward_mem_dict: Dict[str, Tuple[int, int]],
+                                       backward_reserved_mem_dict: Dict[str, int],
+                                       max_mem: int,
+                                       forward_pool_reclaimable_dict: Dict[str, int] = None,
+                                       backward_pool_reclaimable_dict: Dict[str, int] = None):
     """Admit the final shared backing against both actual phase plans.
 
     The forward plan is metadata-only until AOTAutograd lazily invokes the
@@ -332,9 +358,9 @@ def _training_session_budget_admission(forward_graph: Graph, forward_plan: Dict,
     bounded_forward_plan = dict(forward_plan, capacity=capacity_bound)
     bounded_backward_plan = dict(backward_plan, capacity=capacity_bound)
     forward = _prefetch_arena_budget_admission(forward_graph, bounded_forward_plan, forward_mem_dict,
-                                               forward_reserved_mem_dict, max_mem)
+                                               forward_reserved_mem_dict, max_mem, forward_pool_reclaimable_dict)
     backward = _prefetch_arena_budget_admission(backward_graph, bounded_backward_plan, backward_mem_dict,
-                                                backward_reserved_mem_dict, max_mem)
+                                                backward_reserved_mem_dict, max_mem, backward_pool_reclaimable_dict)
     return {
         "accepted": forward["accepted"] and backward["accepted"],
         "max_mem": int(max_mem),
@@ -343,6 +369,8 @@ def _training_session_budget_admission(forward_graph: Graph, forward_plan: Dict,
         "backward_arena_peak": int(backward["arena_modeled_peak"]),
         "forward_original_peak": int(forward["original_modeled_peak"]),
         "backward_original_peak": int(backward["original_modeled_peak"]),
+        "forward_pool_reclaimable_bytes": int(forward["limiting_pool_reclaimable_bytes"]),
+        "backward_pool_reclaimable_bytes": int(backward["limiting_pool_reclaimable_bytes"]),
     }
 
 
@@ -416,6 +444,10 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     reserved_mem_dict = {
         node.name: int(node.meta["profile_reserved_peak"])
         for node in profile_graph.nodes if "profile_reserved_peak" in node.meta
+    }
+    pool_reclaimable_dict = {
+        node.name: int(node.meta.get("profile_gather_pool_charged", 0))
+        for node in profile_graph.nodes
     }
     time_dict = {name: (device_time, wall_time) for name, device_time, wall_time in op_time}
     tensor_size_dict = {name: size for name, size in tensor_sizes}
@@ -573,7 +605,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 arena_reason = "incomplete_reserved_profile"
             else:
                 admission = _prefetch_arena_budget_admission(new_graph, arena_plan, mem_dict, reserved_mem_dict,
-                                                             max_mem)
+                                                             max_mem, pool_reclaimable_dict)
         if arena_plan is not None:
             print_rank_0(f"prefetch_arena_admission graph_id={graph_id} "
                          f"phase={'bwd' if bwd else 'fwd'} accepted={int(admission['accepted'])} "
@@ -586,7 +618,8 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                          f"arena_reserved_peak={admission['arena_reserved_peak']} "
                          f"incremental_peak={admission['incremental_peak']} "
                          f"limiting_node={admission['limiting_node']} "
-                         f"limiting_metric={admission['limiting_metric']}")
+                         f"limiting_metric={admission['limiting_metric']} "
+                         f"pool_reclaimable_bytes={admission['limiting_pool_reclaimable_bytes']}")
             if not admission["accepted"]:
                 if require_backward and not bwd:
                     profile.prefetch_arena_session_accepted = False
@@ -603,6 +636,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 profile.prefetch_arena_forward_plan = arena_plan
                 profile.prefetch_arena_forward_mem = dict(mem_dict)
                 profile.prefetch_arena_forward_reserved_mem = dict(reserved_mem_dict)
+                profile.prefetch_arena_forward_pool_reclaimable = dict(pool_reclaimable_dict)
                 profile.prefetch_arena_session_accepted = None
                 profile.prefetch_arena_session_capacity_bound = 0
                 profile.prefetch_arena_session_reason = None
@@ -612,17 +646,16 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 arena_plan = None
                 arena_reason = profile.prefetch_arena_session_reason or "session_not_admitted"
             elif (profile.prefetch_arena_forward_graph is None or profile.prefetch_arena_forward_plan is None
-                  or profile.prefetch_arena_forward_mem is None
-                  or profile.prefetch_arena_forward_reserved_mem is None):
+                  or profile.prefetch_arena_forward_mem is None or profile.prefetch_arena_forward_reserved_mem is None
+                  or profile.prefetch_arena_forward_pool_reclaimable is None):
                 arena_plan = None
                 arena_reason = "incomplete_forward_arena_profile"
             else:
-                session_admission = _training_session_budget_admission(profile.prefetch_arena_forward_graph,
-                                                                       profile.prefetch_arena_forward_plan,
-                                                                       profile.prefetch_arena_forward_mem,
-                                                                       profile.prefetch_arena_forward_reserved_mem,
-                                                                       new_graph, arena_plan, mem_dict,
-                                                                       reserved_mem_dict, max_mem)
+                session_admission = _training_session_budget_admission(
+                    profile.prefetch_arena_forward_graph, profile.prefetch_arena_forward_plan,
+                    profile.prefetch_arena_forward_mem, profile.prefetch_arena_forward_reserved_mem, new_graph,
+                    arena_plan, mem_dict, reserved_mem_dict, max_mem, profile.prefetch_arena_forward_pool_reclaimable,
+                    pool_reclaimable_dict)
                 profile.prefetch_arena_session_accepted = bool(session_admission["accepted"])
                 profile.prefetch_arena_session_capacity_bound = int(session_admission["capacity_bound"])
                 profile.prefetch_arena_session_reason = (None if session_admission["accepted"] else "shared_budget")
@@ -633,7 +666,11 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                              f"forward_original_peak={session_admission['forward_original_peak']} "
                              f"forward_arena_peak={session_admission['forward_arena_peak']} "
                              f"backward_original_peak={session_admission['backward_original_peak']} "
-                             f"backward_arena_peak={session_admission['backward_arena_peak']}")
+                             f"backward_arena_peak={session_admission['backward_arena_peak']} "
+                             f"forward_pool_reclaimable_bytes="
+                             f"{session_admission['forward_pool_reclaimable_bytes']} "
+                             f"backward_pool_reclaimable_bytes="
+                             f"{session_admission['backward_pool_reclaimable_bytes']}")
                 if not session_admission["accepted"]:
                     arena_plan = None
                     arena_reason = "shared_budget"

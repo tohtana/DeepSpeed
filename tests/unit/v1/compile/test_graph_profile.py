@@ -61,12 +61,19 @@ class FakeDeepCompileHandle:
 
     def __init__(self):
         self.events = []
+        self.reclaimable_bytes = 0
 
     def enable_profiling(self, enabled):
         self.events.append(("enable", enabled))
 
     def clear_all_gathered_params(self):
         self.events.append(("clear", None))
+
+    def get_z3_gather_buffer_pool_reclaimable_bytes(self):
+        return self.reclaimable_bytes
+
+    def get_z3_gather_buffer_pool_transition_reclaimable_bytes(self):
+        return self.reclaimable_bytes
 
 
 class FakeEvent:
@@ -201,6 +208,7 @@ def test_memory_profiling_interpreter_disables_profiling_if_cleanup_fails(monkey
 
 def test_memory_profiling_interpreter_records_allocator_reserved_peaks(monkeypatch):
     fake_handle = FakeDeepCompileHandle()
+    fake_handle.reclaimable_bytes = 32
 
     class ReservedAccelerator(FakeAccelerator):
 
@@ -232,6 +240,7 @@ def test_memory_profiling_interpreter_records_allocator_reserved_peaks(monkeypat
     assert output.meta["profile_reserved_start"] == 107
     assert output.meta["profile_reserved_current"] == 107
     assert output.meta["profile_reserved_peak"] == 127
+    assert output.meta["profile_gather_pool_charged"] == 32
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
 
 

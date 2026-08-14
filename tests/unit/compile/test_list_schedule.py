@@ -264,6 +264,48 @@ def test_prefetch_arena_interval_packing_alignment_and_reuse():
     assert packed["capacity"] == 768
 
 
+def test_prefetch_arena_interval_packing_uses_best_fit_free_block():
+    packed, reason = prefetch_mod._pack_prefetch_intervals([
+        {
+            "ds_id": 1,
+            "start": 0,
+            "end": 1,
+            "bytes": 10
+        },
+        {
+            "ds_id": 2,
+            "start": 0,
+            "end": 10,
+            "bytes": 4
+        },
+        {
+            "ds_id": 3,
+            "start": 1,
+            "end": 2,
+            "bytes": 6
+        },
+        {
+            "ds_id": 4,
+            "start": 3,
+            "end": 4,
+            "bytes": 6
+        },
+        {
+            "ds_id": 5,
+            "start": 3,
+            "end": 4,
+            "bytes": 10
+        },
+    ],
+                                                           alignment=1)
+
+    assert reason is None
+    assert packed["capacity"] == packed["max_live_bytes"] == 20
+    offsets = {interval["ds_id"]: interval["offset"] for interval in packed["intervals"]}
+    assert offsets[4] == 14
+    assert offsets[5] == 0
+
+
 def test_prefetch_arena_plan_uses_final_padded_bytes_and_coalesces_repeated_ids():
     graph = Graph()
     first = graph.placeholder("first")
@@ -419,12 +461,35 @@ def test_prefetch_arena_budget_admission_replaces_live_gather_charge_with_fixed_
         "arena_reserved_peak": 756,
         "incremental_peak": 244,
         "limiting_node": "param",
-        "limiting_metric": "reserved",
+        "limiting_metric": "allocated_after_pool_drain_and_empty_cache",
+        "limiting_pool_reclaimable_bytes": 0,
     }
     assert accepted["accepted"] is True
     # Capacity replaces the already-counted 12 live bytes rather than being
     # added on top of them a second time.
     assert accepted["incremental_peak"] == plan["capacity"] - 12
+
+
+def test_prefetch_arena_budget_does_not_charge_cache_flushed_before_backing():
+    graph = Graph()
+    param = graph.placeholder("param")
+    _arena_prefetch(graph, [param], [1], 10, [12])
+    release = _release(graph, param, 1, "arena_param")
+    graph.output((release, ))
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+    assert reason is None
+
+    mem_dict = {node.name: (500, 500) for node in graph.nodes}
+    reserved_mem_dict = {node.name: 900 for node in graph.nodes}
+    admission = prefetch_mod._prefetch_arena_budget_admission(graph, plan, mem_dict, reserved_mem_dict, max_mem=800)
+
+    assert admission["accepted"] is True
+    assert admission["arena_allocated_peak"] == 756
+    assert admission["arena_modeled_peak"] == 756
+    assert admission["arena_reserved_peak"] == 1156
+    assert admission["limiting_metric"] == "allocated_after_pool_drain_and_empty_cache"
+    assert admission["limiting_pool_reclaimable_bytes"] == 0
 
 
 def test_training_session_budget_uses_shared_forward_backward_capacity_bound():
@@ -468,7 +533,65 @@ def test_training_session_budget_uses_shared_forward_backward_capacity_bound():
         "backward_arena_peak": 612,
         "forward_original_peak": 112,
         "backward_original_peak": 400,
+        "forward_pool_reclaimable_bytes": 0,
+        "backward_pool_reclaimable_bytes": 0,
     }
+
+
+def test_training_session_budget_subtracts_only_profiled_pool_charge():
+    fwd = Graph()
+    fwd_param = _placeholder(fwd, "fwd_param")
+    _arena_prefetch(fwd, [fwd_param], [1], 10, [12])
+    fwd.output((_release(fwd, fwd_param, 1, "fwd_param"), ))
+    fwd_plan, reason = prefetch_mod._build_prefetch_arena_plan(fwd,
+                                                               _fake_arena_param_manager([("fwd_param", 1, (5, ),
+                                                                                           torch.float16)]),
+                                                               world_size=2,
+                                                               bwd=False)
+    assert reason is None
+
+    bwd = Graph()
+    bwd_param = _placeholder(bwd, "bwd_param")
+    _arena_prefetch(bwd, [bwd_param], [1], 1_000_010, [300])
+    bwd.output((_release(bwd, bwd_param, 1, "bwd_param"), ))
+    bwd_plan, reason = prefetch_mod._build_prefetch_arena_plan(bwd,
+                                                               _fake_arena_param_manager([("bwd_param", 1, (150, ),
+                                                                                           torch.float16)]),
+                                                               world_size=2,
+                                                               bwd=True)
+    assert reason is None
+
+    fwd_mem = {node.name: (600, 600) for node in fwd.nodes}
+    bwd_mem = {node.name: (600, 600) for node in bwd.nodes}
+    reserved = {node.name: 900 for node in (*list(fwd.nodes), *list(bwd.nodes))}
+    no_credit = prefetch_mod._training_session_budget_admission(fwd,
+                                                                fwd_plan,
+                                                                fwd_mem,
+                                                                reserved,
+                                                                bwd,
+                                                                bwd_plan,
+                                                                bwd_mem,
+                                                                reserved,
+                                                                max_mem=700)
+    pool_credit = {node.name: 450 for node in (*list(fwd.nodes), *list(bwd.nodes))}
+    credited = prefetch_mod._training_session_budget_admission(fwd,
+                                                               fwd_plan,
+                                                               fwd_mem,
+                                                               reserved,
+                                                               bwd,
+                                                               bwd_plan,
+                                                               bwd_mem,
+                                                               reserved,
+                                                               max_mem=700,
+                                                               forward_pool_reclaimable_dict=pool_credit,
+                                                               backward_pool_reclaimable_dict=pool_credit)
+
+    assert no_credit["accepted"] is False
+    assert credited["accepted"] is True
+    assert credited["forward_arena_peak"] == 662
+    assert credited["backward_arena_peak"] == 662
+    assert credited["forward_pool_reclaimable_bytes"] == 450
+    assert credited["backward_pool_reclaimable_bytes"] == 450
 
 
 @pytest.mark.parametrize("arena_enabled", [False, True])
@@ -732,7 +855,9 @@ def test_schedule_prefetch_training_backward_decides_pending_session(monkeypatch
                               prefetch_arena_forward_mem={node.name: (0, 0)
                                                           for node in fwd.nodes},
                               prefetch_arena_forward_reserved_mem={node.name: 0
-                                                                   for node in fwd.nodes})
+                                                                   for node in fwd.nodes},
+                              prefetch_arena_forward_pool_reclaimable={node.name: 0
+                                                                       for node in fwd.nodes})
     for node in bwd.nodes:
         node.meta["profile_reserved_peak"] = 0
     manager = _fake_arena_param_manager([("bwd_param", 1, (5, ), torch.float16)])

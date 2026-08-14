@@ -15,6 +15,8 @@ void update_z3_gather_buffer_pool_allocator_pressure_for_test(int64_t retries,
                                                               int64_t free_bytes,
                                                               int64_t total_bytes);
 std::vector<int64_t> get_z3_gather_buffer_pool_state_for_test();
+int64_t get_z3_gather_buffer_pool_reclaimable_bytes();
+int64_t get_z3_gather_buffer_pool_transition_reclaimable_bytes();
 void reset_z3_gather_buffer_pool();
 void register_graph_ops_z3(long graph_id,
                            const std::vector<std::string>& op_names,

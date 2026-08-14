@@ -418,19 +418,30 @@ class MemoryProfilingInterpreter(Interpreter):
 
         current_alloc, max_alloc = _absolute_profile_memory(self.mem_usage_out_of_torch)
         current_reserved, max_reserved = _absolute_profile_reserved_memory(self.mem_usage_out_of_torch)
-        absolute_record = torch.tensor([profile_mem_start, current_alloc, max_alloc, profile_reserved_start,
-                                        current_reserved, max_reserved],
+        # Arena transition disables the gather pool, drains its idle entries,
+        # and waits for checked-out entries to retire before allocating the
+        # backing. Record that transition-specific charge rather than the
+        # pool's narrower immediately-idle reuse credit.
+        gather_pool_charged = int(self.nz3.get_z3_gather_buffer_pool_transition_reclaimable_bytes())
+        absolute_record = torch.tensor([
+            profile_mem_start, current_alloc, max_alloc, profile_reserved_start, current_reserved, max_reserved,
+            -gather_pool_charged
+        ],
                                        device=self.device,
                                        dtype=torch.int64)
         if dist.is_initialized():
             dist.all_reduce(absolute_record, dist.ReduceOp.MAX, group=self.process_group)
-        (profile_mem_start, current_alloc, max_alloc, profile_reserved_start, current_reserved,
-         max_reserved) = (int(value.item()) for value in absolute_record)
+        (profile_mem_start, current_alloc, max_alloc, profile_reserved_start, current_reserved, max_reserved,
+         negative_gather_pool_charged) = (int(value.item()) for value in absolute_record)
         n.meta["profile_mem_start"] = profile_mem_start
         n.meta["profile_mem_peak"] = max_alloc
         n.meta["profile_reserved_start"] = profile_reserved_start
         n.meta["profile_reserved_current"] = current_reserved
         n.meta["profile_reserved_peak"] = max_reserved
+        # The record is MAX-reduced for existing memory fields. Negating this
+        # one field gives the cross-rank minimum reclaimable charge without a
+        # second collective, keeping the post-transition projection safe.
+        n.meta["profile_gather_pool_charged"] = -negative_gather_pool_charged
 
         self.mem_record.append((n.name, current_alloc, current_alloc - self.last_alloc, max_alloc))
 

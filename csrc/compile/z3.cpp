@@ -48,6 +48,7 @@ public:
                        const c10::Device& device,
                        at::cuda::CUDAStream stream)
     {
+        if (arena_transition_started_) { return at::Tensor(); }
         flushCompletedPressureRecovery();
         observeAllocatorPressure(device.index());
         if (!enabled_ || pressure_recovery_in_progress_) { return at::Tensor(); }
@@ -120,6 +121,9 @@ public:
         for (auto it = entries_.begin(); it != entries_.end(); ++it) {
             if (storageImpl(*it) != storage_impl) { continue; }
             if (excluded) { return retireEntry(it, storage_impl, "excluded", false); }
+            if (arena_transition_started_) {
+                return retireEntry(it, storage_impl, "arena_transition_release", false);
+            }
             if (pressure_recovery_in_progress_) {
                 return retireEntry(it, storage_impl, "recovery_release", true);
             }
@@ -134,7 +138,7 @@ public:
             return ReleaseDisposition::NoResizeNeeded;
         }
 
-        if (excluded || !enabled_ || pressure_recovery_in_progress_) {
+        if (excluded || arena_transition_started_ || !enabled_ || pressure_recovery_in_progress_) {
             return ReleaseDisposition::ResizeByCaller;
         }
 
@@ -194,6 +198,79 @@ public:
         enabled_ = false;
         fixed_budget_override_ = false;
         adaptive_budget_initialized_ = false;
+        arena_transition_started_ = false;
+        arena_transition_flush_complete_ = false;
+    }
+
+    bool prepareForArenaTransition()
+    {
+        if (!arena_transition_started_) {
+            // Once the optimized prefetch session has both phase plans, the
+            // independent gather pool is no longer part of that execution
+            // mode. Relinquish idle storages immediately and make checked-out
+            // storages retire on their final release. This keeps the old pool
+            // and the fixed arena from becoming two simultaneous budgets.
+            arena_transition_started_ = true;
+            enabled_ = false;
+            budget_bytes_ = 0;
+            pressure_recovery_in_progress_ = false;
+            pressure_recovery_complete_ = false;
+            pressure_recovery_flush_pending_ = false;
+            pressure_recovery_budget_bytes_ = 0;
+            pressure_recovery_targets_.clear();
+
+            for (auto it = entries_.begin(); it != entries_.end();) {
+                if (it->checked_out) {
+                    ++it;
+                    continue;
+                }
+                auto storage = it->buffer.storage();
+                non_retainable_storages_.erase(storage.unsafeGetStorageImpl());
+                at::native::resize_bytes_cuda(storage.unsafeGetStorageImpl(), 0);
+                charged_bytes_ -= it->capacity_bytes;
+                it = entries_.erase(it);
+            }
+            logState(entries_.empty() ? "arena_transition_drained" : "arena_transition_waiting");
+        }
+
+        return entries_.empty();
+    }
+
+    void flushForArenaTransition()
+    {
+        TORCH_CHECK(arena_transition_started_,
+                    "gather-buffer-pool flush requested before arena transition");
+        TORCH_CHECK(entries_.empty(),
+                    "gather-buffer-pool flush requested with live entries: ",
+                    entries_.size());
+        if (!arena_transition_flush_complete_) {
+            // Resizing releases pool ownership, but the CUDA allocator may
+            // still retain those blocks. Flush exactly once before requesting
+            // the single contiguous arena backing.
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            arena_transition_flush_complete_ = true;
+            logState("arena_transition_flushed");
+        }
+    }
+
+    int64_t reclaimableBytes() const
+    {
+        size_t reclaimable_bytes = 0;
+        for (const auto& entry : entries_) {
+            if (!entry.checked_out && entry.ready_event) {
+                reclaimable_bytes += entry.capacity_bytes;
+            }
+        }
+        return static_cast<int64_t>(reclaimable_bytes);
+    }
+
+    int64_t transitionReclaimableBytes() const
+    {
+        // Arena transition disables further pool reuse, drains idle entries,
+        // and waits for checked-out entries to retire on final release before
+        // allocating the arena. Unlike reclaimableBytes(), every pool-owned
+        // charge is therefore guaranteed to leave allocated memory first.
+        return static_cast<int64_t>(charged_bytes_);
     }
 
     void observeAllocatorPressureForTest(int64_t retries, int64_t free_bytes, int64_t total_bytes)
@@ -222,7 +299,9 @@ public:
                 pressure_recovery_complete_ ? 1 : 0,
                 static_cast<int64_t>(pressure_recovery_budget_bytes_),
                 static_cast<int64_t>(recoveryPendingEntries()),
-                pressure_recovery_in_progress_ ? 1 : 0};
+                pressure_recovery_in_progress_ ? 1 : 0,
+                arena_transition_started_ ? 1 : 0,
+                arena_transition_flush_complete_ ? 1 : 0};
     }
 
 private:
@@ -531,7 +610,10 @@ private:
                   << " pressure_recovery_in_progress=" << (pressure_recovery_in_progress_ ? 1 : 0)
                   << " pressure_recovery_complete=" << (pressure_recovery_complete_ ? 1 : 0)
                   << " pressure_recovery_budget_bytes=" << pressure_recovery_budget_bytes_
-                  << " pressure_recovery_pending_entries=" << recoveryPendingEntries() << std::endl;
+                  << " pressure_recovery_pending_entries=" << recoveryPendingEntries()
+                  << " arena_transition_started=" << (arena_transition_started_ ? 1 : 0)
+                  << " arena_transition_flush_complete="
+                  << (arena_transition_flush_complete_ ? 1 : 0) << std::endl;
     }
 
     static constexpr int64_t kIdlePressureEvictionThreshold = 3;
@@ -551,6 +633,8 @@ private:
     bool enabled_ = false;
     bool fixed_budget_override_ = false;
     bool adaptive_budget_initialized_ = false;
+    bool arena_transition_started_ = false;
+    bool arena_transition_flush_complete_ = false;
 };
 
 class AdmissionExclusionRollback {
@@ -731,7 +815,8 @@ public:
         logState("session_disable_pending_consensus");
     }
 
-    void ensureRankConsistent(ncclComm_t nccl_comm)
+    void ensureRankConsistent(ncclComm_t nccl_comm,
+                              const std::shared_ptr<GatherBufferPool>& gather_buffer_pool)
     {
         if (rank_consistency_checked_) { return; }
 
@@ -789,6 +874,40 @@ public:
             }
             return;
         }
+
+        // Admission is a session decision, so every rank must finish retiring
+        // the old gather pool before any rank allocates the shared arena. A
+        // rank with an outstanding old-pool lease makes this fused prefetch use
+        // the normal allocation path; the next fused prefetch retries after
+        // release. The collective keeps rank control flow aligned.
+        at::Tensor transition_ready;
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            transition_ready =
+                torch::tensor({gather_buffer_pool->prepareForArenaTransition() ? 1 : 0},
+                              at::TensorOptions().dtype(at::kLong))
+                    .to(at::TensorOptions().dtype(at::kLong).device(at::kCUDA));
+            const auto transition_result = ncclAllReduce(transition_ready.data_ptr(),
+                                                         transition_ready.data_ptr(),
+                                                         transition_ready.numel(),
+                                                         ncclInt64,
+                                                         ncclMin,
+                                                         nccl_comm,
+                                                         ag_stream_);
+            TORCH_CHECK(transition_result == ncclSuccess,
+                        "prefetch arena pool-transition reduction failed: ",
+                        ncclGetErrorString(transition_result));
+        }
+        at::cuda::stream_synchronize(ag_stream_);
+        if (transition_ready.cpu().item<int64_t>() == 0) {
+            enabled_ = false;
+            logState("pool_transition_pending");
+            return;
+        }
+        // Flush only after every rank has drained its pool. Otherwise an early
+        // rank could flush, fall back while another rank still owns a lease,
+        // then allocate unrelated cache before the eventual arena attempt.
+        gather_buffer_pool->flushForArenaTransition();
 
         std::vector<long> phase_ids;
         phase_ids.reserve(phases_.size());
@@ -1350,6 +1469,18 @@ std::vector<int64_t> get_z3_gather_buffer_pool_state_for_test()
     return get_gather_buffer_pool()->stateForTest();
 }
 
+int64_t get_z3_gather_buffer_pool_reclaimable_bytes()
+{
+    if (auto pool = weak_gather_buffer_pool.lock()) { return pool->reclaimableBytes(); }
+    return 0;
+}
+
+int64_t get_z3_gather_buffer_pool_transition_reclaimable_bytes()
+{
+    if (auto pool = weak_gather_buffer_pool.lock()) { return pool->transitionReclaimableBytes(); }
+    return 0;
+}
+
 void reset_z3_gather_buffer_pool()
 {
     if (auto pool = weak_gather_buffer_pool.lock()) { pool->reset(); }
@@ -1565,7 +1696,7 @@ public:
         // asynchronous per-rank compilation, so it must never enter this
         // collective.
         if (diagnosticEnvEnabled("DEEPSPEED_COMPILE_PREFETCH_ARENA") && !profile) {
-            prefetch_arena_->ensureRankConsistent(nccl_comm_);
+            prefetch_arena_->ensureRankConsistent(nccl_comm_, gather_buffer_pool_);
         }
 
         std::vector<std::tuple<long, std::optional<at::ScalarType>>> invalid_params;
