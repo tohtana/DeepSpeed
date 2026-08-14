@@ -45,6 +45,7 @@ void prefetch_params_fused_meta(long graph_id,
                                 long arena_plan_id);
 void configure_z3_prefetch_arena(long graph_id,
                                  long phase,
+                                 bool require_backward,
                                  int64_t capacity_bytes,
                                  int64_t max_live_bytes,
                                  int64_t digest,
@@ -52,6 +53,7 @@ void configure_z3_prefetch_arena(long graph_id,
                                  const std::vector<long>& ds_ids,
                                  const std::vector<int64_t>& offsets,
                                  const std::vector<int64_t>& request_bytes);
+void disable_z3_prefetch_arena(long graph_id, const std::string& reason);
 std::vector<int64_t> get_z3_prefetch_arena_state_for_test(long graph_id);
 // for profiling
 void invalidate_gathered_param(long ds_id);

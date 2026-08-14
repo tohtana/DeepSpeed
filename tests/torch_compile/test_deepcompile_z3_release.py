@@ -80,9 +80,18 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
                 "rank_plan_mismatches", "relocations", "stale_registry_releases")
         return dict(zip(keys, dc.get_z3_prefetch_arena_state_for_test(graph_id)))
 
-    def _configure_arena(self, dc, graph_id, plan_ids, ds_ids, offsets, request_bytes, capacity=512, phase=0):
-        dc.configure_z3_prefetch_arena(graph_id, phase, capacity, capacity, 12345 + phase, plan_ids, ds_ids, offsets,
-                                       request_bytes)
+    def _configure_arena(self,
+                         dc,
+                         graph_id,
+                         plan_ids,
+                         ds_ids,
+                         offsets,
+                         request_bytes,
+                         capacity=512,
+                         phase=0,
+                         require_backward=False):
+        dc.configure_z3_prefetch_arena(graph_id, phase, require_backward, capacity, capacity, 12345 + phase, plan_ids,
+                                       ds_ids, offsets, request_bytes)
 
     def _prefetch(self, shards, graph_id, ds_ids, plan_id, dtypes=None):
         torch.ops.dc.prefetch_params_fused.default(graph_id, shards, ds_ids, dtypes, plan_id)
@@ -193,6 +202,97 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert state["pointer_stable"] == 1
             assert forward_storage.data_ptr() == backward_storage.data_ptr()
             assert forward_storage.nbytes() == backward_storage.nbytes() == 512
+        finally:
+            dc.cleanup()
+
+    def test_training_prefetch_arena_waits_for_backward_phase_before_allocating(self):
+        graph_id, forward_id, backward_id = 9233, 9234, 9235
+        dc = self._init_dc()
+        try:
+            forward = self._register_param(dc, graph_id, forward_id, [3], register_graph=False)
+            backward = self._register_param(dc, graph_id, backward_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [forward_id, backward_id])
+            self._configure_arena(dc,
+                                  graph_id, [10], [forward_id], [0], [16],
+                                  capacity=512,
+                                  phase=0,
+                                  require_backward=True)
+
+            self._prefetch([forward], graph_id, [forward_id], 10)
+            forward_view, forward_storage = self._gather_view_and_storage(forward, graph_id, forward_id)
+            pending = self._arena_state(dc, graph_id)
+            assert pending["enabled"] == 0
+            assert pending["phases"] == 1
+            assert pending["backing_allocations"] == 0
+            assert pending["fallback_bytes"] == 0
+            self._release(forward_view, graph_id, forward_id, 1)
+
+            self._configure_arena(dc,
+                                  graph_id, [1_000_010], [backward_id], [0], [32],
+                                  capacity=256,
+                                  phase=1,
+                                  require_backward=True)
+            self._prefetch([backward], graph_id, [backward_id], 1_000_010)
+            backward_view, backward_storage = self._gather_view_and_storage(backward, graph_id, backward_id)
+            active = self._arena_state(dc, graph_id)
+            assert active["enabled"] == 1
+            assert active["phases"] == 2
+            assert active["backing_allocations"] == 1
+            assert forward_storage.data_ptr() != backward_storage.data_ptr()
+            self._release(backward_view, graph_id, backward_id, 1)
+        finally:
+            dc.cleanup()
+
+    def test_training_prefetch_arena_session_disable_prevents_forward_only_backing(self):
+        graph_id, ds_id = 9236, 9237
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, [5])
+            self._configure_arena(dc, graph_id, [10], [ds_id], [0], [32], capacity=512, phase=0, require_backward=True)
+            dc.disable_z3_prefetch_arena(graph_id, "shared_budget")
+            self._prefetch([shard], graph_id, [ds_id], 10)
+            gathered, _ = self._gather_view_and_storage(shard, graph_id, ds_id)
+            state = self._arena_state(dc, graph_id)
+            assert state["enabled"] == 0
+            assert state["backing_allocations"] == 0
+            assert state["fallback_bytes"] > 0
+            self._release(gathered, graph_id, ds_id, 1)
+        finally:
+            dc.cleanup()
+
+    def test_prefetch_arena_asymmetric_session_disable_reaches_terminal_consensus(self):
+        graph_id, first_id, second_id = 9238, 9239, 9240
+        dc = self._init_dc()
+        try:
+            first = self._register_param(dc, graph_id, first_id, [3], register_graph=False)
+            second = self._register_param(dc, graph_id, second_id, [5], register_graph=False)
+            dc.register_graph_z3(graph_id, [first_id, second_id])
+            self._configure_arena(dc, graph_id, [10, 11], [first_id, second_id], [0, 256], [16, 32])
+            rank = dist.get_rank()
+            if rank == 0:
+                dc.disable_z3_prefetch_arena(graph_id, "rank_local_budget")
+
+            self._prefetch([first], graph_id, [first_id], -1 if rank == 0 else 10)
+            first_view, first_storage = self._gather_view_and_storage(first, graph_id, first_id)
+            first_state = self._arena_state(dc, graph_id)
+            assert first_state["enabled"] == 0
+            assert first_state["backing_allocations"] == 0
+            assert first_state["rank_consistency_checks"] == 1
+            assert first_state["active_leases"] == 0
+            self._release(first_view, graph_id, first_id, 1)
+            assert first_storage.nbytes() == 0
+
+            # The globally disabled decision is terminal, so a later fused
+            # prefetch falls back without entering another session collective.
+            self._prefetch([second], graph_id, [second_id], -1 if rank == 0 else 11)
+            second_view, second_storage = self._gather_view_and_storage(second, graph_id, second_id)
+            self._release(second_view, graph_id, second_id, 1)
+            final_state = self._arena_state(dc, graph_id)
+            assert final_state["enabled"] == 0
+            assert final_state["backing_allocations"] == 0
+            assert final_state["rank_consistency_checks"] == 1
+            assert final_state["active_leases"] == 0
+            assert second_storage.nbytes() == 0
         finally:
             dc.cleanup()
 
@@ -332,7 +432,8 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         dc = self._init_dc()
         try:
             shard = self._register_param(dc, graph_id, ds_id, [5])
-            dc.configure_z3_prefetch_arena(graph_id, 0, 512, 512, 12345 + dist.get_rank(), [10], [ds_id], [0], [32])
+            dc.configure_z3_prefetch_arena(graph_id, 0, False, 512, 512, 12345 + dist.get_rank(), [10], [ds_id], [0],
+                                           [32])
 
             self._prefetch([shard], graph_id, [ds_id], 10)
             gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id)

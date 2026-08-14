@@ -36,6 +36,12 @@ class FakeAccelerator:
     def max_memory_allocated(self):
         return 0
 
+    def memory_reserved(self):
+        return 0
+
+    def max_memory_reserved(self):
+        return 0
+
     def reset_peak_memory_stats(self):
         return None
 
@@ -190,6 +196,42 @@ def test_memory_profiling_interpreter_disables_profiling_if_cleanup_fails(monkey
     with pytest.raises(RuntimeError, match="cleanup failed"):
         interpreter.run()
 
+    assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
+
+
+def test_memory_profiling_interpreter_records_allocator_reserved_peaks(monkeypatch):
+    fake_handle = FakeDeepCompileHandle()
+
+    class ReservedAccelerator(FakeAccelerator):
+
+        def memory_allocated(self):
+            return 10
+
+        def max_memory_allocated(self):
+            return 20
+
+        def memory_reserved(self):
+            return 100
+
+        def max_memory_reserved(self):
+            return 120
+
+    monkeypatch.setattr(graph_profile, "get_deepcompile_handle", lambda: fake_handle)
+    monkeypatch.setattr(graph_profile, "get_accelerator", lambda: ReservedAccelerator())
+    monkeypatch.setattr(graph_profile, "_all_real_if_tensor", lambda args: True)
+    monkeypatch.setattr(graph_profile, "_get_mem_usage_out_of_torch", lambda: 7)
+    monkeypatch.setattr(graph_profile.dist, "is_initialized", lambda: False)
+
+    gm = _make_empty_graph_module()
+    interpreter = graph_profile.MemoryProfilingInterpreter(gm)
+
+    assert interpreter.run() is None
+    output = next(node for node in gm.graph.nodes if node.op == "output")
+    assert output.meta["profile_mem_start"] == 17
+    assert output.meta["profile_mem_peak"] == 27
+    assert output.meta["profile_reserved_start"] == 107
+    assert output.meta["profile_reserved_current"] == 107
+    assert output.meta["profile_reserved_peak"] == 127
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
 
 

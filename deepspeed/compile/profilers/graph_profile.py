@@ -151,6 +151,13 @@ def _absolute_profile_memory(mem_usage_out_of_torch):
             int(get_accelerator().max_memory_allocated()) + int(mem_usage_out_of_torch))
 
 
+def _absolute_profile_reserved_memory(mem_usage_out_of_torch):
+    """Read allocator-reserved residency with external memory included once."""
+    accelerator = get_accelerator()
+    return (int(accelerator.memory_reserved() or 0) + int(mem_usage_out_of_torch),
+            int(accelerator.max_memory_reserved() or 0) + int(mem_usage_out_of_torch))
+
+
 def _rank_max_profile_memory(start_mem, peak_mem, device, distributed, process_group=None):
     """Return per-field worst-rank absolute memory without averaging rank asymmetry."""
     values = torch.tensor([int(start_mem), int(peak_mem)], device=device, dtype=torch.int64)
@@ -397,6 +404,7 @@ class MemoryProfilingInterpreter(Interpreter):
     def run_node(self, n: torch.fx.Node) -> Any:
         get_accelerator().reset_peak_memory_stats()
         profile_mem_start, _ = _absolute_profile_memory(self.mem_usage_out_of_torch)
+        profile_reserved_start, _ = _absolute_profile_reserved_memory(self.mem_usage_out_of_torch)
 
         if n.op in {"placeholder", "output"}:
             ret = super().run_node(n)
@@ -409,14 +417,20 @@ class MemoryProfilingInterpreter(Interpreter):
             del args, kwargs
 
         current_alloc, max_alloc = _absolute_profile_memory(self.mem_usage_out_of_torch)
-        absolute_record = torch.tensor([profile_mem_start, current_alloc, max_alloc],
+        current_reserved, max_reserved = _absolute_profile_reserved_memory(self.mem_usage_out_of_torch)
+        absolute_record = torch.tensor([profile_mem_start, current_alloc, max_alloc, profile_reserved_start,
+                                        current_reserved, max_reserved],
                                        device=self.device,
                                        dtype=torch.int64)
         if dist.is_initialized():
             dist.all_reduce(absolute_record, dist.ReduceOp.MAX, group=self.process_group)
-        profile_mem_start, current_alloc, max_alloc = (int(value.item()) for value in absolute_record)
+        (profile_mem_start, current_alloc, max_alloc, profile_reserved_start, current_reserved,
+         max_reserved) = (int(value.item()) for value in absolute_record)
         n.meta["profile_mem_start"] = profile_mem_start
         n.meta["profile_mem_peak"] = max_alloc
+        n.meta["profile_reserved_start"] = profile_reserved_start
+        n.meta["profile_reserved_current"] = current_reserved
+        n.meta["profile_reserved_peak"] = max_reserved
 
         self.mem_record.append((n.name, current_alloc, current_alloc - self.last_alloc, max_alloc))
 

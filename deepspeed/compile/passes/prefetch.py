@@ -246,19 +246,118 @@ def _add_prefetch_arena_release_dependencies(graph: Graph) -> None:
         pending_releases.clear()
 
 
-def _configure_prefetch_arena(graph: Graph, graph_id: int, param_manager: DSGraphParamManager, bwd: bool,
-                              process_group) -> None:
-    if not _env_enabled(PREFETCH_ARENA_ENV):
-        return
-    if not dist.is_initialized():
-        print_rank_0(f"prefetch_arena graph_id={graph_id} fallback=distributed_uninitialized")
-        return
+def _prefetch_arena_budget_admission(graph: Graph, plan: Dict, mem_dict: Dict[str, Tuple[int, int]],
+                                     reserved_mem_dict: Dict[str, int], max_mem: int):
+    """Check the fixed backing against the same profiled peaks as prefetch.
 
-    plan, reason = _build_prefetch_arena_plan(graph, param_manager, dist.get_world_size(group=process_group), bwd)
-    if plan is None:
-        print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if bwd else 'fwd'} fallback={reason}")
-        return
+    The existing scheduler charges each gathered tensor only while it is live.
+    A flat arena instead keeps its full aligned capacity from the first arena
+    prefetch through graph completion.  Admission therefore replaces the live
+    eligible-gather charge with the fixed capacity; it must not add capacity on
+    top of those same live bytes.
+    """
+    intervals = plan["intervals"]
+    previous_peak = 0
+    original_allocated_peak = 0
+    arena_allocated_peak = 0
+    original_reserved_peak = 0
+    arena_reserved_peak = 0
+    original_modeled_peak = 0
+    arena_modeled_peak = 0
+    limiting_node = None
+    limiting_metric = None
+    previous_reserved_peak = 0
 
+    for index, node in enumerate(graph.nodes):
+        if node.name in mem_dict:
+            previous_peak = int(mem_dict[node.name][1])
+        if node.name in reserved_mem_dict:
+            previous_reserved_peak = int(reserved_mem_dict[node.name])
+        live_gather_bytes = sum(
+            int(interval["bytes"]) for interval in intervals if interval["start"] <= index <= interval["end"])
+        # Keep the scheduler's existing conservative model: the profiled peak
+        # is treated as non-gather residency and scheduled gathers are charged
+        # separately according to the final prefetch lifetimes.
+        original_at_node = previous_peak + live_gather_bytes
+        # Native backing survives executor reuse and is shared by forward and
+        # backward, so after warmup it is resident for the complete graph, not
+        # merely between the first and last interval in this invocation.
+        arena_at_node = previous_peak + int(plan["capacity"])
+        original_allocated_peak = max(original_allocated_peak, original_at_node)
+        original_reserved_at_node = previous_reserved_peak
+        # Cached fragmentation and every unrelated reservation remain charged.
+        # Do not assume that fragmented cached blocks can satisfy the arena's
+        # single contiguous backing allocation.
+        arena_reserved_at_node = previous_reserved_peak + int(plan["capacity"])
+        original_reserved_peak = max(original_reserved_peak, original_reserved_at_node)
+        arena_reserved_peak = max(arena_reserved_peak, arena_reserved_at_node)
+        original_modeled_peak = max(original_modeled_peak, original_at_node, original_reserved_at_node)
+        arena_allocated_peak = max(arena_allocated_peak, arena_at_node)
+        effective_arena_peak = max(arena_at_node, arena_reserved_at_node)
+        if effective_arena_peak > arena_modeled_peak:
+            arena_modeled_peak = effective_arena_peak
+            limiting_node = node.name
+            limiting_metric = "reserved" if arena_reserved_at_node >= arena_at_node else "allocated"
+
+    return {
+        "accepted": arena_modeled_peak <= int(max_mem),
+        "max_mem": int(max_mem),
+        "capacity": int(plan["capacity"]),
+        "original_allocated_peak": original_allocated_peak,
+        "arena_allocated_peak": arena_allocated_peak,
+        "original_modeled_peak": original_modeled_peak,
+        "arena_modeled_peak": arena_modeled_peak,
+        "original_reserved_peak": original_reserved_peak,
+        "arena_reserved_peak": arena_reserved_peak,
+        "incremental_peak": arena_modeled_peak - original_modeled_peak,
+        "limiting_node": limiting_node,
+        "limiting_metric": limiting_metric,
+    }
+
+
+def _training_session_budget_admission(forward_graph: Graph, forward_plan: Dict, forward_mem_dict: Dict[str,
+                                                                                                        Tuple[int,
+                                                                                                              int]],
+                                       forward_reserved_mem_dict: Dict[str, int], backward_graph: Graph,
+                                       backward_plan: Dict, backward_mem_dict: Dict[str, Tuple[int, int]],
+                                       backward_reserved_mem_dict: Dict[str, int], max_mem: int):
+    """Admit the final shared backing against both actual phase plans.
+
+    The forward plan is metadata-only until AOTAutograd lazily invokes the
+    backward compiler.  At that point both interval packs and both original
+    memory profiles are known, so the shared capacity can be charged to each
+    phase without either a forward-only allocation or a pessimistic estimate.
+    """
+    capacity_bound = max(int(forward_plan["capacity"]), int(backward_plan["capacity"]))
+    bounded_forward_plan = dict(forward_plan, capacity=capacity_bound)
+    bounded_backward_plan = dict(backward_plan, capacity=capacity_bound)
+    forward = _prefetch_arena_budget_admission(forward_graph, bounded_forward_plan, forward_mem_dict,
+                                               forward_reserved_mem_dict, max_mem)
+    backward = _prefetch_arena_budget_admission(backward_graph, bounded_backward_plan, backward_mem_dict,
+                                                backward_reserved_mem_dict, max_mem)
+    return {
+        "accepted": forward["accepted"] and backward["accepted"],
+        "max_mem": int(max_mem),
+        "capacity_bound": capacity_bound,
+        "forward_arena_peak": int(forward["arena_modeled_peak"]),
+        "backward_arena_peak": int(backward["arena_modeled_peak"]),
+        "forward_original_peak": int(forward["original_modeled_peak"]),
+        "backward_original_peak": int(backward["original_modeled_peak"]),
+    }
+
+
+def _disable_prefetch_arena(graph: Graph) -> None:
+    """Restore the exact original fused-prefetch call shape before lowering."""
+    for node in graph.nodes:
+        if node.target != torch.ops.dc.prefetch_params_fused.default or len(node.args) < 5:
+            continue
+        node.args = tuple(node.args[:3])
+        node.meta.pop("prefetch_arena_eligible_ds_ids", None)
+        node.meta.pop("prefetch_arena_bytes_by_ds_id", None)
+        node.meta.pop("prefetch_arena_ordering_dependencies", None)
+
+
+def _configure_prefetch_arena(graph: Graph, graph_id: int, plan: Dict, require_backward: bool) -> None:
     entries = plan["entries"]
     # Configure the rank-local immutable plan here, but defer cross-rank
     # consensus until the first fused-prefetch execution.  Compilation can run
@@ -266,7 +365,7 @@ def _configure_prefetch_arena(graph: Graph, graph_id: int, param_manager: DSGrap
     # process-group collective in this pass can cross graph-compilation
     # lifetimes and deadlock.  The native executor verifies the complete plan
     # digest on its communication stream before admitting any arena slice.
-    get_deepcompile_handle().configure_z3_prefetch_arena(graph_id, plan["phase"], plan["capacity"],
+    get_deepcompile_handle().configure_z3_prefetch_arena(graph_id, plan["phase"], require_backward, plan["capacity"],
                                                          plan["max_live_bytes"], plan["digest"],
                                                          [entry["plan_id"]
                                                           for entry in entries], [entry["ds_id"] for entry in entries],
@@ -275,7 +374,8 @@ def _configure_prefetch_arena(graph: Graph, graph_id: int, param_manager: DSGrap
     ordering_dependencies = sum(
         len(node.meta.get("prefetch_arena_ordering_dependencies", ())) for node in graph.nodes
         if node.target == torch.ops.dc.prefetch_params_fused.default)
-    print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if bwd else 'fwd'} capacity={plan['capacity']} "
+    print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if plan['phase'] else 'fwd'} "
+                 f"capacity={plan['capacity']} "
                  f"max_live_bytes={plan['max_live_bytes']} internal_fragmentation={plan['internal_fragmentation']} "
                  f"entries={len(entries)} ordering_dependencies={ordering_dependencies} digest={plan['digest']}")
 
@@ -295,6 +395,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                       bwd: bool) -> GraphModule:
 
     profile = profiling_results[graph_id]
+    require_backward = bool(profile.needs_backward)
     process_group = getattr(profile, "process_group", None)
     profile_graph = profile.bwd_graph if bwd else profile.fwd_graph
     mem_complete = profile.bwd_mem_complete if bwd else profile.fwd_mem_complete
@@ -312,6 +413,10 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     tensor_sizes = profiling_results[graph_id].bwd_tensor_sizes if bwd else profiling_results[graph_id].fwd_tensor_sizes
 
     mem_dict = {name: (alloc_mem, peak) for name, alloc_mem, delta, peak in mem}
+    reserved_mem_dict = {
+        node.name: int(node.meta["profile_reserved_peak"])
+        for node in profile_graph.nodes if "profile_reserved_peak" in node.meta
+    }
     time_dict = {name: (device_time, wall_time) for name, device_time, wall_time in op_time}
     tensor_size_dict = {name: size for name, size in tensor_sizes}
 
@@ -455,12 +560,99 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
             else:
                 new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
                                         args=(graph_id, param_nodes_copy, ds_ids))
+    arena_plan = None
     if arena_enabled:
-        _add_prefetch_arena_release_dependencies(new_graph)
+        if not dist.is_initialized():
+            arena_reason = "distributed_uninitialized"
+        else:
+            arena_plan, arena_reason = _build_prefetch_arena_plan(new_graph, graph_param_manager,
+                                                                  dist.get_world_size(group=process_group), bwd)
+        if arena_plan is not None:
+            if len(reserved_mem_dict) != len(list(profile_graph.nodes)):
+                arena_plan = None
+                arena_reason = "incomplete_reserved_profile"
+            else:
+                admission = _prefetch_arena_budget_admission(new_graph, arena_plan, mem_dict, reserved_mem_dict,
+                                                             max_mem)
+        if arena_plan is not None:
+            print_rank_0(f"prefetch_arena_admission graph_id={graph_id} "
+                         f"phase={'bwd' if bwd else 'fwd'} accepted={int(admission['accepted'])} "
+                         f"max_mem={admission['max_mem']} capacity={admission['capacity']} "
+                         f"original_allocated_peak={admission['original_allocated_peak']} "
+                         f"arena_allocated_peak={admission['arena_allocated_peak']} "
+                         f"original_modeled_peak={admission['original_modeled_peak']} "
+                         f"arena_modeled_peak={admission['arena_modeled_peak']} "
+                         f"original_reserved_peak={admission['original_reserved_peak']} "
+                         f"arena_reserved_peak={admission['arena_reserved_peak']} "
+                         f"incremental_peak={admission['incremental_peak']} "
+                         f"limiting_node={admission['limiting_node']} "
+                         f"limiting_metric={admission['limiting_metric']}")
+            if not admission["accepted"]:
+                if require_backward and not bwd:
+                    profile.prefetch_arena_session_accepted = False
+                    profile.prefetch_arena_session_reason = "shared_budget"
+                arena_plan = None
+                arena_reason = "shared_budget"
+        if arena_plan is not None and require_backward:
+            if not bwd:
+                # The optimized backward does not exist yet.  Keep the final
+                # forward plan as native metadata, but native execution will
+                # deliberately use the normal gather pool until the backward
+                # compiler registers its plan and decides the shared budget.
+                profile.prefetch_arena_forward_graph = new_graph
+                profile.prefetch_arena_forward_plan = arena_plan
+                profile.prefetch_arena_forward_mem = dict(mem_dict)
+                profile.prefetch_arena_forward_reserved_mem = dict(reserved_mem_dict)
+                profile.prefetch_arena_session_accepted = None
+                profile.prefetch_arena_session_capacity_bound = 0
+                profile.prefetch_arena_session_reason = None
+                print_rank_0(f"prefetch_arena_session_pending graph_id={graph_id} "
+                             f"forward_capacity={arena_plan['capacity']}")
+            elif profile.prefetch_arena_session_accepted is False:
+                arena_plan = None
+                arena_reason = profile.prefetch_arena_session_reason or "session_not_admitted"
+            elif (profile.prefetch_arena_forward_graph is None or profile.prefetch_arena_forward_plan is None
+                  or profile.prefetch_arena_forward_mem is None
+                  or profile.prefetch_arena_forward_reserved_mem is None):
+                arena_plan = None
+                arena_reason = "incomplete_forward_arena_profile"
+            else:
+                session_admission = _training_session_budget_admission(profile.prefetch_arena_forward_graph,
+                                                                       profile.prefetch_arena_forward_plan,
+                                                                       profile.prefetch_arena_forward_mem,
+                                                                       profile.prefetch_arena_forward_reserved_mem,
+                                                                       new_graph, arena_plan, mem_dict,
+                                                                       reserved_mem_dict, max_mem)
+                profile.prefetch_arena_session_accepted = bool(session_admission["accepted"])
+                profile.prefetch_arena_session_capacity_bound = int(session_admission["capacity_bound"])
+                profile.prefetch_arena_session_reason = (None if session_admission["accepted"] else "shared_budget")
+                print_rank_0(f"prefetch_arena_session_admission graph_id={graph_id} "
+                             f"accepted={int(session_admission['accepted'])} "
+                             f"max_mem={session_admission['max_mem']} "
+                             f"capacity_bound={session_admission['capacity_bound']} "
+                             f"forward_original_peak={session_admission['forward_original_peak']} "
+                             f"forward_arena_peak={session_admission['forward_arena_peak']} "
+                             f"backward_original_peak={session_admission['backward_original_peak']} "
+                             f"backward_arena_peak={session_admission['backward_arena_peak']}")
+                if not session_admission["accepted"]:
+                    arena_plan = None
+                    arena_reason = "shared_budget"
+        if arena_plan is None:
+            print_rank_0(f"prefetch_arena graph_id={graph_id} phase={'bwd' if bwd else 'fwd'} "
+                         f"fallback={arena_reason}")
+            _disable_prefetch_arena(new_graph)
+            # Forward may already have registered a pending training-session
+            # plan.  A later backward rejection must invalidate that native
+            # metadata as one session decision, not leave a forward-only arena
+            # available on a subsequent compile/execution.
+            if bwd and require_backward:
+                get_deepcompile_handle().disable_z3_prefetch_arena(graph_id, arena_reason)
+        else:
+            _add_prefetch_arena_release_dependencies(new_graph)
     new_graph.lint()
     gm.graph = new_graph
 
-    if arena_enabled:
-        _configure_prefetch_arena(new_graph, graph_id, graph_param_manager, bwd, process_group)
+    if arena_plan is not None:
+        _configure_prefetch_arena(new_graph, graph_id, arena_plan, require_backward)
 
     return gm

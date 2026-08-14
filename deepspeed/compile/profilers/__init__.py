@@ -26,3 +26,14 @@ class ProfilingResult:
     # Keep newly added fields at the end so positional construction of the
     # long-standing profiling fields remains backward compatible.
     process_group: Any = None
+    # AOTAutograd invokes the optimized forward before it has compiled the
+    # optimized backward.  Retain the accepted forward plan and its original
+    # memory profile so the backward compiler can make one session-wide
+    # admission decision before the native shared backing is allocated.
+    prefetch_arena_forward_graph: Any = None
+    prefetch_arena_forward_plan: Any = None
+    prefetch_arena_forward_mem: Any = None
+    prefetch_arena_forward_reserved_mem: Any = None
+    prefetch_arena_session_accepted: Any = None
+    prefetch_arena_session_capacity_bound: int = 0
+    prefetch_arena_session_reason: Any = None

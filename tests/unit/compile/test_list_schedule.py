@@ -392,6 +392,85 @@ def test_prefetch_arena_plan_falls_back_on_dynamic_shape():
     assert reason == "dynamic_shape"
 
 
+def test_prefetch_arena_budget_admission_replaces_live_gather_charge_with_fixed_capacity():
+    graph = Graph()
+    param = graph.placeholder("param")
+    _arena_prefetch(graph, [param], [1], 10, [12])
+    release = _release(graph, param, 1, "arena_param")
+    graph.output((release, ))
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    plan, reason = prefetch_mod._build_prefetch_arena_plan(graph, manager, world_size=2, bwd=False)
+    assert reason is None
+    mem_dict = {node.name: (500, 500) for node in graph.nodes}
+
+    reserved_mem_dict = {node.name: 500 for node in graph.nodes}
+    rejected = prefetch_mod._prefetch_arena_budget_admission(graph, plan, mem_dict, reserved_mem_dict, max_mem=700)
+    accepted = prefetch_mod._prefetch_arena_budget_admission(graph, plan, mem_dict, reserved_mem_dict, max_mem=800)
+
+    assert rejected == {
+        "accepted": False,
+        "max_mem": 700,
+        "capacity": 256,
+        "original_allocated_peak": 512,
+        "arena_allocated_peak": 756,
+        "original_modeled_peak": 512,
+        "arena_modeled_peak": 756,
+        "original_reserved_peak": 500,
+        "arena_reserved_peak": 756,
+        "incremental_peak": 244,
+        "limiting_node": "param",
+        "limiting_metric": "reserved",
+    }
+    assert accepted["accepted"] is True
+    # Capacity replaces the already-counted 12 live bytes rather than being
+    # added on top of them a second time.
+    assert accepted["incremental_peak"] == plan["capacity"] - 12
+
+
+def test_training_session_budget_uses_shared_forward_backward_capacity_bound():
+    fwd = Graph()
+    fwd_param = _placeholder(fwd, "fwd_param")
+    _arena_prefetch(fwd, [fwd_param], [1], 10, [12])
+    fwd_release = _release(fwd, fwd_param, 1, "fwd_param")
+    fwd.output((fwd_release, ))
+    manager = _fake_arena_param_manager([("fwd_param", 1, (5, ), torch.float16)])
+    fwd_plan, reason = prefetch_mod._build_prefetch_arena_plan(fwd, manager, world_size=2, bwd=False)
+    assert reason is None
+
+    bwd = Graph()
+    bwd_param = _placeholder(bwd, "bwd_param")
+    _arena_prefetch(bwd, [bwd_param], [1], 1_000_010, [300])
+    bwd_release = _release(bwd, bwd_param, 1, "bwd_param")
+    bwd.output((bwd_release, ))
+    bwd_manager = _fake_arena_param_manager([("bwd_param", 1, (150, ), torch.float16)])
+    bwd_plan, reason = prefetch_mod._build_prefetch_arena_plan(bwd, bwd_manager, world_size=2, bwd=True)
+    assert reason is None
+    fwd_mem = {node.name: (100, 100) for node in fwd.nodes}
+    fwd_reserved = {node.name: 100 for node in fwd.nodes}
+    bwd_mem = {node.name: (100, 100) for node in bwd.nodes}
+    bwd_reserved = {node.name: 100 for node in bwd.nodes}
+
+    admission = prefetch_mod._training_session_budget_admission(fwd,
+                                                                fwd_plan,
+                                                                fwd_mem,
+                                                                fwd_reserved,
+                                                                bwd,
+                                                                bwd_plan,
+                                                                bwd_mem,
+                                                                bwd_reserved,
+                                                                max_mem=700)
+
+    assert admission == {
+        "accepted": True,
+        "max_mem": 700,
+        "capacity_bound": 512,
+        "forward_arena_peak": 612,
+        "backward_arena_peak": 612,
+        "forward_original_peak": 112,
+        "backward_original_peak": 400,
+    }
+
+
 @pytest.mark.parametrize("arena_enabled", [False, True])
 def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypatch, arena_enabled):
     graph = Graph()
@@ -412,6 +491,8 @@ def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypat
                               fwd_time=times,
                               fwd_tensor_sizes=sizes,
                               process_group="test-group")
+    for node in graph.nodes:
+        node.meta["profile_reserved_peak"] = 0
     manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
     configured = []
     reductions = []
@@ -465,12 +546,312 @@ def test_schedule_prefetch_configures_env_gated_arena_from_final_graph(monkeypat
         assert prefetch_nodes[0].args[4] == 0
         assert prefetch_nodes[0].meta["prefetch_arena_eligible_ds_ids"] == (1, )
         assert len(configured) == 1
-        assert configured[0][:4] == (0, 0, 256, 256)
-        assert configured[0][4] > 0
-        assert configured[0][5:] == ([0], [1], [0], [12])
+        assert configured[0][:5] == (0, 0, False, 256, 256)
+        assert configured[0][5] > 0
+        assert configured[0][6:] == ([0], [1], [0], [12])
     else:
         assert len(prefetch_nodes[0].args) == 3
         assert configured == []
+
+
+def test_schedule_prefetch_shared_budget_rejection_restores_original_call_shape(monkeypatch):
+    graph = Graph()
+    param = _placeholder(graph, "param")
+    ag = _allgather(graph, param, 1, "arena", tensor_size=12)
+    ag.meta["allgather_allocation_bytes"] = 12
+    wait = _wait(graph, ag, 1, "arena")
+    use = _neg(graph, wait, "arena_use")
+    release = _release(graph, use, 1, "arena")
+    graph.output((release, ))
+    graph.lint()
+
+    # 90% of 1 MiB is 943,718 bytes. The fixed 256-byte backing takes the
+    # modeled peak above that common budget even though the original 12-byte
+    # live gather remains admissible.
+    records = [(node.name, 943_500, 0, 943_500) for node in graph.nodes]
+    times = [(node.name, 1, 1) for node in graph.nodes]
+    sizes = [(node.name, int(node.meta.get("tensor_size", 0))) for node in graph.nodes]
+    profile = ProfilingResult(fwd_graph=graph,
+                              fwd_mem=records,
+                              fwd_time=times,
+                              fwd_tensor_sizes=sizes,
+                              process_group="test-group")
+    for node in graph.nodes:
+        node.meta["profile_reserved_peak"] = 943_500
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    configured = []
+    logs = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1 << 20
+
+        def available_memory(self):
+            return 1 << 20
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
+    monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(prefetch_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(prefetch_mod, "get_deepcompile_handle",
+                        lambda: SimpleNamespace(configure_z3_prefetch_arena=lambda *args: configured.append(args)))
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    result = prefetch_mod.schedule_prefetch(gm,
+                                            graph_id=0,
+                                            graph_order=[(0, False)],
+                                            profiling_results={0: profile},
+                                            create_inputs_fn=lambda: (),
+                                            mem_budget=0,
+                                            param_manager={0: manager},
+                                            bwd=False)
+
+    prefetch_nodes = [node for node in result.graph.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    assert len(prefetch_nodes) == 1
+    assert len(prefetch_nodes[0].args) == 3
+    assert "prefetch_arena_eligible_ds_ids" not in prefetch_nodes[0].meta
+    assert configured == []
+    assert any("accepted=0" in message for message in logs)
+    assert any("fallback=shared_budget" in message for message in logs)
+
+
+def test_schedule_prefetch_training_forward_registers_pending_session_plan(monkeypatch):
+    graph = Graph()
+    param = _placeholder(graph, "param")
+    ag = _allgather(graph, param, 1, "arena", tensor_size=12)
+    ag.meta["allgather_allocation_bytes"] = 12
+    wait = _wait(graph, ag, 1, "arena")
+    use = _neg(graph, wait, "arena_use")
+    release = _release(graph, use, 1, "arena")
+    graph.output((release, ))
+    records = [(node.name, 0, 0, 0) for node in graph.nodes]
+    profile = ProfilingResult(fwd_graph=graph,
+                              fwd_mem=records,
+                              fwd_time=[(node.name, 1, 1) for node in graph.nodes],
+                              fwd_tensor_sizes=[(node.name, int(node.meta.get("tensor_size", 0)))
+                                                for node in graph.nodes],
+                              needs_backward=True,
+                              process_group="test-group")
+    for node in graph.nodes:
+        node.meta["profile_reserved_peak"] = 0
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    configured = []
+    logs = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1 << 20
+
+        def available_memory(self):
+            return 1 << 20
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
+    monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(prefetch_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        prefetch_mod, "get_deepcompile_handle",
+        lambda: SimpleNamespace(configure_z3_prefetch_arena=lambda *args: configured.append(args),
+                                disable_z3_prefetch_arena=lambda *args: None))
+
+    result = prefetch_mod.schedule_prefetch(GraphModule(torch.nn.Module(), graph),
+                                            graph_id=0,
+                                            graph_order=[(0, True)],
+                                            profiling_results={0: profile},
+                                            create_inputs_fn=lambda: (),
+                                            mem_budget=0,
+                                            param_manager={0: manager},
+                                            bwd=False)
+
+    prefetch_nodes = [node for node in result.graph.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    assert len(prefetch_nodes) == 1
+    assert prefetch_nodes[0].args[4] == 0
+    assert len(configured) == 1
+    assert configured[0][:5] == (0, 0, True, 256, 256)
+    assert profile.prefetch_arena_forward_plan is not None
+    assert profile.prefetch_arena_session_accepted is None
+    assert any("prefetch_arena_session_pending" in message for message in logs)
+
+
+def test_schedule_prefetch_training_backward_decides_pending_session(monkeypatch):
+    fwd = Graph()
+    fwd_param = _placeholder(fwd, "fwd_param")
+    _arena_prefetch(fwd, [fwd_param], [1], 0, [12])
+    fwd_release = _release(fwd, fwd_param, 1, "fwd_param")
+    fwd.output((fwd_release, ))
+    fwd_plan, reason = prefetch_mod._build_prefetch_arena_plan(fwd,
+                                                               _fake_arena_param_manager([("fwd_param", 1, (5, ),
+                                                                                           torch.float16)]),
+                                                               world_size=2,
+                                                               bwd=False)
+    assert reason is None
+
+    bwd = Graph()
+    bwd_param = _placeholder(bwd, "bwd_param")
+    bwd_ag = _allgather(bwd, bwd_param, 1, "bwd_param", tensor_size=12)
+    bwd_ag.meta["allgather_allocation_bytes"] = 12
+    bwd_wait = _wait(bwd, bwd_ag, 1, "bwd_param")
+    bwd_release = _release(bwd, bwd_wait, 1, "bwd_param")
+    bwd.output((bwd_release, ))
+    records = [(node.name, 0, 0, 0) for node in bwd.nodes]
+    profile = ProfilingResult(bwd_graph=bwd,
+                              bwd_mem=records,
+                              bwd_time=[(node.name, 1, 1) for node in bwd.nodes],
+                              bwd_tensor_sizes=[(node.name, int(node.meta.get("tensor_size", 0)))
+                                                for node in bwd.nodes],
+                              needs_backward=True,
+                              process_group="test-group",
+                              prefetch_arena_forward_graph=fwd,
+                              prefetch_arena_forward_plan=fwd_plan,
+                              prefetch_arena_forward_mem={node.name: (0, 0)
+                                                          for node in fwd.nodes},
+                              prefetch_arena_forward_reserved_mem={node.name: 0
+                                                                   for node in fwd.nodes})
+    for node in bwd.nodes:
+        node.meta["profile_reserved_peak"] = 0
+    manager = _fake_arena_param_manager([("bwd_param", 1, (5, ), torch.float16)])
+    configured = []
+    logs = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1 << 20
+
+        def available_memory(self):
+            return 1 << 20
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
+    monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(prefetch_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        prefetch_mod, "get_deepcompile_handle",
+        lambda: SimpleNamespace(configure_z3_prefetch_arena=lambda *args: configured.append(args),
+                                disable_z3_prefetch_arena=lambda *args: None))
+
+    result = prefetch_mod.schedule_prefetch(GraphModule(torch.nn.Module(), bwd),
+                                            graph_id=0,
+                                            graph_order=[(0, True)],
+                                            profiling_results={0: profile},
+                                            create_inputs_fn=lambda: (),
+                                            mem_budget=0,
+                                            param_manager={0: manager},
+                                            bwd=True)
+
+    prefetch_nodes = [node for node in result.graph.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    assert len(prefetch_nodes) == 1
+    assert prefetch_nodes[0].args[4] == 1_000_000
+    assert len(configured) == 1
+    assert configured[0][:5] == (0, 1, True, 256, 256)
+    assert profile.prefetch_arena_session_accepted is True
+    assert profile.prefetch_arena_session_capacity_bound == 256
+    assert any("prefetch_arena_session_admission" in message and "accepted=1" in message for message in logs)
+
+
+def test_schedule_prefetch_missing_reserved_profile_restores_original_call_shape(monkeypatch):
+    graph = Graph()
+    param = _placeholder(graph, "param")
+    ag = _allgather(graph, param, 1, "arena", tensor_size=12)
+    ag.meta["allgather_allocation_bytes"] = 12
+    wait = _wait(graph, ag, 1, "arena")
+    use = _neg(graph, wait, "arena_use")
+    release = _release(graph, use, 1, "arena")
+    graph.output((release, ))
+    graph.lint()
+
+    records = [(node.name, 0, 0, 0) for node in graph.nodes]
+    times = [(node.name, 1, 1) for node in graph.nodes]
+    sizes = [(node.name, int(node.meta.get("tensor_size", 0))) for node in graph.nodes]
+    profile = ProfilingResult(fwd_graph=graph,
+                              fwd_mem=records,
+                              fwd_time=times,
+                              fwd_tensor_sizes=sizes,
+                              process_group="test-group")
+    manager = _fake_arena_param_manager([("param", 1, (5, ), torch.float16)])
+    configured = []
+    logs = []
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1 << 20
+
+        def available_memory(self):
+            return 1 << 20
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    monkeypatch.setenv(prefetch_mod.PREFETCH_ARENA_ENV, "1")
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", logs.append)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _: 1)
+    monkeypatch.setattr(prefetch_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(prefetch_mod.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(prefetch_mod, "get_deepcompile_handle",
+                        lambda: SimpleNamespace(configure_z3_prefetch_arena=lambda *args: configured.append(args)))
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    result = prefetch_mod.schedule_prefetch(gm,
+                                            graph_id=0,
+                                            graph_order=[(0, False)],
+                                            profiling_results={0: profile},
+                                            create_inputs_fn=lambda: (),
+                                            mem_budget=0,
+                                            param_manager={0: manager},
+                                            bwd=False)
+
+    prefetch_nodes = [node for node in result.graph.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    assert len(prefetch_nodes) == 1
+    assert len(prefetch_nodes[0].args) == 3
+    assert configured == []
+    assert any("fallback=incomplete_reserved_profile" in message for message in logs)
 
 
 def _scheduled_graph(graph, scheduler_budget=None):

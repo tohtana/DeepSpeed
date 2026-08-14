@@ -117,6 +117,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("configure_z3_prefetch_arena",
           &dc::configure_z3_prefetch_arena,
           "Configure a fixed ZeRO-3 prefetch arena plan");
+    m.def("disable_z3_prefetch_arena",
+          &dc::disable_z3_prefetch_arena,
+          "Disable every phase of a ZeRO-3 prefetch arena session");
     m.def("get_z3_prefetch_arena_state_for_test",
           &dc::get_z3_prefetch_arena_state_for_test,
           "Inspect ZeRO-3 prefetch arena accounting for tests");

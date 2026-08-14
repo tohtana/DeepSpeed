@@ -632,6 +632,7 @@ public:
     }
 
     void configure(long phase,
+                   bool require_backward,
                    int64_t capacity_bytes,
                    int64_t max_live_bytes,
                    int64_t digest,
@@ -646,6 +647,13 @@ public:
         TORCH_CHECK(plan_ids.size() == ds_ids.size() && plan_ids.size() == offsets.size() &&
                         plan_ids.size() == request_bytes.size(),
                     "prefetch arena plan vectors must have equal length");
+
+        require_backward_ = require_backward_ || require_backward;
+        session_pending_logged_ = false;
+        if (session_disabled_) {
+            logState("configure_ignored_session_disabled");
+            return;
+        }
 
         auto existing = phases_.find(phase);
         if (existing != phases_.end()) {
@@ -697,9 +705,90 @@ public:
         logState("plan_configured");
     }
 
+    void disableSession(const std::string& reason)
+    {
+        TORCH_CHECK(active_leases_.empty(),
+                    "prefetch arena session disable attempted with active leases graph_id=",
+                    graph_id_,
+                    " active_leases=",
+                    active_leases_.size());
+        if (rank_consistency_checked_) {
+            TORCH_CHECK(
+                session_disabled_,
+                "prefetch arena session disable attempted after terminal rank consensus graph_id=",
+                graph_id_);
+            logState("session_disable_idempotent");
+            return;
+        }
+        session_disabled_ = true;
+        enabled_ = false;
+        // This is only a rank-local compiler decision until the next fused
+        // prefetch. Peers must observe it before any rank can safely return or
+        // enter the full plan collectives.
+        rank_consistency_checked_ = false;
+        for (auto& [_, phase] : phases_) { phase.disabled = true; }
+        noteFallback("session_" + reason, 0);
+        logState("session_disable_pending_consensus");
+    }
+
     void ensureRankConsistent(ncclComm_t nccl_comm)
     {
         if (rank_consistency_checked_) { return; }
+
+        // AOTAutograd compiles and executes forward before it lazily compiles
+        // backward.  A training arena must therefore wait for both phase plans
+        // before allocating its shared backing.  Otherwise a later backward
+        // budget rejection leaves a forward-only arena resident for the rest
+        // of the compile session.
+        constexpr int64_t kSessionDisabled = 0;
+        constexpr int64_t kTrainingPending = 1;
+        constexpr int64_t kSessionReady = 2;
+        int64_t local_session_state = kSessionReady;
+        if (session_disabled_) {
+            local_session_state = kSessionDisabled;
+        } else if (require_backward_ && (phases_.count(0) == 0 || phases_.count(1) == 0)) {
+            local_session_state = kTrainingPending;
+        }
+
+        at::Tensor session_state;
+        {
+            at::cuda::CUDAStreamGuard guard(ag_stream_);
+            session_state =
+                torch::tensor({local_session_state}, at::TensorOptions().dtype(at::kLong))
+                    .to(at::TensorOptions().dtype(at::kLong).device(at::kCUDA));
+            const auto session_result = ncclAllReduce(session_state.data_ptr(),
+                                                      session_state.data_ptr(),
+                                                      session_state.numel(),
+                                                      ncclInt64,
+                                                      ncclMin,
+                                                      nccl_comm,
+                                                      ag_stream_);
+            TORCH_CHECK(session_result == ncclSuccess,
+                        "prefetch arena session-state reduction failed: ",
+                        ncclGetErrorString(session_result));
+        }
+        at::cuda::stream_synchronize(ag_stream_);
+        rank_consistency_checks_++;
+
+        const int64_t global_session_state = session_state.cpu().item<int64_t>();
+        if (global_session_state == kSessionDisabled) {
+            const bool disabled_locally = session_disabled_;
+            session_disabled_ = true;
+            enabled_ = false;
+            rank_consistency_checked_ = true;
+            for (auto& [_, phase] : phases_) { phase.disabled = true; }
+            if (!disabled_locally) { noteFallback("session_peer_disabled", 0); }
+            logState("session_disabled_globally");
+            return;
+        }
+        if (global_session_state == kTrainingPending) {
+            enabled_ = false;
+            if (!session_pending_logged_) {
+                logState("session_pending_backward");
+                session_pending_logged_ = true;
+            }
+            return;
+        }
 
         std::vector<long> phase_ids;
         phase_ids.reserve(phases_.size());
@@ -764,7 +853,6 @@ public:
         }
         at::cuda::stream_synchronize(ag_stream_);
 
-        rank_consistency_checks_++;
         rank_consistency_checked_ = true;
         if (!minimum.cpu().equal(maximum.cpu())) {
             enabled_ = false;
@@ -813,6 +901,14 @@ public:
         const int64_t requested_bytes = numel * c10::elementSize(dtype);
         request_bytes_ += requested_bytes;
         if (!enabled_) {
+            // The first optimized forward necessarily executes before
+            // AOTAutograd has compiled the backward plan.  Using the normal
+            // gather pool during this metadata-only pending interval is the
+            // designed warmup path, not a failed arena admission.
+            if (require_backward_ && !session_disabled_ &&
+                (phases_.count(0) == 0 || phases_.count(1) == 0)) {
+                return at::Tensor();
+            }
             noteFallback("not_configured", requested_bytes);
             return at::Tensor();
         }
@@ -1187,6 +1283,9 @@ private:
     int rank_;
     at::cuda::CUDAStream ag_stream_;
     bool enabled_ = false;
+    bool require_backward_ = false;
+    bool session_disabled_ = false;
+    bool session_pending_logged_ = false;
     std::unordered_map<long, Phase> phases_;
     at::Tensor shared_backing_;
     int64_t shared_capacity_bytes_ = 0;
@@ -1305,6 +1404,7 @@ public:
     void prepareForReset() override { prefetch_arena_->prepareForReset(); }
 
     void configurePrefetchArena(long phase,
+                                bool require_backward,
                                 int64_t capacity_bytes,
                                 int64_t max_live_bytes,
                                 int64_t digest,
@@ -1314,6 +1414,7 @@ public:
                                 const std::vector<int64_t>& request_bytes)
     {
         prefetch_arena_->configure(phase,
+                                   require_backward,
                                    capacity_bytes,
                                    max_live_bytes,
                                    digest,
@@ -1321,6 +1422,11 @@ public:
                                    ds_ids,
                                    offsets,
                                    request_bytes);
+    }
+
+    void disablePrefetchArena(const std::string& reason)
+    {
+        prefetch_arena_->disableSession(reason);
     }
 
     std::vector<int64_t> getPrefetchArenaStateForTest() const
@@ -1947,6 +2053,7 @@ void prefetch_params_fused_meta(long graph_id,
 
 void configure_z3_prefetch_arena(long graph_id,
                                  long phase,
+                                 bool require_backward,
                                  int64_t capacity_bytes,
                                  int64_t max_live_bytes,
                                  int64_t digest,
@@ -1956,8 +2063,21 @@ void configure_z3_prefetch_arena(long graph_id,
                                  const std::vector<int64_t>& request_bytes)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
-    executor->configurePrefetchArena(
-        phase, capacity_bytes, max_live_bytes, digest, plan_ids, ds_ids, offsets, request_bytes);
+    executor->configurePrefetchArena(phase,
+                                     require_backward,
+                                     capacity_bytes,
+                                     max_live_bytes,
+                                     digest,
+                                     plan_ids,
+                                     ds_ids,
+                                     offsets,
+                                     request_bytes);
+}
+
+void disable_z3_prefetch_arena(long graph_id, const std::string& reason)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    executor->disablePrefetchArena(reason);
 }
 
 std::vector<int64_t> get_z3_prefetch_arena_state_for_test(long graph_id)
