@@ -850,10 +850,11 @@ class LinearLayer(TensorParallel_Layer):
                 # The gather changes the activation's width, so downstream ops (e.g. a depthwise
                 # conv sized for the full width) only trace correctly if it happens inline. The
                 # custom op is graph-capturable, unlike GatherFromTensorParallelRegion, which
-                # reads gathered shard sizes back into Python.
-                output = torch.ops.autotp.gather_from_tp_region(output)
+                # reads gathered shard sizes back into Python. Pass the frozen shard widths so the
+                # compiled custom op supports uneven TP partitions too.
+                output = torch.ops.autotp.gather_from_tp_region(output, self._partition_sizes)
             else:
-                output = GatherFromTensorParallelRegion.apply(self.mp_group, output)
+                output = GatherFromTensorParallelRegion.apply(self.mp_group, output, self._partition_sizes)
 
         return output
 
