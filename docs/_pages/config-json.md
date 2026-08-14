@@ -2179,11 +2179,31 @@ DeepSpeed provides compiler-based optimization passes through the `compile` conf
 }
 ```
 
+### AutoTP options
+
+The `autotp` pass emits AutoTP's tensor-parallel collectives into the compiled graph instead of
+running them from inside the injected `LinearLayer` / `LinearAllreduce` modules. The model is
+partitioned by the regular AutoTP path, so `tensor_parallel.autotp_size` must be greater than 1
+and the pass reuses the same tensor-parallel group.
+
+```json
+{
+    "zero_optimization": {"stage": 0},
+    "tensor_parallel": {"autotp_size": 4},
+    "compile": {
+        "deepcompile": true,
+        "passes": ["autotp"],
+    }
+}
+```
+
 <i>**passes**</i>: [array of strings]
 
-| Description                                                              | Default |
-| ------------------------------------------------------------------------ | ------- |
-| List of compiler passes to apply. Currently supported: `["autosp"]`.     | `[]`    |
+| Description                                                                       | Default |
+| ----------------------------------------------------------------------------------- | ------- |
+| List of compiler passes to apply. Currently supported: `["autosp", "autotp"]`.    | `[]`    |
+
+
 
 ### Data Type options
 
