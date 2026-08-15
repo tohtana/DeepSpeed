@@ -5638,7 +5638,12 @@ class DeepSpeedEngine(Module):
                     assert callable(p) or p in opt_passes, f"Unknown pass {p}"
                 return [p if callable(p) else opt_passes[p] for p in passes]
 
-            validate_schedule(schedule, opt_passes)
+            stage_pass = {
+                ZeroStageEnum.optimizer_states: zero_1_and_2_compile.NAME_Z1,
+                ZeroStageEnum.gradients: zero_1_and_2_compile.NAME_Z2,
+                ZeroStageEnum.weights: zero3_compile.NAME,
+            }.get(self.zero_optimization_stage())
+            validate_schedule(schedule, opt_passes, context_passes=[stage_pass] if stage_pass else None)
             schedule = [(step, passes_name_to_fn(passes)) for step, passes in schedule]
 
         assert backend in ['inductor', 'eager'], f"Backend {backend} is not supported for DeepCompile."

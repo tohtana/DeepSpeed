@@ -74,7 +74,9 @@ def _resolve_pass_name(pass_ref, name_registry: Optional[Dict]) -> Optional[str]
     return None
 
 
-def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[Dict] = None) -> None:
+def validate_schedule(schedule: List[Tuple[int, List]],
+                      name_registry: Optional[Dict] = None,
+                      context_passes: Optional[List[str]] = None) -> None:
     """Validate that a DeepCompile pass schedule satisfies the registered pass contracts.
 
     ``schedule`` uses the ``[(step, passes), ...]`` format consumed by ``init_schedule``. Validate
@@ -86,11 +88,17 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
     contracted and ad-hoc passes remain valid; it is still checked against conflicts that other
     passes declare. Raises :class:`PassContractError` on the first unmet requirement or conflict.
 
-    Each step is validated independently: DeepCompile resets Dynamo and recompiles from the
-    original graph at every launched step (see ``launch_compile_passes``), so capabilities a pass
-    provides in one step do not carry over to later steps. A pass must therefore find every
-    capability it requires among the passes scheduled earlier within the same step.
+    ``context_passes`` names passes implied by the active runtime configuration. They participate
+    in conflict checks without providing capabilities, which lets stage-specific validation reject
+    an incompatible pass even when a user schedule omits the stage's default pass.
+
+    DeepCompile resets Dynamo and recompiles from the original graph at every launched step (see
+    ``launch_compile_passes``), so capabilities a pass provides in one step do not carry over to
+    later steps. A pass must therefore find every capability it requires among the passes scheduled
+    earlier within the same step. Conflicts apply to the complete schedule because incompatible
+    passes cannot safely share a run even when they launch at different steps.
     """
+    scheduled: List[str] = list(context_passes or [])
     for step, passes in schedule:
         provided: set = set()
         applied: List[str] = []
@@ -108,8 +116,8 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
                                         f"pass provides. Passes scheduled so far: {applied}.")
 
             # Conflicts are treated symmetrically: either pass may declare the incompatibility.
-            conflicts = set(contract.conflicts_with.intersection(applied))
-            for prev_name in applied:
+            conflicts = set(contract.conflicts_with.intersection(scheduled))
+            for prev_name in scheduled:
                 prev_contract = _pass_contracts.get(prev_name, _UNCONSTRAINED)
                 if name in prev_contract.conflicts_with:
                     conflicts.add(prev_name)
@@ -119,3 +127,4 @@ def validate_schedule(schedule: List[Tuple[int, List]], name_registry: Optional[
 
             provided |= contract.provides
             applied.append(name)
+            scheduled.append(name)

@@ -3,12 +3,16 @@
 
 # DeepSpeed Team
 
+from types import SimpleNamespace
+
 import pytest
 
 from deepspeed.compile.passes import (contract as contract_mod, offload_adam_states, offload_parameters, prefetch,
                                       selective_gather, zero_1_and_2_compile, zero3_compile)
 from deepspeed.compile.passes.contract import (PassContract, PassContractError, register_pass_contract,
                                                get_pass_contract, validate_schedule)
+from deepspeed.runtime import engine as engine_mod
+from deepspeed.runtime.zero.config import ZeroStageEnum
 
 # Mirrors the registration in DeepSpeedEngine.__init__ so the built-in contracts can be exercised
 # without building an engine.
@@ -109,8 +113,20 @@ def test_conflict_with_uncontracted_pass(clean_registry):
         validate_schedule([(0, ["a", "custom"])])
     with pytest.raises(PassContractError, match="conflicts"):
         validate_schedule([(0, ["custom", "a"])])
-    # Steps are validated independently.
-    validate_schedule([(0, ["a"]), (10, ["custom"])])
+    # Requirements reset between steps, but conflicts apply to the complete schedule.
+    with pytest.raises(PassContractError, match="conflicts"):
+        validate_schedule([(0, ["a"]), (10, ["custom"])])
+
+
+def test_context_pass_checks_conflicts_without_providing_requirements(clean_registry):
+    register_pass_contract("stage", PassContract(provides=frozenset({"stage_cap"})))
+    register_pass_contract("bad", PassContract(conflicts_with=frozenset({"stage"})))
+    register_pass_contract("needs_stage_cap", PassContract(requires=frozenset({"stage_cap"})))
+
+    with pytest.raises(PassContractError, match="conflicts"):
+        validate_schedule([(0, ["bad"])], context_passes=["stage"])
+    with pytest.raises(PassContractError, match="requires"):
+        validate_schedule([(0, ["needs_stage_cap"])], context_passes=["stage"])
 
 
 def test_uncontracted_passes_are_unconstrained(clean_registry):
@@ -172,6 +188,11 @@ def test_offload_targets_conflict(builtin_registry):
                                             offload_adam_states.NAME], [z3, params, offload_adam_states.NAME_SYNC]):
         with pytest.raises(PassContractError, match="conflicts"):
             validate_schedule([(0, passes)], builtin_registry)
+    for schedule in ([(0, [z3, params]),
+                      (1, [for_init, z3, offload_adam_states.NAME])], [(0, [for_init, z3, offload_adam_states.NAME]),
+                                                                       (1, [z3, params])]):
+        with pytest.raises(PassContractError, match="conflicts"):
+            validate_schedule(schedule, builtin_registry)
 
 
 def test_offload_opt_states_conflict_with_zero1_and_2(builtin_registry):
@@ -181,6 +202,8 @@ def test_offload_opt_states_conflict_with_zero1_and_2(builtin_registry):
         for offload_pass in (offload_adam_states.NAME_FOR_INIT, offload_adam_states.NAME_SYNC):
             with pytest.raises(PassContractError, match="conflicts"):
                 validate_schedule([(0, [reduce_pass, offload_pass])], builtin_registry)
+            with pytest.raises(PassContractError, match="conflicts"):
+                validate_schedule([(0, [reduce_pass]), (1, [offload_pass])], builtin_registry)
 
 
 def test_offload_adam_states_requires_for_init(builtin_registry):
@@ -210,6 +233,27 @@ def test_zero1_and_zero3_conflict(builtin_registry):
         validate_schedule([(0, [zero3_compile.NAME, zero_1_and_2_compile.NAME_Z1])], builtin_registry)
     with pytest.raises(PassContractError, match="conflicts"):
         validate_schedule([(0, [zero_1_and_2_compile.NAME_Z2, zero3_compile.NAME])], builtin_registry)
+    with pytest.raises(PassContractError, match="conflicts"):
+        validate_schedule([(0, [zero3_compile.NAME]), (1, [zero_1_and_2_compile.NAME_Z1])], builtin_registry)
+
+
+@pytest.mark.parametrize(
+    "zero_stage,pass_ref",
+    [(ZeroStageEnum.optimizer_states, offload_adam_states.NAME_SYNC),
+     (ZeroStageEnum.optimizer_states, offload_adam_states.move_opt_states_sync),
+     (ZeroStageEnum.gradients, offload_adam_states.NAME_FOR_INIT),
+     (ZeroStageEnum.gradients, offload_adam_states.offload_adam_states_for_init),
+     (ZeroStageEnum.weights, zero_1_and_2_compile.NAME_Z1),
+     (ZeroStageEnum.weights, zero_1_and_2_compile.add_z1_reduce)],
+)
+def test_engine_rejects_pass_for_wrong_zero_stage(zero_stage, pass_ref, builtin_registry, monkeypatch):
+    monkeypatch.setattr(engine_mod, "opt_passes", builtin_registry)
+    engine = SimpleNamespace(zero_optimization_stage=lambda: zero_stage,
+                             compile_autosp=lambda: False,
+                             get_deepcompile_backend=lambda backend, compile_kwargs, schedule: object())
+
+    with pytest.raises(PassContractError, match="conflicts"):
+        engine_mod.DeepSpeedEngine.get_deepspeed_compile_backend(engine, "eager", {}, [(0, [pass_ref])])
 
 
 def test_schedule_written_with_callables_is_validated(builtin_registry):
