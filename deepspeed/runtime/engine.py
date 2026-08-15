@@ -737,6 +737,7 @@ class DeepSpeedEngine(Module):
                             orig_layer_impl=None,
                             keep_module_on_host=tp_config.keep_module_on_host,
                             partition_config=partition_config)
+            autotp.configure_tp_shard(model_config, tp_config.tensor_parallel.tp_grain_size)
             autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
             autotp.update_linear_policies()
             autotp._replace_module(model)
@@ -776,6 +777,7 @@ class DeepSpeedEngine(Module):
                     keep_module_on_host=tp_config.keep_module_on_host,
                     partition_config=tp_plan_config,
                 )
+                autotp.configure_tp_shard(model_config, tp_config.tensor_parallel.tp_grain_size)
                 autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
                 autotp.update_linear_policies()
                 autotp._replace_module(model)

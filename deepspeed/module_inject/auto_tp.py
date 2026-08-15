@@ -15,7 +15,8 @@ from deepspeed import comm as dist
 from .layers import *
 from deepspeed.accelerator import get_accelerator
 from .fusedqkv_utils import require_tp_fused_qkvw
-from deepspeed.module_inject.tp_shard import get_shard_size, get_shard_size_list
+from deepspeed.module_inject.tp_shard import (get_shard_size, get_shard_size_list, set_n_embd, set_num_attention_heads,
+                                              set_num_kv_heads, set_tp_grain_size)
 from deepspeed.utils import groups
 from deepspeed.utils.logging import log_dist
 from deepspeed.module_inject.layers import is_autotp_training_mode
@@ -765,6 +766,31 @@ class AutoTP():
                 if num_kv_heads is not None:
                     break
         return num_kv_heads
+
+    def configure_tp_shard(self, model_config, tp_grain_size):
+        """Initialize the process-wide shard geometry before constructing TP layers."""
+        if hasattr(model_config, "vision_config"):
+            if "MllamaVisionEncoderLayer" in str(self.module):
+                num_kv_heads = self.get_model_num_kv_heads(model_config.vision_config)
+            elif hasattr(model_config, "text_config"):
+                num_kv_heads = self.get_model_num_kv_heads(model_config.text_config)
+            else:
+                num_kv_heads = self.get_model_num_kv_heads(model_config)
+        else:
+            num_kv_heads = self.get_model_num_kv_heads(model_config)
+        set_num_kv_heads(num_kv_heads)
+
+        n_embd = None
+        for name in ('n_embd', 'hidden_size'):
+            if hasattr(model_config, name):
+                n_embd = getattr(model_config, name)
+            if n_embd is not None:
+                break
+        set_n_embd(n_embd)
+
+        if hasattr(model_config, 'num_attention_heads'):
+            set_num_attention_heads(getattr(model_config, 'num_attention_heads'))
+        set_tp_grain_size(tp_grain_size)
 
     def _replace_last_linear_module(self, r_module):
         if hasattr(r_module, "lm_head"):
