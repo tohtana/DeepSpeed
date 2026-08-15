@@ -7,8 +7,15 @@
 #include "deepcompile.h"
 
 #include <ATen/native/cuda/Resize.h>
+#include <unordered_set>
 
 namespace dc {
+
+namespace {
+
+std::unordered_set<long> deferred_parameter_offload_ids;
+
+}  // namespace
 
 const size_t TIMEOUT_SYMMETRIC_MEMORY_BARRIER = 60000;
 
@@ -533,6 +540,20 @@ void register_z3_param(long ds_id,
         }
     }
 }
+
+void defer_parameter_offload(long graph_id, long ds_id)
+{
+    auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
+    assert(executor->hasParam(ds_id));
+    deferred_parameter_offload_ids.insert(ds_id);
+}
+
+void run_deferred_parameter_offloads()
+{
+    for (long ds_id : deferred_parameter_offload_ids) { param_registry->offload(ds_id); }
+}
+
+void clear_deferred_parameter_offloads() { deferred_parameter_offload_ids.clear(); }
 
 at::Tensor allgather_param(at::Tensor param_tensor,
                            long graph_id,

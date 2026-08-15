@@ -38,6 +38,9 @@ void prefetch_params_fused_meta(long graph_id,
 // for profiling
 void invalidate_gathered_param(long ds_id);
 void clear_all_gathered_params();
+void defer_parameter_offload(long graph_id, long ds_id);
+void run_deferred_parameter_offloads();
+void clear_deferred_parameter_offloads();
 at::Tensor allgather_param_meta(at::Tensor param_tensor,
                                 long graph_id,
                                 long ds_id,

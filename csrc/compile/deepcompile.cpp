@@ -4,6 +4,7 @@
 // DeepSpeed Team
 
 #include "deepcompile.h"
+#include "z3.h"
 
 #define USE_C10D_NCCL
 
@@ -77,6 +78,7 @@ ncclDataType_t get_nccl_data_type(at::ScalarType scalar_type)
 void reset()
 {
     executors.clear();
+    clear_deferred_parameter_offloads();
     // We keep the buckets for memory estimation
     // reduce_buckets->clear();
 }
@@ -184,6 +186,7 @@ void end_backward(const c10::IValue& deps, long graph_id, bool release_reduce_bu
     auto executor = getExecutor<CustomOpExecutor>(graph_id, executors);
     executor->endBackward();
     if (release_reduce_buckets) {
+        run_deferred_parameter_offloads();
         // reduce_buckets is shared across graph executors, so release it once
         // after the final backward graph has flushed its pending reductions.
         reduce_buckets->clear();

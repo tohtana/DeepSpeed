@@ -49,7 +49,7 @@ def add_allgather(graph_id: int, graph: Graph, node: Node, ds_id: int, dtype: to
                                     meta=_make_node_meta(node, ds_id, False))
     new_wait_node.meta["val"] = new_ag_node.meta["val"]
 
-    return new_ag_node
+    return new_wait_node
 
 
 def add_release(graph_id: int, graph: Graph, node: Node, release_node: Node, ds_id: int, n_users: int):
@@ -90,7 +90,11 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
                 fuse_typecast = True
                 target_dtype = casted_dtype
 
-        add_allgather(graph_id, graph, pn, param_manager.ds_ids[pn.name], target_dtype)
+        output_node = get_output_node(graph)
+        # An output-only parameter is consumed by Python after a graph break.
+        # Keep its wait node live so the eager resume receives the gathered value.
+        is_parameter_liveout = len(node_to_uses[pn]) == 0 and pn in output_node.all_input_nodes
+        wait_node = add_allgather(graph_id, graph, pn, param_manager.ds_ids[pn.name], target_dtype)
         if fuse_typecast:
             users = node_to_uses[typecast_node]
             wait_node = typecast_node.args[0]
@@ -101,6 +105,8 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
             graph.erase_node(typecast_node)
         else:
             users = node_to_uses[pn]
+            if is_parameter_liveout:
+                output_node.replace_input_with(pn, wait_node)
 
         ds_id = param_manager.ds_ids[pn.name]
         for user in users:

@@ -112,4 +112,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("reset", &dc::reset, "Reset the state");
     m.def("invalidate_gathered_param", &dc::invalidate_gathered_param, "Invalidate gathered param");
     m.def("clear_all_gathered_params", &dc::clear_all_gathered_params, "Clear all gathered params");
+    m.def("defer_parameter_offload",
+          &dc::defer_parameter_offload,
+          "Offload a parameter after backward");
 }
