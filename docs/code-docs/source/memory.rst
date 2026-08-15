@@ -316,8 +316,14 @@ buffer for later filling.
 Backend Selection
 =================
 
-The pinning implementation is selected with the ``DS_PIN_MEMORY_BACKEND``
-environment variable (default ``torch``).
+Whether to pin ZeRO CPU/NVMe offload buffers is controlled by
+``zero_optimization.offload_param.pin_memory`` /
+``zero_optimization.offload_optimizer.pin_memory`` (both default ``true``).
+That is independent of **how** pages are locked.
+
+The pinning **backend** (Torch vs DeepSpeed native) is selected only with the
+``DS_PIN_MEMORY_BACKEND`` environment variable (default ``torch``). There is
+no ``ds_config`` field for the backend.
 
 Both backends page-lock host memory for DMA, are visible to AIO/GDS I/O
 handles (so DeepNVMe can skip bounce buffers), and are counted by
