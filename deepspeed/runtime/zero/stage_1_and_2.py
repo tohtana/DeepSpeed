@@ -690,18 +690,39 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Release the page-locked host buffers we pinned for CPU offload. unpin_memory is a
         # no-op for the torch backend and only frees under DS_PIN_MEMORY_BACKEND=native,
         # where the mlocked allocation would otherwise persist until garbage collection.
-        if not (self.cpu_offload and self.cpu_offload_pin_memory):
-            return
         accelerator = get_accelerator()
-        for fp32_partition in self.single_partition_of_fp32_groups:
-            accelerator.unpin_memory(fp32_partition)
-            if fp32_partition.grad is not None:
-                accelerator.unpin_memory(fp32_partition.grad)
-        for buffer in self.param_buffer_of_bit16_for_cpu_offload_groups:
+        unpinned = set()
+
+        def unpin_once(buffer):
+            if buffer is None or not torch.is_tensor(buffer) or not accelerator.is_pinned(buffer):
+                return
+            pin_base = getattr(buffer, "ds_pin_base", None)
+            pin_base = buffer.data_ptr() if pin_base is None else pin_base
+            if pin_base in unpinned:
+                return
             accelerator.unpin_memory(buffer)
-        temp_grad_buffer = getattr(self, 'temp_grad_buffer_for_cpu_offload', None)
-        if temp_grad_buffer is not None:
-            accelerator.unpin_memory(temp_grad_buffer)
+            unpinned.add(pin_base)
+
+        if self.cpu_offload and self.cpu_offload_pin_memory:
+            for fp32_partition in self.single_partition_of_fp32_groups:
+                unpin_once(fp32_partition)
+                unpin_once(fp32_partition.grad)
+            for buffer in self.param_buffer_of_bit16_for_cpu_offload_groups:
+                unpin_once(buffer)
+            unpin_once(getattr(self, 'temp_grad_buffer_for_cpu_offload', None))
+
+        # Dynamic offload owns separate native-pinned buffers even when static CPU
+        # offload is disabled. Release those owners explicitly at destroy time.
+        for attr in ("hp_params_pin_buffers", "lp_params_pin_buffers"):
+            for buffer in getattr(self, attr, []):
+                unpin_once(buffer)
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        if OffloadStateTypeEnum.optim_states in self.offloaded_states:
+            for state in self.optimizer.state.values():
+                for value in state.values():
+                    unpin_once(value)
 
     def _enable_universal_checkpoint(self):
         self._universal_checkpoint_info = None
@@ -3015,18 +3036,24 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 If True, attempts to perform reload operations asynchronously. Defaults to False.
         """
         device = get_accelerator().current_device_name()
+        release_hp_pin_buffers = False
+        release_lp_pin_buffers = False
+        reload_sources = []
 
         # Reload FP32 Master Parameters (HP Params)
         if OffloadStateTypeEnum.hp_params in self.offloaded_states:
+            if non_blocking:
+                reload_sources.extend(getattr(self, "hp_params_pin_buffers", []))
             for buf in self.single_partition_of_fp32_groups:
                 buf.data = buf.data.to(device, non_blocking=non_blocking)
-            if hasattr(self, "hp_params_pin_buffers"):
-                del self.hp_params_pin_buffers
+            release_hp_pin_buffers = hasattr(self, "hp_params_pin_buffers")
             self._link_all_hp_params()
             self.offloaded_states.remove(OffloadStateTypeEnum.hp_params)
 
         # Reload FP16/BF16 Model Parameters (LP Params)
         if OffloadStateTypeEnum.lp_params in self.offloaded_states:
+            if non_blocking:
+                reload_sources.extend(getattr(self, "lp_params_pin_buffers", []))
             for buf in self.bit16_groups_flat:
                 buf.data = buf.data.to(device, non_blocking=non_blocking)
 
@@ -3039,8 +3066,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for i in range(len(self.bit16_groups)):
                 self._update_model_bit16_weights(i)
 
-            if hasattr(self, "lp_params_pin_buffers"):
-                del self.lp_params_pin_buffers
+            release_lp_pin_buffers = hasattr(self, "lp_params_pin_buffers")
             self._link_all_hp_params()
             self.offloaded_states.remove(OffloadStateTypeEnum.lp_params)
 
@@ -3059,11 +3085,19 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
         # Reload Optimizer States
         if OffloadStateTypeEnum.optim_states in self.offloaded_states:
+            if non_blocking:
+                reload_sources.extend(value for state in self.optimizer.state.values() for value in state.values()
+                                      if torch.is_tensor(value))
             reload_optimizer_states(self.optimizer, device, non_blocking=non_blocking)
             self.offloaded_states.remove(OffloadStateTypeEnum.optim_states)
 
         if non_blocking:
             get_accelerator().synchronize()
+
+        if release_hp_pin_buffers:
+            del self.hp_params_pin_buffers
+        if release_lp_pin_buffers:
+            del self.lp_params_pin_buffers
 
 
 def _handle_overflow(cpu_sum, x, i):

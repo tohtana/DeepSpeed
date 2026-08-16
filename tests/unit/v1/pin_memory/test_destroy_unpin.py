@@ -13,6 +13,8 @@ import os
 import pytest
 import torch
 import deepspeed
+from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.offload_config import OffloadStateTypeEnum
 from deepspeed.utils.pin_memory import get_active_native_pinned_memory
 
 from unit.common import DistributedTest, preferred_dtype
@@ -145,5 +147,66 @@ class TestDestroyUnpinsNativeBuffers(DistributedTest):
             engine.destroy()
             # Sanity: torch path never activates the native manager.
             assert get_active_native_pinned_memory() is None
+        finally:
+            _restore_pin_backend(prev)
+
+    def test_dynamic_native_reload_keeps_sources_until_synchronize(self, monkeypatch):
+        prev = os.environ.get("DS_PIN_MEMORY_BACKEND")
+        try:
+            native = _require_native()
+            releases = []
+            original_release = native._release
+
+            def record_release(handle, begin, ranges, finalizers):
+                releases.append(begin)
+                original_release(handle, begin, ranges, finalizers)
+
+            monkeypatch.setattr(native, "_release", record_release)
+            config, dtype = _config(stage=2)
+            del config["zero_optimization"]["offload_optimizer"]
+            hidden_dim = 16
+            model = SimpleModel(hidden_dim, nlayers=2)
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            _run_one_step(engine, hidden_dim, dtype)
+
+            states = [
+                OffloadStateTypeEnum.hp_params, OffloadStateTypeEnum.lp_params, OffloadStateTypeEnum.optim_states
+            ]
+            engine.offload_states(include=states, pin_memory=True, non_blocking=False)
+
+            accelerator = get_accelerator()
+            original_synchronize = accelerator.synchronize
+            releases_seen_at_sync = []
+
+            def record_synchronize():
+                releases_seen_at_sync.append(len(releases))
+                original_synchronize()
+
+            monkeypatch.setattr(accelerator, "synchronize", record_synchronize)
+            engine.reload_states(non_blocking=True)
+            engine.destroy()
+            assert releases_seen_at_sync == [0]
+        finally:
+            _restore_pin_backend(prev)
+
+    def test_dynamic_native_destroy_releases_buffers(self):
+        prev = os.environ.get("DS_PIN_MEMORY_BACKEND")
+        try:
+            native = _require_native()
+            baseline_ranges = len(native._ranges)
+            config, dtype = _config(stage=2)
+            del config["zero_optimization"]["offload_optimizer"]
+            hidden_dim = 16
+            model = SimpleModel(hidden_dim, nlayers=2)
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            _run_one_step(engine, hidden_dim, dtype)
+
+            states = [
+                OffloadStateTypeEnum.hp_params, OffloadStateTypeEnum.lp_params, OffloadStateTypeEnum.optim_states
+            ]
+            engine.offload_states(include=states, pin_memory=True, non_blocking=False)
+            assert len(native._ranges) > baseline_ranges
+            engine.destroy()
+            assert len(native._ranges) == baseline_ranges
         finally:
             _restore_pin_backend(prev)
