@@ -15,6 +15,8 @@ from ..runtime import compiler
 from deepspeed.utils.torch import required_torch_version
 import os
 
+DS_SET_DEVICE_ID = 'DEEPSPEED_SET_DEVICE_ID'
+
 DS_COMM_ALL_GATHER_OFF = False
 DS_COMM_REDUCE_SCATTER_OFF = False
 DS_COMM_BROADCAST_OFF = False
@@ -26,6 +28,64 @@ def disable_compiler_collective(func):
     if required_torch_version(min_version=2.3):
         return func
     return compiler.disable(func)
+
+
+def resolve_world_size(world_size):
+    """World size as the launcher sees it.
+
+    ``init_distributed`` defaults its ``world_size`` argument to -1 and lets torch read the value
+    out of the environment, so fall back to that when we were not given a real one.
+    """
+    if world_size is not None and world_size > 0:
+        return world_size
+    return int(os.environ.get('WORLD_SIZE', '1'))
+
+
+def get_init_process_group_device_id(world_size):
+    """Resolve the ``device_id`` to pass to ``torch.distributed.init_process_group``.
+
+    Returns ``None`` when no device should be bound.
+
+    Binding a device stores it on the default process group as ``bound_device_id``, which
+    switches torch into eager communicator init: every later ``new_group()`` in the process,
+    including calls made by other libraries, builds its NCCL communicator immediately via
+    ``ncclCommSplit`` instead of on first use. For a multi-rank job that is what we want, as it
+    silences the "devices used by this process are currently unknown" warning that ``barrier()``
+    would otherwise emit. For a single-rank job there is no peer to connect to, so eager init
+    buys nothing and only adds failure surface on platforms that cannot complete it.
+
+    Set ``DEEPSPEED_SET_DEVICE_ID`` to 0 to never bind a device, or to 1 to bind it even for a
+    single-rank job.
+    """
+    # device_id arg was added in torch==2.3
+    if 'device_id' not in inspect.signature(torch.distributed.init_process_group).parameters:
+        return None
+
+    # setting device_id leads to hanging in 2.6.0<torch<2.7.1 https://github.com/pytorch/pytorch/issues/153960
+    if version.parse("2.6.0") < version.parse(torch.__version__) < version.parse("2.7.1"):
+        return None
+
+    # device_id works and is needed for `cuda`, other accelerators may have issues at the moment.
+    if get_accelerator().device_name() != 'cuda':
+        return None
+
+    # LOCAL_RANK is not always a valid index into the visible devices, for example when
+    # CUDA_VISIBLE_DEVICES is narrowed independently of the launcher's rank numbering. Binding an
+    # out-of-range device makes torch reject the process group outright with a ValueError, which
+    # is a worse outcome than the barrier warning we set the device to avoid.
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    if not 0 <= local_rank < get_accelerator().device_count():
+        return None
+
+    override = os.environ.get(DS_SET_DEVICE_ID, '').strip().lower()
+    if override in ('0', 'false', 'no'):
+        return None
+
+    # A single-rank job has no peer to connect to, so eager init is all cost and no benefit.
+    if not override and resolve_world_size(world_size) <= 1:
+        return None
+
+    return get_accelerator().device(local_rank)
 
 
 def build_shm_op():
@@ -165,15 +225,9 @@ class TorchBackend(Backend):
     def init_process_group(self, backend, timeout, init_method, rank, world_size):
         if not torch.distributed.is_initialized():
             kwargs = dict(timeout=timeout, init_method=init_method, rank=rank, world_size=world_size)
-
-            # 1. device_id arg was added in torch==2.3
-            # 2. setting device_id leads to hanging in 2.6.0<torch<2.7.1 https://github.com/pytorch/pytorch/issues/153960
-            # 3. device_id works and is needed for `cuda`, other accelerators may have issues at the moment. Therefore only do it for the `cuda` accelerator.
-            if ('device_id' in inspect.signature(torch.distributed.init_process_group).parameters
-                    and not (version.parse("2.6.0") < version.parse(torch.__version__) < version.parse("2.7.1"))
-                    and get_accelerator().device_name() == 'cuda'):
-                local_rank = int(os.environ.get('LOCAL_RANK', 0))
-                kwargs.update(device_id=get_accelerator().device(local_rank))
+            device_id = get_init_process_group_device_id(world_size)
+            if device_id is not None:
+                kwargs.update(device_id=device_id)
             torch.distributed.init_process_group(backend, **kwargs)
 
         self.using_mpi = torch.distributed.get_backend() == 'mpi'
