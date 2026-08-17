@@ -214,12 +214,10 @@ class TestDistInitWithModel(DistributedTest):
                                                   dist_init_required=dist_init_required)
 
 
-# `deepspeed.comm.torch` is shadowed by the real torch module inside the `deepspeed.comm`
-# namespace, so the submodule has to be reached for explicitly.
+# `deepspeed.comm.torch` is shadowed by the real torch module in the `deepspeed.comm` namespace.
 ds_comm_torch = importlib.import_module("deepspeed.comm.torch")
 
-# Referred to by name, not through ds_comm_torch, so the end-to-end checks below still run
-# against a DeepSpeed build that predates the constant.
+# Spelled out rather than imported, so the end-to-end checks also run against unpatched DeepSpeed.
 SET_DEVICE_ID_ENV = "DEEPSPEED_SET_DEVICE_ID"
 
 
@@ -255,8 +253,7 @@ def resolve_device_id(monkeypatch, world_size, local_rank=0, device_count=8, ove
 
 
 def test_device_id_skipped_for_single_rank(monkeypatch):
-    # A single-rank job has no peer to connect to, so eager NCCL init buys nothing and only adds
-    # failure surface on platforms that cannot complete it. See #8248.
+    # No peer to connect to, so eager init is pure failure surface. This is the case in #8248.
     assert resolve_device_id(monkeypatch, world_size=1) is None
 
 
@@ -276,15 +273,13 @@ def test_device_id_forced_by_env_for_single_rank(monkeypatch, override):
 
 @pytest.mark.parametrize("override", ["fasle", "banana", "2"])
 def test_unrecognized_env_value_falls_back_to_the_default(monkeypatch, override):
-    # A typo must not pick an answer for the user. Anything unrecognized is ignored, so the
-    # world_size default still decides and a misspelt "false" cannot silently mean "true".
+    # A misspelt "false" must not silently mean "true"; the world_size default still decides.
     assert resolve_device_id(monkeypatch, world_size=1, override=override) is None
     assert resolve_device_id(monkeypatch, world_size=2, override=override) == torch.device('cuda', 0)
 
 
 def test_device_id_skipped_when_local_rank_is_not_visible(monkeypatch):
-    # CUDA_VISIBLE_DEVICES can be narrowed independently of the launcher's rank numbering, and
-    # binding a device that does not exist fails inside NCCL rather than warning.
+    # CUDA_VISIBLE_DEVICES can be narrowed independently of the launcher's rank numbering.
     assert resolve_device_id(monkeypatch, world_size=8, local_rank=3, device_count=1) is None
 
 
@@ -321,9 +316,7 @@ def assert_device_binding(override, expect_bound):
     default_pg = torch.distributed.distributed_c10d._get_default_group()
     assert (default_pg.bound_device_id is not None) == expect_bound
 
-    # The binding is what makes every later new_group() split a communicator off the default one
-    # up front instead of waiting for the first collective. That eager split is the call that
-    # fails in #8248, so check it is only made when a device was bound.
+    # The eager split new_group() makes when a device is bound is the call that fails in #8248.
     device = get_accelerator().device(int(os.environ["LOCAL_RANK"]))
     default_backend = default_pg._get_backend(device)
     if hasattr(default_backend, "comm_split_count"):

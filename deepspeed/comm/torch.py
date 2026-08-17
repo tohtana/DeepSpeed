@@ -31,11 +31,10 @@ def disable_compiler_collective(func):
 
 
 def get_env_flag(name):
-    """Read a boolean environment variable.
+    """Parse a boolean environment variable.
 
-    Returns True or False for a recognized value, and None when the variable is unset or holds
-    something we do not understand. Callers read None as "no preference expressed", so a typo falls
-    back to the default instead of silently selecting one of the two answers.
+    Returns None when unset or unrecognized, so a typo falls back to the caller's default instead
+    of silently selecting one of the two answers.
     """
     value = os.environ.get(name, '').strip().lower()
     if value in ('1', 'true', 'yes', 'on'):
@@ -48,31 +47,17 @@ def get_env_flag(name):
 
 
 def resolve_world_size(world_size):
-    """World size as the launcher sees it.
-
-    ``init_distributed`` defaults its ``world_size`` argument to -1 and lets torch read the value
-    out of the environment, so fall back to that when we were not given a real one.
-    """
+    """World size as the launcher sees it; ``init_distributed`` defaults its argument to -1."""
     if world_size is not None and world_size > 0:
         return world_size
     return int(os.environ.get('WORLD_SIZE', '1'))
 
 
 def get_init_process_group_device_id(world_size):
-    """Resolve the ``device_id`` to pass to ``torch.distributed.init_process_group``.
+    """Resolve the ``device_id`` for ``init_process_group``, or None to leave the device unbound.
 
-    Returns ``None`` when no device should be bound.
-
-    Binding a device stores it on the default process group as ``bound_device_id``, which
-    switches torch into eager communicator init: every later ``new_group()`` in the process,
-    including calls made by other libraries, builds its NCCL communicator immediately via
-    ``ncclCommSplit`` instead of on first use. For a multi-rank job that is what we want, as it
-    silences the "devices used by this process are currently unknown" warning that ``barrier()``
-    would otherwise emit. For a single-rank job there is no peer to connect to, so eager init
-    buys nothing and only adds failure surface on platforms that cannot complete it.
-
-    Set ``DEEPSPEED_SET_DEVICE_ID`` to 0 to never bind a device, or to 1 to bind it even for a
-    single-rank job.
+    Binding switches torch to eager NCCL init, so every later ``new_group()`` splits a communicator
+    up front: wanted for multi-rank, pure cost for a single rank (#8248).
     """
     # device_id arg was added in torch==2.3
     if 'device_id' not in inspect.signature(torch.distributed.init_process_group).parameters:
@@ -86,14 +71,13 @@ def get_init_process_group_device_id(world_size):
     if get_accelerator().device_name() != 'cuda':
         return None
 
-    # LOCAL_RANK is not always a valid index into the visible devices, for example when
-    # CUDA_VISIBLE_DEVICES is narrowed independently of the launcher's rank numbering. Binding an
-    # out-of-range device makes torch reject the process group outright with a ValueError, which
-    # is a worse outcome than the barrier warning we set the device to avoid.
+    # LOCAL_RANK can exceed the visible device count when CUDA_VISIBLE_DEVICES is narrowed
+    # separately; binding a device that does not exist fails harder than the warning we avoid.
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     if not 0 <= local_rank < get_accelerator().device_count():
         return None
 
+    # DEEPSPEED_SET_DEVICE_ID forces either answer; see init_distributed's docstring.
     override = get_env_flag(DS_SET_DEVICE_ID)
     if override is False:
         return None
