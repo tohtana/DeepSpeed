@@ -264,13 +264,22 @@ def test_device_id_set_for_multi_rank(monkeypatch):
     assert resolve_device_id(monkeypatch, world_size=2, local_rank=1) == torch.device('cuda', 1)
 
 
-@pytest.mark.parametrize("override", ["0", "false", "NO"])
+@pytest.mark.parametrize("override", ["0", "false", "NO", "off", " 0 "])
 def test_device_id_disabled_by_env(monkeypatch, override):
     assert resolve_device_id(monkeypatch, world_size=4, override=override) is None
 
 
-def test_device_id_forced_by_env_for_single_rank(monkeypatch):
-    assert resolve_device_id(monkeypatch, world_size=1, override="1") == torch.device('cuda', 0)
+@pytest.mark.parametrize("override", ["1", "true", "YES", "on"])
+def test_device_id_forced_by_env_for_single_rank(monkeypatch, override):
+    assert resolve_device_id(monkeypatch, world_size=1, override=override) == torch.device('cuda', 0)
+
+
+@pytest.mark.parametrize("override", ["fasle", "banana", "2"])
+def test_unrecognized_env_value_falls_back_to_the_default(monkeypatch, override):
+    # A typo must not pick an answer for the user. Anything unrecognized is ignored, so the
+    # world_size default still decides and a misspelt "false" cannot silently mean "true".
+    assert resolve_device_id(monkeypatch, world_size=1, override=override) is None
+    assert resolve_device_id(monkeypatch, world_size=2, override=override) == torch.device('cuda', 0)
 
 
 def test_device_id_skipped_when_local_rank_is_not_visible(monkeypatch):

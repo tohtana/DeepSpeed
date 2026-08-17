@@ -30,6 +30,23 @@ def disable_compiler_collective(func):
     return compiler.disable(func)
 
 
+def get_env_flag(name):
+    """Read a boolean environment variable.
+
+    Returns True or False for a recognized value, and None when the variable is unset or holds
+    something we do not understand. Callers read None as "no preference expressed", so a typo falls
+    back to the default instead of silently selecting one of the two answers.
+    """
+    value = os.environ.get(name, '').strip().lower()
+    if value in ('1', 'true', 'yes', 'on'):
+        return True
+    if value in ('0', 'false', 'no', 'off'):
+        return False
+    if value:
+        utils.logger.warning(f'Ignoring {name}={value}, expected one of 1/0, true/false, yes/no, on/off')
+    return None
+
+
 def resolve_world_size(world_size):
     """World size as the launcher sees it.
 
@@ -77,12 +94,12 @@ def get_init_process_group_device_id(world_size):
     if not 0 <= local_rank < get_accelerator().device_count():
         return None
 
-    override = os.environ.get(DS_SET_DEVICE_ID, '').strip().lower()
-    if override in ('0', 'false', 'no'):
+    override = get_env_flag(DS_SET_DEVICE_ID)
+    if override is False:
         return None
 
     # A single-rank job has no peer to connect to, so eager init is all cost and no benefit.
-    if not override and resolve_world_size(world_size) <= 1:
+    if override is None and resolve_world_size(world_size) <= 1:
         return None
 
     return get_accelerator().device(local_rank)
