@@ -20,6 +20,8 @@ The fix filters parameters to only include those with requires_grad=True,
 ensuring empty parameter groups are properly handled.
 """
 
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import deepspeed
@@ -344,6 +346,42 @@ def test_muon_aux_adam_rebinds_zero_parameter_groups():
     assert original_param not in optimizer.state
     assert replacement_param in optimizer.state
     assert optimizer.aux_optimizer.param_groups[0] is optimizer.param_groups[0]
+
+
+@pytest.mark.parametrize("optimizer_class", [torch.optim.Adam, torch.optim.AdamW])
+def test_muon_aux_adam_resumes_checkpoint_written_without_a_backend(optimizer_class):
+    """A checkpoint written by the inline update must still step under an Adam backend.
+
+    ``load_state_dict`` rebuilds ``param_groups`` from the checkpoint and replaces ``state``, so
+    the backend's own per-group options are missing from the loaded groups and its ``step`` counter
+    may have the wrong type. Both have to be restored before the backend is stepped again, and the
+    resumed step must match what the backend itself would do from the same checkpoint.
+    """
+    group_options = {"lr": 0.01, "betas": (0.8, 0.9), "eps": 1e-8, "weight_decay": 0.1}
+    inline_param = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    inline = MuonWithAuxAdam([dict(params=[inline_param], use_muon=False, **group_options)])
+    inline_param.grad = torch.tensor([0.25, -0.5])
+    inline.step()
+    assert inline.aux_optimizer is None
+    checkpoint = deepcopy(inline.state_dict())
+
+    resumed_param = torch.nn.Parameter(inline_param.detach().clone())
+    resumed = MuonWithAuxAdam([dict(params=[resumed_param], use_muon=False, **group_options)],
+                              adam_optimizer=optimizer_class)
+    resumed.load_state_dict(deepcopy(checkpoint))
+
+    expected_param = torch.nn.Parameter(inline_param.detach().clone())
+    expected = optimizer_class([dict(params=[expected_param], **group_options)])
+    expected.load_state_dict(deepcopy(checkpoint))
+
+    for optimizer, parameter in ((resumed, resumed_param), (expected, expected_param)):
+        parameter.grad = torch.tensor([-0.1, 0.2])
+        optimizer.step()
+
+    torch.testing.assert_close(resumed_param, expected_param)
+    # The backend is re-pointed at the reloaded groups and state by the step that follows the load.
+    assert resumed.aux_optimizer.state is resumed.state
+    assert resumed.aux_optimizer.param_groups[0] is resumed.param_groups[0]
 
 
 class _AdamSelectionEngine:

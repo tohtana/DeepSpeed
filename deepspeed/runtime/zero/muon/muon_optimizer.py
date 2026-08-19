@@ -33,11 +33,28 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
                     raise
                 logger.warning(f"FusedAdam initialization failed; falling back to Muon's inline Adam update: {error}")
             if self.aux_optimizer is not None:
-                for group, aux_group in zip(aux_param_groups, self.aux_optimizer.param_groups):
-                    for key, value in aux_group.items():
-                        group.setdefault(key, value)
-                self.aux_optimizer.param_groups = aux_param_groups
-                self.aux_optimizer.state = self.state
+                self._aux_defaults = dict(self.aux_optimizer.defaults)
+                self._bind_aux_optimizer(aux_param_groups)
+
+    def _bind_aux_optimizer(self, aux_param_groups):
+        """Point the auxiliary optimizer at this optimizer's live groups and state.
+
+        The auxiliary backend keeps its per-group options (for example FusedAdam's
+        ``bias_correction`` or torch Adam's ``amsgrad``) in the group dicts it is constructed
+        with, and torch's ``load_state_dict`` replaces ``param_groups`` and ``state`` with
+        objects rebuilt from the checkpoint. A checkpoint written before those options existed,
+        or written with a different auxiliary backend, therefore yields groups the backend cannot
+        step. Re-apply the backend's defaults and let the backend's own ``__setstate__`` run, so
+        it also normalizes anything else it owns, such as torch Adam's tensor ``step`` counter.
+        """
+        self._aux_param_groups = aux_param_groups
+        for group in aux_param_groups:
+            for key, value in self._aux_defaults.items():
+                group.setdefault(key, value)
+        type(self.aux_optimizer).__setstate__(self.aux_optimizer, {
+            "state": self.state,
+            "param_groups": aux_param_groups
+        })
 
     @torch.no_grad()
     def step(self, closure=None, step_id=None):
@@ -55,17 +72,14 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
 
         aux_param_groups = [group for group in self.param_groups if not group["use_muon"]]
         if self.aux_optimizer is not None:
-            if (len(aux_param_groups) != len(self._aux_param_groups)
+            if (self.aux_optimizer.state is not self.state or len(aux_param_groups) != len(self._aux_param_groups)
                     or any(current is not cached
                            for current, cached in zip(aux_param_groups, self._aux_param_groups))):
-                self._aux_param_groups = aux_param_groups
-                self.aux_optimizer.param_groups = aux_param_groups
+                self._bind_aux_optimizer(aux_param_groups)
             for group in aux_param_groups:
                 for p in group["params"]:
                     if p.grad is None:
                         p.grad = torch.zeros_like(p)
-            if self.aux_optimizer.state is not self.state:
-                self.aux_optimizer.state = self.state
             if step_id is not None and getattr(self.aux_optimizer, "overlap_step", None) is False:
                 self.aux_optimizer.step(step_id=step_id)
             else:
