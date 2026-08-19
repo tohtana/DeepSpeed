@@ -270,6 +270,27 @@ def test_muon_aux_adam_matches_torch(optimizer_class):
     assert optimizer.state[actual_param].keys() == reference.state[expected_param].keys()
 
 
+def test_muon_aux_adam_falls_back_to_inline_update():
+    actual_param = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    expected_param = torch.nn.Parameter(actual_param.detach().clone())
+    group_options = {
+        "lr": 0.01,
+        "betas": (0.8, 0.9),
+        "eps": 1e-8,
+        "weight_decay": 0.1,
+    }
+    optimizer = MuonWithAuxAdam([dict(params=[actual_param], use_muon=False, **group_options)])
+    reference = torch.optim.AdamW([expected_param], **group_options)
+
+    for grad in (torch.tensor([0.25, -0.5]), torch.tensor([-0.1, 0.2]), torch.tensor([0.3, 0.4])):
+        actual_param.grad = grad.clone()
+        expected_param.grad = grad.clone()
+        optimizer.step()
+        reference.step()
+
+    torch.testing.assert_close(actual_param, expected_param)
+
+
 def test_muon_aux_adam_rebinds_zero_parameter_groups():
     original_param = torch.nn.Parameter(torch.tensor([1.0]))
     replacement_param = torch.nn.Parameter(torch.tensor([2.0]))
@@ -307,10 +328,14 @@ class _AdamSelectionEngine:
     [
         (_AdamSelectionEngine(), {
             "torch_adam": True
-        }, True, torch.optim.AdamW, {}),
+        }, True, torch.optim.AdamW, {
+            "foreach": None
+        }),
         (_AdamSelectionEngine(cpu_offload=True), {
             "torch_adam": True
-        }, False, torch.optim.Adam, {}),
+        }, False, torch.optim.Adam, {
+            "foreach": None
+        }),
         (_AdamSelectionEngine(), {}, True, FusedAdam, {
             "adam_w_mode": True
         }),
