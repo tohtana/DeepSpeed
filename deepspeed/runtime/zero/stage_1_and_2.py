@@ -795,7 +795,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     def _update_model_bit16_weights(self, group_index):
         updated_params = self.unflatten(self.bit16_groups_flat[group_index], self.round_robin_bit16_meta[group_index])
         for p, q in zip(self.round_robin_bit16_groups[group_index], updated_params):
-            p.data = q.data
+            # Some kernels, including torch grouped_mm, require 16-byte aligned parameter pointers.
+            if q.data_ptr() % 16 == 0:
+                p.data = q.data
+            elif (p.data.shape == q.shape and p.data.dtype == q.dtype and p.data.device == q.device
+                  and p.data.data_ptr() % 16 == 0):
+                p.data.copy_(q.data)
+            else:
+                p.data = q.data.clone()
 
         # set model fp16 weight to slices of reordered flattened buffer
         for param_index, param in enumerate(self.bit16_groups[group_index]):

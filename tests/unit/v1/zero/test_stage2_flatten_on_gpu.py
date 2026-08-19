@@ -18,6 +18,17 @@ from unit.simple_model import SimpleModel, random_dataloader
 _DTYPE_MAP = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
+class _MisalignedParamModel(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.offset = torch.nn.Parameter(torch.ones(1))
+        self.weight = torch.nn.Parameter(torch.ones(8, 8))
+
+    def forward(self, x):
+        return (x @ self.weight).sum() + self.offset.sum()
+
+
 def _apply_dtype_to_config(config_dict, dtype):
     """Set bf16/fp16 in config_dict based on dtype; skip if not supported."""
     if dtype == "bf16":
@@ -29,6 +40,46 @@ def _apply_dtype_to_config(config_dict, dtype):
             pytest.skip("fp16 is not supported on this accelerator")
         config_dict["fp16"] = {"enabled": True, "initial_scale_power": 8}
     # fp32: no half-precision block
+
+
+class TestStage1ParamAlignment(DistributedTest):
+    world_size = 1
+
+    def test_model_params_remain_16_byte_aligned(self):
+        if not get_accelerator().is_bf16_supported():
+            pytest.skip("bf16 is not supported on this accelerator")
+
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "bf16": {
+                "enabled": True
+            },
+            "zero_optimization": {
+                "stage": 1
+            },
+        }
+        model = _MisalignedParamModel()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               optimizer=optimizer,
+                                               model_parameters=model.parameters())
+
+        opt = engine.optimizer
+        flat_views = opt.unflatten(opt.bit16_groups_flat[0], opt.round_robin_bit16_meta[0])
+        assert flat_views[1].data_ptr() % 16 != 0
+        assert engine.module.weight.data_ptr() % 16 == 0
+        weight_before_step = engine.module.weight.detach().clone()
+
+        data = torch.ones(1, 8, device=engine.device, dtype=torch.bfloat16)
+        loss = engine(data)
+        engine.backward(loss)
+        engine.step()
+
+        assert engine.module.weight.data_ptr() % 16 == 0
+        assert not torch.equal(engine.module.weight, weight_before_step)
+        flat_views = opt.unflatten(opt.bit16_groups_flat[0], opt.round_robin_bit16_meta[0])
+        assert torch.equal(engine.module.weight, flat_views[1])
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2])
