@@ -394,7 +394,7 @@ class _AdamSelectionEngine:
     ],
 )
 def test_adam_backend_selection(engine, parameters, adam_w_mode, expected_class, expected_kwargs):
-    optimizer_class, optimizer_kwargs = engine._select_adam_optimizer(parameters, adam_w_mode)
+    optimizer_class, optimizer_kwargs = engine.get_optimizer_configuration(parameters, adam_w_mode)
 
     assert optimizer_class is expected_class
     assert optimizer_kwargs == expected_kwargs

@@ -2052,7 +2052,7 @@ class DeepSpeedEngine(Module):
             return
         configure(getattr(self, "_autoep_folding_spec", None))
 
-    def _select_adam_optimizer(self, optimizer_parameters, adam_w_mode, allow_legacy_fallback=False):
+    def get_optimizer_configuration(self, optimizer_parameters, adam_w_mode, allow_legacy_fallback=False):
         torch_adam = optimizer_parameters.pop(TORCH_ADAM_PARAM, False)
         user_fp32_optimizer_states = optimizer_parameters.pop('fp32_optimizer_states', None)
         if torch_adam:
@@ -2101,8 +2101,8 @@ class DeepSpeedEngine(Module):
 
             # Optimizer name of Adam forces AdamW logic unless adam_w_mode is explicitly set
             effective_adam_w_mode = self.optimizer_name() == ADAMW_OPTIMIZER or adam_w_mode
-            adam_optimizer, adam_optimizer_kwargs = self._select_adam_optimizer(optimizer_parameters,
-                                                                                effective_adam_w_mode)
+            adam_optimizer, adam_optimizer_kwargs = self.get_optimizer_configuration(
+                optimizer_parameters, effective_adam_w_mode)
             optimizer = adam_optimizer(model_parameters, **optimizer_parameters, **adam_optimizer_kwargs)
 
         elif self.optimizer_name() == ADAGRAD_OPTIMIZER:
@@ -2163,9 +2163,9 @@ class DeepSpeedEngine(Module):
             optimizer = MuSGD(model_parameters, **optimizer_parameters)
         elif self.optimizer_name() == MUON_OPTIMIZER:
             adam_w_mode = optimizer_parameters.pop(ADAM_W_MODE, ADAM_W_MODE_DEFAULT)
-            adam_optimizer, adam_optimizer_kwargs = self._select_adam_optimizer(optimizer_parameters,
-                                                                                adam_w_mode,
-                                                                                allow_legacy_fallback=True)
+            adam_optimizer, adam_optimizer_kwargs = self.get_optimizer_configuration(optimizer_parameters,
+                                                                                     adam_w_mode,
+                                                                                     allow_legacy_fallback=True)
             # Flatten param group dicts (created by MoE/EP) into a raw parameter list
             all_params = []
             for item in model_parameters:
