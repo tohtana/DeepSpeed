@@ -2204,7 +2204,10 @@ class DeepSpeedEngine(Module):
                 param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
             optimizer = MuonWithAuxAdam(param_groups,
                                         adam_optimizer=adam_optimizer,
-                                        adam_optimizer_kwargs=adam_optimizer_kwargs)
+                                        adam_optimizer_kwargs=adam_optimizer_kwargs,
+                                        adam_w_mode=adam_w_mode,
+                                        fallback_to_inline=adam_optimizer is not None
+                                        and adam_optimizer.__name__ == "FusedAdam")
         else:
             torch_optimizer = getattr(torch.optim, self.optimizer_name())
             optimizer = torch_optimizer(model_parameters, **optimizer_parameters)

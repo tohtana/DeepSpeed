@@ -270,7 +270,8 @@ def test_muon_aux_adam_matches_torch(optimizer_class):
     assert optimizer.state[actual_param].keys() == reference.state[expected_param].keys()
 
 
-def test_muon_aux_adam_falls_back_to_inline_update():
+@pytest.mark.parametrize("adam_w_mode, optimizer_class", [(True, torch.optim.AdamW), (False, torch.optim.Adam)])
+def test_muon_aux_adam_falls_back_to_inline_update(adam_w_mode, optimizer_class):
     actual_param = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
     expected_param = torch.nn.Parameter(actual_param.detach().clone())
     group_options = {
@@ -279,8 +280,9 @@ def test_muon_aux_adam_falls_back_to_inline_update():
         "eps": 1e-8,
         "weight_decay": 0.1,
     }
-    optimizer = MuonWithAuxAdam([dict(params=[actual_param], use_muon=False, **group_options)])
-    reference = torch.optim.AdamW([expected_param], **group_options)
+    optimizer = MuonWithAuxAdam([dict(params=[actual_param], use_muon=False, **group_options)],
+                                adam_w_mode=adam_w_mode)
+    reference = optimizer_class([expected_param], **group_options)
 
     for grad in (torch.tensor([0.25, -0.5]), torch.tensor([-0.1, 0.2]), torch.tensor([0.3, 0.4])):
         actual_param.grad = grad.clone()
@@ -289,6 +291,42 @@ def test_muon_aux_adam_falls_back_to_inline_update():
         reference.step()
 
     torch.testing.assert_close(actual_param, expected_param)
+
+
+def test_muon_aux_adam_falls_back_when_backend_initialization_fails():
+
+    class UnavailableAdam:
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("backend unavailable")
+
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = MuonWithAuxAdam([dict(params=[param], use_muon=False)],
+                                adam_optimizer=UnavailableAdam,
+                                fallback_to_inline=True)
+
+    assert optimizer.aux_optimizer is None
+
+
+def test_muon_aux_adam_passes_step_id_to_sequential_zenflow():
+
+    class SequentialAdam(torch.optim.AdamW):
+
+        def __init__(self, params):
+            super().__init__(params)
+            self.overlap_step = False
+            self.received_step_id = None
+
+        def step(self, step_id, closure=None):
+            self.received_step_id = step_id
+            return super().step(closure)
+
+    param = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = MuonWithAuxAdam([dict(params=[param], use_muon=False)], adam_optimizer=SequentialAdam)
+    param.grad = torch.ones_like(param)
+    optimizer.step(step_id=3)
+
+    assert optimizer.aux_optimizer.received_step_id == 3
 
 
 def test_muon_aux_adam_rebinds_zero_parameter_groups():
