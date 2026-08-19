@@ -2427,6 +2427,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                              start_alignment_factor=self.nccl_start_alignment_factor,
                              allgather_bucket_size=self.allgather_bucket_size)
 
+        # Misaligned parameters may use standalone aligned storage instead of flat-buffer views.
+        for i in range(len(self.bit16_groups)):
+            self._update_model_bit16_weights(i)
+
     def _average_expert_grad_norms(self, norm_groups):
         for i, norm in enumerate(norm_groups):
             if self.is_moe_param_group[i]:

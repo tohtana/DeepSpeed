@@ -42,10 +42,13 @@ def _apply_dtype_to_config(config_dict, dtype):
     # fp32: no half-precision block
 
 
-class TestStage1ParamAlignment(DistributedTest):
-    world_size = 1
+@pytest.mark.parametrize("zero_stage", [1, 2])
+class TestStage12ParamAlignment(DistributedTest):
+    world_size = 2
 
-    def test_model_params_remain_16_byte_aligned(self):
+    def test_model_params_remain_16_byte_aligned(self, zero_stage):
+        if not get_accelerator().is_available():
+            pytest.skip("Accelerator not available")
         if not get_accelerator().is_bf16_supported():
             pytest.skip("bf16 is not supported on this accelerator")
 
@@ -55,7 +58,7 @@ class TestStage1ParamAlignment(DistributedTest):
                 "enabled": True
             },
             "zero_optimization": {
-                "stage": 1
+                "stage": zero_stage
             },
         }
         model = _MisalignedParamModel()
@@ -78,6 +81,16 @@ class TestStage1ParamAlignment(DistributedTest):
 
         assert engine.module.weight.data_ptr() % 16 == 0
         assert not torch.equal(engine.module.weight, weight_before_step)
+        flat_views = opt.unflatten(opt.bit16_groups_flat[0], opt.round_robin_bit16_meta[0])
+        assert torch.equal(engine.module.weight, flat_views[1])
+
+        # Universal checkpoint loading updates the fp32 partitions and then calls update_lp_params().
+        # Verify that path also keeps standalone aligned model parameters synchronized with the flat buffer.
+        for fp32_partition in opt.single_partition_of_fp32_groups:
+            fp32_partition.data.add_(1)
+        opt.update_lp_params()
+
+        assert engine.module.weight.data_ptr() % 16 == 0
         flat_views = opt.unflatten(opt.bit16_groups_flat[0], opt.round_robin_bit16_meta[0])
         assert torch.equal(engine.module.weight, flat_views[1])
 
