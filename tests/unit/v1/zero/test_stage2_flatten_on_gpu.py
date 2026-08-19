@@ -96,6 +96,77 @@ class TestStage12ParamAlignment(DistributedTest):
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2])
+@pytest.mark.parametrize("load_kwargs", [{
+    "load_module_only": True
+}, {
+    "load_optimizer_states": False
+}],
+                         ids=["module_only", "no_optimizer_states"])
+class TestStage12ParamAlignmentCheckpointLoad(DistributedTest):
+    world_size = 2
+
+    def _build_engine(self, zero_stage, fill):
+        config_dict = {
+            "train_micro_batch_size_per_gpu": 1,
+            "bf16": {
+                "enabled": True
+            },
+            "zero_optimization": {
+                "stage": zero_stage
+            },
+        }
+        model = _MisalignedParamModel()
+        with torch.no_grad():
+            model.offset.fill_(fill)
+            model.weight.fill_(fill)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+        engine, _, _, _ = deepspeed.initialize(config=config_dict,
+                                               model=model,
+                                               optimizer=optimizer,
+                                               model_parameters=model.parameters())
+        return engine
+
+    def _train_one_step(self, engine):
+        data = torch.ones(1, 8, device=engine.device, dtype=torch.bfloat16)
+        loss = engine(data)
+        engine.backward(loss)
+        engine.step()
+
+    def test_flat_buffer_synchronized_after_checkpoint_load(self, tmpdir, zero_stage, load_kwargs):
+        if not get_accelerator().is_available():
+            pytest.skip("Accelerator not available")
+        if not get_accelerator().is_bf16_supported():
+            pytest.skip("bf16 is not supported on this accelerator")
+
+        save_engine = self._build_engine(zero_stage, fill=1.0)
+        save_opt = save_engine.optimizer
+        assert save_opt.unflatten(save_opt.bit16_groups_flat[0],
+                                  save_opt.round_robin_bit16_meta[0])[1].data_ptr() % 16 != 0
+
+        self._train_one_step(save_engine)
+        saved_weight = save_engine.module.weight.detach().clone()
+        save_engine.save_checkpoint(str(tmpdir), tag="ckpt")
+
+        # A clearly different starting point so a discarded load is unambiguous.
+        load_engine = self._build_engine(zero_stage, fill=2.0)
+        load_engine.load_checkpoint(str(tmpdir), tag="ckpt", **load_kwargs)
+
+        weight_after_load = load_engine.module.weight.detach().clone()
+        assert torch.equal(weight_after_load, saved_weight)
+
+        # Checkpoint load writes the model parameter in place, and the fp32 master weights are
+        # rebuilt by reading the flat buffer, so a standalone aligned parameter must be pushed back.
+        load_opt = load_engine.optimizer
+        flat_views = load_opt.unflatten(load_opt.bit16_groups_flat[0], load_opt.round_robin_bit16_meta[0])
+        assert torch.equal(load_engine.module.weight, flat_views[1])
+
+        # The loaded weights must survive the first optimizer step.
+        self._train_one_step(load_engine)
+        drift = (load_engine.module.weight.float() - weight_after_load.float()).abs().max().item()
+        assert drift < 0.5
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2])
 @pytest.mark.parametrize("dtype", ["fp32", "fp16", "bf16"], ids=["fp32", "fp16", "bf16"])
 class TestStage2FlattenOnGPU(DistributedTest):
     """ZeRO-1 and ZeRO-2 with small model should flatten on GPU (sufficient VRAM)."""

@@ -2668,8 +2668,21 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for current, saved in zip(self.single_partition_of_fp32_groups, merged_single_partition_of_fp32_groups):
             current.data.copy_(saved.data)
 
+    def _update_flat_buffer_from_model_bit16_weights(self, group_index):
+        # A parameter whose flat-buffer view is not 16-byte aligned keeps its own aligned storage,
+        # so in-place writes to the model parameter (for example module.load_state_dict() during
+        # checkpoint load) never reach bit16_groups_flat. Push those values back before the flat
+        # buffer is read as the source of truth.
+        flat_views = self.unflatten(self.bit16_groups_flat[group_index], self.round_robin_bit16_meta[group_index])
+        for p, q in zip(self.round_robin_bit16_groups[group_index], flat_views):
+            if p.data.data_ptr() != q.data_ptr():
+                q.data.copy_(p.data)
+
     # Restore base optimizer fp32 weights from ZeRO fp16 or bfloat16 weights
     def _restore_from_bit16_weights(self):
+        for i in range(len(self.bit16_groups)):
+            self._update_flat_buffer_from_model_bit16_weights(i)
+
         for group_id, (bit16_partitions, fp32_partition) in enumerate(
                 zip(self.parallel_partitioned_bit16_groups, self.single_partition_of_fp32_groups)):
             partition_id = dist.get_rank(group=self.real_dp_process_group[group_id])
