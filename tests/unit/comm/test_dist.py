@@ -240,10 +240,28 @@ class FakeAccelerator:
         return torch.device(self._name, device_index)
 
 
-def resolve_device_id(monkeypatch, world_size, local_rank=0, device_count=8, override=None, name='cuda'):
+def resolve_device_id(monkeypatch,
+                      world_size,
+                      local_rank=0,
+                      device_count=8,
+                      override=None,
+                      name='cuda',
+                      torch_version='2.9.0',
+                      supports_device_id=True):
     """Run the device_id policy against a pretend host, independent of the real accelerator."""
+    if supports_device_id:
+
+        def init_process_group(*args, device_id=None, **kwargs):
+            pass
+    else:
+
+        def init_process_group(*args, **kwargs):
+            pass
+
     accelerator = FakeAccelerator(name=name, device_count=device_count)
     monkeypatch.setattr(ds_comm_torch, 'get_accelerator', lambda: accelerator)
+    monkeypatch.setattr(ds_comm_torch.torch, '__version__', torch_version)
+    monkeypatch.setattr(ds_comm_torch.torch.distributed, 'init_process_group', init_process_group)
     monkeypatch.setenv('LOCAL_RANK', str(local_rank))
     monkeypatch.setenv('WORLD_SIZE', str(world_size))
     monkeypatch.delenv(SET_DEVICE_ID_ENV, raising=False)
@@ -259,6 +277,15 @@ def test_device_id_skipped_for_single_rank(monkeypatch):
 
 def test_device_id_set_for_multi_rank(monkeypatch):
     assert resolve_device_id(monkeypatch, world_size=2, local_rank=1) == torch.device('cuda', 1)
+
+
+def test_device_id_skipped_when_torch_signature_is_unsupported(monkeypatch):
+    assert resolve_device_id(monkeypatch, world_size=2, supports_device_id=False) is None
+
+
+@pytest.mark.parametrize("torch_version", ["2.6.1", "2.7.0"])
+def test_device_id_skipped_for_unsafe_torch_version(monkeypatch, torch_version):
+    assert resolve_device_id(monkeypatch, world_size=2, torch_version=torch_version) is None
 
 
 @pytest.mark.parametrize("override", ["0", "false", "NO", "off", " 0 "])
@@ -310,6 +337,9 @@ def assert_device_binding(override, expect_bound):
         os.environ.pop(SET_DEVICE_ID_ENV, None)
     else:
         os.environ[SET_DEVICE_ID_ENV] = override
+
+    if expect_bound and ds_comm_torch.get_init_process_group_device_id(-1) is None:
+        pytest.skip("device_id binding is not supported by this PyTorch build")
 
     deepspeed.init_distributed(dist_backend='nccl', auto_mpi_discovery=False)
 
