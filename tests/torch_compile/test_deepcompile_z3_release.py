@@ -63,6 +63,17 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         values = values[:math.prod(shape)].reshape(-1)
         return values.narrow(0, 0, values.numel() - 1).sum()
 
+    def _configure_arena(self, dc, graph_id, ds_id, shape, occurrence_count):
+        world_size = dist.get_world_size()
+        padded_numel = world_size * math.ceil(math.prod(shape) / world_size)
+        nbytes = padded_numel * torch.empty((), dtype=torch.float32).element_size()
+        capacity = math.ceil(nbytes / 256) * 256
+        dc.configure_z3_gather_arena(graph_id, capacity, 256, [ds_id] * occurrence_count,
+                                     list(range(occurrence_count)), [0] * occurrence_count,
+                                     [nbytes] * occurrence_count, [torch.float32] * occurrence_count,
+                                     "test-executor-arena")
+        return capacity
+
     def test_storage_resized_to_zero_after_release_single_use(self):
         graph_id, ds_id = 9010, 9011
         dc = self._init_dc()
@@ -126,5 +137,37 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert torch.allclose(result, self._expected_view_sum([4097]))
             assert storage.nbytes() == 0
             del scratch
+        finally:
+            dc.cleanup()
+
+    def test_executor_arena_reuses_backing_across_fused_and_demand_occurrences(self):
+        graph_id, ds_id = 9050, 9051
+        shape = [4097]
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, shape)
+            capacity = self._configure_arena(dc, graph_id, ds_id, shape, occurrence_count=2)
+
+            prefetched = torch.ops.dc.prefetch_params_fused.default(graph_id, [shard], [ds_id], [torch.float32])
+            first = torch.ops.dc.wait_allgather.default(prefetched[0], graph_id, ds_id)
+            first_storage = first.untyped_storage()
+            first_ptr = first_storage.data_ptr()
+            self._release(first, graph_id, ds_id, 1)
+            assert first_storage.nbytes() == capacity
+
+            second = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            second = torch.ops.dc.wait_allgather.default(second, graph_id, ds_id)
+            second_storage = second.untyped_storage()
+            assert second_storage.data_ptr() == first_ptr
+            self._release(second, graph_id, ds_id, 1)
+            assert second_storage.nbytes() == capacity
+
+            unplanned = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            unplanned = torch.ops.dc.wait_allgather.default(unplanned, graph_id, ds_id)
+            unplanned_storage = unplanned.untyped_storage()
+            assert unplanned_storage.data_ptr() != first_ptr
+            self._release(unplanned, graph_id, ds_id, 1)
+            assert unplanned_storage.nbytes() == 0
+            assert first_storage.nbytes() == capacity
         finally:
             dc.cleanup()

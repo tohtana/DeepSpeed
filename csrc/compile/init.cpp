@@ -105,6 +105,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("register_graph_z3",
           &dc::register_graph_z3,
           "Register graph with a list of ds parameter ids");
+    m.def("configure_z3_gather_arena",
+          &dc::configure_z3_gather_arena,
+          "Configure an executor-local ZeRO-3 gather arena plan");
     m.def("start_forward", &dc::start_forward, "Start forward pass");
     m.def("end_forward", &dc::end_forward, "End forward pass");
     m.def("start_backward", &dc::start_backward, "Start backward pass");

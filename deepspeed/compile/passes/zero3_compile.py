@@ -13,7 +13,7 @@ import _operator
 import torch
 from torch.fx import Graph, Node, GraphModule
 
-from ..executor_arena import admit_executor_arena, plan_graph_executor_arena
+from ..executor_arena import admit_executor_arena, plan_graph_executor_arena, register_executor_arena
 from ..util import get_input_nodes, get_param_nodes, get_index_by_graph_id, get_deepcompile_handle, get_real_uses, is_cast_op
 from ..fx import (add_postprocess, _make_node_meta, get_output_node, move_primals_to_head, add_end_backward,
                   replace_reduce_outputs_with_none, should_release_reduce_buckets)
@@ -360,6 +360,8 @@ def add_gather_and_release(graph_id: int, graph: Graph, param_manager, param_nod
                                        target_dtype,
                                        allgather_allocation_bytes=_param_allgather_allocation_bytes(
                                            param, target_dtype))
+        if getattr(param.param, "ds_persist", False):
+            allgather_node.meta["deepcompile_arena_fallback_reason"] = "persistent_param"
         if fuse_typecast:
             users = node_to_uses[typecast_node]
             wait_node = typecast_node.args[0]
@@ -441,6 +443,7 @@ def add_z3_gather_release_fw(gm: GraphModule,
     # Build the shared scheduling budget after the operator profile is complete
     # but before the scheduler rewrites graph order and Inductor metadata.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
+    arena_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph), process_group)
 
     rank = dist.get_rank(group=process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
@@ -470,10 +473,18 @@ def add_z3_gather_release_fw(gm: GraphModule,
     if rank == 0 and debug_log:
         print(f"Fwd after scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
 
-    gm._deepcompile_executor_arena_plan = plan_graph_executor_arena(gm.graph)
-    gm._deepcompile_executor_arena_admission = admit_executor_arena(
-        gm._deepcompile_executor_arena_plan.packed,
-        demand_profile_bytes=gm._deepcompile_executor_arena_plan.packed.capacity)
+    arena_plan = plan_graph_executor_arena(gm.graph) if arena_profile_complete else None
+    gm._deepcompile_executor_arena_plan = arena_plan
+    if arena_plan is not None:
+        gm._deepcompile_executor_arena_admission = admit_executor_arena(
+            arena_plan.packed, demand_profile_bytes=arena_plan.packed.capacity)
+    else:
+        gm._deepcompile_executor_arena_admission = None
+    gm._deepcompile_executor_arena_registration = register_executor_arena(nz3,
+                                                                          graph_id,
+                                                                          arena_plan,
+                                                                          process_group=process_group,
+                                                                          disabled_reason="incomplete_profile")
     return gm
 
 
@@ -485,6 +496,8 @@ def add_z3_gather_release_bw(gm: GraphModule,
                              param_manager,
                              debug_log=False) -> GraphModule:
     """Profile, budget, and schedule gathers, releases, and reductions for backward."""
+
+    nz3 = get_deepcompile_handle()
 
     param_nodes_bw, param_name_to_grad = param_manager[graph_id].get_bwd_mapping(gm.graph)
     gm.graph = add_gather_and_reduce(graph_id, gm.graph, param_manager[graph_id], param_nodes_bw, param_name_to_grad)
@@ -502,6 +515,7 @@ def add_z3_gather_release_bw(gm: GraphModule,
     # The scheduler consumes only DP-group-reduced inputs, ensuring every group
     # rank emits collectives in the same order even when allocator state differs.
     scheduler_budget, disabled_reason = _scheduler_budget_from_operator_profile(gm, process_group)
+    arena_profile_complete = _sync_profile_complete(_operator_profile_complete(gm.graph), process_group)
 
     rank = dist.get_rank(group=process_group)
     graph_index = get_index_by_graph_id(graph_order, graph_id)
@@ -525,10 +539,18 @@ def add_z3_gather_release_bw(gm: GraphModule,
     replace_reduce_outputs_with_none(gm.graph)
     _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=True, process_group=process_group)
 
-    gm._deepcompile_executor_arena_plan = plan_graph_executor_arena(gm.graph)
-    gm._deepcompile_executor_arena_admission = admit_executor_arena(
-        gm._deepcompile_executor_arena_plan.packed,
-        demand_profile_bytes=gm._deepcompile_executor_arena_plan.packed.capacity)
+    arena_plan = plan_graph_executor_arena(gm.graph) if arena_profile_complete else None
+    gm._deepcompile_executor_arena_plan = arena_plan
+    if arena_plan is not None:
+        gm._deepcompile_executor_arena_admission = admit_executor_arena(
+            arena_plan.packed, demand_profile_bytes=arena_plan.packed.capacity)
+    else:
+        gm._deepcompile_executor_arena_admission = None
+    gm._deepcompile_executor_arena_registration = register_executor_arena(nz3,
+                                                                          graph_id,
+                                                                          arena_plan,
+                                                                          process_group=process_group,
+                                                                          disabled_reason="incomplete_profile")
     return gm
 
 

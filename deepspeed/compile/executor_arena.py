@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import torch
+
+import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 
 EXECUTOR_ARENA_ALIGNMENT = 256
 DEFAULT_LIVE_BUDGET = 4_000_000_000
@@ -26,6 +29,7 @@ class ArenaOccurrence:
     first_use: int
     release: int
     nbytes: int
+    dtype: Optional[torch.dtype] = None
     eligible: bool = True
     fallback_reason: Optional[str] = None
 
@@ -51,6 +55,7 @@ class ArenaPlanEntry:
     nbytes: int
     aligned_nbytes: int
     offset: int
+    dtype: Optional[torch.dtype] = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,13 @@ class GraphArenaPlan:
     packed: ExecutorArenaPlan
 
 
+@dataclass(frozen=True)
+class ArenaRegistration:
+    enabled: bool
+    reason: str
+    signature: str
+
+
 def align_up(value: int, alignment: int = EXECUTOR_ARENA_ALIGNMENT) -> int:
     if alignment <= 0 or alignment & (alignment - 1):
         raise ValueError("arena alignment must be a positive power of two")
@@ -125,10 +137,15 @@ def _plan_digest(alignment: int, capacity: int, entries, fallbacks) -> str:
             "nbytes": entry.nbytes,
             "aligned_nbytes": entry.aligned_nbytes,
             "offset": entry.offset,
+            "dtype": str(entry.dtype),
         } for entry in entries],
         "fallbacks": [{
             "ds_id": occurrence.ds_id,
             "occurrence": occurrence.occurrence,
+            "first_use": occurrence.first_use,
+            "release": occurrence.release,
+            "nbytes": occurrence.nbytes,
+            "dtype": str(occurrence.dtype),
             "reason": occurrence.fallback_reason,
         } for occurrence in fallbacks],
     }
@@ -175,7 +192,8 @@ def pack_executor_arena(occurrences: Iterable[ArenaOccurrence],
                                release=occurrence.release,
                                nbytes=occurrence.nbytes,
                                aligned_nbytes=aligned_nbytes,
-                               offset=offset)
+                               offset=offset,
+                               dtype=occurrence.dtype)
         entries.append(entry)
         active.append((occurrence.release, offset, aligned_nbytes))
         max_live_bytes = max(max_live_bytes, sum(item[2] for item in active))
@@ -199,6 +217,46 @@ def _arena_producer(wait_node):
     return None, None
 
 
+def _arena_dtype(producer):
+    if producer.target == torch.ops.dc.allgather_param.default:
+        dtype = producer.kwargs.get("dtype")
+    else:
+        dtype = producer.meta.get("deepcompile_arena_dtype")
+    if dtype is None:
+        value = producer.meta.get("val")
+        dtype = getattr(value, "dtype", None)
+    return dtype if isinstance(dtype, torch.dtype) else None
+
+
+def _returns_alias(node) -> bool:
+    if node.target == operator.getitem:
+        return True
+    if node.op == "call_method":
+        return node.target in {
+            "as_strided", "chunk", "contiguous", "detach", "expand", "flatten", "movedim", "narrow", "permute",
+            "reshape", "select", "split", "squeeze", "swapaxes", "swapdims", "t", "transpose", "unbind", "unflatten",
+            "unsqueeze", "view"
+        }
+    schema = getattr(node.target, "_schema", None)
+    return schema is not None and any(result.alias_info is not None for result in schema.returns)
+
+
+def _alias_escape_reason(wait_node, output_nodes) -> Optional[str]:
+    pending = list(wait_node.users)
+    visited = set()
+    while pending:
+        node = pending.pop()
+        if node in visited or not _returns_alias(node):
+            continue
+        visited.add(node)
+        if node in output_nodes:
+            return "graph_output_alias_escape"
+        if node.meta.get("deepcompile_saved_tensor"):
+            return "saved_tensor_escape"
+        pending.extend(node.users)
+    return None
+
+
 def plan_graph_executor_arena(graph) -> GraphArenaPlan:
     """Extract contained demand and fused gather occurrences from semantic FX."""
     nodes = list(graph.nodes)
@@ -209,7 +267,7 @@ def plan_graph_executor_arena(graph) -> GraphArenaPlan:
         if node.op == "output":
             output_nodes.update(node.all_input_nodes)
         elif node.target == torch.ops.dc.release_param.default:
-            releases[int(node.args[2])].append(node_positions[node])
+            releases[int(node.args[2])].append((node_positions[node], node))
 
     release_cursors = defaultdict(int)
     occurrence_cursors = defaultdict(int)
@@ -229,26 +287,46 @@ def plan_graph_executor_arena(graph) -> GraphArenaPlan:
         release_index = None
         cursor = release_cursors[ds_id]
         while cursor < len(releases[ds_id]):
-            candidate = releases[ds_id][cursor]
+            candidate, release_node = releases[ds_id][cursor]
             cursor += 1
             if candidate >= node_positions[wait_node]:
                 release_index = candidate
+                try:
+                    release_count = int(release_node.args[3])
+                except (IndexError, TypeError, ValueError):
+                    release_count = 0
+                if release_count <= 0:
+                    release_index = None
+                    break
+                for _ in range(release_count - 1):
+                    if cursor >= len(releases[ds_id]):
+                        release_index = None
+                        break
+                    release_index = releases[ds_id][cursor][0]
+                    cursor += 1
                 break
         release_cursors[ds_id] = cursor
 
         raw_nbytes = producer.meta.get("allgather_allocation_bytes", producer.meta.get("tensor_size", 0))
-        try:
-            nbytes = int(raw_nbytes)
-        except (TypeError, ValueError, RuntimeError):
+        if isinstance(raw_nbytes, torch.SymInt):
             nbytes = 0
+        else:
+            try:
+                nbytes = int(raw_nbytes)
+            except (TypeError, ValueError, RuntimeError):
+                nbytes = 0
+        dtype = _arena_dtype(producer)
         fallback_reason = producer.meta.get("deepcompile_arena_fallback_reason")
         if release_index is None:
             release_index = start
             fallback_reason = fallback_reason or "missing_release"
         if nbytes <= 0:
             fallback_reason = fallback_reason or "dynamic_or_missing_size"
+        if dtype is None:
+            fallback_reason = fallback_reason or "dynamic_or_missing_dtype"
         if producer in output_nodes or wait_node in output_nodes:
             fallback_reason = fallback_reason or "graph_output_escape"
+        fallback_reason = fallback_reason or _alias_escape_reason(wait_node, output_nodes)
         if producer.meta.get("deepcompile_saved_tensor") or wait_node.meta.get("deepcompile_saved_tensor"):
             fallback_reason = fallback_reason or "saved_tensor_escape"
         if previous_release.get(ds_id, -1) >= start:
@@ -261,6 +339,7 @@ def plan_graph_executor_arena(graph) -> GraphArenaPlan:
                             first_use=start,
                             release=release_index,
                             nbytes=max(0, nbytes),
+                            dtype=dtype,
                             eligible=fallback_reason is None,
                             fallback_reason=fallback_reason))
 
@@ -323,3 +402,53 @@ def executor_plan_signature(plan: Optional[ExecutorArenaPlan], disabled_reason: 
         }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _signature_int(signature: str) -> int:
+    return int(signature[:16], 16) & ((1 << 63) - 1)
+
+
+def register_executor_arena(nz3,
+                            graph_id: int,
+                            graph_plan: Optional[GraphArenaPlan],
+                            process_group=None,
+                            disabled_reason: str = "no_plan") -> ArenaRegistration:
+    """Register metadata only; the native executor materializes backing on first real gather."""
+    packed = graph_plan.packed if graph_plan is not None else None
+    signature = executor_plan_signature(packed, disabled_reason)
+    reason = "accepted" if packed is not None else disabled_reason
+
+    if dist.is_initialized():
+        fingerprint = _signature_int(signature)
+        device = torch.device(get_accelerator().current_device())
+        minimum = torch.tensor([fingerprint], device=device, dtype=torch.int64)
+        maximum = minimum.clone()
+        dist.all_reduce(minimum, dist.ReduceOp.MIN, group=process_group)
+        dist.all_reduce(maximum, dist.ReduceOp.MAX, group=process_group)
+        if minimum.item() != maximum.item():
+            packed = None
+            graph_plan = None
+            reason = "rank_plan_mismatch"
+            signature = executor_plan_signature(None, reason)
+
+    if graph_plan is None or packed is None or packed.capacity == 0:
+        nz3.configure_z3_gather_arena(graph_id, 0, EXECUTOR_ARENA_ALIGNMENT, [], [], [], [], [], signature)
+        return ArenaRegistration(enabled=False, reason=reason if packed is None else "empty_plan", signature=signature)
+
+    entries = {(entry.ds_id, entry.occurrence): entry for entry in packed.entries}
+    ds_ids = []
+    occurrences = []
+    offsets = []
+    nbytes = []
+    dtypes = []
+    for occurrence in graph_plan.occurrences:
+        entry = entries.get((occurrence.ds_id, occurrence.occurrence))
+        ds_ids.append(occurrence.ds_id)
+        occurrences.append(occurrence.occurrence)
+        offsets.append(entry.offset if entry is not None else -1)
+        nbytes.append(occurrence.nbytes)
+        dtypes.append(occurrence.dtype if occurrence.dtype is not None else torch.uint8)
+
+    nz3.configure_z3_gather_arena(graph_id, packed.capacity, packed.alignment, ds_ids, occurrences, offsets, nbytes,
+                                  dtypes, signature)
+    return ArenaRegistration(enabled=True, reason=reason, signature=signature)

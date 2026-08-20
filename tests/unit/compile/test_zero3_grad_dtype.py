@@ -9,7 +9,9 @@ import pytest
 import torch
 
 from deepspeed.compile import backend as backend_mod
-from deepspeed.compile.init_z3 import _allow_dynamo_dynamic_parameter_shapes_for_z3, _resolve_expected_grad_dtype
+from deepspeed.compile.init_z3 import (DEFAULT_Z3_OPTIMIZATION_PASSES, _allow_dynamo_dynamic_parameter_shapes_for_z3,
+                                       _resolve_expected_grad_dtype)
+from deepspeed.compile.passes import prefetch, selective_gather, zero3_compile
 from deepspeed.compile.patch_compiled_func import (get_backward_inputs, pop_backward_input, register_backward_frame)
 from deepspeed.runtime.engine import DeepSpeedEngine
 from deepspeed.utils.torch import required_torch_version
@@ -35,6 +37,11 @@ def test_explicit_grad_dtype_is_preserved():
     param.grad_dtype = torch.float32
 
     assert _resolve_expected_grad_dtype(param) is torch.float32
+
+
+def test_default_z3_schedule_selects_persistence_before_prefetch():
+    assert DEFAULT_Z3_OPTIMIZATION_PASSES == (zero3_compile.add_z3_gather_release, selective_gather.selective_gather,
+                                              prefetch.schedule_prefetch)
 
 
 def test_zero3_allows_dynamo_dynamic_parameter_shapes(monkeypatch):
