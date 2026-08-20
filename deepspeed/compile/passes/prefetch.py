@@ -3,7 +3,8 @@
 
 # DeepSpeed Team
 
-from typing import List, Tuple
+import operator
+from typing import Iterable, List, Tuple
 
 import torch
 from torch.fx import Graph, Node, GraphModule
@@ -11,6 +12,8 @@ from torch.fx import Graph, Node, GraphModule
 from deepspeed.accelerator import get_accelerator
 import deepspeed.comm as dist
 
+from ..executor_arena import (DEFAULT_FUSE_BUDGET, DEFAULT_LIVE_BUDGET, admit_executor_arena,
+                              plan_graph_executor_arena)
 from ..profilers.comm_profile import create_predictor
 from ..profilers.graph_profile import is_profile_incomplete
 from ..graph_param import DSGraphParamManager
@@ -22,8 +25,8 @@ CONTRACT = PassContract(requires=frozenset({CAP_Z3_GATHER_RELEASE}))
 
 FUSE_FACTOR = 0.8
 MARGIN = 0.1
-MAX_FUSE_SIZE = 1e9
-MAX_BUFFERED_SIZE = 4e9
+MAX_FUSE_SIZE = DEFAULT_FUSE_BUDGET
+MAX_BUFFERED_SIZE = DEFAULT_LIVE_BUDGET
 
 run_prefetch_pass = False
 
@@ -36,6 +39,58 @@ def print_rank_0(message):
 def get_ds_id(node: Node):
     assert node.target == torch.ops.dc.allgather_param.default
     return node.args[2]
+
+
+def _fused_group_dtypes(ag_nodes: List[Node]):
+    dtypes = [node.kwargs.get("dtype") for node in ag_nodes]
+    if all(dtype is None for dtype in dtypes):
+        return None
+    if any(dtype is None for dtype in dtypes):
+        return False
+    return dtypes
+
+
+def _rewrite_fused_prefetch(ordered_nodes: Iterable, graph_id: int) -> Graph:
+    """Replace scheduled all-gathers with Tensor-producing fused prefetch edges."""
+    new_graph = Graph()
+    env = {}
+    replaced_allgathers = set()
+
+    for node in ordered_nodes:
+        if isinstance(node, Node):
+            if node.name in replaced_allgathers:
+                continue
+            new_node = new_graph.node_copy(node, lambda old_node: env[old_node.name])
+            env[node.name] = new_node
+            continue
+
+        ag_nodes = list(node)
+        if not ag_nodes:
+            continue
+        dtypes = _fused_group_dtypes(ag_nodes)
+        if dtypes is False:
+            # The fused schema cannot represent a mixture of explicit and implicit
+            # dtypes, so preserve the independent demand all-gathers.
+            continue
+
+        param_nodes = [ag_node.args[0] for ag_node in ag_nodes]
+        if any(param_node.name not in env for param_node in param_nodes):
+            raise RuntimeError("fused prefetch was scheduled before its parameter inputs")
+        param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
+        ds_ids = [get_ds_id(ag_node) for ag_node in ag_nodes]
+        fused_node = new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
+                                             args=(graph_id, param_nodes_copy, ds_ids, dtypes))
+        fused_node.meta["deepcompile_fused_ds_ids"] = tuple(ds_ids)
+
+        for index, ag_node in enumerate(ag_nodes):
+            output = new_graph.call_function(operator.getitem, args=(fused_node, index))
+            output.meta.update(ag_node.meta)
+            output.meta["deepcompile_arena_ds_id"] = get_ds_id(ag_node)
+            env[ag_node.name] = output
+            replaced_allgathers.add(ag_node.name)
+
+    new_graph.lint()
+    return new_graph
 
 
 def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int, bool]], profiling_results,
@@ -64,6 +119,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     tensor_size_dict = {name: size for name, size in tensor_sizes}
 
     graph = gm.graph
+    demand_plan = plan_graph_executor_arena(graph)
     total_param_size = sum(
         [tensor_size_dict[n.name] for n in graph.nodes if n.target == torch.ops.dc.allgather_param.default])
 
@@ -167,21 +223,20 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
         assert ag_tensor_size_sum >= 0
 
-    new_graph = Graph()
-    env = {}
-    for node in reversed(new_order_rev):
-        if isinstance(node, Node):
-            #print(f"reconstruct {node.name} {node.target}")
-            new_node = new_graph.node_copy(node, lambda n: env[n.name])
-            env[node.name] = new_node
-        else:
-            param_nodes = [ag_node.args[0] for ag_node in node]
-            param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
-
-            ds_ids = [get_ds_id(ag_node) for ag_node in node]
-            new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
-                                    args=(graph_id, param_nodes_copy, ds_ids))
-    new_graph.lint()
-    gm.graph = new_graph
+    fused_graph = _rewrite_fused_prefetch(reversed(new_order_rev), graph_id)
+    final_plan = plan_graph_executor_arena(fused_graph)
+    admission = admit_executor_arena(final_plan.packed,
+                                     demand_profile_bytes=demand_plan.packed.capacity,
+                                     live_budget=int(MAX_BUFFERED_SIZE))
+    if admission.accepted:
+        gm.graph = fused_graph
+    else:
+        gm.graph = graph
+        final_plan = demand_plan
+        admission = admit_executor_arena(final_plan.packed,
+                                         demand_profile_bytes=demand_plan.packed.capacity,
+                                         live_budget=int(MAX_BUFFERED_SIZE))
+    gm._deepcompile_executor_arena_plan = final_plan
+    gm._deepcompile_executor_arena_admission = admission
 
     return gm
