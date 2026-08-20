@@ -678,7 +678,7 @@ def test_schedule_prefetch_skips_when_memory_profile_incomplete(monkeypatch):
     assert any("incomplete profiling data" in message for message in logs)
 
 
-def test_schedule_prefetch_rejected_admission_registers_disabled_backward_phase(monkeypatch):
+def test_schedule_prefetch_rejected_fused_admission_restores_enabled_backward_demand_arena(monkeypatch):
     graph = Graph()
     param = _placeholder(graph, "admission_param")
     output = graph.output((param, ))
@@ -741,12 +741,20 @@ def test_schedule_prefetch_rejected_admission_registers_disabled_backward_phase(
             self.arena_config = args
 
     native = FakeNative()
+    admissions = []
+
+    def record_admission(plan, demand_profile_bytes, live_budget):
+        admission = executor_arena_mod.admit_executor_arena(plan, demand_profile_bytes, live_budget)
+        admissions.append(admission)
+        return admission
+
     monkeypatch.setattr(prefetch_mod, "MAX_BUFFERED_SIZE", 255)
     monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
     monkeypatch.setattr(prefetch_mod, "print_rank_0", lambda _message: None)
     monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _size: 0)
     monkeypatch.setattr(prefetch_mod, "is_profile_incomplete", lambda _graph: False)
     monkeypatch.setattr(prefetch_mod, "plan_graph_executor_arena", lambda _graph: next(plans))
+    monkeypatch.setattr(prefetch_mod, "admit_executor_arena", record_admission)
     monkeypatch.setattr(prefetch_mod, "get_deepcompile_handle", lambda: native)
     monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda tensor, op, group=None: tensor)
 
@@ -761,10 +769,41 @@ def test_schedule_prefetch_rejected_admission_registers_disabled_backward_phase(
 
     assert returned is gm
     assert gm.graph is graph
-    assert not gm._deepcompile_executor_arena_admission.accepted
-    assert not gm._deepcompile_executor_arena_registration.enabled
-    assert gm._deepcompile_executor_arena_registration.reason == "live_budget_exceeded"
-    assert native.arena_config[0:4] == (0, True, 0, 256)
+    assert [(admission.accepted, admission.capacity, admission.demand_profile_bytes, admission.incremental_bytes)
+            for admission in admissions] == [(False, 512, 256, 256), (True, 256, 256, 0)]
+    assert gm._deepcompile_executor_arena_plan.packed.capacity == 256
+    assert gm._deepcompile_executor_arena_admission.accepted
+    assert gm._deepcompile_executor_arena_admission.incremental_bytes == 0
+    assert gm._deepcompile_executor_arena_registration.enabled
+    assert gm._deepcompile_executor_arena_registration.reason == "accepted"
+    assert native.arena_config[0:5] == (0, True, 256, 256, [101])
+
+    admissions.clear()
+    plans = iter(
+        (
+            executor_arena_mod.GraphArenaPlan(demand_occurrences,
+                                              executor_arena_mod.pack_executor_arena(demand_occurrences)),
+            executor_arena_mod.GraphArenaPlan(final_occurrences,
+                                              executor_arena_mod.pack_executor_arena(final_occurrences)),
+        ))
+    gm = GraphModule(torch.nn.Module(), graph)
+    monkeypatch.setattr(prefetch_mod, "MAX_BUFFERED_SIZE", 256)
+
+    prefetch_mod.schedule_prefetch(gm,
+                                   graph_id=0,
+                                   graph_order=[(0, True)],
+                                   profiling_results=profiling_results,
+                                   create_inputs_fn=lambda: (),
+                                   mem_budget=0,
+                                   param_manager={},
+                                   bwd=True)
+
+    assert gm.graph is not graph
+    assert len(admissions) == 1
+    assert gm._deepcompile_executor_arena_plan.packed.capacity == 512
+    assert gm._deepcompile_executor_arena_admission.accepted
+    assert gm._deepcompile_executor_arena_registration.enabled
+    assert native.arena_config[0:4] == (0, True, 512, 256)
 
 
 def test_graphsafe_rng_state_outputs_are_registered_no_reuse():
