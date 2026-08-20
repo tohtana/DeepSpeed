@@ -6,6 +6,7 @@
 import pytest
 
 from deepspeed.compile.passes import contract as contract_mod
+from deepspeed.compile.passes import prefetch, selective_gather, zero3_compile
 from deepspeed.compile.passes.contract import (PassContract, PassContractError, register_pass_contract,
                                                get_pass_contract, validate_schedule)
 
@@ -77,6 +78,17 @@ def test_conflict_is_symmetric(clean_registry):
         validate_schedule([(0, ["a", "b"])])
     with pytest.raises(PassContractError, match="conflicts"):
         validate_schedule([(0, ["b", "a"])])
+
+
+def test_selective_gather_and_prefetch_require_separate_compile_steps(clean_registry):
+    register_pass_contract(zero3_compile.NAME, zero3_compile.CONTRACT)
+    register_pass_contract(selective_gather.NAME, selective_gather.CONTRACT)
+    register_pass_contract(prefetch.NAME, prefetch.CONTRACT)
+
+    with pytest.raises(PassContractError, match="conflicts"):
+        validate_schedule([(5, [zero3_compile.NAME, selective_gather.NAME, prefetch.NAME])])
+
+    validate_schedule([(5, [zero3_compile.NAME, selective_gather.NAME]), (6, [zero3_compile.NAME, prefetch.NAME])])
 
 
 def test_uncontracted_passes_are_skipped(clean_registry):

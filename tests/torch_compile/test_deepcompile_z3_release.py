@@ -209,8 +209,10 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             assert backward_storage.nbytes() == backward_capacity
             assert backward.data_ptr() == backward_storage.data_ptr() + backward_offset
             assert backward_storage.data_ptr() != forward_storage.data_ptr()
+            with pytest.raises(RuntimeError, match="active leases"):
+                dc.end_backward_phase()
             self._release(backward, graph_id, ds_id, 1)
-            torch.ops.dc.end_backward.default([], graph_id, False)
+            dc.end_backward_phase()
 
             dc.start_forward()
             next_forward = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)

@@ -96,8 +96,9 @@ public:
             it.second.record_stream(at::cuda::getCurrentCUDAStream());
         }
         reload_buffers_.clear();
-        endGatherArenaCycle();
     }
+
+    void endBackwardPhase() override { endGatherArenaCycle(); }
 
     void configureGatherArena(bool bwd,
                               int64_t capacity_bytes,
