@@ -37,7 +37,7 @@ def _reduce_int(value: int, op, process_group=None):
         return int(value)
 
     value_tensor = torch.tensor([int(value)],
-                                device=torch.device(get_accelerator().current_device()),
+                                device=torch.device(get_accelerator().current_device_name()),
                                 dtype=torch.int64)
     dist.all_reduce(value_tensor, op, group=process_group)
     return int(value_tensor.item())
@@ -61,7 +61,7 @@ def _sync_profile_complete(profile_complete: bool, process_group=None):
         return profile_complete
 
     complete = torch.tensor([1 if profile_complete else 0],
-                            device=torch.device(get_accelerator().current_device()),
+                            device=torch.device(get_accelerator().current_device_name()),
                             dtype=torch.int)
     dist.all_reduce(complete, dist.ReduceOp.MIN, group=process_group)
     return bool(complete.item())
@@ -175,7 +175,7 @@ def _validate_final_schedule_fingerprint(graph: Graph, graph_id: int, bwd: bool,
         return fingerprint
 
     _print_scheduler_debug(collective_message, process_group)
-    device = torch.device(get_accelerator().current_device())
+    device = torch.device(get_accelerator().current_device_name())
     min_fingerprint = torch.tensor([fingerprint], device=device, dtype=torch.int64)
     max_fingerprint = min_fingerprint.clone()
     dist.all_reduce(min_fingerprint, dist.ReduceOp.MIN, group=process_group)
@@ -480,11 +480,14 @@ def add_z3_gather_release_fw(gm: GraphModule,
             arena_plan.packed, demand_profile_bytes=arena_plan.packed.capacity)
     else:
         gm._deepcompile_executor_arena_admission = None
-    gm._deepcompile_executor_arena_registration = register_executor_arena(nz3,
-                                                                          graph_id,
-                                                                          arena_plan,
-                                                                          process_group=process_group,
-                                                                          disabled_reason="incomplete_profile")
+    gm._deepcompile_executor_arena_registration = register_executor_arena(
+        nz3,
+        graph_id,
+        arena_plan,
+        process_group=process_group,
+        disabled_reason="incomplete_profile",
+        bwd=False,
+        admission=gm._deepcompile_executor_arena_admission)
     return gm
 
 
@@ -546,11 +549,14 @@ def add_z3_gather_release_bw(gm: GraphModule,
             arena_plan.packed, demand_profile_bytes=arena_plan.packed.capacity)
     else:
         gm._deepcompile_executor_arena_admission = None
-    gm._deepcompile_executor_arena_registration = register_executor_arena(nz3,
-                                                                          graph_id,
-                                                                          arena_plan,
-                                                                          process_group=process_group,
-                                                                          disabled_reason="incomplete_profile")
+    gm._deepcompile_executor_arena_registration = register_executor_arena(
+        nz3,
+        graph_id,
+        arena_plan,
+        process_group=process_group,
+        disabled_reason="incomplete_profile",
+        bwd=True,
+        admission=gm._deepcompile_executor_arena_admission)
     return gm
 
 

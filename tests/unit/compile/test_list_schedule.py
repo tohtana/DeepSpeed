@@ -31,6 +31,7 @@ def _define_dc_ops():
         torch.ops.dc.wait_allgather.default
         torch.ops.dc.release_param.default
         torch.ops.dc.reduce_grad.default
+        torch.ops.dc.reload_parameter.default
         return
     except AttributeError:
         pass
@@ -43,6 +44,7 @@ def _define_dc_ops():
             "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
             "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
             "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
+            "reload_parameter(Tensor a, int graph_id, int id) -> ()",
             "free_tensors(Tensor[] tensors) -> ()",
             "end_backward(Tensor[] tensors, int graph_id, bool release_reduce_buckets = True) -> ()",
     ):
@@ -89,7 +91,7 @@ def test_sync_memory_profile_complete_noops_without_distributed(monkeypatch):
 
 def test_sync_memory_profile_complete_reduces_asymmetric_failure(monkeypatch):
     monkeypatch.setattr(backend_mod.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(backend_mod, "get_accelerator", lambda: SimpleNamespace(current_device=lambda: "cpu"))
+    monkeypatch.setattr(backend_mod, "get_accelerator", lambda: SimpleNamespace(current_device_name=lambda: "cpu"))
 
     def mark_any_rank_failed(tensor, op):
         assert op == backend_mod.dist.ReduceOp.MIN
@@ -126,6 +128,9 @@ def test_zero3_scheduler_budget_uses_rank_reduced_non_gathered_peak(monkeypatch)
     class FakeAccelerator:
 
         def current_device(self):
+            return "cpu"
+
+        def current_device_name(self):
             return "cpu"
 
         def total_memory(self):
@@ -585,6 +590,9 @@ def test_profile_backfill_makes_partial_profile_safe_for_profile_dependent_passe
         def current_device(self):
             return "cpu"
 
+        def current_device_name(self):
+            return "cpu"
+
         def total_memory(self):
             return 1024
 
@@ -668,6 +676,95 @@ def test_schedule_prefetch_skips_when_memory_profile_incomplete(monkeypatch):
                                           bwd=False) is gm
     assert gm.graph is graph
     assert any("incomplete profiling data" in message for message in logs)
+
+
+def test_schedule_prefetch_rejected_admission_registers_disabled_backward_phase(monkeypatch):
+    graph = Graph()
+    param = _placeholder(graph, "admission_param")
+    output = graph.output((param, ))
+    _with_meta(output)
+    graph.lint()
+
+    profile_records = [(node.name, 0, 0, 0) for node in graph.nodes]
+    time_records = [(node.name, 0, 0) for node in graph.nodes]
+    size_records = [(node.name, 0) for node in graph.nodes]
+    profiling_results = {
+        0:
+        ProfilingResult(bwd_graph=graph,
+                        bwd_mem=profile_records,
+                        bwd_time=time_records,
+                        bwd_tensor_sizes=size_records,
+                        bwd_mem_complete=True)
+    }
+    gm = GraphModule(torch.nn.Module(), graph)
+
+    demand_occurrences = (executor_arena_mod.ArenaOccurrence(ds_id=101,
+                                                             occurrence=0,
+                                                             first_use=0,
+                                                             release=1,
+                                                             nbytes=256,
+                                                             dtype=torch.float16), )
+    final_occurrences = (executor_arena_mod.ArenaOccurrence(ds_id=101,
+                                                            occurrence=0,
+                                                            first_use=0,
+                                                            release=1,
+                                                            nbytes=512,
+                                                            dtype=torch.float16), )
+    plans = iter(
+        (
+            executor_arena_mod.GraphArenaPlan(demand_occurrences,
+                                              executor_arena_mod.pack_executor_arena(demand_occurrences)),
+            executor_arena_mod.GraphArenaPlan(final_occurrences,
+                                              executor_arena_mod.pack_executor_arena(final_occurrences)),
+        ))
+
+    class FakeAccelerator:
+
+        def current_device_name(self):
+            return "cpu"
+
+        def total_memory(self):
+            return 1024
+
+        def available_memory(self):
+            return 1024
+
+        def memory_allocated(self):
+            return 0
+
+        def max_memory_allocated(self):
+            return 0
+
+    class FakeNative:
+
+        def configure_z3_gather_arena(self, *args):
+            self.arena_config = args
+
+    native = FakeNative()
+    monkeypatch.setattr(prefetch_mod, "MAX_BUFFERED_SIZE", 255)
+    monkeypatch.setattr(prefetch_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(prefetch_mod, "print_rank_0", lambda _message: None)
+    monkeypatch.setattr(prefetch_mod, "create_predictor", lambda: lambda _size: 0)
+    monkeypatch.setattr(prefetch_mod, "is_profile_incomplete", lambda _graph: False)
+    monkeypatch.setattr(prefetch_mod, "plan_graph_executor_arena", lambda _graph: next(plans))
+    monkeypatch.setattr(prefetch_mod, "get_deepcompile_handle", lambda: native)
+    monkeypatch.setattr(prefetch_mod.dist, "all_reduce", lambda tensor, op, group=None: tensor)
+
+    returned = prefetch_mod.schedule_prefetch(gm,
+                                              graph_id=0,
+                                              graph_order=[(0, True)],
+                                              profiling_results=profiling_results,
+                                              create_inputs_fn=lambda: (),
+                                              mem_budget=0,
+                                              param_manager={},
+                                              bwd=True)
+
+    assert returned is gm
+    assert gm.graph is graph
+    assert not gm._deepcompile_executor_arena_admission.accepted
+    assert not gm._deepcompile_executor_arena_registration.enabled
+    assert gm._deepcompile_executor_arena_registration.reason == "live_budget_exceeded"
+    assert native.arena_config[0:4] == (0, True, 0, 256)
 
 
 def test_graphsafe_rng_state_outputs_are_registered_no_reuse():

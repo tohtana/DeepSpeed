@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,9 @@ from deepspeed.compile.init_z3 import (DEFAULT_Z3_OPTIMIZATION_PASSES, _allow_dy
                                        _resolve_expected_grad_dtype)
 from deepspeed.compile.passes import prefetch, selective_gather, zero3_compile
 from deepspeed.compile.patch_compiled_func import (get_backward_inputs, pop_backward_input, register_backward_frame)
+import deepspeed.runtime.engine as engine_mod
 from deepspeed.runtime.engine import DeepSpeedEngine
+import deepspeed.utils.nvtx as nvtx_mod
 from deepspeed.utils.torch import required_torch_version
 
 
@@ -42,6 +45,45 @@ def test_explicit_grad_dtype_is_preserved():
 def test_default_z3_schedule_selects_persistence_before_prefetch():
     assert DEFAULT_Z3_OPTIMIZATION_PASSES == (zero3_compile.add_z3_gather_release, selective_gather.selective_gather,
                                               prefetch.schedule_prefetch)
+
+
+def test_deepcompile_forward_uses_native_phase_lifecycle(monkeypatch):
+    events = []
+
+    class FakeNative:
+
+        def start_forward(self):
+            events.append("start_forward")
+
+        def end_forward(self):
+            events.append("end_forward")
+
+    class FakeModule(torch.nn.Module):
+
+        def forward(self):
+            events.append("module")
+            return torch.tensor(1.0)
+
+    engine = object.__new__(DeepSpeedEngine)
+    torch.nn.Module.__init__(engine)
+    engine.optimizer = object()
+    engine.__dict__["module"] = FakeModule()
+    engine._is_compiled = True
+    engine.is_deepcompile_enabled = lambda: True
+    engine.is_deepcompile_active = lambda: True
+    engine.autotuning_profile_model_info = lambda: False
+
+    monkeypatch.setattr(nvtx_mod, "enable_nvtx", False)
+    monkeypatch.setattr(engine_mod, "get_deepcompile_handle", lambda: FakeNative())
+    monkeypatch.setattr(engine_mod, "deepcompile_z3_forward_context", lambda _engine: nullcontext(None))
+    monkeypatch.setattr(engine_mod, "autocast_if_enabled", lambda _engine: nullcontext())
+    monkeypatch.setattr(engine_mod, "register_output_backward_hooks",
+                        lambda *_args, **_kwargs: SimpleNamespace(hook_handles=[]))
+
+    output = engine.forward()
+
+    assert output.item() == 1.0
+    assert events == ["start_forward", "module", "end_forward"]
 
 
 def test_zero3_allows_dynamo_dynamic_parameter_shapes(monkeypatch):
