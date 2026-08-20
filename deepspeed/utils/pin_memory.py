@@ -89,12 +89,14 @@ class NativePinnedMemory(object):
         begin = getattr(tensor, "ds_pin_base", None)
         if begin is None:
             begin = tensor.data_ptr()
+        # Unregister first. If this fails, keep the allocation so the driver is
+        # not left holding a registration for pages later reused by malloc.
+        self._unregister_device(begin, self._device_registered)
         finalizer = self._finalizers.pop(begin, None)
         if finalizer is not None:
             # Explicit unpin owns the free; cancel the GC finalizer to avoid a
             # redundant free.
             finalizer.detach()
-        self._unregister_device(begin, self._device_registered)
         freed = self._handle.free_cpu_locked_tensor_by_ptr(begin)
         self._ranges.pop(begin, None)
         if hasattr(tensor, "ds_pinned"):
@@ -103,9 +105,14 @@ class NativePinnedMemory(object):
 
     @staticmethod
     def _release(handle, begin, ranges, finalizers, device_registered):
+        try:
+            NativePinnedMemory._unregister_device(begin, device_registered)
+        except Exception:
+            # Interpreter shutdown / dead device context: leave the allocation
+            # so the driver does not retain a registration for recycled pages.
+            return
         ranges.pop(begin, None)
         finalizers.pop(begin, None)
-        NativePinnedMemory._unregister_device(begin, device_registered)
         try:
             handle.free_cpu_locked_tensor_by_ptr(begin)
         except Exception:
@@ -117,14 +124,9 @@ class NativePinnedMemory(object):
     def _unregister_device(begin, device_registered):
         if begin not in device_registered:
             return
+        from deepspeed.accelerator import get_accelerator
+        get_accelerator().unregister_host_memory(begin)
         device_registered.discard(begin)
-        try:
-            from deepspeed.accelerator import get_accelerator
-            get_accelerator().unregister_host_memory(begin)
-        except Exception:
-            # Best-effort cleanup during interpreter shutdown. The allocation is
-            # still released below even when the device runtime is unavailable.
-            pass
 
     @staticmethod
     def _device_registration_enabled():

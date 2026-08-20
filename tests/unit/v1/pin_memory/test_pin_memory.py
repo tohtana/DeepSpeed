@@ -242,3 +242,36 @@ def test_invalid_register_device_env(monkeypatch, native_pins):
     monkeypatch.setenv("DS_PIN_MEMORY_REGISTER_DEVICE", "maybe")
     with pytest.raises(ValueError, match="DS_PIN_MEMORY_REGISTER_DEVICE"):
         native_pins.pin(torch.empty(8), make_copy=False)
+
+
+def test_unpin_keeps_allocation_when_unregister_fails(monkeypatch, native_pins):
+
+    class _UnregisterFailAccelerator(_RegisteringAccelerator):
+
+        def __init__(self):
+            super().__init__()
+            self.fail_unregister = True
+
+        def unregister_host_memory(self, address):
+            if self.fail_unregister:
+                raise RuntimeError("simulated cudaHostUnregister failure")
+            super().unregister_host_memory(address)
+
+    accelerator = _UnregisterFailAccelerator()
+    monkeypatch.setattr("deepspeed.accelerator.get_accelerator", lambda: accelerator)
+    monkeypatch.setenv("DS_PIN_MEMORY_REGISTER_DEVICE", "1")
+    pinned = native_pins.pin(torch.empty(32), make_copy=False)
+    begin = pinned.data_ptr()
+
+    with pytest.raises(RuntimeError, match="cudaHostUnregister"):
+        native_pins.unpin(pinned)
+
+    assert native_pins.is_pinned(pinned)
+    assert begin in native_pins._device_registered
+    assert begin in native_pins._ranges
+    assert accelerator.unregistered == []
+
+    accelerator.fail_unregister = False
+    assert native_pins.unpin(pinned) is True
+    assert accelerator.unregistered == [begin]
+    assert begin not in native_pins._device_registered
