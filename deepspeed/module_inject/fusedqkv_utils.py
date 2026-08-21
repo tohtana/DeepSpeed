@@ -158,6 +158,9 @@ def prepare_tp_fused_qkvw(module, src, mp_size, gpu_index, meta: AutoTPMeta):
 
     def _bigcode_type_transpose(input, mp_size, meta=meta):
         n_embd = meta.n_embd
+        # A missing hidden size would slice as input[:None], handing the whole fused weight to q
+        # and leaving kv empty rather than failing.
+        assert n_embd is not None
         q = input[:n_embd]
         kv = input[n_embd:]
         shape = q.shape
