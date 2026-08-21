@@ -1088,7 +1088,7 @@ class fused_LinearLayer(SubParamColumnParallel):
         # prepare_tp_fused_qkvw takes its own shard sizes without a layer name, so the widths
         # describing its split must be resolved the same way.
         self._subparam_layout_spec = (fused_qkv_subparam_sizes(kwargs.get('fused_module'), tuple(module.weight.shape),
-                                                               kwargs.get('tp_meta') or AutoTPMeta()), None)
+                                                               kwargs['tp_meta']), None)
         super().__init__(module, mp_group, skip_partition, **kwargs)
 
     def _freeze_partition_sizes(self, total_size):

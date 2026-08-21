@@ -341,7 +341,8 @@ def test_collect_records_fused_layouts_without_a_sub_param_split():
                               mp_group=None,
                               skip_partition=True,
                               fused_module=fused_module,
-                              name="qkv_proj")
+                              name="qkv_proj",
+                              tp_meta=AutoTPMeta())
     model = torch.nn.Module()
     model.qkv_proj = layer
 
