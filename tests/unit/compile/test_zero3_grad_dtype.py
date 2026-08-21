@@ -15,9 +15,12 @@ from deepspeed.compile.init_z3 import (DEFAULT_Z3_OPTIMIZATION_PASSES, DEFAULT_Z
                                        DEFAULT_Z3_SCHEDULE, WARMUP, _allow_dynamo_dynamic_parameter_shapes_for_z3,
                                        _resolve_expected_grad_dtype)
 from deepspeed.compile.passes import prefetch, selective_gather, zero3_compile
+from deepspeed.compile.patch_fake_tensor import _resolve_zero3_guarded_value, patch_fake_tensor
 from deepspeed.compile.patch_compiled_func import (get_backward_inputs, pop_backward_input, register_backward_frame)
 import deepspeed.runtime.engine as engine_mod
 from deepspeed.runtime.engine import DeepSpeedEngine
+from deepspeed.runtime.zero.parameter_offload import ZeROOrderedDict
+from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 import deepspeed.utils.nvtx as nvtx_mod
 from deepspeed.utils.torch import required_torch_version
 
@@ -53,6 +56,59 @@ def test_default_z3_schedule_selects_persistence_before_prefetch():
         (WARMUP, (zero3_compile.add_z3_gather_release, selective_gather.selective_gather)),
         (WARMUP + 1, (zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch)),
     )
+
+
+def test_zero3_semantic_guard_ignores_transient_physical_state_changes():
+
+    class Module(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(0))
+            self.weight.ds_id = 1
+            self.weight.ds_shape = torch.Size((2, 2))
+            self.weight.ds_status = ZeroParamStatus.NOT_AVAILABLE
+
+            params = ZeROOrderedDict(parent_module=self)
+            params.update(self._parameters)
+            params._in_forward = True
+            self._parameters = params
+
+        def forward(self, value):
+            return torch.nn.functional.linear(value, self.weight)
+
+    module = Module()
+    param = next(module.parameters())
+    backend_calls = []
+
+    def backend(_gm, _inputs):
+        backend_calls.append(None)
+        param.data = torch.ones(2, 2)
+        return lambda _weight, value: (value, )
+
+    patch_fake_tensor()
+    compiled = torch.compile(module, backend=backend)
+
+    assert torch.equal(compiled(torch.ones(1, 2)), torch.ones(1, 2))
+    param.data = torch.empty(0)
+    param.ds_status = ZeroParamStatus.AVAILABLE
+    assert torch.equal(compiled(torch.ones(1, 2)), torch.ones(1, 2))
+    assert len(backend_calls) == 1
+
+
+def test_zero3_semantic_guard_resolves_real_parameter_from_dummy_value():
+    param = torch.nn.Parameter(torch.empty(0))
+    param.ds_id = 1
+    param.ds_shape = torch.Size((2, 2))
+
+    class Builder:
+
+        def get(self, _guard):
+            return param
+
+    dummy = torch.nn.Parameter(torch.empty(2, 2))
+
+    assert _resolve_zero3_guarded_value(Builder(), object(), dummy) is param
 
 
 def test_deepcompile_forward_uses_native_phase_lifecycle(monkeypatch):

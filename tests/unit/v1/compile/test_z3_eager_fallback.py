@@ -46,6 +46,25 @@ def test_deepcompile_fallback_suppresses_guard_time_gather(monkeypatch):
     assert fallback.stats()["last_guard_suppressed_param_ids"] == [7]
 
 
+def test_zero_ordered_dict_does_not_guard_volatile_status_while_compiling(monkeypatch):
+
+    class StatusTrap:
+
+        @property
+        def ds_status(self):
+            raise AssertionError("volatile ds_status must not be read while compiling")
+
+    module = torch.nn.Module()
+    params = ZeROOrderedDict(parent_module=module)
+    param = StatusTrap()
+    params["weight"] = param
+    params._in_forward = True
+    module._parameters = params
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    assert module._parameters["weight"] is param
+
+
 def test_real_guard_builder_source_resolution_suppresses_gather(monkeypatch):
     from torch._dynamo.guards import GuardBuilder
     try:
