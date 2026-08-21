@@ -39,6 +39,7 @@ class NativePinnedMemory(object):
                 "DS_PIN_MEMORY_BACKEND=native requires the pin_memory op, which failed to build/load.") from e
 
     def pin(self, tensor, make_copy=True, match_shape=True):
+        register_device = self._device_registration_enabled()
         numel = tensor.numel()
         # ``base`` is the allocation root and the view root for everything derived
         # from it. Every slice/view of the returned tensor keeps ``base`` alive via
@@ -47,32 +48,36 @@ class NativePinnedMemory(object):
         base = self._handle.new_cpu_locked_tensor(numel, tensor)
         begin = base.data_ptr()
         locked = base[:numel]
-        if base.nbytes and self._device_registration_enabled():
-            from deepspeed.accelerator import get_accelerator
-            try:
-                if get_accelerator().register_host_memory(begin, base.nbytes):
-                    self._device_registered.add(begin)
-            except Exception as e:
-                logger.warning_once(
-                    f"Native pinned-memory device registration failed; continuing with mlock only: {e}")
-        if make_copy:
-            locked.copy_(tensor.reshape(-1))
-        if match_shape:
-            locked = locked.view(tensor.shape)
-        self._ranges[begin] = begin + numel * tensor.element_size()
-        locked.ds_pinned = True
-        # Remember the owning allocation address so an explicit unpin() frees the
-        # original region even if the tensor's ``.data`` is later redirected (e.g.
-        # ZeRO offload/reload rebinds ``.data`` to a different buffer).
-        locked.ds_pin_base = begin
-        # Match torch.pin_memory lifetime semantics: free the page-locked allocation
-        # once its root is garbage-collected, so call sites that never call unpin()
-        # do not accumulate mlocked host memory. The finalizer is tied to ``base``
-        # (not the returned view) and frees by address; ``base`` must not be passed
-        # as a finalize argument or it would be kept alive forever.
-        self._finalizers[begin] = weakref.finalize(base, self._release, self._handle, begin, self._ranges,
-                                                   self._finalizers, self._device_registered)
-        return locked
+        try:
+            if base.nbytes and register_device:
+                from deepspeed.accelerator import get_accelerator
+                try:
+                    if get_accelerator().register_host_memory(begin, base.nbytes):
+                        self._device_registered.add(begin)
+                except Exception as e:
+                    logger.warning_once(
+                        f"Native pinned-memory device registration failed; continuing with mlock only: {e}")
+            if make_copy:
+                locked.copy_(tensor.reshape(-1))
+            if match_shape:
+                locked = locked.view(tensor.shape)
+            self._ranges[begin] = begin + numel * tensor.element_size()
+            locked.ds_pinned = True
+            # Remember the owning allocation address so an explicit unpin() frees the
+            # original region even if the tensor's ``.data`` is later redirected (e.g.
+            # ZeRO offload/reload rebinds ``.data`` to a different buffer).
+            locked.ds_pin_base = begin
+            # Match torch.pin_memory lifetime semantics: free the page-locked allocation
+            # once its root is garbage-collected, so call sites that never call unpin()
+            # do not accumulate mlocked host memory. The finalizer is tied to ``base``
+            # (not the returned view) and frees by address; ``base`` must not be passed
+            # as a finalize argument or it would be kept alive forever.
+            self._finalizers[begin] = weakref.finalize(base, self._release, self._handle, begin, self._ranges,
+                                                       self._finalizers, self._device_registered)
+            return locked
+        except Exception:
+            self.unpin(locked)
+            raise
 
     def is_pinned(self, tensor):
         if getattr(tensor, "ds_pinned", False):
