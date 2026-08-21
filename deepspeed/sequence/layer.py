@@ -17,6 +17,11 @@ from deepspeed.utils import groups
 
 # Ulysses sequence parallelism keeps its own kv-head count, memoized on the first uneven
 # all-to-all. The state lives here, independent of AutoTP.
+# TODO: this is process-wide and never reset, so the first model to take the uneven path locks
+# every later Ulysses call into it -- a second model with a different head count would then be
+# split against the first one's value. Moving it onto the attention instance means threading the
+# total head count through _SeqAllToAll and its backward pass, because the gather direction
+# cannot recover it from the tensor shape alone.
 _ulysses_num_kv_heads = None
 
 
