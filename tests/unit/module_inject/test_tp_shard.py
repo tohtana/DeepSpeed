@@ -26,11 +26,27 @@ def test_uneven_shards_without_grain_quantization():
     assert get_shard_size_list(101, 2, AutoTPMeta(), "lm_head") == [51, 50]
 
 
-def test_kv_head_shards_tile_the_dimension():
+# 6 kv heads over 4 ranks gives 2/2/1/1 heads, so an attention projection splits 384 as
+# 128/128/64/64. Every other layer kind keeps the near-even 96/96/96/96 split, either because
+# the dimension has no head structure or because even shards serve it better.
+@pytest.mark.parametrize("name,expected", [
+    ("layers.0.self_attn.q_proj", [128, 128, 64, 64]),
+    ("layers.0.mlp.dense_h_to_4h", [96, 96, 96, 96]),
+    ("lm_head", [96, 96, 96, 96]),
+    ("embed_out", [96, 96, 96, 96]),
+    ("layers.0.experts.w1", [96, 96, 96, 96]),
+])
+def test_kv_head_split_applies_only_to_attention(name, expected):
     meta = AutoTPMeta(num_kv_heads=6)
 
-    # 6 kv heads over 4 ranks gives 2/2/1/1 heads, so 384 hidden splits as 128/128/64/64.
-    assert get_shard_size_list(384, 4, meta, "layers.0.self_attn.q_proj") == [128, 128, 64, 64]
+    assert get_shard_size_list(384, 4, meta, name) == expected
+
+
+def test_kv_head_split_needs_a_divisible_dimension():
+    # 385 is not a multiple of the 6 kv heads, so there is no head-aligned split to make.
+    meta = AutoTPMeta(num_kv_heads=6)
+
+    assert get_shard_size_list(385, 4, meta, "layers.0.self_attn.q_proj") == [97, 96, 96, 96]
 
 
 def test_two_models_do_not_clobber_each_others_meta():
