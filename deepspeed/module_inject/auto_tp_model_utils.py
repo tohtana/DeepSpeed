@@ -28,15 +28,8 @@ class _HeadCountProxy:
 
 
 def get_head_shard_sizes(meta: AutoTPMeta, mp_group=None):
-    num_heads = meta.num_attention_heads
-    num_kv_heads = meta.num_kv_heads
     tp_world_size = dist.get_world_size(group=mp_group)
-    return get_shard_size_list(
-        num_heads,
-        tp_world_size,
-        meta,
-        num_kv_heads=num_kv_heads,
-    )
+    return get_shard_size_list(meta.num_attention_heads, tp_world_size, meta)
 
 
 def install_head_sharded_helper(module, name, wrapper, meta, mp_group=None):

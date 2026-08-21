@@ -82,7 +82,7 @@ class AutoTPMeta:
                    tp_grain_size=tp_grain_size)
 
 
-def get_shard_size(total_size, mp_size, meta: AutoTPMeta, name=None, rank=None, mp_group=None, num_kv_heads=None):
+def get_shard_size(total_size, mp_size, meta: AutoTPMeta, name=None, rank=None, mp_group=None, eff_num_kv_heads=None):
     """Size of one shard of ``total_size`` split across a tensor-parallel group of ``mp_size``.
 
     ``meta`` carries this model's ``num_kv_heads`` / ``tp_grain_size`` so the split is stable
@@ -93,12 +93,13 @@ def get_shard_size(total_size, mp_size, meta: AutoTPMeta, name=None, rank=None, 
     ``dist.get_rank(group=mp_group)`` and the index used by ``get_shard_size_list``. It is not a
     global rank.
 
-    ``num_kv_heads`` overrides ``meta.num_kv_heads`` when set. Passing it explicitly lets callers
-    split fused sub-parameters (Q/K/V) against their respective head counts without
-    reimplementing the KV-head-aligned partition logic at the call site.
+    ``eff_num_kv_heads`` is the head count this split is actually aligned to; it defaults to
+    ``meta.num_kv_heads``. Passing it explicitly lets callers split fused sub-parameters (Q/K/V)
+    against their respective head counts without reimplementing the KV-head-aligned partition
+    logic at the call site.
     """
-    if num_kv_heads is None:
-        num_kv_heads = meta.num_kv_heads
+    if eff_num_kv_heads is None:
+        eff_num_kv_heads = meta.num_kv_heads
     tp_grain_size = meta.tp_grain_size
     last_linear = ["lm_head", "embed_out"]
     # MoE MLP layer use near even division will get better perf.
@@ -116,10 +117,10 @@ def get_shard_size(total_size, mp_size, meta: AutoTPMeta, name=None, rank=None, 
                 raise ValueError("get_shard_size requires a group-local rank or process group when mp_size "
                                  f"({mp_size}) differs from the distributed world size ({world_size}).")
             rank = dist.get_rank()
-    if num_kv_heads is not None and total_size % num_kv_heads == 0 and "mlp" not in str(name) and \
+    if eff_num_kv_heads is not None and total_size % eff_num_kv_heads == 0 and "mlp" not in str(name) and \
         str(name) not in last_linear and not_moe_mlp_layer:
-        my_slices = (num_kv_heads // mp_size) + (1 if rank < (num_kv_heads % mp_size) else 0)
-        return total_size * my_slices // num_kv_heads
+        my_slices = (eff_num_kv_heads // mp_size) + (1 if rank < (eff_num_kv_heads % mp_size) else 0)
+        return total_size * my_slices // eff_num_kv_heads
     else:
         if total_size >= tp_grain_size:
             grain_size, remainder = divmod(total_size, tp_grain_size)
@@ -134,16 +135,16 @@ def get_shard_size(total_size, mp_size, meta: AutoTPMeta, name=None, rank=None, 
             return total_size // mp_size + (1 if rank < (total_size % mp_size) else 0)
 
 
-def get_shard_size_list(total_size, mp_size, meta: AutoTPMeta, name=None, num_kv_heads=None):
+def get_shard_size_list(total_size, mp_size, meta: AutoTPMeta, name=None, eff_num_kv_heads=None):
     shard_sizes = []
-    if num_kv_heads is None:
-        num_kv_heads = meta.num_kv_heads
+    if eff_num_kv_heads is None:
+        eff_num_kv_heads = meta.num_kv_heads
     for i in range(mp_size):
-        shard_sizes.append(get_shard_size(total_size, mp_size, meta, name, i, num_kv_heads=num_kv_heads))
+        shard_sizes.append(get_shard_size(total_size, mp_size, meta, name, i, eff_num_kv_heads=eff_num_kv_heads))
     # Shards must tile the dimension exactly, otherwise the partitioned weights no longer
     # reconstruct the original tensor.
     assert sum(shard_sizes) == total_size, (
         f"AutoTP shard sizes {shard_sizes} for layer '{name}' do not sum to the dimension size "
         f"{total_size} with tp_size={mp_size}, tp_grain_size={meta.tp_grain_size} and "
-        f"num_kv_heads={num_kv_heads}.")
+        f"num_kv_heads={eff_num_kv_heads}.")
     return shard_sizes

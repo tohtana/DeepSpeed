@@ -71,12 +71,12 @@ def test_explicit_num_kv_heads_overrides_meta():
     # the model-wide kv-head count carried by the meta.
     meta = AutoTPMeta(num_kv_heads=2)
 
-    assert get_shard_size_list(384, 4, meta, "self_attn.q_proj", num_kv_heads=6) == [128, 128, 64, 64]
+    assert get_shard_size_list(384, 4, meta, "self_attn.q_proj", eff_num_kv_heads=6) == [128, 128, 64, 64]
 
 
 def test_explicit_num_kv_heads_matches_meta_value():
     expected = get_shard_size_list(384, 4, AutoTPMeta(num_kv_heads=6), "self_attn.q_proj")
 
-    actual = get_shard_size_list(384, 4, AutoTPMeta(), "self_attn.q_proj", num_kv_heads=6)
+    actual = get_shard_size_list(384, 4, AutoTPMeta(), "self_attn.q_proj", eff_num_kv_heads=6)
 
     assert actual == expected
