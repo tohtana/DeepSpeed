@@ -68,6 +68,12 @@ class AutoTPMeta:
         """
         if model_config is None:
             return cls(tp_grain_size=tp_grain_size)
+        # Multimodal configs (e.g. vision-language models) keep the head counts only under
+        # text_config while the outer config carries the modality heads, so descend to the
+        # text config when it exists.
+        text_config = getattr(model_config, "text_config", None)
+        if text_config is not None:
+            model_config = text_config
         num_kv_heads = _kv_head_count_from(model_config)
         n_embd = None
         for name in ('n_embd', 'hidden_size'):

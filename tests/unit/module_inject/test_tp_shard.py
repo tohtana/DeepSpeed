@@ -4,6 +4,7 @@
 # DeepSpeed Team
 
 import pytest
+from types import SimpleNamespace
 
 from deepspeed.module_inject import tp_shard
 from deepspeed.module_inject.tp_shard import AutoTPMeta, get_shard_size, get_shard_size_list
@@ -24,6 +25,24 @@ def test_grain_quantized_shards_tile_the_dimension(total_size, tp_size):
 
 def test_uneven_shards_without_grain_quantization():
     assert get_shard_size_list(101, 2, AutoTPMeta(), "lm_head") == [51, 50]
+
+
+def test_meta_descends_into_multimodal_text_config():
+    # Vision-language outer configs keep the head counts only under text_config; reading the
+    # outer config directly would lose them and fall back to an even-grain split.
+    outer = SimpleNamespace(text_config=SimpleNamespace(num_key_value_heads=4, num_attention_heads=8, hidden_size=64))
+
+    meta = AutoTPMeta.from_model_config(outer)
+
+    assert meta == AutoTPMeta(num_kv_heads=4, num_attention_heads=8, n_embd=64)
+
+
+def test_meta_descends_only_when_text_config_is_set():
+    plain = SimpleNamespace(num_key_value_heads=3, num_attention_heads=6, hidden_size=32)
+
+    meta = AutoTPMeta.from_model_config(plain)
+
+    assert meta == AutoTPMeta(num_kv_heads=3, num_attention_heads=6, n_embd=32)
 
 
 # 6 kv heads over 4 ranks gives 2/2/1/1 heads, so an attention projection splits 384 as

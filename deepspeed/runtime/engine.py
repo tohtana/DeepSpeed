@@ -728,10 +728,11 @@ class DeepSpeedEngine(Module):
         model_config = getattr(model, "config", None)
         # AutoTP derives its per-model sharding metadata from the model config; the warning
         # below only needs the kv-head count, which that same metadata already carries.
+        # from_model_config descends into text_config itself, so multimodal outer configs
+        # work here too.
         from deepspeed.module_inject.tp_shard import AutoTPMeta
 
-        head_config = getattr(model_config, "text_config", model_config)
-        num_kv_heads = AutoTPMeta.from_model_config(head_config).num_kv_heads
+        num_kv_heads = AutoTPMeta.from_model_config(model_config).num_kv_heads
 
         # Ranks beyond the KV head count get no attention shard. This still computes the
         # correct result because the row-parallel all-reduce sums their empty contribution,

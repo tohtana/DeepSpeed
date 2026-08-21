@@ -979,3 +979,26 @@ class TestAutoTPMultipleModels(DistributedTest):
         assert list(teacher_layer._partition_sizes) == teacher_split
         assert get_shard_size_list(192, 2, teacher_layer.tp_meta, teacher_layer.name) == teacher_split
         assert teacher_layer.weight.shape[0] == teacher_split[dist.get_rank()]
+
+    def test_multimodal_outer_config_keeps_kv_head_split(self):
+        skip_on_device()
+        # Multimodal configs keep the head counts only under text_config; passing the outer
+        # config to AutoTP would lose num_kv_heads and fall back to an even-grain split that
+        # cuts through KV heads.
+        partition_config = {
+            "use_default_specs": False,
+            "layer_specs": [{
+                "patterns": [".*q_proj\\.weight$"],
+                "partition_type": "column",
+            }],
+        }
+
+        model = AttentionOnlyModel(hidden_dim=64, proj_dim=192, num_kv_heads=3)
+        text_config = model.config
+        model.config = SimpleNamespace(text_config=text_config)
+
+        model = apply_autotp_with_partition_config(model, tp_size=2, partition_config=partition_config)
+        layer = model.self_attn.q_proj
+        assert layer.tp_meta.num_kv_heads == 3
+        assert list(layer._partition_sizes) == [128, 64]
+        assert layer.weight.shape[0] == [128, 64][dist.get_rank()]
