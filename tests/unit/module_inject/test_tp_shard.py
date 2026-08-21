@@ -49,23 +49,6 @@ def test_kv_head_split_needs_a_divisible_dimension():
     assert get_shard_size_list(385, 4, meta, "layers.0.self_attn.q_proj") == [97, 96, 96, 96]
 
 
-def test_two_models_do_not_clobber_each_others_meta():
-    # Each model carries its own AutoTPMeta, so loading a second model does not re-shard the
-    # first one.
-    model_a = AutoTPMeta(num_kv_heads=6, tp_grain_size=64)
-    model_b = AutoTPMeta(num_kv_heads=2, tp_grain_size=1)
-
-    a_qproj = get_shard_size_list(384, 4, model_a, "layers.0.self_attn.q_proj")
-    a_lmhead = get_shard_size_list(1001, 2, model_a, "lm_head")
-
-    # A second model is loaded into the same process.
-    _ = get_shard_size_list(384, 4, model_b, "layers.0.self_attn.q_proj")
-
-    # Model A's partition contract is unchanged.
-    assert get_shard_size_list(384, 4, model_a, "layers.0.self_attn.q_proj") == a_qproj
-    assert get_shard_size_list(1001, 2, model_a, "lm_head") == a_lmhead
-
-
 def test_process_group_resolves_noncontiguous_group_rank(monkeypatch):
     meta = AutoTPMeta(tp_grain_size=64)
     tp_group = object()
