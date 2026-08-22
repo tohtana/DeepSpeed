@@ -8,7 +8,6 @@ import torch
 import deepspeed.comm as dist
 import deepspeed
 from copy import deepcopy
-from types import SimpleNamespace
 from torch import nn
 
 from unit.common import DistributedTest, preferred_dtype
@@ -928,77 +927,5 @@ class TestAutoTPFusedWeights(DistributedTest):
         assert_close_for_preferred_dtype(gathered_output, full_output)
 
 
-class AttentionOnlyModel(torch.nn.Module):
-    """Minimal stand-in for a decoder layer, named so AutoTP treats it as attention."""
-
-    class _Attention(torch.nn.Module):
-
-        def __init__(self, hidden_dim, proj_dim):
-            super().__init__()
-            self.q_proj = torch.nn.Linear(hidden_dim, proj_dim, bias=False)
-
-    def __init__(self, hidden_dim, proj_dim, num_kv_heads):
-        super().__init__()
-        self.self_attn = AttentionOnlyModel._Attention(hidden_dim, proj_dim)
-        # AutoTPMeta probes attributes by name, so any config-like object will do.
-        self.config = SimpleNamespace(num_key_value_heads=num_kv_heads,
-                                      num_attention_heads=num_kv_heads,
-                                      hidden_size=hidden_dim)
-
-
-class TestAutoTPMultipleModels(DistributedTest):
-    world_size = 2
-    reuse_dist_env = False
-
-    def test_a_second_model_does_not_reshard_the_first(self):
-        skip_on_device()
-        # 3 kv heads over 2 ranks is uneven ([128, 64] of 192), while 2 kv heads divides evenly
-        # ([96, 96]). The second model's split is what a clobbered kv-head count would give the
-        # first one, so the two are distinguishable.
-        partition_config = {
-            "use_default_specs": False,
-            "layer_specs": [{
-                "patterns": [".*q_proj\\.weight$"],
-                "partition_type": "column",
-            }],
-        }
-
-        teacher = AttentionOnlyModel(hidden_dim=64, proj_dim=192, num_kv_heads=3)
-        teacher = apply_autotp_with_partition_config(teacher, tp_size=2, partition_config=partition_config)
-        teacher_layer = teacher.self_attn.q_proj
-        teacher_split = list(teacher_layer._partition_sizes)
-        assert teacher_split == [128, 64]
-
-        # A second model with a different kv-head count is built in the same process.
-        student = AttentionOnlyModel(hidden_dim=64, proj_dim=192, num_kv_heads=2)
-        student = apply_autotp_with_partition_config(student, tp_size=2, partition_config=partition_config)
-        assert list(student.self_attn.q_proj._partition_sizes) == [96, 96]
-
-        # The teacher still describes, and re-derives, its own split.
-        assert teacher_layer.tp_meta.num_kv_heads == 3
-        assert list(teacher_layer._partition_sizes) == teacher_split
-        assert get_shard_size_list(192, 2, teacher_layer.tp_meta, teacher_layer.name) == teacher_split
-        assert teacher_layer.weight.shape[0] == teacher_split[dist.get_rank()]
-
-    def test_multimodal_outer_config_keeps_kv_head_split(self):
-        skip_on_device()
-        # Multimodal configs keep the head counts only under text_config; passing the outer
-        # config to AutoTP would lose num_kv_heads and fall back to an even-grain split that
-        # cuts through KV heads.
-        partition_config = {
-            "use_default_specs": False,
-            "layer_specs": [{
-                "patterns": [".*q_proj\\.weight$"],
-                "partition_type": "column",
-            }],
-        }
-
-        model = AttentionOnlyModel(hidden_dim=64, proj_dim=192, num_kv_heads=3)
-        text_config = model.config
-        model.config = SimpleNamespace(text_config=text_config)
-
-        model = apply_autotp_with_partition_config(model, tp_size=2, partition_config=partition_config)
-        layer = model.self_attn.q_proj
-        assert layer.tp_meta.num_kv_heads == 3
-        assert list(layer._partition_sizes) == [128, 64]
-        assert layer.weight.shape[0] == [128, 64][dist.get_rank()]
+# Multi-model (teacher + student in one process) and multimodal-config regressions live in
+# tests/unit/v1/autotp/test_autotp_multiple_models.py so they run on the GPU workflow too.
