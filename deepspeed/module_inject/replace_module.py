@@ -307,7 +307,7 @@ def replace_transformer_layer(orig_layer_impl, model, checkpoint_dict, config, m
         # 4. Set linear policies
         _autotp.update_linear_policies()
 
-        # 6. Replace modules
+        # 5. Replace modules
         if "lm_head" in all_reduce_linears or "embed_out" in all_reduce_linears:
             return _autotp._replace_last_linear_module(module)
         return _autotp._replace_module(module)

@@ -488,10 +488,23 @@ def test_lm_head_forward_uses_frozen_partition_sizes():
     layer.tp_index = 1
     frozen = layer._freeze_partition_sizes(101)
     assert frozen == (51, 50)
-
-    # A later model carries a different grain; this layer's split is frozen from its own meta.
-    other_meta = AutoTPMeta(tp_grain_size=64)
-    assert other_meta.tp_grain_size != layer.tp_meta.tp_grain_size
+    assert layer.tp_meta.tp_grain_size == 1
     layer.weight.data = torch.zeros(8, frozen[1])
+
+    # A second layer of a different model is then built and initialized in the same process:
+    # a coarser grain (vocabulary sharding) and a different kv-head count (GQA attention
+    # sharding). Neither may leak into the first layer, whose meta and frozen split describe
+    # its own model only.
+    second = LmHeadLinearAllreduce(torch.nn.Linear(101, 8, bias=False),
+                                   mp_group=None,
+                                   tp_meta=AutoTPMeta(tp_grain_size=64, num_kv_heads=1))
+    second.tp_world_size = 2
+    second.tp_index = 1
+    assert second._freeze_partition_sizes(101) == (64, 37)
+
+    assert layer.tp_meta.tp_grain_size == 1
+    assert layer.tp_meta.num_kv_heads is None
+    assert layer._freeze_partition_sizes(101) == frozen
+    assert layer._partition_sizes == frozen
 
     layer(torch.zeros(1, 1, 101))
