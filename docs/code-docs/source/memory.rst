@@ -327,11 +327,12 @@ Whether to pin and how to pin are orthogonal:
 * **How:** ``DS_PIN_MEMORY_BACKEND=torch|native`` (environment only; not a
   ``ds_config`` field). Every call site that pins through
   ``get_accelerator().pin_memory()`` honors this env var, including ZeRO
-  CPU-offload buffers and eager activation checkpoint offload. Keep the default
-  ``torch`` backend for activation offload: ``native`` is ``mlock`` without
-  ``cudaHostRegister``, so its host buffers are not registered for accelerator
-  DMA and the offload's async copies can still block. DeepCompile activation
-  offload pins with ATen ``pinned_memory`` and does **not** use
+  CPU-offload buffers and eager activation checkpoint offload. On CUDA,
+  ``native`` registers its ``mlock`` allocation with ``cudaHostRegister`` by
+  default so asynchronous copies can use accelerator DMA. It remains
+  ``mlock``-only when device registration is disabled, unavailable, or fails;
+  asynchronous accelerator copies can still block in those cases. DeepCompile
+  activation offload pins with ATen ``pinned_memory`` and does **not** use
   ``DS_PIN_MEMORY_BACKEND``.
 
 Backend Selection
@@ -343,9 +344,12 @@ environment variable (default ``torch``).
 The ``torch`` backend page-locks host memory for **accelerator DMA**
 (``cudaHostRegister`` / device-specific pin). The ``native`` backend
 page-locks via ``posix_memalign`` + ``mlock`` for AIO/GDS (DeepNVMe can
-skip bounce buffers) and does **not** register the allocation with CUDA/XPU,
-so async GPU copies to native-pinned tensors can still block. Both are
-counted by ``track_pinned_memory`` when pages are actually locked. Differences:
+skip bounce buffers) and, on CUDA, registers the allocation with the runtime
+by default for asynchronous accelerator DMA. Disabling device registration,
+using an accelerator without a registration hook, or a registration failure
+leaves the allocation ``mlock``-only, so asynchronous accelerator copies can
+still block. Both backends are counted by ``track_pinned_memory`` when pages
+are actually locked. Differences:
 
 .. list-table:: Differences between ``torch`` and ``native`` pin backends
    :header-rows: 1

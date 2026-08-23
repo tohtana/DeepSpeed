@@ -132,6 +132,60 @@ class _RegisteringAccelerator:
         self.unregistered.append(address)
 
 
+class _FaultingTensor:
+
+    def __init__(self, numel, *, fail_copy=False):
+        self._numel = numel
+        self.nbytes = numel * 4
+        self.shape = (numel, )
+        self._fail_copy = fail_copy
+
+    def numel(self):
+        return self._numel
+
+    def element_size(self):
+        return 4
+
+    def data_ptr(self):
+        return 123456
+
+    def reshape(self, *args):
+        return self
+
+    def __getitem__(self, key):
+        return self
+
+    def copy_(self, source):
+        if self._fail_copy:
+            raise RuntimeError("injected copy failure")
+        return self
+
+
+class _FaultingHandle:
+
+    def __init__(self, *, fail_copy=False):
+        self.allocations = 0
+        self.frees = []
+        self.fail_copy = fail_copy
+
+    def new_cpu_locked_tensor(self, numel, tensor):
+        self.allocations += 1
+        return _FaultingTensor(numel, fail_copy=self.fail_copy)
+
+    def free_cpu_locked_tensor_by_ptr(self, address):
+        self.frees.append(address)
+        return True
+
+
+def _manager_with_handle(handle):
+    manager = NativePinnedMemory.__new__(NativePinnedMemory)
+    manager._ranges = {}
+    manager._finalizers = {}
+    manager._device_registered = set()
+    manager._handle = handle
+    return manager
+
+
 def test_native_device_registration_and_unpin(monkeypatch, native_pins):
     accelerator = _RegisteringAccelerator()
     monkeypatch.setattr("deepspeed.accelerator.get_accelerator", lambda: accelerator)
@@ -238,10 +292,37 @@ def test_device_registration_gc_unregisters(monkeypatch, native_pins):
     assert accelerator.unregistered == [begin]
 
 
-def test_invalid_register_device_env(monkeypatch, native_pins):
+@pytest.mark.parametrize("numel", [8, 0])
+def test_invalid_register_device_env(monkeypatch, numel):
+    handle = _FaultingHandle()
+    native_pins = _manager_with_handle(handle)
     monkeypatch.setenv("DS_PIN_MEMORY_REGISTER_DEVICE", "maybe")
     with pytest.raises(ValueError, match="DS_PIN_MEMORY_REGISTER_DEVICE"):
-        native_pins.pin(torch.empty(8), make_copy=False)
+        native_pins.pin(_FaultingTensor(numel), make_copy=False, match_shape=False)
+    assert handle.allocations == 0
+    assert handle.frees == []
+    assert native_pins._ranges == {}
+    assert native_pins._finalizers == {}
+    assert native_pins._device_registered == set()
+
+
+def test_pin_copy_failure_unwinds_device_registration(monkeypatch):
+    accelerator = _RegisteringAccelerator()
+    monkeypatch.setattr("deepspeed.accelerator.get_accelerator", lambda: accelerator)
+    monkeypatch.setenv("DS_PIN_MEMORY_REGISTER_DEVICE", "1")
+    handle = _FaultingHandle(fail_copy=True)
+    native_pins = _manager_with_handle(handle)
+
+    with pytest.raises(RuntimeError, match="injected copy failure"):
+        native_pins.pin(_FaultingTensor(8))
+
+    assert accelerator.registered == [(123456, 32)]
+    assert accelerator.unregistered == [123456]
+    assert handle.allocations == 1
+    assert handle.frees == [123456]
+    assert native_pins._ranges == {}
+    assert native_pins._finalizers == {}
+    assert native_pins._device_registered == set()
 
 
 def test_unpin_keeps_allocation_when_unregister_fails(monkeypatch, native_pins):
