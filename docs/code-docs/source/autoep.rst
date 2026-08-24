@@ -84,6 +84,48 @@ Weights-only/module-only Universal Checkpoint loads use the converted
 4. Expert parameters are marked for expert-data-parallel gradient reduction;
    router and shared-expert parameters use standard data-parallel reduction.
 
+**Fused local token engine (experimental):**
+
+``expert_parallel.local_token_backend`` selects how routed rows are moved around
+the two expert all-to-alls. ``"eager"`` (default) keeps the existing
+general-purpose tensor ops. ``"fused"`` replaces them with Triton kernels:
+
+.. code-block:: json
+
+    {
+        "expert_parallel": {
+            "enabled": true,
+            "autoep_size": 16,
+            "preset_model": "qwen3_moe",
+            "local_token_backend": "fused"
+        }
+    }
+
+The fused engine groups rows by local expert, undoes that grouping, and applies
+router scores while reducing over top-k. It reads and writes each row once, so
+the padded copy of the token matrix, the zero-filled scatter buffer, and the
+``[tokens, top_k, hidden]`` FP32 intermediate are never allocated. Routing
+weights are still accumulated in FP32 and cast once, matching the eager result to
+within the reduction order.
+
+The collectives, the router and the grouped GEMM are untouched, so a measured
+difference between the two backends belongs to the local token engine alone.
+
+``"fused"`` is rejected, rather than quietly ignored, when it would have nothing
+to replace or would change semantics:
+
+- ``expert_tensor_parallel_size`` greater than 1, which restores combined tokens
+  from assignment metadata instead of the weighted reduction;
+- an explicit ``combine_impl="legacy_bmm"``, which selects the legacy reduction
+  kept for model-family verification;
+- a resolved ``score_apply`` other than ``"post"``;
+- activations that are not bfloat16 or float16, a non-CUDA device, or a build
+  without Triton.
+
+Failing fast matters for measurement: a run that asked for ``"fused"`` and
+silently got ``"eager"`` would report the difference between a backend and
+itself.
+
 **Constraints:**
 
 - ``autoep_size`` must divide ``num_experts`` for all detected MoE layers.

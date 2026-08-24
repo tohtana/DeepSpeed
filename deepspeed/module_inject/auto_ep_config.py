@@ -58,6 +58,7 @@ def parse_autoep_config(param_dict: dict) -> AutoEPConfig:
     config.route_scale = param_dict.get("route_scale", 1.0)
     config.score_apply = param_dict.get("score_apply", "auto")
     config.combine_impl = param_dict.get("combine_impl", "auto")
+    config.local_token_backend = param_dict.get("local_token_backend", "eager")
     config.num_expert_groups = param_dict.get("num_expert_groups", None)
     config.num_limited_groups = param_dict.get("num_limited_groups", None)
     config.score_func = param_dict.get("score_func", "auto")
@@ -117,6 +118,28 @@ def validate_autoep_config(
 
     if not config.enabled:
         return
+
+    # Validate local_token_backend
+    valid_local_token_backend = ("eager", "fused")
+    if config.local_token_backend not in valid_local_token_backend:
+        raise ValueError(f"local_token_backend must be one of {valid_local_token_backend}, "
+                         f"got '{config.local_token_backend}'")
+
+    # The fused engine only replaces the reorder and weighted restore that the
+    # standard expert-parallel path runs. Where it has nothing to replace, say so
+    # instead of running eager under a config that asked for fused: a benchmark
+    # that believes it measured the fused path would otherwise report noise.
+    if config.local_token_backend == "fused":
+        if config.expert_tensor_parallel_size > 1:
+            raise ValueError('local_token_backend="fused" does not support folded tensor parallelism '
+                             f"(expert_tensor_parallel_size={config.expert_tensor_parallel_size}), which restores "
+                             "combined tokens from assignment metadata instead of the weighted reduction the fused "
+                             'engine implements. Set expert_tensor_parallel_size to 1, or local_token_backend to '
+                             '"eager".')
+        if config.combine_impl == "legacy_bmm":
+            raise ValueError('local_token_backend="fused" implements the weighted-sum reduction, so it cannot honor '
+                             'combine_impl="legacy_bmm". Leave combine_impl unset, or set local_token_backend to '
+                             '"eager" to keep the legacy reduction for model-family verification.')
 
     folding_spec = build_folding_spec(
         world_size=world_size,
@@ -272,6 +295,15 @@ def validate_autoep_post_detection(
         return
 
     for spec in specs:
+        # The fused weighted restore folds the routing weight into the top-k
+        # reduction, which only exists when scores are applied after the experts.
+        if config.local_token_backend == "fused":
+            resolved_score_apply = config.score_apply if config.score_apply != "auto" else spec.score_apply
+            if resolved_score_apply != "post":
+                raise ValueError(f'local_token_backend="fused" requires score_apply="post", but layer '
+                                 f"'{spec.moe_module_name}' resolved score_apply=\"{resolved_score_apply}\". "
+                                 'Set local_token_backend to "eager".')
+
         # ep_size must not exceed num_experts
         if config.autoep_size > spec.num_experts:
             valid_divisors = _divisors(spec.num_experts)

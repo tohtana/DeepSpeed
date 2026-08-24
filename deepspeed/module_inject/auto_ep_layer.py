@@ -22,6 +22,7 @@ import deepspeed.comm as dist
 from deepspeed.module_inject.auto_ep_config import AutoEPConfig, MoELayerSpec, resolve_autoep_config_defaults
 from deepspeed.module_inject.auto_ep_folding import mark_autoep_folding_router_parameter
 from deepspeed.utils import logger
+from deepspeed.moe import autoep_fused_token_ops as fused_token_ops
 from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.moe.ep_count import count_tokens_per_expert
 from deepspeed.moe.ep_experts import GroupedExperts
@@ -241,44 +242,14 @@ def permute_by_local_expert(
         aligned_counts: [E_local] aligned token counts per expert (for expert computation)
         n_tokens: original token count before padding (for unpermute)
     """
-    from deepspeed.moe.ep_kernels import generate_permute_indices, TOKEN_GROUP_ALIGN_SIZE_M
-
-    if local_counts.ndim == 1:
-        # [E_local]: already aggregated over sources (ep_degree=1)
-        ep_degree = 1
-        num_local_experts = local_counts.shape[0]
-        local_counts_flat = local_counts
-    elif local_counts.ndim == 2:
-        # [ep_size, E_local]: preserve per-source layout for correct regrouping
-        ep_degree, num_local_experts = local_counts.shape
-        local_counts_flat = local_counts.reshape(-1)
-    else:
-        raise ValueError(
-            f"local_counts must have shape [E_local] or [ep_degree, E_local], got {tuple(local_counts.shape)}")
+    from deepspeed.moe.ep_kernels import generate_local_expert_permute_indices
 
     n_tokens = tokens.shape[0]
-    alignment = TOKEN_GROUP_ALIGN_SIZE_M
-
-    # Compute padded max length
-    x_padded_per_expert = n_tokens + num_local_experts * alignment
-    padded_max_len = ((x_padded_per_expert + alignment - 1) // alignment) * alignment
-
-    # Use the pure-PyTorch path for host tensors. The CPU accelerator reports
-    # CPU tensors as "on accelerator", but Triton still requires a GPU driver.
-    use_cpu = tokens.device.type == "cpu"
-    counts_for_permute = local_counts_flat.cpu() if use_cpu else local_counts_flat
-    with torch.no_grad():
-        permuted_indices, m_sizes, _offsets = generate_permute_indices(
-            counts_for_permute,
-            num_local_experts,
-            ep_degree,
-            padded_max_len,
-            alignment,
-            use_cpu=use_cpu,
-        )
-    if not use_cpu:
-        permuted_indices = permuted_indices.to(tokens.device)
-        m_sizes = m_sizes.to(tokens.device)
+    permuted_indices, m_sizes = generate_local_expert_permute_indices(
+        n_tokens=n_tokens,
+        local_counts=local_counts,
+        device=tokens.device,
+    )
 
     # Add padding row for out-of-bounds indices (index n_tokens -> zero row)
     tokens_padded = torch.vstack((tokens, tokens.new_zeros((tokens.shape[-1], ))))
@@ -377,6 +348,8 @@ class AutoEPMoELayer(nn.Module):
         self.top_k = spec.top_k
         self.score_apply = resolve_score_apply_mode(spec, config.score_apply)
         self.combine_impl = resolve_combine_impl(config.combine_impl)
+        self.local_token_backend = config.local_token_backend
+        self._fused_backend_checked = False
         route_norm = spec.route_norm if config.route_norm is None else config.route_norm
         self.ep_size = ep_size
         self.ep_rank = ep_rank
@@ -550,6 +523,10 @@ class AutoEPMoELayer(nn.Module):
 
         if folding_group_handles is not None:
             self.folding_group_handles = folding_group_handles
+            if self.local_token_backend == "fused" and folding_group_handles.spec.tp_size > 1:
+                raise ValueError('local_token_backend="fused" does not support folded tensor parallelism '
+                                 f"(expert_tensor_parallel_size={folding_group_handles.spec.tp_size}). Set "
+                                 'expert_tensor_parallel_size to 1, or local_token_backend to "eager".')
             self.ep_group_name = folding_group_handles.ep_group_name
             self.ep_group = folding_group_handles.ep_group
             self.tp_group = folding_group_handles.tp_group
@@ -572,6 +549,17 @@ class AutoEPMoELayer(nn.Module):
             )
         self.ep_group = groups._get_expert_parallel_group(self.ep_group_name)
 
+    def _run_local_experts(self, rows: torch.Tensor, local_counts: torch.Tensor) -> torch.Tensor:
+        """Group rows by local expert, run the grouped GEMM, and undo the grouping."""
+        if self.local_token_backend == "fused":
+            reordered, reorder_context = fused_token_ops.fused_permute_by_local_expert(rows, local_counts)
+            expert_output = self.experts(reordered, reorder_context.aligned_counts)
+            return fused_token_ops.fused_unpermute_by_local_expert(expert_output, reorder_context)
+
+        reordered, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(rows, local_counts)
+        expert_output = self.experts(reordered, aligned_counts)
+        return unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -587,6 +575,10 @@ class AutoEPMoELayer(nn.Module):
         """
         bsz, seqlen, hdim = hidden_states.shape
         x = hidden_states.reshape(-1, hdim)  # [T, H]
+
+        if self.local_token_backend == "fused" and not self._fused_backend_checked:
+            fused_token_ops.assert_supported(x, score_apply=self.score_apply)
+            self._fused_backend_checked = True
 
         # Router
         ro: RouterOutput = RouterOutput(*self.router(x, self.expert_bias))
@@ -652,12 +644,7 @@ class AutoEPMoELayer(nn.Module):
 
         if self.ep_size == 1:
             # No AllToAll needed - local computation only
-            local_counts = ro.num_tokens_per_expert
-
-            routed_input_permuted, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, local_counts)
-            expert_output = self.experts(routed_input_permuted, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
+            expert_output = self._run_local_experts(routed_input, ro.num_tokens_per_expert)
         else:
             # EP dispatch/compute/combine
             if folded_tp:
@@ -679,12 +666,7 @@ class AutoEPMoELayer(nn.Module):
                 )
 
             routed_input = _AllToAllV.apply(self.ep_group, routed_input, plan.input_splits, plan.output_splits)
-
-            routed_input, perm_indices, aligned_counts, n_tokens = permute_by_local_expert(
-                routed_input, plan.local_counts_by_source)
-            expert_output = self.experts(routed_input, aligned_counts)
-            expert_output = unpermute_by_local_expert(expert_output, perm_indices, n_tokens)
-
+            expert_output = self._run_local_experts(routed_input, plan.local_counts_by_source)
             expert_output = _AllToAllV.apply(self.ep_group, expert_output, plan.output_splits, plan.input_splits)
 
         if folded_tp:
@@ -693,6 +675,14 @@ class AutoEPMoELayer(nn.Module):
                                       tp_group=self.tp_group,
                                       validate_coverage=self.validate_folding_routing).reshape(bsz, seqlen, hdim)
             self._last_folding_dispatch_counters = dispatch_counters(restore_ctx)
+        elif self.local_token_backend == "fused":
+            output = fused_token_ops.fused_weighted_restore(
+                expert_output,
+                top_scores=ro.top_scores,
+                token_indices_sorted=token_indices_sorted,
+                top_k=self.top_k,
+                shape=(bsz, seqlen, hdim),
+            )
         else:
             output = combine_from_routed(
                 expert_output,
