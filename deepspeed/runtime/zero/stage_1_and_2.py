@@ -16,7 +16,8 @@ from deepspeed.runtime.zenflow import zenflow_utils
 import gc
 import math
 from typing import Container
-from deepspeed.runtime.zero.offload_states import offload_optimizer_states, reload_optimizer_states
+from deepspeed.runtime.zero.offload_states import (offload_optimizer_states, reload_optimizer_states,
+                                                   unpin_offloaded_optimizer_states)
 from deepspeed.runtime.base_optimizer import ZeROOptimizer
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
@@ -691,9 +692,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # Release the page-locked host buffers we pinned for CPU offload. unpin_memory is a
         # no-op for the torch backend and only frees under DS_PIN_MEMORY_BACKEND=native,
         # where the mlocked allocation would otherwise persist until garbage collection.
+        accelerator = get_accelerator()
+        # offload_states(pin_memory=True) pins host buffers regardless of the ZeRO
+        # CPU-offload config, and destroy() may run while states are still offloaded.
+        for attr in ('hp_params_pin_buffers', 'lp_params_pin_buffers'):
+            for buffer in getattr(self, attr, []):
+                accelerator.unpin_memory(buffer)
+        unpin_offloaded_optimizer_states(self.optimizer)
         if not (self.cpu_offload and self.cpu_offload_pin_memory):
             return
-        accelerator = get_accelerator()
         for fp32_partition in self.single_partition_of_fp32_groups:
             accelerator.unpin_memory(fp32_partition)
             if fp32_partition.grad is not None:

@@ -41,6 +41,21 @@ def reload_optimizer_states(optimizer, device, non_blocking=False):
     return host_buffers
 
 
+def unpin_offloaded_optimizer_states(optimizer):
+    """Release host buffers that offloading page-locked in the optimizer state.
+
+    Offload pins these regardless of the ZeRO CPU-offload config, so destroy()
+    must release them even when the optimizer itself owns no pinned memory.
+    """
+    accelerator = get_accelerator()
+    for state in optimizer.state.values():
+        for tensor in state.values():
+            if not torch.is_tensor(tensor) or tensor.device.type != 'cpu':
+                continue
+            if accelerator.is_pinned(tensor):
+                accelerator.unpin_memory(tensor)
+
+
 def offload_adam_states(optimizer, device, pin_memory: bool = False, non_blocking: bool = False):
     """Move optimizer states to device. Note that this assumes the state structure of DeepSpeed Adam."""
 

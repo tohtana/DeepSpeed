@@ -37,14 +37,13 @@ def _restore_pin_backend(prev):
         os.environ["DS_PIN_MEMORY_BACKEND"] = prev
 
 
-def _config(stage, pin_memory=True, offload_param=False):
-    zero = {
-        "stage": stage,
-        "offload_optimizer": {
+def _config(stage, pin_memory=True, offload_param=False, offload_optimizer=True):
+    zero = {"stage": stage}
+    if offload_optimizer:
+        zero["offload_optimizer"] = {
             "device": "cpu",
             "pin_memory": pin_memory,
-        },
-    }
+        }
     if offload_param:
         zero["offload_param"] = {
             "device": "cpu",
@@ -128,6 +127,31 @@ class TestDestroyUnpinsNativeBuffers(DistributedTest):
             ranges_after = len(native._ranges)
             assert ranges_after < ranges_before, (f"expected optimizer-owned pins to be freed on destroy: "
                                                   f"before={ranges_before} after={ranges_after}")
+        finally:
+            _restore_pin_backend(prev)
+
+    @pytest.mark.parametrize("stage", [2, 3])
+    def test_native_destroy_frees_offload_states_pins(self, stage):
+        # offload_states(pin_memory=True) pins host buffers even with no ZeRO
+        # CPU offload configured. destroy() must release them when the caller
+        # never reloaded the states.
+        prev = os.environ.get("DS_PIN_MEMORY_BACKEND")
+        try:
+            native = _require_native()
+            config, dtype = _config(stage, pin_memory=True, offload_optimizer=False)
+            hidden_dim = 16
+            model = SimpleModel(hidden_dim, nlayers=2)
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            _run_one_step(engine, hidden_dim, dtype)
+
+            ranges_before = len(native._ranges)
+            engine.offload_states(pin_memory=True)
+            ranges_offloaded = len(native._ranges)
+            assert ranges_offloaded > ranges_before, "expected offload_states to pin host buffers"
+
+            engine.destroy()
+            assert len(native._ranges) <= ranges_before, (f"offload_states pins not released on destroy: "
+                                                          f"offloaded={ranges_offloaded} after={len(native._ranges)}")
         finally:
             _restore_pin_backend(prev)
 
