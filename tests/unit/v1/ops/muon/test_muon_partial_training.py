@@ -20,6 +20,8 @@ The fix filters parameters to only include those with requires_grad=True,
 ensuring empty parameter groups are properly handled.
 """
 
+from copy import deepcopy
+
 import torch
 import torch.nn as nn
 import deepspeed
@@ -379,6 +381,33 @@ def test_muon_aux_adam_loads_legacy_inline_state_with_backend_defaults():
     restored_optimizer.step()
 
     assert restored_optimizer.state[restored_param]["step"] == 2
+
+
+@pytest.mark.parametrize("optimizer_class", [torch.optim.Adam, torch.optim.AdamW])
+def test_muon_aux_adam_normalizes_legacy_state_for_torch_backend(optimizer_class):
+    group_options = {"lr": 0.01, "betas": (0.8, 0.9), "eps": 1e-8, "weight_decay": 0.1}
+    legacy_param = torch.nn.Parameter(torch.tensor([1.0, -2.0]))
+    legacy_optimizer = MuonWithAuxAdam([dict(params=[legacy_param], use_muon=False, **group_options)])
+    legacy_param.grad = torch.tensor([0.25, -0.5])
+    legacy_optimizer.step()
+    checkpoint = deepcopy(legacy_optimizer.state_dict())
+
+    restored_param = torch.nn.Parameter(legacy_param.detach().clone())
+    restored_optimizer = MuonWithAuxAdam([dict(params=[restored_param], use_muon=False, **group_options)],
+                                         adam_optimizer=optimizer_class)
+    restored_optimizer.load_state_dict(deepcopy(checkpoint))
+
+    expected_param = torch.nn.Parameter(legacy_param.detach().clone())
+    expected_optimizer = optimizer_class([dict(params=[expected_param], **group_options)])
+    expected_optimizer.load_state_dict(deepcopy(checkpoint))
+
+    for optimizer, param in ((restored_optimizer, restored_param), (expected_optimizer, expected_param)):
+        param.grad = torch.tensor([-0.1, 0.2])
+        optimizer.step()
+
+    torch.testing.assert_close(restored_param, expected_param)
+    assert restored_optimizer.aux_optimizer.state is restored_optimizer.state
+    assert restored_optimizer.aux_optimizer.param_groups[0] is restored_optimizer.param_groups[0]
 
 
 class _AdamSelectionEngine:

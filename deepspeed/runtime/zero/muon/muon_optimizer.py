@@ -49,7 +49,16 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
             for key, value in self.aux_optimizer.defaults.items():
                 group.setdefault(key, value)
         self._aux_param_groups = aux_param_groups
-        self.aux_optimizer.param_groups = aux_param_groups
+
+        # Let the selected backend normalize its own state schema (for example, torch Adam
+        # converts legacy integer step counters to tensors). Limit the temporary state view to
+        # auxiliary parameters so older backend hooks do not inspect Muon-only state entries.
+        aux_state = {
+            param: self.state[param]
+            for group in aux_param_groups
+            for param in group["params"] if param in self.state
+        }
+        self.aux_optimizer.__setstate__({"state": aux_state, "param_groups": aux_param_groups})
         self.aux_optimizer.state = self.state
 
     @torch.no_grad()
