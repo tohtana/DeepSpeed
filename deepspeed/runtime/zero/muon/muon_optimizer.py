@@ -39,6 +39,19 @@ class MuonWithAuxAdam(BaseMuonWithAuxAdam):
                 self.aux_optimizer.param_groups = aux_param_groups
                 self.aux_optimizer.state = self.state
 
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        if self.aux_optimizer is None:
+            return
+
+        aux_param_groups = [group for group in self.param_groups if not group["use_muon"]]
+        for group in aux_param_groups:
+            for key, value in self.aux_optimizer.defaults.items():
+                group.setdefault(key, value)
+        self._aux_param_groups = aux_param_groups
+        self.aux_optimizer.param_groups = aux_param_groups
+        self.aux_optimizer.state = self.state
+
     @torch.no_grad()
     def step(self, closure=None, step_id=None):
         loss = None

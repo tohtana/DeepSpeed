@@ -346,6 +346,41 @@ def test_muon_aux_adam_rebinds_zero_parameter_groups():
     assert optimizer.aux_optimizer.param_groups[0] is optimizer.param_groups[0]
 
 
+class _StrictAdamBackend(torch.optim.Optimizer):
+
+    def __init__(self, params, **kwargs):
+        defaults = dict(lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, bias_correction=True, amsgrad=False)
+        defaults.update(kwargs)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for group in self.param_groups:
+            assert group["bias_correction"]
+            assert group["amsgrad"] is False
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                self.state[p]["step"] += 1
+
+
+def test_muon_aux_adam_loads_legacy_inline_state_with_backend_defaults():
+    legacy_param = torch.nn.Parameter(torch.tensor([1.0]))
+    legacy_optimizer = MuonWithAuxAdam([dict(params=[legacy_param], use_muon=False, lr=0.1)])
+    legacy_param.grad = torch.ones_like(legacy_param)
+    legacy_optimizer.step()
+    legacy_state_dict = legacy_optimizer.state_dict()
+
+    restored_param = torch.nn.Parameter(torch.tensor([1.0]))
+    restored_optimizer = MuonWithAuxAdam([dict(params=[restored_param], use_muon=False, lr=0.1)],
+                                         adam_optimizer=_StrictAdamBackend)
+    restored_optimizer.load_state_dict(legacy_state_dict)
+    restored_param.grad = torch.ones_like(restored_param)
+    restored_optimizer.step()
+
+    assert restored_optimizer.state[restored_param]["step"] == 2
+
+
 class _AdamSelectionEngine:
 
     def __init__(self, cpu_offload=False, bf16_states=False, zenflow=False):
