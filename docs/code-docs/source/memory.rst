@@ -311,7 +311,10 @@ APIs:
 
 ``pin_memory`` accepts ``make_copy`` and ``match_shape`` (both default ``True``) so
 callers can either allocate a shaped copy of ``tensor`` or obtain a flat locked
-buffer for later filling.
+buffer for later filling. With ``make_copy=False`` the input is only a
+shape/dtype template: both backends page-lock a fresh buffer and never read
+``tensor``, so scratch destinations do not pay for a second full-size
+allocation and a copy.
 
 Backend Selection
 =================
@@ -346,7 +349,7 @@ handles (so DeepNVMe can skip bounce buffers), and are counted by
      - None beyond the active accelerator / PyTorch
      - DeepSpeed **pin_memory** op must build and load; fails early if unavailable (no silent fallback)
    * - ``pin_memory`` extras
-     - ``make_copy`` / ``match_shape`` are ignored on this path
+     - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
      - Honors ``make_copy`` and ``match_shape`` (both default ``True``)
    * - Pin recognition (``is_pinned``)
      - Torch pinned status (``tensor.is_pinned()``)
