@@ -2,35 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Fused GPU-local token movement for AutoEP.
+"""Fused weighted token restoration for AutoEP.
 
-The eager path moves routed rows around the two expert all-to-alls with
-general-purpose tensor ops: it materializes a padded copy of the token matrix,
-gathers through an advanced index, scatters expert outputs into a zero-filled
-buffer, and builds a ``[T, K, H]`` FP32 intermediate only to apply routing
-weights and reduce over top-k.
+After the combine all-to-all, the eager path returns one row per routed
+assignment and turns it back into one row per token in general-purpose steps: it
+scatters the rows into a zero-filled ``[tokens * top_k, hidden]`` buffer, views
+that as ``[tokens, top_k, hidden]``, widens it to FP32 to apply routing weights,
+and reduces over top-k. The FP32 intermediate alone is 64 MiB at the canonical
+shape, and every step of that sequence costs a full pass over the routed
+activations, in every MoE layer, on every step.
 
-This module replaces that sequence with Triton kernels that touch each row once.
-It deliberately leaves the collectives, the router and the grouped GEMM alone, so
-that a measured difference is attributable to the local token engine.
+This module does the same arithmetic in one pass. Each program owns one token
+and one slice of the hidden dimension, walks its top-k rows in registers,
+accumulates in FP32 and writes the token's output once, so neither the scattered
+assignment buffer nor the FP32 intermediate is ever allocated.
 
-The reorder is expressed entirely as row gathers. Writing the four passes out
-shows why only one kernel is needed, where ``perm`` maps an expert-major slot to
-its source row and ``inv`` is its inverse:
-
-    permute   forward   out[i]  = tokens[perm[i]]      gather by perm
-    permute   backward  dtok[j] = dout[inv[j]]         gather by inv
-    unpermute forward   out[j]  = expert_out[inv[j]]   gather by inv
-    unpermute backward  dexp[i] = dout[perm[i]]        gather by perm
-
-``perm`` is injective on real rows, so no pass needs atomics, and carrying
-``inv`` (4 bytes per row) removes both the padded input copy and the zero-filled
-scatter buffer (``2 * H`` bytes per row) that the eager path allocates.
+Only the reduction is replaced. The collectives, the router, the grouped GEMM
+and the expert-major reorder are all untouched, so a measured difference belongs
+to the reduction alone.
 """
 
 from __future__ import annotations
-
-from typing import NamedTuple
 
 import torch
 
@@ -42,44 +34,17 @@ try:
 except ImportError:
     _TRITON_AVAILABLE = False
 
-# The grouped GEMM consumes the reordered rows, so the fused path supports the
-# dtypes it is built for rather than silently widening them.
+# The grouped GEMM produces the rows this consumes, so the supported dtypes are
+# the ones it is built for rather than a silent widening.
 SUPPORTED_ROW_DTYPES = (torch.bfloat16, torch.float16)
 
 _MAX_BLOCK_HIDDEN = 512
 _INVERT_INDEX_BLOCK = 256
-# The restore kernels hold a [slots, BLOCK_H] FP32 block live, so the hidden tile
-# shrinks as top-k grows to keep that block in registers instead of spilling.
+# The kernels hold a [slots, BLOCK_H] FP32 block live, so the hidden tile shrinks
+# as top-k grows to keep that block in registers rather than spilling.
 _MAX_BLOCK_ELEMENTS = 2048
 
 if _TRITON_AVAILABLE:
-
-    @triton.jit
-    def _gather_rows_kernel(
-        source_ptr,
-        index_ptr,
-        out_ptr,
-        hidden,
-        source_stride,
-        out_stride,
-        BLOCK_H: tl.constexpr,
-    ):
-        out_row = tl.program_id(0)
-        hidden_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-        hidden_mask = hidden_offsets < hidden
-
-        source_row = tl.load(index_ptr + out_row).to(tl.int64)
-        # A negative index marks an alignment-padding slot. The eager path spelled
-        # that as an appended zero row; here it is a masked-off load.
-        row_valid = source_row >= 0
-        safe_row = tl.where(row_valid, source_row, 0)
-
-        values = tl.load(
-            source_ptr + safe_row * source_stride + hidden_offsets,
-            mask=hidden_mask & row_valid,
-            other=0.0,
-        )
-        tl.store(out_ptr + out_row * out_stride + hidden_offsets, values, mask=hidden_mask)
 
     @triton.jit
     def _invert_index_kernel(
@@ -169,7 +134,9 @@ if _TRITON_AVAILABLE:
 
         grad_rows_dtype = grad_rows_ptr.dtype.element_ty
         # One token per program, so the score gradient reduces over the hidden
-        # dimension in registers instead of through a cross-program atomic.
+        # dimension in registers. Splitting that dimension across programs and
+        # reducing the partials afterwards measured slower at this shape: the
+        # extra pass costs more than the added parallelism returns.
         score_partials = tl.zeros([K_PADDED, BLOCK_H], dtype=tl.float32)
 
         for hidden_start in range(0, hidden, BLOCK_H):
@@ -204,42 +171,33 @@ if _TRITON_AVAILABLE:
         )
 
 
-class FusedReorderContext(NamedTuple):
-    """Index metadata shared by the reorder forward and backward passes."""
-
-    permutation: torch.Tensor  # [N_padded] int32; -1 marks an alignment-padding slot
-    inverse: torch.Tensor  # [n_tokens] int32; -1 marks a row no slot claimed
-    aligned_counts: torch.Tensor  # [E_local] int32 row counts for the grouped GEMM
-    n_tokens: int
-
-
 def is_available() -> bool:
-    """Whether this build can run the fused local token engine at all."""
+    """Whether this build can run the fused weighted restore at all."""
     return _TRITON_AVAILABLE
 
 
 def assert_supported(rows: torch.Tensor, *, score_apply: str) -> None:
-    """Reject configurations the fused path does not implement.
+    """Reject configurations the fused restore does not implement.
 
     Checked before any collective runs: a rank that raised while its peers
     proceeded would turn a clear error into a hang.
     """
     if not _TRITON_AVAILABLE:
-        raise RuntimeError('expert_parallel.local_token_backend="fused" needs Triton, which is not installed in '
-                           'this environment. Install Triton, or set local_token_backend to "eager".')
+        raise RuntimeError('combine_impl="fused_weighted_sum" needs Triton, which is not installed in this '
+                           "environment. Install Triton, or leave combine_impl unset.")
     if rows.device.type != "cuda":
-        raise RuntimeError('expert_parallel.local_token_backend="fused" runs CUDA kernels but this layer is on '
-                           f'device "{rows.device.type}". Set local_token_backend to "eager" to run here.')
+        raise RuntimeError('combine_impl="fused_weighted_sum" runs CUDA kernels but this layer is on device '
+                           f'"{rows.device.type}". Leave combine_impl unset to run here.')
     if rows.dtype not in SUPPORTED_ROW_DTYPES:
-        raise RuntimeError('expert_parallel.local_token_backend="fused" supports bfloat16 and float16 rows, got '
-                           f'{rows.dtype}. Set local_token_backend to "eager", or train in bf16/fp16.')
+        raise RuntimeError('combine_impl="fused_weighted_sum" supports bfloat16 and float16 rows, got '
+                           f"{rows.dtype}. Leave combine_impl unset, or train in bf16/fp16.")
     if score_apply != "post":
-        raise RuntimeError('expert_parallel.local_token_backend="fused" implements the post-expert weighted '
-                           f'restore, but this layer resolved score_apply="{score_apply}". Set local_token_backend '
-                           'to "eager".')
+        raise RuntimeError('combine_impl="fused_weighted_sum" folds the routing weight into the top-k reduction, '
+                           f'which only exists for score_apply="post", but this layer resolved '
+                           f'score_apply="{score_apply}". Leave combine_impl unset.')
 
 
-def _block_hidden(hidden: int, slots: int = 1) -> int:
+def _block_hidden(hidden: int, slots: int) -> int:
     """Pick a power-of-two hidden tile that fits alongside ``slots`` rows of FP32.
 
     The floor keeps the budget honest for top-k values far wider than any real
@@ -252,28 +210,6 @@ def _block_hidden(hidden: int, slots: int = 1) -> int:
 def _padded_top_k(top_k: int) -> int:
     """Round top-k up to a power of two, which ``tl.arange`` requires."""
     return max(2, triton.next_power_of_2(top_k))
-
-
-def _gather_rows(source: torch.Tensor, index: torch.Tensor, num_out_rows: int) -> torch.Tensor:
-    """Gather the ``source`` rows named by ``index``, reading a negative index as zero."""
-    hidden = source.shape[-1]
-    out = torch.empty((num_out_rows, hidden), dtype=source.dtype, device=source.device)
-    if num_out_rows == 0 or hidden == 0:
-        return out
-
-    source = source.contiguous()
-    block_hidden = _block_hidden(hidden)
-    grid = (num_out_rows, triton.cdiv(hidden, block_hidden))
-    _gather_rows_kernel[grid](
-        source,
-        index,
-        out,
-        hidden,
-        source.stride(0),
-        out.stride(0),
-        BLOCK_H=block_hidden,
-    )
-    return out
 
 
 def _invert_index(index: torch.Tensor, num_inverse_rows: int) -> torch.Tensor:
@@ -292,36 +228,6 @@ def _invert_index(index: torch.Tensor, num_inverse_rows: int) -> torch.Tensor:
         BLOCK=_INVERT_INDEX_BLOCK,
     )
     return inverse
-
-
-class _FusedReorder(torch.autograd.Function):
-    """Gather routed rows into expert-major, alignment-padded order."""
-
-    @staticmethod
-    def forward(ctx, tokens, permutation, inverse, n_padded):
-        ctx.save_for_backward(inverse)
-        ctx.n_tokens = tokens.shape[0]
-        return _gather_rows(tokens, permutation, n_padded)
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        inverse, = ctx.saved_tensors
-        return _gather_rows(grad_out.contiguous(), inverse, ctx.n_tokens), None, None, None
-
-
-class _FusedInverseReorder(torch.autograd.Function):
-    """Restore source-major order and drop the alignment padding."""
-
-    @staticmethod
-    def forward(ctx, expert_output, permutation, inverse):
-        ctx.save_for_backward(permutation)
-        ctx.n_padded = expert_output.shape[0]
-        return _gather_rows(expert_output, inverse, inverse.numel())
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        permutation, = ctx.saved_tensors
-        return _gather_rows(grad_out.contiguous(), permutation, ctx.n_padded), None, None
 
 
 class _FusedWeightedRestore(torch.autograd.Function):
@@ -370,7 +276,7 @@ class _FusedWeightedRestore(torch.autograd.Function):
         n_tokens, hidden = top_scores.shape[0], combined_rows.shape[-1]
         if n_tokens == 0 or hidden == 0:
             # Nothing is reduced, so the score gradient is zero rather than
-            # whatever the uninitialized buffer happened to hold.
+            # whatever an uninitialized buffer happened to hold.
             return grad_rows, torch.zeros_like(top_scores), None, None
 
         k_padded = _padded_top_k(ctx.top_k)
@@ -392,42 +298,6 @@ class _FusedWeightedRestore(torch.autograd.Function):
             BLOCK_H=_block_hidden(hidden, slots=k_padded),
         )
         return grad_rows, grad_scores, None, None
-
-
-def fused_permute_by_local_expert(
-    tokens: torch.Tensor,
-    local_counts: torch.Tensor,
-) -> tuple[torch.Tensor, FusedReorderContext]:
-    """Reorder routed rows into expert-contiguous, alignment-padded order.
-
-    Fused counterpart of ``permute_by_local_expert``. It shares that function's
-    index generation and produces the same rows, without materializing the padded
-    copy of ``tokens`` that the eager advanced index needs.
-    """
-    from deepspeed.moe.ep_kernels import generate_local_expert_permute_indices
-
-    permutation, aligned_counts = generate_local_expert_permute_indices(
-        n_tokens=tokens.shape[0],
-        local_counts=local_counts,
-        device=tokens.device,
-    )
-    inverse = _invert_index(permutation, tokens.shape[0])
-    context = FusedReorderContext(
-        permutation=permutation,
-        inverse=inverse,
-        aligned_counts=aligned_counts,
-        n_tokens=tokens.shape[0],
-    )
-    permuted = _FusedReorder.apply(tokens, permutation, inverse, permutation.numel())
-    return permuted, context
-
-
-def fused_unpermute_by_local_expert(
-    expert_output: torch.Tensor,
-    context: FusedReorderContext,
-) -> torch.Tensor:
-    """Reverse :func:`fused_permute_by_local_expert` and strip the padding."""
-    return _FusedInverseReorder.apply(expert_output.contiguous(), context.permutation, context.inverse)
 
 
 def fused_weighted_restore(

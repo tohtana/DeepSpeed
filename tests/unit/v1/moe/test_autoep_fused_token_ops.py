@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""The fused local token engine against the eager reorder and weighted restore.
+"""The fused weighted restore against the eager reduction it replaces.
 
-The eager implementations are the reference: the fused engine is only worth
-having if it is indistinguishable from them, so every assertion here compares the
-two directly rather than against hand-written expectations.
+``combine_from_routed`` is the reference: the fused reduction is only worth
+having if it is indistinguishable from it, so every assertion compares the two
+directly rather than against hand-written expectations.
 """
 
 import pytest
@@ -14,11 +14,7 @@ import torch
 
 from deepspeed.accelerator import get_accelerator
 from deepspeed.moe import autoep_fused_token_ops as fused_ops
-from deepspeed.module_inject.auto_ep_layer import (
-    combine_from_routed,
-    permute_by_local_expert,
-    unpermute_by_local_expert,
-)
+from deepspeed.module_inject.auto_ep_layer import combine_from_routed
 
 
 def _fused_engine_available():
@@ -27,78 +23,11 @@ def _fused_engine_available():
 
 
 pytestmark = pytest.mark.skipif(not _fused_engine_available(),
-                                reason="the fused local token engine needs CUDA and Triton")
-
-# Row counts per local expert, or per [source rank, local expert] where nested.
-# They are the only thing that decides the reorder, so they carry every shape the
-# engine has to survive: idle experts, one expert taking everything, and sources
-# that contribute nothing to a given expert.
-REORDER_CASES = {
-    "balanced": [8, 8, 8, 8],
-    "empty_experts": [0, 12, 0, 4],
-    "extreme_skew": [40, 0, 0, 0],
-    "per_source": [[3, 5], [7, 1]],
-    "ragged_per_source": [[0, 9], [5, 0], [2, 2]],
-}
+                                reason="the fused weighted restore needs CUDA and Triton")
 
 
 def _device():
     return get_accelerator().current_device_name()
-
-
-def _counts(case):
-    return torch.tensor(REORDER_CASES[case], dtype=torch.int32, device=_device())
-
-
-@pytest.mark.parametrize("case", sorted(REORDER_CASES))
-@pytest.mark.parametrize("hidden", [64, 130])
-def test_fused_reorder_places_the_same_rows_as_eager(case, hidden):
-    counts = _counts(case)
-    tokens = torch.randn(int(counts.sum()), hidden, device=_device(), dtype=torch.bfloat16)
-
-    eager_rows, _permutation, eager_counts, _n_tokens = permute_by_local_expert(tokens, counts)
-    fused_rows, context = fused_ops.fused_permute_by_local_expert(tokens, counts)
-
-    # Pure data movement on both sides, so anything short of equality is a bug.
-    assert torch.equal(fused_rows, eager_rows)
-    assert torch.equal(context.aligned_counts, eager_counts)
-
-
-def test_fused_reorder_handles_a_batch_no_expert_claimed():
-    counts = torch.zeros(4, dtype=torch.int32, device=_device())
-    tokens = torch.randn(0, 32, device=_device(), dtype=torch.bfloat16)
-
-    eager_rows, _permutation, eager_counts, _n_tokens = permute_by_local_expert(tokens, counts)
-    fused_rows, context = fused_ops.fused_permute_by_local_expert(tokens, counts)
-
-    assert torch.equal(fused_rows, eager_rows)
-    assert torch.equal(context.aligned_counts, eager_counts)
-    assert not fused_rows.any()
-
-
-@pytest.mark.parametrize("case", sorted(REORDER_CASES))
-def test_fused_reorder_round_trip_matches_eager_including_gradients(case):
-    hidden = 96
-    counts = _counts(case)
-    n_tokens = int(counts.sum())
-    tokens = torch.randn(n_tokens, hidden, device=_device(), dtype=torch.bfloat16)
-    upstream = torch.randn(n_tokens, hidden, device=_device(), dtype=torch.bfloat16)
-
-    eager_tokens = tokens.clone().requires_grad_(True)
-    eager_rows, permutation, _counts_out, n = permute_by_local_expert(eager_tokens, counts)
-    # Scaling by a power of two keeps the comparison exact while still putting a
-    # real op between the reorder and its inverse.
-    eager_output = unpermute_by_local_expert(eager_rows * 2.0, permutation, n)
-
-    fused_tokens = tokens.clone().requires_grad_(True)
-    fused_rows, context = fused_ops.fused_permute_by_local_expert(fused_tokens, counts)
-    fused_output = fused_ops.fused_unpermute_by_local_expert(fused_rows * 2.0, context)
-
-    assert torch.equal(fused_output, eager_output)
-
-    eager_output.backward(upstream)
-    fused_output.backward(upstream)
-    assert torch.equal(fused_tokens.grad, eager_tokens.grad)
 
 
 @pytest.mark.parametrize("top_k", [2, 4, 6, 8])

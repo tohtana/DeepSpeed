@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""End-to-end parity between the eager and fused local token backends.
+"""End-to-end parity between the eager and fused combine implementations.
 
-The fused engine is only a layout change, so a step taken through it has to
-produce the same loss, the same gradients on every trainable tensor, and the same
-parameter update as the eager path it replaces.
+The fused reduction only changes how the weighted sum is computed, so a step
+taken through it has to produce the same loss, the same gradients on every
+trainable tensor, and the same parameter update as the eager path.
 """
 
 import functools
@@ -44,10 +44,10 @@ def _fused_engine_available():
 
 
 pytestmark = pytest.mark.skipif(not _fused_engine_available(),
-                                reason="the fused local token engine needs CUDA and Triton")
+                                reason="the fused weighted restore needs CUDA and Triton")
 
 
-def _config(local_token_backend, ep_size):
+def _config(combine_impl, ep_size):
     return {
         **mixed_precision_config(),
         "train_micro_batch_size_per_gpu": 1,
@@ -65,19 +65,19 @@ def _config(local_token_backend, ep_size):
             "autoep_size": ep_size,
             "preset_model": "mixtral",
             "load_balance_coeff": None,
-            "local_token_backend": local_token_backend,
+            "combine_impl": combine_impl,
         },
     }
 
 
-def _build_engine(local_token_backend, ep_size, reference_state, seed):
+def _build_engine(combine_impl, ep_size, reference_state, seed):
     seed_everything(seed)
     model = MockMoETransformer(num_layers=2,
                                num_experts=NUM_EXPERTS,
                                hidden_size=HIDDEN_SIZE,
                                intermediate_size=2 * HIDDEN_SIZE)
     model.load_state_dict(reference_state)
-    engine, _, _, _ = deepspeed.initialize(model=model, config=_config(local_token_backend, ep_size))
+    engine, _, _, _ = deepspeed.initialize(model=model, config=_config(combine_impl, ep_size))
     return engine
 
 
@@ -173,12 +173,12 @@ class TestAutoEPFusedParityExpertParallel(DistributedTest):
                                              hidden_size=HIDDEN_SIZE,
                                              intermediate_size=2 * HIDDEN_SIZE).state_dict()
 
-        eager_engine = _build_engine("eager", 2, reference_state, seed)
+        eager_engine = _build_engine("weighted_sum", 2, reference_state, seed)
         eager = _take_one_step(eager_engine, seed, checkpoint_activations=checkpoint_activations)
 
-        fused_engine = _build_engine("fused", 2, reference_state, seed)
-        assert all(module.local_token_backend == "fused" for module in fused_engine.module.modules()
-                   if isinstance(module, AutoEPMoELayer)), "the fused backend was not actually selected"
+        fused_engine = _build_engine("fused_weighted_sum", 2, reference_state, seed)
+        assert all(module.combine_impl == "fused_weighted_sum" for module in fused_engine.module.modules()
+                   if isinstance(module, AutoEPMoELayer)), "the fused reduction was not actually selected"
         fused = _take_one_step(fused_engine, seed, checkpoint_activations=checkpoint_activations)
 
         _assert_step_matches(fused, eager)
@@ -195,7 +195,11 @@ class TestAutoEPFusedParityLocalExperts(DistributedTest):
                                              hidden_size=HIDDEN_SIZE,
                                              intermediate_size=2 * HIDDEN_SIZE).state_dict()
 
-        eager = _take_one_step(_build_engine("eager", 1, reference_state, seed), seed, checkpoint_activations=False)
-        fused = _take_one_step(_build_engine("fused", 1, reference_state, seed), seed, checkpoint_activations=False)
+        eager = _take_one_step(_build_engine("weighted_sum", 1, reference_state, seed),
+                               seed,
+                               checkpoint_activations=False)
+        fused = _take_one_step(_build_engine("fused_weighted_sum", 1, reference_state, seed),
+                               seed,
+                               checkpoint_activations=False)
 
         _assert_step_matches(fused, eager)

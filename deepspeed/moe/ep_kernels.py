@@ -251,68 +251,6 @@ def generate_permute_indices(
 
 
 # ===================================================================
-# generate_local_expert_permute_indices
-# ===================================================================
-
-
-def generate_local_expert_permute_indices(
-    n_tokens: int,
-    local_counts: torch.Tensor,
-    device: torch.device,
-) -> tuple:
-    """Build the expert-major row order for ``n_tokens`` received rows.
-
-    Args:
-        n_tokens: Number of received rows, before alignment padding.
-        local_counts: ``(E_local,)`` when the counts are already aggregated over
-            sources, or ``(ep_degree, E_local)`` to keep the per-source layout
-            that correct regrouping depends on.
-        device: Device the returned tensors should live on.
-
-    Returns:
-        Tuple of:
-            - permuted_indices: expert-major slot -> source row, ``-1`` where a
-              slot is alignment padding rather than a routed row.
-            - aligned_counts: per-expert row counts for the grouped GEMM.
-    """
-    if local_counts.ndim == 1:
-        # [E_local]: already aggregated over sources (ep_degree=1)
-        ep_degree = 1
-        num_local_experts = local_counts.shape[0]
-        local_counts_flat = local_counts
-    elif local_counts.ndim == 2:
-        # [ep_size, E_local]: preserve per-source layout for correct regrouping
-        ep_degree, num_local_experts = local_counts.shape
-        local_counts_flat = local_counts.reshape(-1)
-    else:
-        raise ValueError(
-            f"local_counts must have shape [E_local] or [ep_degree, E_local], got {tuple(local_counts.shape)}")
-
-    alignment = TOKEN_GROUP_ALIGN_SIZE_M
-    x_padded_per_expert = n_tokens + num_local_experts * alignment
-    padded_max_len = _round_up(x_padded_per_expert, alignment)
-
-    # Use the pure-PyTorch path for host tensors. The CPU accelerator reports
-    # CPU tensors as "on accelerator", but Triton still requires a GPU driver.
-    use_cpu = device.type == "cpu"
-    counts_for_permute = local_counts_flat.cpu() if use_cpu else local_counts_flat
-    with torch.no_grad():
-        permuted_indices, m_sizes, _offsets = generate_permute_indices(
-            counts_for_permute,
-            num_local_experts,
-            ep_degree,
-            padded_max_len,
-            alignment,
-            use_cpu=use_cpu,
-        )
-    if not use_cpu:
-        permuted_indices = permuted_indices.to(device)
-        m_sizes = m_sizes.to(device)
-
-    return permuted_indices, m_sizes
-
-
-# ===================================================================
 # _permute / _unpermute / indices_padding_wrapper
 # ===================================================================
 

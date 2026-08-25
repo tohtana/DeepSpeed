@@ -109,8 +109,7 @@ class AutoEPConfig:
     route_norm: bool | None = None
     route_scale: float = 1.0
     score_apply: Literal["auto", "pre", "post"] = "auto"
-    combine_impl: Literal["auto", "weighted_sum", "legacy_bmm"] = "auto"
-    local_token_backend: Literal["eager", "fused"] = "eager"
+    combine_impl: Literal["auto", "weighted_sum", "fused_weighted_sum", "legacy_bmm"] = "auto"
     num_expert_groups: int | None = None
     num_limited_groups: int | None = None
     score_func: Literal["auto", "softmax", "sigmoid"] = "auto"

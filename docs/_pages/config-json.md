@@ -994,11 +994,11 @@ smoke coverage used for this AutoEP surface produced the following version gates
 | -------------------------------------------------------------------------------------------------------------- | -------- |
 | When to apply router scores: `"pre"` (before experts), `"post"` (during combine), or `"auto"` (from preset). | `"auto"` |
 
-***local_token_backend***: [string]
+***combine_impl***: [string]
 
 | Description                                                                                                    | Default  |
 | -------------------------------------------------------------------------------------------------------------- | -------- |
-| GPU-local token movement backend. `"eager"` keeps the general-purpose reorder and combine. `"fused"` is experimental and replaces them with Triton kernels that group rows by expert, undo that grouping, and apply router scores while reducing over top-k, without materializing the padded token copy or the `[tokens, top_k, hidden]` FP32 intermediate. Collectives, routing and the grouped GEMM are unchanged. `"fused"` requires CUDA, Triton, bfloat16/float16 activations, `expert_tensor_parallel_size=1`, and a resolved `score_apply="post"`; it is rejected rather than silently ignored when any of those does not hold. | `"eager"` |
+| How expert outputs are weighted by their router scores and reduced over top-k. `"auto"` resolves to `"weighted_sum"`. `"fused_weighted_sum"` is experimental and computes the same reduction in one Triton pass, without materializing the scattered assignment buffer or the `[tokens, top_k, hidden]` FP32 intermediate; it requires CUDA, Triton, bfloat16/float16 activations, `expert_tensor_parallel_size=1`, and a resolved `score_apply="post"`, and is rejected rather than silently ignored when any of those does not hold. `"legacy_bmm"` is a debug reduction retained for model-family verification. | `"auto"` |
 
 ***route_norm***: [boolean]
 

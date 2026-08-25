@@ -234,46 +234,33 @@ class TestAutoEPConfig:
                                    tp_size=1,
                                    sp_size=1)
 
-    def test_local_token_backend_defaults_to_eager(self):
-        assert parse_autoep_config({}).local_token_backend == "eager"
-        assert parse_autoep_config({"enabled": True}).local_token_backend == "eager"
-
-    def test_local_token_backend_rejects_unknown_value(self):
-        config = parse_autoep_config({"enabled": True, "local_token_backend": "triton"})
-        with pytest.raises(ValueError, match="local_token_backend must be one of"):
+    def test_combine_impl_rejects_unknown_value(self):
+        config = parse_autoep_config({"enabled": True, "combine_impl": "triton"})
+        with pytest.raises(ValueError, match="combine_impl must be one of"):
             validate_autoep_config(config, world_size=1, pp_size=1, tp_size=1, sp_size=1)
 
-    def test_fused_local_token_backend_rejects_folded_tensor_parallelism(self):
+    def test_fused_combine_rejects_folded_tensor_parallelism(self):
         config = parse_autoep_config({
             "enabled": True,
             "autoep_size": 2,
             "expert_tensor_parallel_size": 2,
-            "local_token_backend": "fused",
+            "combine_impl": "fused_weighted_sum",
         })
         with pytest.raises(ValueError, match="folded tensor parallelism"):
             validate_autoep_config(config, world_size=4, pp_size=1, tp_size=2, sp_size=1)
 
-    def test_fused_local_token_backend_rejects_explicit_legacy_bmm(self):
-        config = parse_autoep_config({
-            "enabled": True,
-            "local_token_backend": "fused",
-            "combine_impl": "legacy_bmm",
-        })
-        with pytest.raises(ValueError, match="legacy_bmm"):
-            validate_autoep_config(config, world_size=1, pp_size=1, tp_size=1, sp_size=1)
-
     @pytest.mark.parametrize("score_apply, spec_score_apply", [("auto", "pre"), ("pre", "post")])
-    def test_fused_local_token_backend_requires_post_score_apply(self, score_apply, spec_score_apply):
+    def test_fused_combine_requires_post_score_apply(self, score_apply, spec_score_apply):
         config = parse_autoep_config({
             "enabled": True,
-            "local_token_backend": "fused",
+            "combine_impl": "fused_weighted_sum",
             "score_apply": score_apply,
         })
         with pytest.raises(ValueError, match='requires score_apply="post"'):
             validate_autoep_post_detection(config, [_make_spec(score_apply=spec_score_apply)])
 
-    def test_fused_local_token_backend_accepts_the_standard_path(self):
-        config = parse_autoep_config({"enabled": True, "autoep_size": 2, "local_token_backend": "fused"})
+    def test_fused_combine_accepts_the_standard_path(self):
+        config = parse_autoep_config({"enabled": True, "autoep_size": 2, "combine_impl": "fused_weighted_sum"})
         validate_autoep_config(config, world_size=2, pp_size=1, tp_size=1, sp_size=1)
         validate_autoep_post_detection(config, [_make_spec(num_experts=4, score_apply="post")])
 

@@ -84,11 +84,10 @@ Weights-only/module-only Universal Checkpoint loads use the converted
 4. Expert parameters are marked for expert-data-parallel gradient reduction;
    router and shared-expert parameters use standard data-parallel reduction.
 
-**Fused local token engine (experimental):**
+**Fused weighted restore (experimental):**
 
-``expert_parallel.local_token_backend`` selects how routed rows are moved around
-the two expert all-to-alls. ``"eager"`` (default) keeps the existing
-general-purpose tensor ops. ``"fused"`` replaces them with Triton kernels:
+After the combine all-to-all, AutoEP holds one row per routed assignment and has
+to turn it back into one row per token. ``combine_impl`` selects how:
 
 .. code-block:: json
 
@@ -97,34 +96,35 @@ general-purpose tensor ops. ``"fused"`` replaces them with Triton kernels:
             "enabled": true,
             "autoep_size": 16,
             "preset_model": "qwen3_moe",
-            "local_token_backend": "fused"
+            "combine_impl": "fused_weighted_sum"
         }
     }
 
-The fused engine groups rows by local expert, undoes that grouping, and applies
-router scores while reducing over top-k. It reads and writes each row once, so
-the padded copy of the token matrix, the zero-filled scatter buffer, and the
-``[tokens, top_k, hidden]`` FP32 intermediate are never allocated. Routing
-weights are still accumulated in FP32 and cast once, matching the eager result to
-within the reduction order.
+``"auto"`` (default) resolves to ``"weighted_sum"``, which scatters the rows into
+a zero-filled ``[tokens * top_k, hidden]`` buffer, widens it to FP32 to apply the
+routing weights, and reduces over top-k. ``"fused_weighted_sum"`` computes the
+same result in a single pass: each program owns one token and one slice of the
+hidden dimension, walks its top-k rows in registers and accumulates in FP32, so
+neither the scattered buffer nor the FP32 intermediate is allocated. At the
+canonical shape the FP32 intermediate alone is 64 MiB per layer.
 
-The collectives, the router and the grouped GEMM are untouched, so a measured
-difference between the two backends belongs to the local token engine alone.
+Routing weights are still accumulated in FP32 and cast once, so the result
+matches the eager reduction to within the order of the top-k summation. Only the
+reduction changes: the collectives, the router, the grouped GEMM and the
+expert-major reorder are untouched.
 
-``"fused"`` is rejected, rather than quietly ignored, when it would have nothing
-to replace or would change semantics:
+``"fused_weighted_sum"`` is rejected, rather than quietly ignored, when it would
+have nothing to replace or would change semantics:
 
 - ``expert_tensor_parallel_size`` greater than 1, which restores combined tokens
-  from assignment metadata instead of the weighted reduction;
-- an explicit ``combine_impl="legacy_bmm"``, which selects the legacy reduction
-  kept for model-family verification;
+  from assignment metadata instead;
 - a resolved ``score_apply`` other than ``"post"``;
 - activations that are not bfloat16 or float16, a non-CUDA device, or a build
   without Triton.
 
-Failing fast matters for measurement: a run that asked for ``"fused"`` and
-silently got ``"eager"`` would report the difference between a backend and
-itself.
+Failing fast matters for measurement: a run that asked for the fused reduction
+and silently got the eager one would report the difference between an
+implementation and itself.
 
 **Constraints:**
 
