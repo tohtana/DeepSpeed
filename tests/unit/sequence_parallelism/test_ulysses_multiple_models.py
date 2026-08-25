@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import deepspeed.comm as dist
+from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.tp_shard import get_num_kv_heads, set_num_kv_heads
 from deepspeed.sequence.layer import DistributedAttention, _SeqAllToAll
 from deepspeed.utils import groups
@@ -38,9 +39,14 @@ class _RecordingAttention(torch.nn.Module):
 
 
 def _tagged(num_heads):
-    tensor = torch.zeros(1, LOCAL_SEQ, num_heads, HEAD_DIM, requires_grad=True)
+    tensor = torch.zeros(1,
+                         LOCAL_SEQ,
+                         num_heads,
+                         HEAD_DIM,
+                         device=get_accelerator().current_device_name(),
+                         requires_grad=True)
     with torch.no_grad():
-        tensor[:] = torch.arange(num_heads).view(1, 1, -1, 1).float()
+        tensor[:] = torch.arange(num_heads, device=tensor.device).view(1, 1, -1, 1).float()
     return tensor
 
 
@@ -114,7 +120,12 @@ class TestUlyssesMultipleModels(DistributedTest):
         # swapped, so the count it infers here has to survive to that point.
         sp_group = self._sequence_parallel_group()
 
-        query = torch.randn(1, LOCAL_SEQ, 3, HEAD_DIM, requires_grad=True)
+        query = torch.randn(1,
+                            LOCAL_SEQ,
+                            3,
+                            HEAD_DIM,
+                            device=get_accelerator().current_device_name(),
+                            requires_grad=True)
         output = _SeqAllToAll.apply(sp_group, query, 2, 1, 0)
         output.sum().backward()
 
@@ -127,8 +138,9 @@ class TestUlyssesMultipleModels(DistributedTest):
         sp_group = self._sequence_parallel_group()
 
         attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1)
-        query = torch.zeros(1, LOCAL_SEQ, 2, HEAD_DIM, requires_grad=True)
-        key = torch.zeros(1, LOCAL_SEQ, 1, HEAD_DIM, requires_grad=True)
+        device = get_accelerator().current_device_name()
+        query = torch.zeros(1, LOCAL_SEQ, 2, HEAD_DIM, device=device, requires_grad=True)
+        key = torch.zeros(1, LOCAL_SEQ, 1, HEAD_DIM, device=device, requires_grad=True)
 
         with pytest.raises(AssertionError, match="at least the sequence parallel size"):
             attn(query, key, key.clone(), 0)
