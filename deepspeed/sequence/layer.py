@@ -128,15 +128,15 @@ def apply_rotary_pos_emb(t, freqs_cos, freqs_sin):
     return res
 
 
-# Sentinel for ``num_total_heads``. ``None`` is a meaningful value - it means "this
+# Sentinel for ``num_kv_heads``. ``None`` is a meaningful value - it means "this
 # all-to-all splits evenly, take the fast path" - so it cannot double as "not supplied".
-_HEADS_FROM_GLOBAL = object()
+_KV_HEADS_FROM_GLOBAL = object()
 
 
-def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, num_total_heads=None):
+def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, num_kv_heads=None):
     seq_world_size = dist.get_world_size(group)
-    if num_total_heads is None:
-        num_total_heads = get_num_kv_heads()
+    if num_kv_heads is None:
+        num_kv_heads = get_num_kv_heads()
     inp_shape = list(input.shape)
     assert batch_dim_idx in [0, 1], "batch_dim_idx must be either 0 or 1"
 
@@ -144,7 +144,7 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, n
     # module-level default: the partition has to follow this all-to-all's own head count, not
     # whichever value AutoTP or another model last wrote into ``tp_shard``.
     if not (scatter_idx < 2):
-        input_splits = get_shard_size_list(inp_shape[scatter_idx], seq_world_size, num_kv_heads=num_total_heads)
+        input_splits = get_shard_size_list(inp_shape[scatter_idx], seq_world_size, num_kv_heads=num_kv_heads)
         input = input.transpose(0, scatter_idx).contiguous()
         local_heads = input_splits[groups._get_sequence_parallel_rank()]
         output_splits = [local_heads] * seq_world_size
@@ -178,7 +178,7 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, n
         elif batch_dim_idx == 1:  #s,b,h
             input = input.transpose(1, 2).contiguous()  #s,h,b
         seq_len, h, batch_size = input.shape
-        num_local_heads_list = get_shard_size_list(num_total_heads, seq_world_size, num_kv_heads=num_total_heads)
+        num_local_heads_list = get_shard_size_list(num_kv_heads, seq_world_size, num_kv_heads=num_kv_heads)
         local_heads = num_local_heads_list[groups._get_sequence_parallel_rank()]
         h_dim = h // local_heads
         local_seq_len = seq_len // seq_world_size
@@ -189,7 +189,7 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, n
         coeff = local_seq_len_with_heads // local_heads  #per head: dim size of local_seq_len*hdim
 
         #uneven seq_world_size coeff,  total_heads/local_heads.
-        heads_scale_coeff = num_total_heads / local_heads
+        heads_scale_coeff = num_kv_heads / local_heads
 
         output_splits = [num_local_heads * coeff for num_local_heads in num_local_heads_list]
         output_buff_d1_size = int(heads_scale_coeff * local_seq_len_with_heads)
@@ -206,9 +206,9 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, n
         #total_num_large_heads=sum([2,2,2])=7
         #total_num_small_heads=sum([1])=1
 
-        chunk_num_heads_small = num_total_heads // seq_world_size  # even heads compatible
+        chunk_num_heads_small = num_kv_heads // seq_world_size  # even heads compatible
         chunk_num_heads_large = chunk_num_heads_small + 1
-        num_chunk_heads_large = num_total_heads % seq_world_size
+        num_chunk_heads_large = num_kv_heads % seq_world_size
         num_chunk_heads_small = seq_world_size - num_chunk_heads_large
         total_num_large_heads = num_chunk_heads_large * chunk_num_heads_large
         total_num_small_heads = num_chunk_heads_small * chunk_num_heads_small
@@ -256,7 +256,7 @@ def single_all_to_all(input,
                       async_op=False,
                       handle=None,
                       type=None,
-                      num_total_heads=_HEADS_FROM_GLOBAL):
+                      num_kv_heads=_KV_HEADS_FROM_GLOBAL):
     seq_world_size = dist.get_world_size(group)
     # we only need num_heads once
     num_heads = input.shape[2]
@@ -265,22 +265,22 @@ def single_all_to_all(input,
     # direction and the backward pass see an already-sharded one. Callers that know the count
     # pass it in. Callers that do not (Megatron-DeepSpeed calls this helper directly) keep the
     # historical process-wide slot, which ``set_num_kv_heads`` below still populates for them.
-    reads_global = num_total_heads is _HEADS_FROM_GLOBAL
+    reads_global = num_kv_heads is _KV_HEADS_FROM_GLOBAL
     if reads_global:
-        num_total_heads = get_num_kv_heads()
+        num_kv_heads = get_num_kv_heads()
 
-    if num_total_heads is not None or (num_heads % seq_world_size != 0 and not scatter_idx < 2):
+    if num_kv_heads is not None or (num_heads % seq_world_size != 0 and not scatter_idx < 2):
         # Assuming here that the number of heads for q is consistent with kv
         # If not, additional logic is required for cases like GQA
-        if num_total_heads is None:
+        if num_kv_heads is None:
             assert num_heads > seq_world_size, f"Number of heads ({num_heads}) must be larger than sequence parallel size ({seq_world_size})"
-            # set heads at first call by num_total_heads.
-            # then use ``num_total_heads is not None`` to re-entry uneven path.
-            num_total_heads = num_heads
+            # set heads at first call by num_kv_heads.
+            # then use ``num_kv_heads is not None`` to re-entry uneven path.
+            num_kv_heads = num_heads
             if reads_global:
                 set_num_kv_heads(num_heads)
         assert async_op == False, "uneven head sp does not support async op"
-        return uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, num_total_heads)
+        return uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, num_kv_heads)
 
     pre_all2all_permute_idx, pre_all2all_inp_shape, post_all2all_permute_idx, post_all2all_res_shape = _generate_layout_params(
         scatter_idx, batch_dim_idx, seq_world_size, input)
@@ -335,7 +335,7 @@ class _SeqAllToAll(torch.autograd.Function):
                 handle=None,
                 type=None,
                 is_fwd=True,
-                num_total_heads=_HEADS_FROM_GLOBAL) -> Tensor:
+                num_kv_heads=_KV_HEADS_FROM_GLOBAL) -> Tensor:
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
@@ -346,9 +346,9 @@ class _SeqAllToAll(torch.autograd.Function):
         # Resolve once here rather than per call: the backward pass runs with scatter and
         # gather swapped and cannot recover the count from its own tensor, and the global may
         # have moved on by then if another model was built in between.
-        if num_total_heads is _HEADS_FROM_GLOBAL:
-            num_total_heads = get_num_kv_heads()
-        ctx.num_total_heads = num_total_heads
+        if num_kv_heads is _KV_HEADS_FROM_GLOBAL:
+            num_kv_heads = get_num_kv_heads()
+        ctx.num_kv_heads = num_kv_heads
         if ctx.handle is None:
             res = single_all_to_all(input,
                                     scatter_idx,
@@ -356,7 +356,7 @@ class _SeqAllToAll(torch.autograd.Function):
                                     batch_dim_idx,
                                     group,
                                     False,
-                                    num_total_heads=num_total_heads)
+                                    num_kv_heads=num_kv_heads)
 
         else:
             # overlap communication path
@@ -368,7 +368,7 @@ class _SeqAllToAll(torch.autograd.Function):
                                         batch_dim_idx,
                                         group,
                                         False,
-                                        num_total_heads=num_total_heads)
+                                        num_kv_heads=num_kv_heads)
                 get_accelerator().current_stream().wait_stream(ctx.stream)
                 # The computation of d o_weight can overlap with the communication of d o_input
 
@@ -383,7 +383,7 @@ class _SeqAllToAll(torch.autograd.Function):
                                         True,
                                         handle,
                                         type,
-                                        num_total_heads=num_total_heads)
+                                        num_kv_heads=num_kv_heads)
 
             elif is_fwd and type in ('q', 'k'):
                 # Achieve communication overlap by pipelining the matrix computation and communication of q, k, and v
@@ -396,7 +396,7 @@ class _SeqAllToAll(torch.autograd.Function):
                                         False,
                                         handle,
                                         type,
-                                        num_total_heads=num_total_heads)
+                                        num_kv_heads=num_kv_heads)
 
             else:
                 res = single_all_to_all(input,
@@ -405,7 +405,7 @@ class _SeqAllToAll(torch.autograd.Function):
                                         batch_dim_idx,
                                         group,
                                         False,
-                                        num_total_heads=num_total_heads)
+                                        num_kv_heads=num_kv_heads)
 
         return res
 
@@ -415,7 +415,7 @@ class _SeqAllToAll(torch.autograd.Function):
         return (None,
                 _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx, ctx.batch_dim_idx,
                                    ctx.stream, ctx.handle, ctx.type, False,
-                                   ctx.num_total_heads), None, None, None, None, None, None, None, None)
+                                   ctx.num_kv_heads), None, None, None, None, None, None, None, None)
 
 
 class DistributedAttention(torch.nn.Module):
@@ -426,9 +426,10 @@ class DistributedAttention(torch.nn.Module):
         sequence_process_group (ProcessGroup): sequence parallel process group
         scatter_idx (int): scatter_idx for all2all comm
         gather_idx (int): gather_idx for all2all comm
-        num_total_heads (int): total number of attention heads before sharding. Only needed
-            when the count does not divide evenly by the sequence parallel world size; when
-            omitted it is read from the query tensor of each forward.
+        num_kv_heads (int): number of key-value heads before sharding, which is what the
+            uneven partition follows. Only needed when it does not divide evenly by the
+            sequence parallel world size; when omitted it is read from the key tensor of
+            each forward.
     """
 
     def __init__(
@@ -438,17 +439,17 @@ class DistributedAttention(torch.nn.Module):
         scatter_idx: int = 2,
         gather_idx: int = 0,
         sp_stream=None,
-        num_total_heads: int = None,
+        num_kv_heads: int = None,
     ) -> None:
 
         super(DistributedAttention, self).__init__()
         self.local_attn = local_attention
         self.spg = sequence_process_group
-        # Total attention head count this module splits against, kept per instance. A second
-        # model with a different head count - or AutoTP, which writes the same process-wide
-        # slot - must not decide how this one is sharded. Left as None the count is taken from
-        # the query tensor on each forward.
-        self.num_total_heads = num_total_heads
+        # KV head count this module partitions against, kept per instance. A second model with
+        # a different head count - or AutoTP, which writes the same process-wide slot - must
+        # not decide how this one is sharded. Left as None it is read from the key tensor on
+        # each forward.
+        self.num_kv_heads = num_kv_heads
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
         self.sp_overlap_comm = False
@@ -501,24 +502,26 @@ class DistributedAttention(torch.nn.Module):
 
             return pre_hook_fun
 
-        # Resolve the head count from this module's own query tensor. Only an uneven split
-        # needs it: the even path recovers everything it needs from the tensor shapes, and
-        # claiming a count there would push every model onto the slower uneven kernels.
-        num_total_heads = self.num_total_heads
-        if num_total_heads is None and query.shape[2] % dist.get_world_size(self.spg) != 0:
-            num_total_heads = query.shape[2]
+        # The partition follows KV groups, so the count comes off the key tensor - under GQA a
+        # query head has to land on the rank holding its KV head, and Q // world_size would
+        # tear the group apart. Only an uneven split needs the value: the even path recovers
+        # everything from tensor shapes, and claiming a count there would push every model
+        # onto the slower uneven kernels.
+        num_kv_heads = self.num_kv_heads
+        if num_kv_heads is None and key.shape[2] % dist.get_world_size(self.spg) != 0:
+            num_kv_heads = key.shape[2]
 
         self.layer_sync(query)
         query_layer = _SeqAllToAll.apply(self.spg, query, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                         self.overlap_handles, 'q', True, num_total_heads)
+                                         self.overlap_handles, 'q', True, num_kv_heads)
         self.layer_sync(key)
         key_layer = _SeqAllToAll.apply(self.spg, key, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                       self.overlap_handles, 'k', True, num_total_heads)
+                                       self.overlap_handles, 'k', True, num_kv_heads)
         if self.sp_overlap_comm:
             self.default_stream.wait_stream(self.sp_stream)
 
         value_layer = _SeqAllToAll.apply(self.spg, value, self.scatter_idx, self.gather_idx, batch_dim_idx, None,
-                                         self.overlap_handles, 'v', True, num_total_heads)
+                                         self.overlap_handles, 'v', True, num_kv_heads)
 
         if self.sp_overlap_comm:
             # Register a hook to synchronize dq and dk after the all-to-all
@@ -540,7 +543,7 @@ class DistributedAttention(torch.nn.Module):
         context_layer = self.local_attn(query_layer, key_layer, value_layer, *args, **kwargs)
 
         output = _SeqAllToAll.apply(self.spg, context_layer, self.gather_idx, self.scatter_idx, batch_dim_idx,
-                                    self.sp_stream, self.overlap_handles, 'o', True, num_total_heads)
+                                    self.sp_stream, self.overlap_handles, 'o', True, num_kv_heads)
 
         #out e.g., [s/p::h]
         return output

@@ -37,12 +37,18 @@ class _RecordingAttention(torch.nn.Module):
         return value
 
 
-def _run_attention(attn, num_heads):
-    """One forward + backward through ``attn``; returns the head ids this rank received."""
-    query = torch.zeros(1, LOCAL_SEQ, num_heads, HEAD_DIM, requires_grad=True)
+def _tagged(num_heads):
+    tensor = torch.zeros(1, LOCAL_SEQ, num_heads, HEAD_DIM, requires_grad=True)
     with torch.no_grad():
-        query[:] = torch.arange(num_heads).view(1, 1, -1, 1).float()
-    output = attn(query, query.clone(), query.clone(), 0)
+        tensor[:] = torch.arange(num_heads).view(1, 1, -1, 1).float()
+    return tensor
+
+
+def _run_attention(attn, num_heads, num_kv_heads=None):
+    """One forward + backward through ``attn``; returns the query head ids this rank received."""
+    query = _tagged(num_heads)
+    key = _tagged(num_kv_heads if num_kv_heads is not None else num_heads)
+    output = attn(query, key, key.clone(), 0)
     output.sum().backward()
     return attn.local_attn.head_ids
 
@@ -91,11 +97,22 @@ class TestUlyssesMultipleModels(DistributedTest):
 
         assert _run_attention(attn, 6) == [[0, 1, 2], [3, 4, 5]][rank]
 
+    def test_gqa_partitions_by_kv_groups(self):
+        # Q=6 / KV=3 over 2 ranks. 6 divides evenly, but a query head has to stay on the rank
+        # holding its KV head, so the split follows the KV groups [2, 1] and Q becomes [4, 2].
+        # Reading the count off the query tensor instead would tear group 1 apart.
+        sp_group = self._sequence_parallel_group()
+        rank = dist.get_rank(group=sp_group)
+
+        attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1)
+
+        assert _run_attention(attn, 6, num_kv_heads=3) == [[0, 1, 2, 3], [4, 5]][rank]
+
     def test_explicit_head_count_is_honoured(self):
         # Callers that know the count up front can pass it instead of having it inferred.
         sp_group = self._sequence_parallel_group()
         rank = dist.get_rank(group=sp_group)
 
-        attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1, num_total_heads=3)
+        attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1, num_kv_heads=3)
 
         assert _run_attention(attn, 3) == [[0, 1], [2]][rank]
