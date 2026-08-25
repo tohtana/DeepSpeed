@@ -14,8 +14,8 @@ import pytest
 import torch
 
 import deepspeed.comm as dist
-from deepspeed.module_inject.tp_shard import set_num_kv_heads
-from deepspeed.sequence.layer import DistributedAttention
+from deepspeed.module_inject.tp_shard import get_num_kv_heads, set_num_kv_heads
+from deepspeed.sequence.layer import DistributedAttention, _SeqAllToAll
 from deepspeed.utils import groups
 
 from unit.common import DistributedTest
@@ -107,6 +107,31 @@ class TestUlyssesMultipleModels(DistributedTest):
         attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1)
 
         assert _run_attention(attn, 6, num_kv_heads=3) == [[0, 1, 2, 3], [4, 5]][rank]
+
+    def test_direct_all_to_all_replays_the_inferred_count_in_backward(self):
+        # Megatron-DeepSpeed reaches _SeqAllToAll directly and threads nothing. Only the scatter
+        # direction can see that 3 heads do not divide by 2; backward runs with scatter and gather
+        # swapped, so the count it infers here has to survive to that point.
+        sp_group = self._sequence_parallel_group()
+
+        query = torch.randn(1, LOCAL_SEQ, 3, HEAD_DIM, requires_grad=True)
+        output = _SeqAllToAll.apply(sp_group, query, 2, 1, 0)
+        output.sum().backward()
+
+        assert query.grad is not None
+        assert get_num_kv_heads() == 3
+
+    def test_fewer_kv_heads_than_ranks_is_rejected_before_the_collective(self):
+        # 1 KV head over 2 ranks leaves rank 1 with nothing to attend over. Both ranks have to
+        # reject it together: one of them raising inside the all-to-all hangs the other.
+        sp_group = self._sequence_parallel_group()
+
+        attn = DistributedAttention(_RecordingAttention(), sp_group, scatter_idx=2, gather_idx=1)
+        query = torch.zeros(1, LOCAL_SEQ, 2, HEAD_DIM, requires_grad=True)
+        key = torch.zeros(1, LOCAL_SEQ, 1, HEAD_DIM, requires_grad=True)
+
+        with pytest.raises(AssertionError, match="at least the sequence parallel size"):
+            attn(query, key, key.clone(), 0)
 
     def test_explicit_head_count_is_honoured(self):
         # Callers that know the count up front can pass it instead of having it inferred.

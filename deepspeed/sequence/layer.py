@@ -248,6 +248,31 @@ def uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, n
     return output
 
 
+def _resolve_kv_heads(input, scatter_idx, seq_world_size, num_kv_heads):
+    """Effective KV head count for one all-to-all, or None to take the even-split path.
+
+    Only the scatter direction can read the count off the tensor. The gather direction and
+    ``_SeqAllToAll.backward`` see an already-sharded one, so whoever resolves it here has to hand
+    the value on: threaded through the autograd context for callers that pass one, and published
+    to ``tp_shard`` for callers that do not.
+    """
+    reads_global = num_kv_heads is _KV_HEADS_FROM_GLOBAL
+    if reads_global:
+        num_kv_heads = get_num_kv_heads()
+
+    if num_kv_heads is None and not scatter_idx < 2 and input.shape[2] % seq_world_size != 0:
+        num_kv_heads = input.shape[2]
+        if reads_global:
+            set_num_kv_heads(num_kv_heads)
+
+    if num_kv_heads is not None:
+        assert num_kv_heads >= seq_world_size, (
+            f"Number of key-value heads ({num_kv_heads}) must be at least the sequence parallel "
+            f"size ({seq_world_size}); a smaller count leaves a rank with no head to attend over.")
+
+    return num_kv_heads
+
+
 def single_all_to_all(input,
                       scatter_idx,
                       gather_idx,
@@ -258,27 +283,14 @@ def single_all_to_all(input,
                       type=None,
                       num_kv_heads=_KV_HEADS_FROM_GLOBAL):
     seq_world_size = dist.get_world_size(group)
-    # we only need num_heads once
-    num_heads = input.shape[2]
 
-    # Only the scatter direction can read the total head count off the tensor; the gather
-    # direction and the backward pass see an already-sharded one. Callers that know the count
-    # pass it in. Callers that do not (Megatron-DeepSpeed calls this helper directly) keep the
-    # historical process-wide slot, which ``set_num_kv_heads`` below still populates for them.
-    reads_global = num_kv_heads is _KV_HEADS_FROM_GLOBAL
-    if reads_global:
-        num_kv_heads = get_num_kv_heads()
+    # Callers that do not thread a count (Megatron-DeepSpeed calls this helper directly) keep the
+    # historical process-wide slot, which _resolve_kv_heads still populates for them.
+    num_kv_heads = _resolve_kv_heads(input, scatter_idx, seq_world_size, num_kv_heads)
 
-    if num_kv_heads is not None or (num_heads % seq_world_size != 0 and not scatter_idx < 2):
+    if num_kv_heads is not None:
         # Assuming here that the number of heads for q is consistent with kv
         # If not, additional logic is required for cases like GQA
-        if num_kv_heads is None:
-            assert num_heads > seq_world_size, f"Number of heads ({num_heads}) must be larger than sequence parallel size ({seq_world_size})"
-            # set heads at first call by num_kv_heads.
-            # then use ``num_kv_heads is not None`` to re-entry uneven path.
-            num_kv_heads = num_heads
-            if reads_global:
-                set_num_kv_heads(num_heads)
         assert async_op == False, "uneven head sp does not support async op"
         return uneven_heads_all2all(input, scatter_idx, gather_idx, batch_dim_idx, group, num_kv_heads)
 
@@ -343,11 +355,11 @@ class _SeqAllToAll(torch.autograd.Function):
         ctx.handle = handle
         ctx.type = type
         ctx.batch_dim_idx = batch_dim_idx
-        # Resolve once here rather than per call: the backward pass runs with scatter and
-        # gather swapped and cannot recover the count from its own tensor, and the global may
-        # have moved on by then if another model was built in between.
-        if num_kv_heads is _KV_HEADS_FROM_GLOBAL:
-            num_kv_heads = get_num_kv_heads()
+        # Resolve once here rather than per call: the backward pass runs with scatter and gather
+        # swapped and cannot recover the count from its own tensor, and the global may have moved
+        # on by then if another model was built in between. Resolving includes the shape-based
+        # inference, so a caller that passed nothing still gets the effective value replayed.
+        num_kv_heads = _resolve_kv_heads(input, scatter_idx, dist.get_world_size(group), num_kv_heads)
         ctx.num_kv_heads = num_kv_heads
         if ctx.handle is None:
             res = single_all_to_all(input,
