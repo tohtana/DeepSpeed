@@ -174,7 +174,7 @@ def test_fused_engine_names_what_it_cannot_run():
     with pytest.raises(RuntimeError, match="bfloat16 and float16"):
         fused_ops.assert_supported(torch.randn(8, 16, device=device, dtype=torch.float32), score_apply="post")
 
-    with pytest.raises(RuntimeError, match='score_apply="post"'):
+    with pytest.raises(RuntimeError, match='resolved score_apply="pre"'):
         fused_ops.assert_supported(supported, score_apply="pre")
 
     with pytest.raises(RuntimeError, match="CUDA kernels"):
