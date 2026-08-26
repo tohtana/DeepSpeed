@@ -230,6 +230,22 @@ def _invert_index(index: torch.Tensor, num_inverse_rows: int) -> torch.Tensor:
     return inverse
 
 
+def _differentiable_backward(grad_output, combined_rows, top_scores, inverse, top_k):
+    """Build the rare higher-order backward with regular PyTorch operations."""
+    n_tokens, hidden = top_scores.shape[0], combined_rows.shape[-1]
+    valid = inverse >= 0
+    safe_inverse = inverse.clamp_min(0).to(torch.int64)
+    gathered_rows = combined_rows.index_select(0, safe_inverse).reshape(n_tokens, top_k, hidden)
+
+    grad_by_assignment = (grad_output[:, None, :] * top_scores[:, :, None]).to(combined_rows.dtype).reshape(-1, hidden)
+    grad_rows = torch.zeros_like(combined_rows)
+    grad_rows = grad_rows.index_copy(0, safe_inverse[valid], grad_by_assignment[valid])
+
+    grad_scores = (gathered_rows.float() * grad_output.float()[:, None, :]).sum(dim=-1)
+    grad_scores = torch.where(valid.reshape(n_tokens, top_k), grad_scores, 0.0).to(top_scores.dtype)
+    return grad_rows, grad_scores
+
+
 class _FusedWeightedRestore(torch.autograd.Function):
     """Weight rows by their routing score and reduce over top-k in one pass."""
 
@@ -267,10 +283,15 @@ class _FusedWeightedRestore(torch.autograd.Function):
         combined_rows, top_scores, inverse = ctx.saved_tensors
         grad_output = grad_output.contiguous()
 
-        # Every row is claimed by exactly one slot, which fused_weighted_restore
-        # checks by shape before building the inverse, so both gradients are
-        # written in full and neither buffer needs pre-zeroing.
-        grad_rows = torch.empty_like(combined_rows)
+        if torch.is_grad_enabled():
+            grad_rows, grad_scores = _differentiable_backward(grad_output, combined_rows, top_scores, inverse,
+                                                              ctx.top_k)
+            return grad_rows, grad_scores, None, None
+
+        # AutoEP supplies an exact permutation, so every row is written once.
+        # Zero initialization also keeps malformed direct calls deterministic
+        # when an invalid or duplicate assignment leaves an inverse slot empty.
+        grad_rows = torch.zeros_like(combined_rows)
         grad_scores = torch.empty_like(top_scores)
 
         n_tokens, hidden = top_scores.shape[0], combined_rows.shape[-1]
@@ -314,11 +335,36 @@ def fused_weighted_restore(
     assignment buffer nor the ``[T, K, H]`` FP32 intermediate is allocated.
     """
     bsz, seqlen, hidden = shape
+    if top_k <= 0:
+        raise RuntimeError(f"fused weighted restore expects top_k > 0, got {top_k}.")
+    if bsz < 0 or seqlen < 0 or hidden < 0:
+        raise RuntimeError(f"fused weighted restore expects non-negative output dimensions, got {shape}.")
+    if combined_rows.ndim != 2:
+        raise RuntimeError(f"fused weighted restore expects combined_rows to be 2D, got shape "
+                           f"{tuple(combined_rows.shape)}.")
+    if combined_rows.shape[1] != hidden:
+        raise RuntimeError(f"fused weighted restore output hidden size is {hidden}, but combined rows have hidden "
+                           f"size {combined_rows.shape[1]}.")
+
     n_tokens = bsz * seqlen
     expected_rows = n_tokens * top_k
     if combined_rows.shape[0] != expected_rows:
         raise RuntimeError(f"fused weighted restore expects one row per assignment: {expected_rows} rows for "
                            f"{n_tokens} tokens at top_k={top_k}, got {combined_rows.shape[0]}.")
+    if tuple(top_scores.shape) != (n_tokens, top_k):
+        raise RuntimeError(f"fused weighted restore expects top_scores shape {(n_tokens, top_k)}, got "
+                           f"{tuple(top_scores.shape)}.")
+    if token_indices_sorted.ndim != 1 or token_indices_sorted.numel() != expected_rows:
+        raise RuntimeError(f"fused weighted restore expects token_indices_sorted to contain {expected_rows} "
+                           f"assignments, got shape {tuple(token_indices_sorted.shape)}.")
+    if token_indices_sorted.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError("fused weighted restore expects token_indices_sorted to use int32 or int64 indices, got "
+                           f"{token_indices_sorted.dtype}.")
+    if not torch.is_floating_point(top_scores):
+        raise RuntimeError(f"fused weighted restore expects floating-point top_scores, got {top_scores.dtype}.")
+    if combined_rows.device != top_scores.device or combined_rows.device != token_indices_sorted.device:
+        raise RuntimeError("fused weighted restore expects rows, scores, and indices on the same device, got "
+                           f"{combined_rows.device}, {top_scores.device}, and {token_indices_sorted.device}.")
 
     inverse = _invert_index(token_indices_sorted, expected_rows)
     output = _FusedWeightedRestore.apply(combined_rows, top_scores.contiguous(), inverse, top_k)

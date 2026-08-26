@@ -95,6 +95,51 @@ def test_fused_weighted_restore_requires_one_row_per_assignment():
         )
 
 
+@pytest.mark.parametrize(
+    "rows_shape,scores_shape,index_count,index_dtype,error",
+    [
+        ((8, 15), (4, 2), 8, torch.int64, "output hidden size"),
+        ((8, 16), (4, 1), 8, torch.int64, "top_scores shape"),
+        ((8, 16), (4, 2), 7, torch.int64, "token_indices_sorted"),
+        ((8, 16), (4, 2), 8, torch.float32, "int32 or int64"),
+    ],
+)
+def test_fused_weighted_restore_validates_input_contract(rows_shape, scores_shape, index_count, index_dtype, error):
+    device = _device()
+    with pytest.raises(RuntimeError, match=error):
+        fused_ops.fused_weighted_restore(
+            torch.randn(rows_shape, device=device, dtype=torch.bfloat16),
+            top_scores=torch.rand(scores_shape, device=device),
+            token_indices_sorted=torch.arange(index_count, device=device).to(index_dtype),
+            top_k=2,
+            shape=(1, 4, 16),
+        )
+
+
+def test_fused_weighted_restore_supports_double_backward():
+    device = _device()
+    num_tokens, top_k, hidden = 4, 2, 16
+    token_indices_sorted = torch.tensor([2, 0, 7, 1, 4, 6, 3, 5], device=device)
+    rows = torch.randn(num_tokens * top_k, hidden, device=device, dtype=torch.bfloat16, requires_grad=True)
+    scores = torch.rand(num_tokens, top_k, device=device, dtype=torch.float32, requires_grad=True)
+
+    output = fused_ops.fused_weighted_restore(
+        rows,
+        top_scores=scores,
+        token_indices_sorted=token_indices_sorted,
+        top_k=top_k,
+        shape=(1, num_tokens, hidden),
+    )
+    grad_rows, grad_scores = torch.autograd.grad(output.float().sum(), (rows, scores), create_graph=True)
+    score_cross_gradient = torch.autograd.grad(grad_rows.float().sum(), scores, retain_graph=True)[0]
+    row_cross_gradient = torch.autograd.grad(grad_scores.float().sum(), rows)[0]
+
+    assert torch.isfinite(score_cross_gradient).all()
+    assert torch.isfinite(row_cross_gradient).all()
+    assert score_cross_gradient.abs().sum() > 0
+    assert row_cross_gradient.abs().sum() > 0
+
+
 def test_fused_engine_names_what_it_cannot_run():
     device = _device()
     supported = torch.randn(8, 16, device=device, dtype=torch.bfloat16)
