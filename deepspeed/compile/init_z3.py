@@ -14,7 +14,7 @@ from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToMo
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
 from .passes import zero3_compile, prefetch, selective_gather, offload_parameters, offload_activation
-from .backend import make_backend, launch_compile_passes, init_schedule
+from .backend import agent_optimization_loop, make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
@@ -84,6 +84,68 @@ def _resolve_expected_grad_dtype(param):
     return param.dtype
 
 
+def _default_z3_schedule(compile_config):
+    use_agent = compile_config.zero3_tuning_strategy == "agent"
+    schedule = []
+    if compile_config.offload_parameters:
+        parameter_passes = [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]
+        schedule.append((0, parameter_passes))
+        if use_agent:
+            schedule.append((WARMUP, parameter_passes + [agent_optimization_loop]))
+    elif compile_config.offload_opt_states:
+        from .passes.offload_adam_states import move_opt_states, offload_adam_states_for_init
+        schedule.append((0, [zero3_compile.add_z3_gather_release]))
+        schedule.append((1, [offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states]))
+        if use_agent:
+            schedule.append((WARMUP, [
+                offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states,
+                agent_optimization_loop
+            ]))
+    elif compile_config.offload_activation:
+        offload_activation.register_activation_offload_ops()
+        schedule.append((0, [zero3_compile.add_z3_gather_release, offload_activation.offload_activation_floor]))
+        warmup_passes = [
+            zero3_compile.add_z3_gather_release, offload_activation.offload_activation_floor,
+            offload_activation.offload_activation
+        ]
+        if use_agent:
+            warmup_passes.append(agent_optimization_loop)
+        schedule.append((WARMUP, warmup_passes))
+    elif use_agent:
+        schedule.append((0, [zero3_compile.add_z3_gather_release]))
+        schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, agent_optimization_loop]))
+    else:
+        schedule.append((0, [zero3_compile.add_z3_gather_release]))
+        schedule.append(
+            (WARMUP,
+             [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
+    return schedule
+
+
+def _compose_agent_schedule(schedule, compile_config):
+    if compile_config.zero3_tuning_strategy != "agent":
+        return schedule
+
+    composed = [(step, list(passes)) for step, passes in schedule]
+    for index, (step, passes) in enumerate(composed):
+        if step == WARMUP:
+            structural_passes = [opt_pass for opt_pass in passes if opt_pass is not agent_optimization_loop]
+            composed[index] = (step, structural_passes + [agent_optimization_loop])
+            return composed
+
+    # Experimental explicit schedules without a warmup entry reuse the latest pre-warmup
+    # structural pass set. This preserves the user's capture setup when the warm graph is recaptured.
+    prior_entries = [(step, passes) for step, passes in composed if step < WARMUP]
+    if prior_entries:
+        warmup_passes = list(max(prior_entries, key=lambda entry: entry[0])[1])
+    else:
+        warmup_passes = [zero3_compile.add_z3_gather_release]
+    warmup_entry = (WARMUP, warmup_passes + [agent_optimization_loop])
+    insert_at = next((index for index, (step, _) in enumerate(composed) if step > WARMUP), len(composed))
+    composed.insert(insert_at, warmup_entry)
+    return composed
+
+
 def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
 
     # Validate before touching the engine: everything below removes hooks and unpatches modules,
@@ -150,39 +212,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                              "choose one offloading target per run. Note that offload_parameters may have "
                              "been enabled implicitly: the engine turns it on when the ZeRO config "
                              "offloads both optimizer and parameters to CPU.")
-        schedule = []
-        if (compile_config.offload_parameters):
-            schedule.append((0, [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]))
-        elif compile_config.offload_opt_states:
-            from .passes.offload_adam_states import move_opt_states, offload_adam_states_for_init
-            schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            # States exist from step 0's optimizer step, so offloading engages at step 1.
-            # for_init empties them before profiling, so the plan is made against the floor and a
-            # job that only fits with offloading never runs a step with everything resident.
-            schedule.append((1, [offload_adam_states_for_init, zero3_compile.add_z3_gather_release, move_opt_states]))
-        elif compile_config.offload_activation:
-            offload_activation.register_activation_offload_ops()
-            # The floor pass must engage at step 0: a job that only fits with its activations
-            # moved out never reaches WARMUP otherwise. It offloads in the forward and reloads
-            # in the backward, so it runs correctly on its own.
-            #
-            # The planner runs at WARMUP because it only gives memory back, and because the
-            # floor it needs cannot be measured at step 0 -- a profile of the compiled forward
-            # graph cannot see work outside it, such as a tiled loss driving a nested backward.
-            #
-            # Both entries list the floor pass: passes are re-applied from the captured graph at
-            # each scheduled step rather than accumulated, which is also why the default
-            # schedule below repeats add_z3_gather_release.
-            schedule.append((0, [zero3_compile.add_z3_gather_release, offload_activation.offload_activation_floor]))
-            schedule.append((WARMUP, [
-                zero3_compile.add_z3_gather_release, offload_activation.offload_activation_floor,
-                offload_activation.offload_activation
-            ]))
-        else:
-            schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append(
-                (WARMUP,
-                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
+        schedule = _default_z3_schedule(compile_config)
+    schedule = _compose_agent_schedule(schedule, compile_config)
 
     init_schedule(schedule)
 
@@ -203,6 +234,7 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         for _, passes in schedule:
             if move_opt_states in passes or move_opt_states_sync in passes or offload_adam_states_for_init in passes:
                 init_offload_opt_states(optimizer, dc)
+                break
 
     engine._deepcompile_owned_frames = set()
     engine.launch_compile_passes = partial(launch_compile_passes, owned_frames=engine._deepcompile_owned_frames)

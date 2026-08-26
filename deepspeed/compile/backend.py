@@ -3,6 +3,7 @@
 
 # DeepSpeed Team
 
+from dataclasses import asdict
 from typing import Dict, List, Callable, Tuple, Set
 import time
 import gc
@@ -41,6 +42,7 @@ next_passes = None
 current_passes = None
 
 param_manager: Dict[int, DSGraphParamManager] = {}
+optimization_trace = []
 
 
 class GraphOrder:
@@ -74,6 +76,12 @@ frames_partitioned: Set[int] = set()
 profiling_results: Dict[int, ProfilingResult] = {}
 opt_pass_times = []
 opt_passes = {}
+
+
+def agent_optimization_loop(*args, **kwargs):
+    """Schedule marker consumed by run_optimization after the preceding structural passes."""
+    raise RuntimeError("agent_optimization_loop is a schedule marker and must not run as an ordinary pass")
+
 
 fwd_real_inputs = []
 
@@ -120,7 +128,7 @@ def init_schedule(schedule):
 
 def launch_compile_passes(global_steps: int, owned_frames=None):
     """Advance the pass schedule and discard state owned by the previous compile cycle."""
-    global next_pass_step, next_passes
+    global next_pass_step, next_passes, optimization_trace
 
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
         _, next_passes = remaining_schedule.popleft()
@@ -133,6 +141,10 @@ def launch_compile_passes(global_steps: int, owned_frames=None):
         param_manager.clear()
         cleanup_compiled_backward_state(owned_frames=owned_frames)
         frames_partitioned.clear()
+        optimization_trace.clear()
+        if agent_optimization_loop in next_passes:
+            from .optimizer import _reset_inspection_session_root
+            _reset_inspection_session_root()
 
 
 def set_time_and_tensor_size(graph_id, graph: Graph, mem, bwd, profiling_results, mem_complete=True):
@@ -281,6 +293,51 @@ def run_opt_passes(opt_passes: List[Callable],
             get_accelerator().empty_cache()
 
 
+def run_optimization(opt_passes: List[Callable],
+                     gm: GraphModule,
+                     graph_id: int,
+                     graph_slot: Tuple[int, str],
+                     graph_order: List[Tuple[int, bool]],
+                     profiling_results,
+                     create_inputs_fn,
+                     mem_budget: float,
+                     param_manager,
+                     bwd: bool,
+                     compile_config,
+                     debug_log=False):
+    use_agent = agent_optimization_loop in opt_passes
+    structural_passes = [opt_pass for opt_pass in opt_passes if opt_pass is not agent_optimization_loop]
+    run_opt_passes(structural_passes, gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget,
+                   param_manager, bwd, debug_log)
+    if not use_agent:
+        return None
+
+    import copy
+    from .agent_runner import AgentRunner, AgentRunnerConfig
+    from .optimizer import OptimizationContext, TwoAgentLoopOptimizer
+
+    warmup_trace = copy.deepcopy(optimization_trace)
+    structural_ctx = OptimizationContext(gm=gm,
+                                         graph_id=graph_id,
+                                         graph_slot=graph_slot,
+                                         graph_order=graph_order,
+                                         profiling_results=profiling_results,
+                                         create_inputs_fn=create_inputs_fn,
+                                         bwd=bwd,
+                                         debug_log=debug_log,
+                                         compile_config=compile_config,
+                                         warmup_trace=warmup_trace)
+    runner_config = {
+        "timeout_sec": compile_config.agent_timeout_sec,
+        "debug_log": compile_config.debug_log,
+    }
+    evaluator_command = compile_config.agent_evaluator_command or compile_config.agent_command
+    optimizer_command = compile_config.agent_optimizer_command or compile_config.agent_command
+    evaluator_runner = AgentRunner(AgentRunnerConfig(command=evaluator_command, **runner_config))
+    optimizer_runner = AgentRunner(AgentRunnerConfig(command=optimizer_command, **runner_config))
+    return TwoAgentLoopOptimizer(evaluator_runner, optimizer_runner, compile_config).optimize(gm, structural_ctx)
+
+
 def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
 
     register_custom_ops()
@@ -356,17 +413,23 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
             param_manager[graph_id] = DSGraphParamManager(gm.graph, real_inputs, param_indices)
 
             real_inputs_with_rng = real_inputs + tuple(sample_inputs[len(real_inputs):])
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order_with_frame_id.get_graph_order(),
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: real_inputs_with_rng,
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=False,
-                debug_log=debug_log)
+            result = run_optimization(opt_passes=next_passes,
+                                      gm=gm,
+                                      graph_id=graph_id,
+                                      graph_slot=(graph_index, "fwd"),
+                                      graph_order=graph_order_with_frame_id.get_graph_order(),
+                                      profiling_results=profiling_results,
+                                      create_inputs_fn=lambda: real_inputs_with_rng,
+                                      mem_budget=.0,
+                                      param_manager=param_manager,
+                                      bwd=False,
+                                      compile_config=compile_config,
+                                      debug_log=debug_log)
+            if result is not None:
+                optimization_trace.extend({
+                    "graph_slot": [graph_index, "fwd"],
+                    **asdict(entry)
+                } for entry in result.trace)
 
             opt_pass_times.append(("fwd", graph_index, graph_id, time.time() - time_start))
 
@@ -395,17 +458,23 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
                 sample_inputs_with_real_params = param_manager[graph_id].replace_fake_tensors_with_real_params(
                     sample_inputs, gm.graph)
                 bwd_real_inputs = set_example_values_to_symints(sample_inputs_with_real_params)
-            run_opt_passes(
-                opt_passes=next_passes,
-                gm=gm,
-                graph_id=graph_id,
-                graph_order=graph_order,
-                profiling_results=profiling_results,
-                create_inputs_fn=lambda: tuple(bwd_real_inputs),
-                mem_budget=.0,  # unused
-                param_manager=param_manager,
-                bwd=True,
-                debug_log=debug_log)
+            result = run_optimization(opt_passes=next_passes,
+                                      gm=gm,
+                                      graph_id=graph_id,
+                                      graph_slot=(graph_index, "bwd"),
+                                      graph_order=graph_order,
+                                      profiling_results=profiling_results,
+                                      create_inputs_fn=lambda: tuple(bwd_real_inputs),
+                                      mem_budget=.0,
+                                      param_manager=param_manager,
+                                      bwd=True,
+                                      compile_config=compile_config,
+                                      debug_log=debug_log)
+            if result is not None:
+                optimization_trace.extend({
+                    "graph_slot": [graph_index, "bwd"],
+                    **asdict(entry)
+                } for entry in result.trace)
 
             # assert graph_id in param_manager, f"Graph {graph_id} not found in param_manager"
 
