@@ -623,7 +623,12 @@ def _conv_trans_flops_compute(
 ):
     batch_size = input.shape[0]
     in_channels = input.shape[1]
-    out_channels = weight.shape[1]
+    # A transposed-convolution weight is [in_channels, out_channels // groups, *kernel],
+    # so dim 1 already holds the per-group filter count and must not be divided by groups
+    # a second time. Doing so reports zero macs for a depthwise transposed convolution,
+    # where out_channels // groups is 1.
+    filters_per_channel = weight.shape[1]
+    out_channels = filters_per_channel * groups
     kernel_dims = list(weight.shape[2:])
     input_dims = list(input.shape[2:])
 
@@ -632,19 +637,16 @@ def _conv_trans_flops_compute(
     paddings = padding if type(padding) is tuple else (padding, ) * length
     strides = stride if type(stride) is tuple else (stride, ) * length
     dilations = dilation if type(dilation) is tuple else (dilation, ) * length
+    output_paddings = output_padding if type(output_padding) is tuple else (output_padding, ) * length
 
     output_dims = []
     for idx, input_dim in enumerate(input_dims):
-
-        output_dim = (input_dim + 2 * paddings[idx] - (dilations[idx] *
-                                                       (kernel_dims[idx] - 1) + 1)) // strides[idx] + 1
+        # A transposed convolution inverts the forward shape formula, so the output grows
+        # with the stride rather than shrinking by it.
+        output_dim = ((input_dim - 1) * strides[idx] - 2 * paddings[idx] + dilations[idx] * (kernel_dims[idx] - 1) +
+                      output_paddings[idx] + 1)
         output_dims.append(output_dim)
 
-    paddings = padding if type(padding) is tuple else (padding, padding)
-    strides = stride if type(stride) is tuple else (stride, stride)
-    dilations = dilation if type(dilation) is tuple else (dilation, dilation)
-
-    filters_per_channel = out_channels // groups
     conv_per_position_macs = int(_prod(kernel_dims)) * in_channels * filters_per_channel
     active_elements_count = batch_size * int(_prod(input_dims))
     overall_conv_macs = conv_per_position_macs * active_elements_count
