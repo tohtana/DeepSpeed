@@ -26,13 +26,18 @@ from __future__ import annotations
 
 import torch
 
-try:
-    import triton
-    import triton.language as tl
+_IS_ROCM_PYTORCH = getattr(torch.version, "hip", None) is not None
 
-    _TRITON_AVAILABLE = True
-except ImportError:
+if _IS_ROCM_PYTORCH:
     _TRITON_AVAILABLE = False
+else:
+    try:
+        import triton
+        import triton.language as tl
+
+        _TRITON_AVAILABLE = True
+    except ImportError:
+        _TRITON_AVAILABLE = False
 
 # The grouped GEMM produces the rows this consumes, so the supported dtypes are
 # the ones it is built for rather than a silent widening.
