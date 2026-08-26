@@ -118,10 +118,7 @@ def validate_autoep_config(
     if not config.enabled:
         return
 
-    # The fused reduction only replaces the weighted sum the standard
-    # expert-parallel path runs. Where it has nothing to replace, say so instead
-    # of running the eager reduction under a config that asked for the fused
-    # one: a benchmark believing it measured the fused path would report noise.
+    # Reject configurations that would bypass the requested fused reduction.
     if config.combine_impl == "fused_weighted_sum":
         if tp_size > 1:
             raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '

@@ -2,24 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Fused weighted token restoration for AutoEP.
+"""Fused AutoEP token restore without the eager scatter and FP32 intermediate.
 
-After the combine all-to-all, the eager path returns one row per routed
-assignment and turns it back into one row per token in general-purpose steps: it
-scatters the rows into a zero-filled ``[tokens * top_k, hidden]`` buffer, views
-that as ``[tokens, top_k, hidden]``, widens it to FP32 to apply routing weights,
-and reduces over top-k. The FP32 intermediate alone is 64 MiB at the canonical
-shape, and every step of that sequence costs a full pass over the routed
-activations, in every MoE layer, on every step.
-
-This module does the same arithmetic in one pass. Each program owns one token
-and one slice of the hidden dimension, walks its top-k rows in registers,
-accumulates in FP32 and writes the token's output once, so neither the scattered
-assignment buffer nor the FP32 intermediate is ever allocated.
-
-Only the reduction is replaced. The collectives, the router, the grouped GEMM
-and the expert-major reorder are all untouched, so a measured difference belongs
-to the reduction alone.
+The kernel reduces each token's top-k rows in FP32. Communication, routing,
+expert reorder, and grouped GEMM remain unchanged.
 """
 
 from __future__ import annotations
@@ -39,8 +25,6 @@ else:
     except ImportError:
         _TRITON_AVAILABLE = False
 
-# The grouped GEMM produces the rows this consumes, so the supported dtypes are
-# the ones it is built for rather than a silent widening.
 SUPPORTED_ROW_DTYPES = (torch.bfloat16, torch.float16)
 
 _MAX_BLOCK_HIDDEN = 512
@@ -100,8 +84,7 @@ if _TRITON_AVAILABLE:
             other=0.0,
         ).to(tl.float32)
 
-        # FP32 product and reduction with a single cast on the way out, matching
-        # the dtype discipline of the eager weighted sum.
+        # Match the eager path's FP32 product and accumulation.
         weighted = tl.sum(values * scores[:, None], axis=0)
         tl.store(
             out_ptr + token * out_stride + hidden_offsets,
@@ -138,10 +121,7 @@ if _TRITON_AVAILABLE:
         scores = tl.load(scores_ptr + token * scores_stride + slots, mask=slot_mask, other=0.0).to(tl.float32)
 
         grad_rows_dtype = grad_rows_ptr.dtype.element_ty
-        # One token per program, so the score gradient reduces over the hidden
-        # dimension in registers. Splitting that dimension across programs and
-        # reducing the partials afterwards measured slower at this shape: the
-        # extra pass costs more than the added parallelism returns.
+        # Keeping one token per program avoids a second reduction pass for scores.
         score_partials = tl.zeros([K_PADDED, BLOCK_H], dtype=tl.float32)
 
         for hidden_start in range(0, hidden, BLOCK_H):
@@ -182,11 +162,7 @@ def is_available() -> bool:
 
 
 def assert_supported(rows: torch.Tensor, *, score_apply: str) -> None:
-    """Reject configurations the fused restore does not implement.
-
-    Checked before any collective runs: a rank that raised while its peers
-    proceeded would turn a clear error into a hang.
-    """
+    """Reject unsupported configurations before collectives begin."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError('combine_impl="fused_weighted_sum" needs Triton, which is not installed in this '
                            "environment. Install Triton, or leave combine_impl unset.")
@@ -203,11 +179,7 @@ def assert_supported(rows: torch.Tensor, *, score_apply: str) -> None:
 
 
 def _block_hidden(hidden: int, slots: int) -> int:
-    """Pick a power-of-two hidden tile that fits alongside ``slots`` rows of FP32.
-
-    The floor keeps the budget honest for top-k values far wider than any real
-    router, so the tile shrinks rather than overrunning the element budget.
-    """
+    """Choose a power-of-two tile within the FP32 register budget."""
     budget = max(16, _MAX_BLOCK_ELEMENTS // slots)
     return min(_MAX_BLOCK_HIDDEN, budget, max(16, triton.next_power_of_2(hidden)))
 
@@ -293,16 +265,12 @@ class _FusedWeightedRestore(torch.autograd.Function):
                                                               ctx.top_k)
             return grad_rows, grad_scores, None, None
 
-        # AutoEP supplies an exact permutation, so every row is written once.
-        # Zero initialization also keeps malformed direct calls deterministic
-        # when an invalid or duplicate assignment leaves an inverse slot empty.
+        # Zero initialization keeps malformed direct calls deterministic.
         grad_rows = torch.zeros_like(combined_rows)
         grad_scores = torch.empty_like(top_scores)
 
         n_tokens, hidden = top_scores.shape[0], combined_rows.shape[-1]
         if n_tokens == 0 or hidden == 0:
-            # Nothing is reduced, so the score gradient is zero rather than
-            # whatever an uninitialized buffer happened to hold.
             return grad_rows, torch.zeros_like(top_scores), None, None
 
         k_padded = _padded_top_k(ctx.top_k)
@@ -333,12 +301,7 @@ def fused_weighted_restore(
     top_k: int,
     shape: tuple[int, int, int],
 ) -> torch.Tensor:
-    """Weight combined rows by their routing scores and reduce over top-k.
-
-    Fused counterpart of ``combine_from_routed`` for ``score_apply="post"``. It
-    goes straight from ``[T * K, H]`` to ``[B, S, H]``, so neither the scattered
-    assignment buffer nor the ``[T, K, H]`` FP32 intermediate is allocated.
-    """
+    """Restore ``[T * K, H]`` rows directly to weighted ``[B, S, H]`` output."""
     bsz, seqlen, hidden = shape
     if top_k <= 0:
         raise RuntimeError(f"fused weighted restore expects top_k > 0, got {top_k}.")

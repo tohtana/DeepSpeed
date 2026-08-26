@@ -2,12 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""The fused weighted restore against the eager reduction it replaces.
-
-``combine_from_routed`` is the reference: the fused reduction is only worth
-having if it is indistinguishable from it, so every assertion compares the two
-directly rather than against hand-written expectations.
-"""
+"""Compare the fused weighted restore with the eager reference."""
 
 import pytest
 import torch
@@ -40,7 +35,6 @@ def test_fused_weighted_restore_matches_eager_including_gradients(top_k, hidden,
 
     selected_experts = torch.randint(0, num_experts, (num_tokens, top_k), device=device, generator=generator)
     token_indices_sorted = torch.argsort(selected_experts.view(-1), stable=True)
-    # A restore that only had to undo the identity would not exercise anything.
     assert not torch.equal(token_indices_sorted, torch.arange(num_tokens * top_k, device=device))
 
     rows = torch.randn(num_tokens * top_k, hidden, device=device, dtype=torch.bfloat16, generator=generator)
@@ -75,10 +69,7 @@ def test_fused_weighted_restore_matches_eager_including_gradients(top_k, hidden,
     fused_output.backward(upstream)
 
     torch.testing.assert_close(fused_rows.grad, eager_rows.grad)
-    # The score gradient reduces over the hidden dimension, so the fused and eager
-    # summation orders differ even though both accumulate in FP32. That shows up
-    # in FP32 scores; a bfloat16 score rounds the difference away, and asking for
-    # FP32 precision there would fail on a rounding boundary rather than on a bug.
+    # Hidden reduction order only affects the last bits of FP32 score gradients.
     score_tolerance = {"rtol": 1e-4, "atol": 1e-5} if score_dtype == torch.float32 else {}
     torch.testing.assert_close(fused_scores.grad, eager_scores.grad, **score_tolerance)
 

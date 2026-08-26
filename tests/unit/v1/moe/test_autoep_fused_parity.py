@@ -2,12 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""End-to-end parity between the eager and fused combine implementations.
-
-The fused reduction only changes how the weighted sum is computed, so a step
-taken through it has to produce the same loss, the same gradients on every
-trainable tensor, and the same parameter update as the eager path.
-"""
+"""End-to-end parity for the eager and fused combine implementations."""
 
 import functools
 
@@ -31,10 +26,7 @@ HIDDEN_SIZE = 64
 SEQ_LEN = 16
 NUM_EXPERTS = 4
 
-# Both backends run the same collectives, the same router and the same grouped
-# GEMM; they differ only in the order the top-k reduction accumulates. That
-# survives a full step as a last-few-bits difference, not a structural one, so
-# the tolerance stays far tighter than a wrong permutation could hide behind.
+# The top-k accumulation order differs, so parity allows last-bit noise only.
 PARITY_TOLERANCE = {"rtol": 1e-2, "atol": 1e-3}
 
 
@@ -140,8 +132,7 @@ def _assert_step_matches(fused, eager):
 
     assert fused["gradients"], "no gradients were captured, so the comparison would be vacuous"
     assert set(fused["gradients"]) == set(eager["gradients"])
-    # Router and expert gradients travel different routes through the fused
-    # restore, so they are named rather than left to a bulk comparison.
+    # Ensure both sides of the fused restore reached the comparison.
     assert any(".router." in name for name in fused["gradients"]), "no router gradient was captured"
     assert any(".experts.w" in name for name in fused["gradients"]), "no expert gradient was captured"
 

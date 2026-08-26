@@ -554,9 +554,7 @@ class AutoEPMoELayer(nn.Module):
         if folding_group_handles is not None:
             self.folding_group_handles = folding_group_handles
             if self.combine_impl == "fused_weighted_sum" and folding_group_handles.spec.tp_size > 1:
-                # Folded TP restores combined tokens from assignment metadata and
-                # never reaches the weighted reduction this replaces, so the
-                # request would otherwise be silently ignored.
+                # Folded TP restores tokens through a different path.
                 raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '
                                  f"(tensor_parallel.autotp_size={folding_group_handles.spec.tp_size}). Set "
                                  'tensor_parallel.autotp_size to 1, or leave combine_impl unset.')
@@ -598,9 +596,7 @@ class AutoEPMoELayer(nn.Module):
         bsz, seqlen, hdim = hidden_states.shape
         x = hidden_states.reshape(-1, hdim)  # [T, H]
 
-        # Checked once, ahead of the router and of every collective, so an
-        # unsupported configuration fails on all ranks together rather than
-        # stalling the ones that carried on.
+        # Fail all ranks before any collective can stall.
         if self.combine_impl == "fused_weighted_sum" and not self._fused_combine_checked:
             fused_token_ops.assert_supported(x, score_apply=self.score_apply)
             self._fused_combine_checked = True
