@@ -122,11 +122,16 @@ def validate_autoep_config(
     # expert-parallel path runs. Where it has nothing to replace, say so instead
     # of running the eager reduction under a config that asked for the fused
     # one: a benchmark believing it measured the fused path would report noise.
-    if config.combine_impl == "fused_weighted_sum" and config.expert_tensor_parallel_size > 1:
-        raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '
-                         f"(expert_tensor_parallel_size={config.expert_tensor_parallel_size}), which restores "
-                         "combined tokens from assignment metadata instead of the weighted reduction it "
-                         'implements. Set expert_tensor_parallel_size to 1, or leave combine_impl unset.')
+    if config.combine_impl == "fused_weighted_sum":
+        if tp_size > 1:
+            raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '
+                             f"(tensor_parallel.autotp_size={tp_size}), which restores combined tokens from "
+                             "assignment metadata instead of the weighted reduction it implements. Set "
+                             'tensor_parallel.autotp_size to 1, or leave combine_impl unset.')
+        if config.expert_tensor_parallel_size > 1:
+            raise ValueError('combine_impl="fused_weighted_sum" requires expert_tensor_parallel_size=1, but got '
+                             f"{config.expert_tensor_parallel_size}. Set expert_tensor_parallel_size to 1, or leave "
+                             "combine_impl unset.")
 
     folding_spec = build_folding_spec(
         world_size=world_size,

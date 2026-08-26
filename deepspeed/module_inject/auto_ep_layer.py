@@ -558,8 +558,8 @@ class AutoEPMoELayer(nn.Module):
                 # never reaches the weighted reduction this replaces, so the
                 # request would otherwise be silently ignored.
                 raise ValueError('combine_impl="fused_weighted_sum" does not support folded tensor parallelism '
-                                 f"(expert_tensor_parallel_size={folding_group_handles.spec.tp_size}). Set "
-                                 'expert_tensor_parallel_size to 1, or leave combine_impl unset.')
+                                 f"(tensor_parallel.autotp_size={folding_group_handles.spec.tp_size}). Set "
+                                 'tensor_parallel.autotp_size to 1, or leave combine_impl unset.')
             self.ep_group_name = folding_group_handles.ep_group_name
             self.ep_group = folding_group_handles.ep_group
             self.tp_group = folding_group_handles.tp_group

@@ -243,11 +243,20 @@ class TestAutoEPConfig:
         config = parse_autoep_config({
             "enabled": True,
             "autoep_size": 2,
+            "combine_impl": "fused_weighted_sum",
+        })
+        with pytest.raises(ValueError, match=r"tensor_parallel\.autotp_size=2"):
+            validate_autoep_config(config, world_size=4, pp_size=1, tp_size=2, sp_size=1)
+
+    def test_fused_combine_rejects_expert_tensor_parallelism(self):
+        config = parse_autoep_config({
+            "enabled": True,
+            "autoep_size": 2,
             "expert_tensor_parallel_size": 2,
             "combine_impl": "fused_weighted_sum",
         })
-        with pytest.raises(ValueError, match="folded tensor parallelism"):
-            validate_autoep_config(config, world_size=4, pp_size=1, tp_size=2, sp_size=1)
+        with pytest.raises(ValueError, match="requires expert_tensor_parallel_size=1"):
+            validate_autoep_config(config, world_size=4, pp_size=1, tp_size=1, sp_size=1)
 
     @pytest.mark.parametrize("score_apply, spec_score_apply", [("auto", "pre"), ("pre", "post")])
     def test_fused_combine_requires_post_score_apply(self, score_apply, spec_score_apply):

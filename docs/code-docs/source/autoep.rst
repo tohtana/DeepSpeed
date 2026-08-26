@@ -116,8 +116,9 @@ expert-major reorder are untouched.
 ``"fused_weighted_sum"`` is rejected, rather than quietly ignored, when it would
 have nothing to replace or would change semantics:
 
-- ``expert_tensor_parallel_size`` greater than 1, which restores combined tokens
-  from assignment metadata instead;
+- ``tensor_parallel.autotp_size`` greater than 1, which uses folded tensor
+  parallelism and restores combined tokens from assignment metadata instead;
+- ``expert_tensor_parallel_size`` greater than 1;
 - a resolved ``score_apply`` other than ``"post"``;
 - activations that are not bfloat16 or float16, a non-CUDA device, or a build
   without Triton.
