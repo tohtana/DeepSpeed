@@ -32,15 +32,12 @@ from deepspeed.accelerator import get_accelerator
 
 from .agent_runner import AgentRunner
 from .config import CompileConfig
-from .evaluation_context import (AgentResponseError, EvaluationDecision, GraphSlotRef, GraphVersionTracker,
-                                 candidate_evaluation_payload, parse_evaluation_decision,
-                                 serialize_evaluation_context)
+from .evaluation_context import (AgentResponseError, GraphSlotRef, GraphVersionTracker, candidate_evaluation_payload,
+                                 parse_evaluation_decision, serialize_evaluation_context)
 from .graph_edit import (GraphEditPayload, apply_graph_edit, candidate_fingerprint, finalize_graph_edit,
                          structural_fingerprint)
 from .profilers import ProfilingResult
 from .profilers.graph_profile import MemoryProfilingInterpreter, ProfilingInterpreter, is_profile_incomplete
-from .transform_context import parse_optimizer_edit, serialize_transform_context
-
 
 _logger = logging.getLogger(__name__)
 _INSPECTION_SESSION_ROOT = None
@@ -128,7 +125,8 @@ def broadcast_json_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         encoded = None
     object_list = [encoded]
-    dist.broadcast_object_list(object_list, src=0)
+    with unset_fake_temporarily():
+        dist.broadcast_object_list(object_list, src=0)
     if not isinstance(object_list[0], str):
         raise RuntimeError("Rank-zero JSON broadcast did not produce a string payload")
     decoded = json.loads(object_list[0])
@@ -142,7 +140,8 @@ def gather_rank_records(local_record: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _distributed():
         return [local_record]
     records = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(records, local_record)
+    with unset_fake_temporarily():
+        dist.all_gather_object(records, local_record)
     return records
 
 
@@ -154,11 +153,7 @@ def broadcast_edit_payload(payload: Optional[GraphEditPayload]) -> Optional[Grap
     return GraphEditPayload.from_dict(received["edit"], require_result_fingerprint=True)
 
 
-def _set_profile_from_graph(profile: ProfilingResult,
-                            graph_id: int,
-                            gm: GraphModule,
-                            memory,
-                            bwd: bool,
+def _set_profile_from_graph(profile: ProfilingResult, graph_id: int, gm: GraphModule, memory, bwd: bool,
                             memory_complete: bool) -> None:
     node_time = []
     tensor_sizes = []
@@ -180,8 +175,10 @@ def _set_profile_from_graph(profile: ProfilingResult,
 
 
 def _capture_profile_calls(ctx: OptimizationContext) -> List[_CapturedProfileCall]:
-    return [_CapturedProfileCall(args=tuple(ctx.create_inputs_fn())),
-            _CapturedProfileCall(args=tuple(ctx.create_inputs_fn()))]
+    return [
+        _CapturedProfileCall(args=tuple(ctx.create_inputs_fn())),
+        _CapturedProfileCall(args=tuple(ctx.create_inputs_fn()))
+    ]
 
 
 def _output_leaf_kind(value: Any) -> str:
@@ -200,8 +197,7 @@ def _validate_runtime_call_contract(gm: GraphModule, profile_calls: List[_Captur
         raise _RuntimeABIError(f"Graph cannot accept the captured positional caller ABI: {exc}") from exc
 
 
-def _runtime_abi_descriptor(gm: GraphModule,
-                            profile_calls: List[_CapturedProfileCall],
+def _runtime_abi_descriptor(gm: GraphModule, profile_calls: List[_CapturedProfileCall],
                             output: Any) -> _RuntimeABIDescriptor:
     _validate_runtime_call_contract(gm, profile_calls)
 
@@ -247,11 +243,11 @@ def _profile_phase_consensus(phase: str,
     raise RuntimeError(message)
 
 
-def _profile_graph(gm: GraphModule,
-                   ctx: OptimizationContext,
-                   profile_calls: Optional[List[_CapturedProfileCall]] = None,
-                   expected_abi: Optional[_RuntimeABIDescriptor] = None) -> Tuple[ProfilingResult,
-                                                                                _RuntimeABIDescriptor]:
+def _profile_graph(
+        gm: GraphModule,
+        ctx: OptimizationContext,
+        profile_calls: Optional[List[_CapturedProfileCall]] = None,
+        expected_abi: Optional[_RuntimeABIDescriptor] = None) -> Tuple[ProfilingResult, _RuntimeABIDescriptor]:
     if profile_calls is None:
         profile_calls = _capture_profile_calls(ctx)
 
@@ -272,7 +268,8 @@ def _profile_graph(gm: GraphModule,
             raise RuntimeError("Timing profiling was incomplete")
         runtime_abi = _runtime_abi_descriptor(gm, profile_calls, timing_output)
         if expected_abi is not None and runtime_abi != expected_abi:
-            raise _RuntimeABIError("Candidate output pytree/container or leaf-kind ABI differs from the accepted graph")
+            raise _RuntimeABIError(
+                "Candidate output pytree/container or leaf-kind ABI differs from the accepted graph")
     except Exception as exc:
         timing_error = exc
     _profile_phase_consensus("timing and runtime-ABI validation", timing_error, runtime_abi)
@@ -397,11 +394,10 @@ def _reset_inspection_session_root() -> None:
     _INSPECTION_SESSION_ROOT = None
 
 
-class TwoAgentLoopOptimizer:
+class GraphAgentLoopOptimizer:
 
-    def __init__(self, evaluator_runner: AgentRunner, optimizer_runner: AgentRunner, compile_config: CompileConfig):
-        self.evaluator_runner = evaluator_runner
-        self.optimizer_runner = optimizer_runner
+    def __init__(self, graph_agent_runner: AgentRunner, compile_config: CompileConfig):
+        self.graph_agent_runner = graph_agent_runner
         self.max_iterations = compile_config.agent_max_iterations
         self.max_retries = compile_config.agent_max_retries_per_iteration
         self.debug_log = compile_config.debug_log
@@ -429,7 +425,7 @@ class TwoAgentLoopOptimizer:
                 graph_root = session / f"graph_{ctx.graph_slot[0]}_{ctx.graph_slot[1]}"
                 graph_root.mkdir(parents=True, exist_ok=True)
                 return graph_root, session, True
-        return Path(tempfile.mkdtemp(prefix="deepcompile_two_agent_")), None, False
+        return Path(tempfile.mkdtemp(prefix="deepcompile_graph_agent_")), None, False
 
     def _write_session_metadata(self, session_root: Path, ctx: OptimizationContext) -> None:
         path = session_root / "session.json"
@@ -441,18 +437,18 @@ class TwoAgentLoopOptimizer:
             compile_config = ctx.compile_config.model_dump(mode="json")
         else:
             compile_config = ctx.compile_config.dict()
-        _safe_write_json(path, {
-            "compile_config": compile_config,
-            "evaluator_command": self.evaluator_runner.config.command,
-            "optimizer_command": self.optimizer_runner.config.command,
-            "host_argv": sys.argv,
-            "pid": os.getpid(),
-            "hostname": socket.gethostname(),
-            "python_version": sys.version,
-            "torch_version": torch.__version__,
-            "world_size": dist.get_world_size() if dist.is_initialized() else 1,
-            "capture_rank": 0,
-        })
+        _safe_write_json(
+            path, {
+                "compile_config": compile_config,
+                "graph_agent_command": self.graph_agent_runner.config.command,
+                "host_argv": sys.argv,
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "python_version": sys.version,
+                "torch_version": torch.__version__,
+                "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+                "capture_rank": 0,
+            })
 
     @staticmethod
     def _snapshot_consensus(tracker: GraphVersionTracker) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -627,9 +623,7 @@ class TwoAgentLoopOptimizer:
         return candidate, candidate_profile, profile_records
 
     @staticmethod
-    def _commit_candidate(ctx: OptimizationContext,
-                          tracker: GraphVersionTracker,
-                          candidate: GraphModule,
+    def _commit_candidate(ctx: OptimizationContext, tracker: GraphVersionTracker, candidate: GraphModule,
                           candidate_profile: ProfilingResult) -> Tuple[bool, List[Dict[str, Any]]]:
         previous_graph = ctx.gm.graph
         try:
@@ -657,6 +651,7 @@ class TwoAgentLoopOptimizer:
     def optimize(self, gm: GraphModule, ctx: OptimizationContext) -> OptimizationResult:
         trace = []
         history = list(ctx.warmup_trace)
+        candidate_outcome_recorded = False
         is_rank_zero = _rank() == 0
         slot = GraphSlotRef(index=ctx.graph_slot[0], direction=ctx.graph_slot[1])
         tracker = GraphVersionTracker(slot, gm, ctx.graph_id)
@@ -668,20 +663,22 @@ class TwoAgentLoopOptimizer:
         consensus, consensus_records = self._snapshot_consensus(tracker)
         if not consensus:
             if is_rank_zero:
-                trace.append(OptimizationTraceEntry(iteration=0,
-                                                    action="abort",
-                                                    summary="Post-Z3 graph topology differs across ranks",
-                                                    details={"rank_results": consensus_records}))
+                trace.append(
+                    OptimizationTraceEntry(iteration=0,
+                                           action="abort",
+                                           summary="Post-Z3 graph topology differs across ranks",
+                                           details={"rank_results": consensus_records}))
             retain_temporary_root = True
             return OptimizationResult(trace=trace)
 
         profile_success, profile_records = self._profile_accepted_graph(ctx)
         if not profile_success:
             if is_rank_zero:
-                trace.append(OptimizationTraceEntry(iteration=0,
-                                                    action="abort",
-                                                    summary="Post-Z3 accepted graph profiling failed",
-                                                    details={"rank_results": profile_records}))
+                trace.append(
+                    OptimizationTraceEntry(iteration=0,
+                                           action="abort",
+                                           summary="Post-Z3 accepted graph profiling failed",
+                                           details={"rank_results": profile_records}))
             retain_temporary_root = True
             return OptimizationResult(trace=trace)
 
@@ -692,54 +689,62 @@ class TwoAgentLoopOptimizer:
                 _safe_write_text(iteration_dir / "accepted_graph.py", ctx.gm.code)
 
             evaluation = None
+            edit = None
+            rank_zero_candidate = None
+            mechanical_feedback = []
             if is_rank_zero:
-                try:
-                    prompt = serialize_evaluation_context(ctx, tracker, history)
-                    result = self._checked_run(self.evaluator_runner, prompt, iteration_dir, "evaluator")
-                    evaluation = parse_evaluation_decision(result.stdout, tracker.current_ref(), "accepted_graph")
-                    _safe_write_json(iteration_dir / "evaluation.json", evaluation.to_dict())
-                    trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                        action="evaluate",
-                                                        summary=evaluation.summary,
-                                                        details={"decision": evaluation.decision}))
-                    evaluation_envelope = {"continue": evaluation.decision == "continue", "error": None}
-                except Exception as exc:
-                    evaluation_envelope = {"continue": False, "error": str(exc)}
+                proposal_ready = False
+                proposal_error = None
+                for attempt in range(self.max_retries + 1):
+                    try:
+                        prompt = serialize_evaluation_context(ctx,
+                                                              tracker,
+                                                              history,
+                                                              mechanical_feedback=mechanical_feedback,
+                                                              candidate_required=not candidate_outcome_recorded)
+                        prefix = "accepted_graph_agent" if attempt == 0 else f"accepted_graph_agent_retry_{attempt}"
+                        result = self._checked_run(self.graph_agent_runner,
+                                                   prompt,
+                                                   iteration_dir,
+                                                   "graph_agent",
+                                                   artifact_prefix=prefix)
+                        evaluation = parse_evaluation_decision(result.stdout, tracker.current_ref(), "accepted_graph")
+                        if not candidate_outcome_recorded and evaluation.decision == "finish":
+                            raise AgentResponseError(
+                                "First accepted_graph decision must continue with one graph_edit before any candidate "
+                                "is executed; absence of candidate measurements is not a valid reason to finish")
+                        if evaluation.graph_edit is not None:
+                            edit, rank_zero_candidate = finalize_graph_edit(ctx.gm, evaluation.graph_edit,
+                                                                            ctx.graph_id)
+                            _safe_write_json(iteration_dir / "graph_edit.json", edit.to_dict())
+                        _safe_write_json(iteration_dir / "evaluation.json", evaluation.to_dict())
+                        trace.append(
+                            OptimizationTraceEntry(iteration=iteration,
+                                                   action="evaluate",
+                                                   summary=evaluation.summary,
+                                                   details={"decision": evaluation.decision}))
+                        proposal_ready = True
+                        break
+                    except Exception as exc:
+                        proposal_error = str(exc)
+                        mechanical_feedback.append(proposal_error)
+                        trace.append(
+                            OptimizationTraceEntry(iteration=iteration,
+                                                   action="graph_agent_retry",
+                                                   summary=f"Mechanical graph proposal failed: {exc}",
+                                                   details={"attempt": attempt + 1}))
+                evaluation_envelope = {
+                    "continue": proposal_ready and evaluation.decision == "continue",
+                    "error": None if proposal_ready else proposal_error,
+                }
+                if not proposal_ready:
                     retain_temporary_root = True
-                    trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                        action="abort",
-                                                        summary=f"Evaluator failed: {exc}"))
             else:
                 evaluation_envelope = None
             evaluation_envelope = broadcast_json_payload(evaluation_envelope)
             if not evaluation_envelope["continue"]:
                 break
 
-            edit = None
-            rank_zero_candidate = None
-            mechanical_feedback = []
-            if is_rank_zero:
-                for attempt in range(self.max_retries + 1):
-                    try:
-                        prompt = serialize_transform_context(ctx, evaluation, tracker, history, mechanical_feedback)
-                        prefix = "optimizer" if attempt == 0 else f"optimizer_retry_{attempt}"
-                        result = self._checked_run(self.optimizer_runner,
-                                                   prompt,
-                                                   iteration_dir,
-                                                   "optimizer",
-                                                   artifact_prefix=prefix)
-                        raw_edit = parse_optimizer_edit(result.stdout, tracker)
-                        edit, rank_zero_candidate = finalize_graph_edit(ctx.gm, raw_edit, ctx.graph_id)
-                        _safe_write_json(iteration_dir / "graph_edit.json", edit.to_dict())
-                        break
-                    except Exception as exc:
-                        mechanical_feedback.append(str(exc))
-                        trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                            action="optimizer_retry",
-                                                            summary=f"Mechanical edit replay failed: {exc}",
-                                                            details={"attempt": attempt + 1}))
-                if edit is None:
-                    retain_temporary_root = True
             edit = broadcast_edit_payload(edit)
             if edit is None:
                 break
@@ -759,10 +764,11 @@ class TwoAgentLoopOptimizer:
             if state_restore_failed:
                 retain_temporary_root = True
                 if is_rank_zero:
-                    trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                        action="abort",
-                                                        summary="Candidate state restoration failed",
-                                                        details={"rank_results": rank_results}))
+                    trace.append(
+                        OptimizationTraceEntry(iteration=iteration,
+                                               action="abort",
+                                               summary="Candidate state restoration failed",
+                                               details={"rank_results": rank_results}))
                 raise RuntimeError("Candidate state restoration failed; accepted tensor state may be corrupted")
 
             abi_incompatible = any(record.get("abi_compatible") is False for record in rank_results)
@@ -775,11 +781,11 @@ class TwoAgentLoopOptimizer:
                 else:
                     try:
                         prompt = serialize_evaluation_context(ctx, tracker, history, candidate=candidate_context)
-                        result = self._checked_run(self.evaluator_runner,
+                        result = self._checked_run(self.graph_agent_runner,
                                                    prompt,
                                                    iteration_dir,
-                                                   "evaluator",
-                                                   artifact_prefix="candidate_evaluator")
+                                                   "graph_agent",
+                                                   artifact_prefix="candidate_graph_agent")
                         candidate_result_fingerprint = edit.expected_result_fingerprint
                         candidate_decision = parse_evaluation_decision(
                             result.stdout,
@@ -797,9 +803,10 @@ class TwoAgentLoopOptimizer:
                         stop_after_candidate = True
                         retain_temporary_root = True
                         candidate_summary = None
-                        trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                            action="abort",
-                                                            summary=f"Candidate evaluator failed: {exc}"))
+                        trace.append(
+                            OptimizationTraceEntry(iteration=iteration,
+                                                   action="abort",
+                                                   summary=f"Candidate graph agent failed: {exc}"))
                 decision_envelope = {
                     "accept": accept,
                     "stop": stop_after_candidate,
@@ -827,15 +834,17 @@ class TwoAgentLoopOptimizer:
                 "evaluator_summary": decision_envelope["summary"],
             }
             history.append(history_entry)
+            candidate_outcome_recorded = True
             if is_rank_zero:
                 _safe_write_json(iteration_dir / "outcome.json", history_entry)
-                trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                    action=outcome,
-                                                    summary=decision_envelope["summary"] or outcome,
-                                                    details={
-                                                        "generation": edit.generation,
-                                                        "rank_results": rank_results,
-                                                    }))
+                trace.append(
+                    OptimizationTraceEntry(iteration=iteration,
+                                           action=outcome,
+                                           summary=decision_envelope["summary"] or outcome,
+                                           details={
+                                               "generation": edit.generation,
+                                               "rank_results": rank_results,
+                                           }))
             if decision_envelope["stop"]:
                 break
 
@@ -852,10 +861,11 @@ class TwoAgentLoopOptimizer:
             if not all(record["success"] for record in cleanup_records):
                 retain_temporary_root = True
                 if is_rank_zero:
-                    trace.append(OptimizationTraceEntry(iteration=iteration,
-                                                        action="abort",
-                                                        summary="Post-candidate cleanup failed",
-                                                        details={"rank_results": cleanup_records}))
+                    trace.append(
+                        OptimizationTraceEntry(iteration=iteration,
+                                               action="abort",
+                                               summary="Post-candidate cleanup failed",
+                                               details={"rank_results": cleanup_records}))
                 break
 
         if is_rank_zero and not inspection_enabled and not retain_temporary_root and iteration_root.exists():

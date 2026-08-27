@@ -11,7 +11,7 @@ from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
 PassName = Literal["z1", "z3", "autosp", "autotp"]
 Zero3TuningStrategy = Literal["baseline", "agent"]
-AgentArchitecture = Literal["two_agent"]
+AgentArchitecture = Literal["graph_agent"]
 
 
 class CompileConfig(DeepSpeedConfigModel):
@@ -81,17 +81,11 @@ class CompileConfig(DeepSpeedConfigModel):
     zero3_tuning_strategy: Zero3TuningStrategy = "baseline"
     """ Controls how ZeRO-3 warmup tuning decisions are made. """
 
-    agent_architecture: AgentArchitecture = "two_agent"
-    """ Selects the evaluator/optimizer agent pair. """
+    agent_architecture: AgentArchitecture = "graph_agent"
+    """ Selects the graph proposal and evaluation agent. """
 
     agent_command: Optional[List[str]] = None
-    """ Fallback command argv for external agents. """
-
-    agent_evaluator_command: Optional[List[str]] = None
-    """ Optional evaluator command argv for two-agent mode. """
-
-    agent_optimizer_command: Optional[List[str]] = None
-    """ Optional graph optimizer command argv for two-agent mode. """
+    """ Command argv for the external graph agent. """
 
     agent_max_iterations: int = Field(3, gt=0)
     """ Maximum tuning iterations per graph invocation. """
@@ -100,7 +94,7 @@ class CompileConfig(DeepSpeedConfigModel):
     """ Timeout in seconds for each external agent invocation. """
 
     agent_max_retries_per_iteration: int = Field(1, ge=0)
-    """ Number of optimizer-agent retries after mechanical edit replay fails. """
+    """ Number of graph-agent retries after mechanical edit finalization fails. """
 
     @staticmethod
     def _validate_command(command, field_name):
@@ -114,9 +108,6 @@ class CompileConfig(DeepSpeedConfigModel):
         if self.zero3_tuning_strategy != "agent":
             return self
 
-        evaluator_command = self.agent_evaluator_command or self.agent_command
-        optimizer_command = self.agent_optimizer_command or self.agent_command
-        self._validate_command(evaluator_command, "agent_evaluator_command or agent_command")
-        self._validate_command(optimizer_command, "agent_optimizer_command or agent_command")
+        self._validate_command(self.agent_command, "agent_command")
 
         return self

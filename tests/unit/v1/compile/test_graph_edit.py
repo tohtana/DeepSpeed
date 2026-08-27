@@ -2,6 +2,7 @@
 # DeepSpeed Team
 
 import copy
+from dataclasses import asdict
 import json
 import operator
 import subprocess
@@ -12,12 +13,12 @@ import pytest
 import torch
 
 import deepspeed.compile.optimizer as optimizer_module
-from deepspeed.compile.evaluation_context import (EVALUATION_SCHEMA_VERSION, EvaluationDecision, GraphSlotRef,
-                                                  GraphVersionTracker)
+from deepspeed.compile.evaluation_context import (EVALUATION_SCHEMA_VERSION, AgentResponseError, GraphSlotRef,
+                                                  GraphVersionTracker, parse_evaluation_decision,
+                                                  serialize_evaluation_context)
 from deepspeed.compile.graph_edit import (RUNTIME_GRAPH_ID, GraphEditError, GraphEditPayload, apply_graph_edit,
                                           candidate_fingerprint, finalize_graph_edit, normalized_graph,
                                           structural_fingerprint)
-from deepspeed.compile.transform_context import serialize_transform_context
 
 
 class RichModule(torch.nn.Module):
@@ -62,7 +63,9 @@ def _rich_replacement_log(gm):
             "id": "new:block",
             "node_op": "call_module",
             "target": "block",
-            "args": [{"node": "new:x"}],
+            "args": [{
+                "node": "new:x"
+            }],
             "kwargs": {},
         },
         {
@@ -70,7 +73,11 @@ def _rich_replacement_log(gm):
             "id": "new:add",
             "node_op": "call_method",
             "target": "add",
-            "args": [{"node": "new:block"}, {"node": "new:weight"}],
+            "args": [{
+                "node": "new:block"
+            }, {
+                "node": "new:weight"
+            }],
             "kwargs": {},
         },
         {
@@ -78,17 +85,30 @@ def _rich_replacement_log(gm):
             "id": "new:slice",
             "node_op": "call_function",
             "target": "operator.getitem",
-            "args": [{"node": "new:add"}, {"slice": [0, None, None]}],
+            "args": [{
+                "node": "new:add"
+            }, {
+                "slice": [0, None, None]
+            }],
             "kwargs": {},
         },
         {
-            "op": "create_node",
-            "id": "new:output",
-            "node_op": "output",
-            "target": "output",
+            "op":
+            "create_node",
+            "id":
+            "new:output",
+            "node_op":
+            "output",
+            "target":
+            "output",
             "args": [{
-                "dict": [["value", {"node": "new:slice"}],
-                         ["nested", {"tuple": [[1, 2], {"slice": [None, None, None]}]}]]
+                "dict": [["value", {
+                    "node": "new:slice"
+                }], ["nested", {
+                    "tuple": [[1, 2], {
+                        "slice": [None, None, None]
+                    }]
+                }]]
             }],
             "kwargs": {},
         },
@@ -114,9 +134,8 @@ def test_edit_log_creates_every_fx_node_kind_with_nested_arguments():
     result = candidate(torch.tensor([2.0, 3.0, 4.0]))
     assert torch.equal(result["value"], torch.tensor([3.0, 4.0, 5.0]))
     assert result["nested"] == ([1, 2], slice(None, None, None))
-    assert [node.op for node in candidate.graph.nodes] == [
-        "placeholder", "get_attr", "call_module", "call_method", "call_function", "output"
-    ]
+    assert [node.op for node in candidate.graph.nodes
+            ] == ["placeholder", "get_attr", "call_module", "call_method", "call_function", "output"]
     assert candidate.weight is gm.weight
     assert payload.expected_result_fingerprint == candidate_fingerprint(candidate, payload)
     assert payload.expected_result_fingerprint != structural_fingerprint(candidate)
@@ -131,14 +150,20 @@ def test_edit_log_rewires_deletes_reorders_and_copies_only_local_metadata():
         "id": "new:neg",
         "node_op": "call_function",
         "target": "torch.neg",
-        "args": [{"node": "base:1"}],
+        "args": [{
+            "node": "base:1"
+        }],
         "kwargs": {},
         "copy_meta_from": "base:1",
-        "meta": {"device_time": 0.0},
+        "meta": {
+            "device_time": 0.0
+        },
     }, {
         "op": "rewire",
         "id": "base:3",
-        "args": [{"node": "new:neg"}],
+        "args": [{
+            "node": "new:neg"
+        }],
     }, {
         "op": "delete_node",
         "id": "base:2",
@@ -199,7 +224,9 @@ def test_nested_data_only_meta_is_deep_copied_for_create_and_patch_replay():
                                "id": "new:neg",
                                "node_op": "call_function",
                                "target": "torch.neg",
-                               "args": [{"node": "base:1"}],
+                               "args": [{
+                                   "node": "base:1"
+                               }],
                                "kwargs": {},
                                "meta": created_meta,
                            }, {
@@ -230,7 +257,9 @@ def test_meta_patch_rejects_non_json_values(invalid_meta):
                            operations=[{
                                "op": "patch_meta",
                                "id": "base:1",
-                               "meta": {"invalid": invalid_meta},
+                               "meta": {
+                                   "invalid": invalid_meta
+                               },
                            }, {
                                "op": "reorder",
                                "order": ["base:0", "base:1", "base:2", "base:3"],
@@ -251,7 +280,11 @@ def test_metadata_only_edits_have_distinct_candidate_fingerprints():
                                operations=[{
                                    "op": "patch_meta",
                                    "id": "base:1",
-                                   "meta": {"probe": {"value": [value]}},
+                                   "meta": {
+                                       "probe": {
+                                           "value": [value]
+                                       }
+                                   },
                                }, {
                                    "op": "reorder",
                                    "order": ["base:0", "base:1", "base:2", "base:3"],
@@ -303,7 +336,9 @@ def test_rank_zero_broadcasts_complete_json_log_and_other_rank_replays(monkeypat
                            operations=[{
                                "op": "rewire",
                                "id": "base:3",
-                               "args": [{"node": "base:1"}],
+                               "args": [{
+                                   "node": "base:1"
+                               }],
                            }, {
                                "op": "delete_node",
                                "id": "base:2",
@@ -388,12 +423,16 @@ def test_two_rank_graph_ids_are_canonical_and_new_nodes_replay_each_local_id():
                                "id": "new:local_mul",
                                "node_op": "call_function",
                                "target": "operator.mul",
-                               "args": [{"node": "base:1"}, dict(RUNTIME_GRAPH_ID)],
+                               "args": [{
+                                   "node": "base:1"
+                               }, dict(RUNTIME_GRAPH_ID)],
                                "kwargs": {},
                            }, {
                                "op": "rewire",
                                "id": "base:2",
-                               "args": [{"node": "new:local_mul"}],
+                               "args": [{
+                                   "node": "new:local_mul"
+                               }],
                            }, {
                                "op": "reorder",
                                "order": ["base:0", "base:1", "new:local_mul", "base:2"],
@@ -405,27 +444,63 @@ def test_two_rank_graph_ids_are_canonical_and_new_nodes_replay_each_local_id():
     rank_one_new = next(node for node in rank_one_candidate.graph.nodes if node.target is operator.mul)
     assert rank_zero_new.args[1] == rank_zero_id
     assert rank_one_new.args[1] == rank_one_id
-    assert structural_fingerprint(rank_zero_candidate, rank_zero_id) == structural_fingerprint(
-        rank_one_candidate, rank_one_id)
+    assert structural_fingerprint(rank_zero_candidate,
+                                  rank_zero_id) == structural_fingerprint(rank_one_candidate, rank_one_id)
 
 
-def test_optimizer_edit_prompt_is_identical_for_two_rank_local_graph_ids():
+def test_graph_agent_edit_prompt_is_identical_for_two_rank_local_graph_ids():
     prompts = []
     for graph_id in (120000000001, 890000000007):
         gm = _runtime_graph(graph_id)
         tracker = GraphVersionTracker(GraphSlotRef(index=0, direction="fwd"), gm, graph_id)
-        evaluation = EvaluationDecision(schema_version=EVALUATION_SCHEMA_VERSION,
-                                        based_on=tracker.current_ref(),
-                                        decision="continue",
-                                        summary="exercise local ID encoding",
-                                        optimizer_brief="create any generic edit")
+        profile = SimpleNamespace(fwd_time=[], fwd_mem=[], fwd_tensor_sizes=[])
         ctx = SimpleNamespace(gm=gm,
                               graph_id=graph_id,
                               graph_slot=(0, "fwd"),
                               graph_order=[(graph_id, False)],
+                              profiling_results={graph_id: profile},
                               bwd=False)
-        prompts.append(json.loads(serialize_transform_context(ctx, evaluation, tracker, [], [])))
+        prompts.append(json.loads(serialize_evaluation_context(ctx, tracker, [])))
 
     assert prompts[0] == prompts[1]
     assert prompts[0]["graph_runtime"]["graph_id"] == RUNTIME_GRAPH_ID
-    assert prompts[0]["graph_nodes"][1]["args"][1] == RUNTIME_GRAPH_ID
+    assert prompts[0]["accepted_graph"]["nodes"][1]["args"][1] == RUNTIME_GRAPH_ID
+
+
+def test_graph_agent_decision_parses_exact_edit_and_validates_identity():
+    gm = torch.fx.symbolic_trace(ChainModule())
+    tracker = GraphVersionTracker(GraphSlotRef(index=0, direction="fwd"), gm, 11)
+    snapshot = tracker.current_ref()
+    raw_edit = GraphEditPayload(generation=1,
+                                graph_slot=(0, "fwd"),
+                                base_fingerprint=snapshot.graph_fingerprint,
+                                expected_result_fingerprint=None,
+                                operations=[{
+                                    "op": "reorder",
+                                    "order": ["base:0", "base:1", "base:2", "base:3"],
+                                }],
+                                reason="Preserve the exact data-only edit")
+    response = {
+        "schema_version": EVALUATION_SCHEMA_VERSION,
+        "based_on": asdict(snapshot),
+        "decision": "continue",
+        "summary": "Try the exact edit",
+        "graph_edit": raw_edit.to_dict(),
+        "candidate_generation": None,
+        "candidate_fingerprint": None,
+    }
+
+    decision = parse_evaluation_decision(json.dumps(response), snapshot, "accepted_graph")
+
+    assert decision.graph_edit is not None
+    assert decision.graph_edit.to_dict() == raw_edit.to_dict()
+
+    invalid_edits = []
+    for field, invalid_value in (("graph_slot", [1, "fwd"]), ("generation", 2), ("base_fingerprint", "stale-base"),
+                                 ("expected_result_fingerprint", "premature-result")):
+        invalid = copy.deepcopy(response)
+        invalid["graph_edit"][field] = invalid_value
+        invalid_edits.append(invalid)
+    for invalid in invalid_edits:
+        with pytest.raises(AgentResponseError):
+            parse_evaluation_decision(json.dumps(invalid), snapshot, "accepted_graph")

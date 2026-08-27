@@ -27,9 +27,8 @@ from deepspeed.compile.agent_runner import AgentRunner, AgentRunnerConfig
 from deepspeed.compile.config import CompileConfig
 from deepspeed.compile.graph_edit import (GraphEditPayload, RUNTIME_GRAPH_ID, finalize_graph_edit,
                                           structural_fingerprint)
-from deepspeed.compile.optimizer import (OptimizationContext, OptimizationResult, TwoAgentLoopOptimizer)
+from deepspeed.compile.optimizer import GraphAgentLoopOptimizer, OptimizationContext, OptimizationResult
 from deepspeed.compile.profilers import ProfilingResult
-
 
 init_z3_module = importlib.import_module("deepspeed.compile.init_z3")
 _DISTRIBUTED_MEMORY_PROFILE_ENTERED = False
@@ -116,9 +115,8 @@ class StaticRunner:
 def _config(**kwargs):
     values = {
         "zero3_tuning_strategy": "agent",
-        "agent_architecture": "two_agent",
-        "agent_evaluator_command": ["evaluate"],
-        "agent_optimizer_command": ["optimize"],
+        "agent_architecture": "graph_agent",
+        "agent_command": ["agent"],
         "agent_max_iterations": 1,
         "agent_max_retries_per_iteration": 1,
         "agent_timeout_sec": 5,
@@ -149,7 +147,7 @@ def _context_from_gm(config, gm, create_inputs_fn):
 
 def _context(config, module=None):
     gm = torch.fx.symbolic_trace(module or ChainModule())
-    return _context_from_gm(config, gm, lambda: (torch.tensor([-2.0, 3.0]),))
+    return _context_from_gm(config, gm, lambda: (torch.tensor([-2.0, 3.0]), ))
 
 
 def _aot_lifted_context(config):
@@ -202,7 +200,9 @@ def _rank_divergent_output_abi_worker(rank, init_method, result_queue):
                                operations=[{
                                    "op": "set_args_kwargs",
                                    "id": "base:2",
-                                   "args": [{"node": "base:1"}],
+                                   "args": [{
+                                       "node": "base:1"
+                                   }],
                                }, {
                                    "op": "reorder",
                                    "order": ["base:0", "base:1", "base:2"],
@@ -213,7 +213,7 @@ def _rank_divergent_output_abi_worker(rank, init_method, result_queue):
         optimizer_module.MemoryProfilingInterpreter = _GlooMemoryProfiler
         optimizer_module.is_profile_incomplete = lambda _graph: False
 
-        _, candidate_profile, records = TwoAgentLoopOptimizer._apply_and_profile_candidate(ctx, payload)
+        _, candidate_profile, records = GraphAgentLoopOptimizer._apply_and_profile_candidate(ctx, payload)
         result_queue.put({
             "rank": rank,
             "success": candidate_profile is None and all(not record["success"] for record in records),
@@ -227,6 +227,75 @@ def _rank_divergent_output_abi_worker(rank, init_method, result_queue):
             "success": False,
             "abi_incompatible": False,
             "memory_entered": _DISTRIBUTED_MEMORY_PROFILE_ENTERED,
+            "error": traceback.format_exc(),
+        })
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _fake_mode_rank_sync_worker(rank, init_method, result_queue):
+    try:
+        dist.init_distributed(dist_backend="gloo",
+                              auto_mpi_discovery=False,
+                              init_method=init_method,
+                              rank=rank,
+                              world_size=2,
+                              timeout=timedelta(seconds=10),
+                              verbose=False)
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        gm = torch.fx.symbolic_trace(ChainModule())
+        local_edit = None
+        if rank == 0:
+            raw_edit = GraphEditPayload(generation=1,
+                                        graph_slot=(0, "fwd"),
+                                        base_fingerprint=structural_fingerprint(gm, 11),
+                                        expected_result_fingerprint=None,
+                                        operations=[{
+                                            "op": "create_node",
+                                            "id": "new:neg",
+                                            "node_op": "call_function",
+                                            "target": "torch.neg",
+                                            "args": [{
+                                                "node": "base:1"
+                                            }],
+                                            "kwargs": {},
+                                            "copy_meta_from": "base:2",
+                                        }, {
+                                            "op": "set_args_kwargs",
+                                            "id": "base:3",
+                                            "args": [{
+                                                "node": "new:neg"
+                                            }],
+                                        }, {
+                                            "op": "delete_node",
+                                            "id": "base:2",
+                                        }, {
+                                            "op": "reorder",
+                                            "order": ["base:0", "base:1", "new:neg", "base:3"],
+                                        }],
+                                        reason="Exercise rank-zero generic edit replay")
+            local_edit, _ = finalize_graph_edit(gm, raw_edit, 11)
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            records = optimizer_module.gather_rank_records({"rank": rank, "generated": local_edit is not None})
+            edit = optimizer_module.broadcast_edit_payload(local_edit)
+        candidate = optimizer_module.apply_graph_edit(gm, edit, 11)
+        result_queue.put({
+            "rank": rank,
+            "records": records,
+            "fingerprint": optimizer_module.candidate_fingerprint(candidate, edit, 11),
+            "expected_fingerprint": edit.expected_result_fingerprint,
+            "output": candidate(torch.tensor([-2.0, 3.0])).tolist(),
+            "error": None,
+        })
+    except Exception:
+        result_queue.put({
+            "rank": rank,
+            "records": None,
+            "fingerprint": None,
+            "expected_fingerprint": None,
+            "output": None,
             "error": traceback.format_exc(),
         })
     finally:
@@ -292,21 +361,28 @@ def test_profile_graph_single_rank_runs_timing_then_memory(monkeypatch):
     assert runtime_abi.output_leaf_kinds == ("tensor", )
 
 
-def _metadata_optimizer_response(prompt, role, _call_index):
-    assert role == "optimizer"
-    snapshot = prompt["graph_snapshot"]
-    node_ids = [node["id"] for node in prompt["graph_nodes"]]
+def _metadata_graph_edit(prompt, role, _call_index):
+    assert role == "graph_agent"
+    snapshot = prompt["accepted_graph"]["snapshot"]
+    node_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"]]
     return {
-        "schema_version": 1,
-        "generation": snapshot["generation"] + 1,
+        "schema_version":
+        1,
+        "generation":
+        snapshot["generation"] + 1,
         "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint": snapshot["graph_fingerprint"],
-        "expected_result_fingerprint": None,
-        "reason": "Probe rollback of profiling state",
+        "base_fingerprint":
+        snapshot["graph_fingerprint"],
+        "expected_result_fingerprint":
+        None,
+        "reason":
+        "Probe rollback of profiling state",
         "operations": [{
             "op": "patch_meta",
             "id": node_ids[0],
-            "meta": {"candidate_state_probe": True},
+            "meta": {
+                "candidate_state_probe": True
+            },
         }, {
             "op": "reorder",
             "order": node_ids,
@@ -314,27 +390,30 @@ def _metadata_optimizer_response(prompt, role, _call_index):
     }
 
 
-def _evaluator_response(accept_candidate):
+def _graph_agent_response(accept_candidate, edit_callback=None):
+
+    if edit_callback is None:
+        edit_callback = _generic_graph_edit
 
     def callback(prompt, role, _call_index):
-        assert role == "evaluator"
+        assert role == "graph_agent"
         snapshot = prompt["accepted_graph"]["snapshot"]
         if prompt["stage"] == "accepted_graph":
             return {
-                "schema_version": 3,
+                "schema_version": 4,
                 "based_on": snapshot,
                 "decision": "continue",
                 "summary": "Try a generic replacement",
-                "optimizer_brief": "Replace sigmoid with any valid FX topology",
+                "graph_edit": edit_callback(prompt, role, _call_index),
                 "candidate_generation": None,
                 "candidate_fingerprint": None,
             }
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "based_on": snapshot,
             "decision": "accept" if accept_candidate else "reject",
             "summary": "Candidate decision",
-            "optimizer_brief": "",
+            "graph_edit": None,
             "candidate_generation": prompt["candidate"]["generation"],
             "candidate_fingerprint": prompt["candidate"]["fingerprint"],
         }
@@ -342,28 +421,37 @@ def _evaluator_response(accept_candidate):
     return callback
 
 
-def _optimizer_response(prompt, role, _call_index):
-    assert role == "optimizer"
-    snapshot = prompt["graph_snapshot"]
+def _generic_graph_edit(prompt, role, _call_index):
+    assert role == "graph_agent"
+    snapshot = prompt["accepted_graph"]["snapshot"]
     return {
-        "schema_version": 1,
-        "generation": snapshot["generation"] + 1,
+        "schema_version":
+        1,
+        "generation":
+        snapshot["generation"] + 1,
         "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint": snapshot["graph_fingerprint"],
-        "expected_result_fingerprint": None,
-        "reason": "Replace sigmoid with negation",
+        "base_fingerprint":
+        snapshot["graph_fingerprint"],
+        "expected_result_fingerprint":
+        None,
+        "reason":
+        "Replace sigmoid with negation",
         "operations": [{
             "op": "create_node",
             "id": "new:neg",
             "node_op": "call_function",
             "target": "torch.neg",
-            "args": [{"node": "base:1"}],
+            "args": [{
+                "node": "base:1"
+            }],
             "kwargs": {},
             "copy_meta_from": "base:2",
         }, {
             "op": "set_args_kwargs",
             "id": "base:3",
-            "args": [{"node": "new:neg"}],
+            "args": [{
+                "node": "new:neg"
+            }],
         }, {
             "op": "delete_node",
             "id": "base:2",
@@ -374,12 +462,12 @@ def _optimizer_response(prompt, role, _call_index):
     }
 
 
-def _delete_placeholder_response(prompt, role, _call_index):
-    assert role == "optimizer"
-    snapshot = prompt["graph_snapshot"]
-    placeholder_ids = [node["id"] for node in prompt["graph_nodes"] if node["op"] == "placeholder"]
+def _delete_placeholder_graph_edit(prompt, role, _call_index):
+    assert role == "graph_agent"
+    snapshot = prompt["accepted_graph"]["snapshot"]
+    placeholder_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"] if node["op"] == "placeholder"]
     deleted_id = placeholder_ids[-1]
-    remaining_ids = [node["id"] for node in prompt["graph_nodes"] if node["id"] != deleted_id]
+    remaining_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"] if node["id"] != deleted_id]
     return {
         "schema_version": 1,
         "generation": snapshot["generation"] + 1,
@@ -397,23 +485,30 @@ def _delete_placeholder_response(prompt, role, _call_index):
     }
 
 
-def _change_output_structure_response(prompt, role, _call_index):
-    assert role == "optimizer"
-    snapshot = prompt["graph_snapshot"]
-    node_ids = [node["id"] for node in prompt["graph_nodes"]]
-    output_id = next(node["id"] for node in prompt["graph_nodes"] if node["op"] == "output")
-    output_value = prompt["graph_nodes"][-1]["args"][0]
+def _change_output_structure_graph_edit(prompt, role, _call_index):
+    assert role == "graph_agent"
+    snapshot = prompt["accepted_graph"]["snapshot"]
+    node_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"]]
+    output_id = next(node["id"] for node in prompt["accepted_graph"]["nodes"] if node["op"] == "output")
+    output_value = prompt["accepted_graph"]["nodes"][-1]["args"][0]
     return {
-        "schema_version": 1,
-        "generation": snapshot["generation"] + 1,
+        "schema_version":
+        1,
+        "generation":
+        snapshot["generation"] + 1,
         "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint": snapshot["graph_fingerprint"],
-        "expected_result_fingerprint": None,
-        "reason": "Wrap the existing output in a tuple",
+        "base_fingerprint":
+        snapshot["graph_fingerprint"],
+        "expected_result_fingerprint":
+        None,
+        "reason":
+        "Wrap the existing output in a tuple",
         "operations": [{
             "op": "set_args_kwargs",
             "id": output_id,
-            "args": [{"tuple": [output_value]}],
+            "args": [{
+                "tuple": [output_value]
+            }],
         }, {
             "op": "reorder",
             "order": node_ids,
@@ -421,16 +516,21 @@ def _change_output_structure_response(prompt, role, _call_index):
     }
 
 
-def _rename_placeholder_response(prompt, role, _call_index):
-    assert role == "optimizer"
-    snapshot = prompt["graph_snapshot"]
+def _rename_placeholder_graph_edit(prompt, role, _call_index):
+    assert role == "graph_agent"
+    snapshot = prompt["accepted_graph"]["snapshot"]
     return {
-        "schema_version": 1,
-        "generation": snapshot["generation"] + 1,
+        "schema_version":
+        1,
+        "generation":
+        snapshot["generation"] + 1,
         "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint": snapshot["graph_fingerprint"],
-        "expected_result_fingerprint": None,
-        "reason": "Replace the positional placeholder with a differently named one",
+        "base_fingerprint":
+        snapshot["graph_fingerprint"],
+        "expected_result_fingerprint":
+        None,
+        "reason":
+        "Replace the positional placeholder with a differently named one",
         "operations": [{
             "op": "create_node",
             "id": "new:renamed_input",
@@ -441,7 +541,9 @@ def _rename_placeholder_response(prompt, role, _call_index):
         }, {
             "op": "set_args_kwargs",
             "id": "base:1",
-            "args": [{"node": "new:renamed_input"}],
+            "args": [{
+                "node": "new:renamed_input"
+            }],
         }, {
             "op": "delete_node",
             "id": "base:0",
@@ -452,76 +554,164 @@ def _rename_placeholder_response(prompt, role, _call_index):
     }
 
 
-def test_two_agent_loop_profiles_broadcasts_and_accepts_generic_edit(monkeypatch):
+def test_graph_agent_proposes_and_evaluates_generic_edit_without_optimizer_call(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
-    evaluator = StaticRunner(_evaluator_response(True), "evaluate")
-    graph_optimizer = StaticRunner(_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(True), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert torch.equal(gm(torch.tensor([-2.0, 3.0])), torch.tensor([0.0, -3.0]))
     assert [entry.action for entry in result.trace] == ["evaluate", "accepted"]
-    assert [role for role, _ in evaluator.calls] == ["evaluator", "evaluator"]
-    assert [role for role, _ in graph_optimizer.calls] == ["optimizer"]
-    optimizer_contract = graph_optimizer.calls[0][1]["edit_contract"]
-    assert "registered operator" not in json.dumps(optimizer_contract).lower()
+    assert [role for role, _ in graph_agent.calls] == ["graph_agent", "graph_agent"]
+    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "candidate"]
+    assert graph_agent.calls[0][1]["candidate_required"]
+    assert graph_agent.calls[0][1]["response_contract"]["allowed_decisions"] == ["continue"]
+    edit_contract = graph_agent.calls[0][1]["edit_contract"]
+    assert set(
+        edit_contract["operations"]) == {"create_node", "set_args_kwargs", "delete_node", "patch_meta", "reorder"}
+    assert "rewire" in edit_contract["operations"]["set_args_kwargs"]
+    assert "registered operator" not in json.dumps(edit_contract).lower()
     assert any("There are no semantic operator allowlists or bans" in rule
-               for rule in optimizer_contract["mechanical_rules"])
-    assert graph_optimizer.calls[0][1]["graph_runtime"]["graph_id"] == RUNTIME_GRAPH_ID
-    assert evaluator.calls[0][1]["graph_runtime"]["graph_id"] == RUNTIME_GRAPH_ID
+               for rule in edit_contract["mechanical_rules"])
+    assert graph_agent.calls[0][1]["graph_runtime"]["graph_id"] == RUNTIME_GRAPH_ID
+    assert graph_agent.calls[1][1]["edit_contract"] is None
+
+
+def test_graph_agent_retries_finish_before_first_candidate_with_same_runner(monkeypatch):
+    config = _config()
+    gm, ctx = _context(config)
+    expected_error = ("First accepted_graph decision must continue with one graph_edit before any candidate is "
+                      "executed; absence of candidate measurements is not a valid reason to finish")
+
+    def retrying_graph_agent(prompt, role, call_index):
+        response = _graph_agent_response(False)(prompt, role, call_index)
+        if prompt["stage"] == "candidate":
+            return response
+        assert prompt["candidate_required"]
+        assert prompt["response_contract"]["allowed_decisions"] == ["continue"]
+        if call_index == 0:
+            assert prompt["mechanical_feedback"] == []
+            response["decision"] = "finish"
+            response["summary"] = "No candidate measurements exist"
+            response["graph_edit"] = None
+        else:
+            assert prompt["mechanical_feedback"] == [expected_error]
+        return response
+
+    graph_agent = StaticRunner(retrying_graph_agent, "agent")
+    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
+    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+
+    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "accepted_graph", "candidate"]
+    assert [entry.action for entry in result.trace] == ["graph_agent_retry", "evaluate", "rejected"]
+
+
+def test_graph_agent_allows_finish_after_one_candidate_outcome(monkeypatch):
+    config = _config(agent_max_iterations=2)
+    gm, ctx = _context(config)
+
+    def finishing_graph_agent(prompt, role, call_index):
+        response = _graph_agent_response(False)(prompt, role, call_index)
+        if call_index < 2:
+            return response
+        assert prompt["stage"] == "accepted_graph"
+        assert not prompt["candidate_required"]
+        assert prompt["response_contract"]["allowed_decisions"] == ["continue", "finish"]
+        assert len(prompt["history"]) == 1
+        assert prompt["history"][0]["outcome"] == "rejected"
+        response["decision"] = "finish"
+        response["summary"] = "Stop after measuring one candidate"
+        response["graph_edit"] = None
+        return response
+
+    graph_agent = StaticRunner(finishing_graph_agent, "agent")
+    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
+    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+
+    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "candidate", "accepted_graph"]
+    assert [entry.action for entry in result.trace] == ["evaluate", "rejected", "evaluate"]
+
+
+def test_graph_agent_retries_exact_mechanical_error_with_same_runner(monkeypatch):
+    config = _config()
+    gm, ctx = _context(config)
+
+    def retrying_graph_agent(prompt, role, call_index):
+        response = _graph_agent_response(True)(prompt, role, call_index)
+        if prompt["stage"] == "candidate":
+            return response
+        snapshot = prompt["accepted_graph"]["snapshot"]
+        expected_error = (f"Graph edit base stale-base does not match accepted graph "
+                          f"{snapshot['graph_fingerprint']}")
+        if call_index == 0:
+            assert prompt["mechanical_feedback"] == []
+            response["graph_edit"]["base_fingerprint"] = "stale-base"
+        else:
+            assert prompt["mechanical_feedback"] == [expected_error]
+        return response
+
+    graph_agent = StaticRunner(retrying_graph_agent, "agent")
+    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
+    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+
+    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "accepted_graph", "candidate"]
+    assert [entry.action for entry in result.trace] == ["graph_agent_retry", "evaluate", "accepted"]
 
 
 def test_rejected_candidate_leaves_accepted_graph_intact(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
     original_fingerprint = structural_fingerprint(gm)
-    evaluator = StaticRunner(_evaluator_response(False), "evaluate")
-    graph_optimizer = StaticRunner(_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(False), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert structural_fingerprint(gm) == original_fingerprint
     assert any(node.target == torch.sigmoid for node in gm.graph.nodes)
     assert result.trace[-1].action == "rejected"
 
 
-def test_placeholder_removal_is_rejected_before_candidate_evaluator(monkeypatch):
+def test_placeholder_removal_is_rejected_before_candidate_graph_agent(monkeypatch):
     config = _config()
     gm = torch.fx.symbolic_trace(TwoInputModule())
     gm, ctx = _context_from_gm(config, gm, lambda: (torch.tensor([-1.0, 2.0]), torch.tensor(0.0)))
-    evaluator = StaticRunner(_evaluator_response(True), "evaluate")
-    graph_optimizer = StaticRunner(_delete_placeholder_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(True, _delete_placeholder_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert result.trace[-1].action == "rejected"
     assert "runtime ABI" in result.trace[-1].summary
-    assert len(evaluator.calls) == 1
-    assert evaluator.calls[0][1]["stage"] == "accepted_graph"
+    assert len(graph_agent.calls) == 1
+    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
     assert len([node for node in gm.graph.nodes if node.op == "placeholder"]) == 2
 
 
-def test_output_structure_change_is_rejected_before_candidate_evaluator(monkeypatch):
+def test_output_structure_change_is_rejected_before_candidate_graph_agent(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
-    evaluator = StaticRunner(_evaluator_response(True), "evaluate")
-    graph_optimizer = StaticRunner(_change_output_structure_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(True, _change_output_structure_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert result.trace[-1].action == "rejected"
     assert "runtime ABI" in result.trace[-1].summary
-    assert len(evaluator.calls) == 1
-    assert evaluator.calls[0][1]["stage"] == "accepted_graph"
+    assert len(graph_agent.calls) == 1
+    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
     assert isinstance(gm(torch.tensor([-1.0, 2.0])), torch.Tensor)
 
 
@@ -562,15 +752,54 @@ def test_rank_divergent_output_abi_stops_before_memory_collectives(tmp_path):
     assert all(not result["memory_entered"] for result in results)
 
 
+def test_rank_sync_collectives_run_outside_active_fake_mode(tmp_path):
+    process_context = multiprocessing.get_context("fork")
+    result_queue = process_context.Queue()
+    init_method = f"file://{tmp_path / 'fake-mode-rank-sync-store'}"
+    processes = [
+        process_context.Process(target=_fake_mode_rank_sync_worker, args=(rank, init_method, result_queue))
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+
+    deadline = time.monotonic() + 20
+    for process in processes:
+        process.join(max(0, deadline - time.monotonic()))
+    alive = [process for process in processes if process.is_alive()]
+    if alive:
+        for process in alive:
+            process.terminate()
+        for process in alive:
+            process.join(5)
+        pytest.fail(f"fake-mode rank-sync workers hung: {[process.pid for process in alive]}")
+
+    results = []
+    try:
+        for _ in processes:
+            results.append(result_queue.get(timeout=2))
+    except queue.Empty:
+        exit_codes = [process.exitcode for process in processes]
+        pytest.fail(f"fake-mode rank-sync workers exited without results: {exit_codes}")
+
+    expected_records = [{"rank": 0, "generated": True}, {"rank": 1, "generated": False}]
+    assert all(process.exitcode == 0 for process in processes)
+    assert {result["rank"] for result in results} == {0, 1}
+    assert all(result["error"] is None for result in results), results
+    assert all(result["records"] == expected_records for result in results)
+    assert all(result["fingerprint"] == result["expected_fingerprint"] for result in results)
+    assert len({result["fingerprint"] for result in results}) == 1
+    assert all(result["output"] == [0.0, -3.0] for result in results)
+
+
 def test_placeholder_name_change_with_same_positional_abi_can_be_accepted(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
-    evaluator = StaticRunner(_evaluator_response(True), "evaluate")
-    graph_optimizer = StaticRunner(_rename_placeholder_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(True, _rename_placeholder_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert result.trace[-1].action == "accepted"
     placeholder = next(node for node in gm.graph.nodes if node.op == "placeholder")
@@ -591,12 +820,11 @@ def test_rejected_candidate_restores_registered_parameters_and_buffers(monkeypat
                 next(profile_gm.buffers()).add_(7)
         return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
 
-    evaluator = StaticRunner(_evaluator_response(False), "evaluate")
-    graph_optimizer = StaticRunner(_metadata_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert result.trace[-1].action == "rejected"
     assert torch.equal(next(gm.parameters()), original_parameter)
@@ -618,12 +846,11 @@ def test_rejected_candidate_restores_nested_aot_lifted_parameter_input(monkeypat
                 captured_parameter.add_(10)
         return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
 
-    evaluator = StaticRunner(_evaluator_response(False), "evaluate")
-    graph_optimizer = StaticRunner(_metadata_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert result.trace[-1].action == "rejected"
     assert torch.equal(lifted_parameter, torch.tensor(2.0))
@@ -643,7 +870,7 @@ def test_accepted_profile_restores_registered_state_on_success(monkeypatch):
 
     monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
 
-    success, records = TwoAgentLoopOptimizer._profile_accepted_graph(ctx)
+    success, records = GraphAgentLoopOptimizer._profile_accepted_graph(ctx)
 
     assert success
     assert all(record["success"] for record in records)
@@ -663,7 +890,7 @@ def test_accepted_profile_restores_lifted_state_after_profiling_failure(monkeypa
 
     monkeypatch.setattr(optimizer_module, "_profile_graph", failing_profile)
 
-    success, records = TwoAgentLoopOptimizer._profile_accepted_graph(ctx)
+    success, records = GraphAgentLoopOptimizer._profile_accepted_graph(ctx)
 
     assert not success
     assert "profile failed after mutation" in records[0]["error"]
@@ -673,8 +900,7 @@ def test_accepted_profile_restores_lifted_state_after_profiling_failure(monkeypa
 def test_accepted_profile_restore_failure_raises_before_any_agent(monkeypatch):
     config = _config()
     gm, ctx, lifted_parameter = _aot_lifted_context(config)
-    evaluator = StaticRunner(_evaluator_response(False), "evaluate")
-    graph_optimizer = StaticRunner(_metadata_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
 
     def mutating_profile(profile_gm, profile_ctx, profile_calls=None, expected_abi=None):
         with torch.no_grad():
@@ -682,22 +908,20 @@ def test_accepted_profile_restore_failure_raises_before_any_agent(monkeypatch):
         return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
 
     monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
-    monkeypatch.setattr(optimizer_module, "_restore_candidate_state",
-                        lambda snapshots: (_ for _ in ()).throw(RuntimeError("restore failed")))
+    monkeypatch.setattr(optimizer_module, "_restore_candidate_state", lambda snapshots:
+                        (_ for _ in ()).throw(RuntimeError("restore failed")))
 
     with pytest.raises(RuntimeError, match="Accepted graph state restoration failed"):
-        TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+        GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
-    assert not evaluator.calls
-    assert not graph_optimizer.calls
+    assert not graph_agent.calls
     assert not torch.equal(lifted_parameter, torch.tensor(2.0))
 
 
 def test_candidate_restore_failure_stops_before_candidate_evaluation(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
-    evaluator = StaticRunner(_evaluator_response(False), "evaluate")
-    graph_optimizer = StaticRunner(_metadata_optimizer_response, "optimize")
+    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     original_restore = optimizer_module._restore_candidate_state
     restore_calls = []
@@ -712,28 +936,27 @@ def test_candidate_restore_failure_stops_before_candidate_evaluation(monkeypatch
     monkeypatch.setattr(optimizer_module, "_restore_candidate_state", fail_candidate_restore)
 
     with pytest.raises(RuntimeError, match="Candidate state restoration failed"):
-        TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+        GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
-    assert len(evaluator.calls) == 1
-    assert evaluator.calls[0][1]["stage"] == "accepted_graph"
+    assert len(graph_agent.calls) == 1
+    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
 
 
 def test_stale_candidate_fingerprint_cannot_be_accepted(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
 
-    def stale_evaluator(prompt, role, _call_index):
-        response = _evaluator_response(True)(prompt, role, _call_index)
+    def stale_graph_agent(prompt, role, _call_index):
+        response = _graph_agent_response(True)(prompt, role, _call_index)
         if prompt["stage"] == "candidate":
             response["candidate_fingerprint"] = "stale-fingerprint"
         return response
 
-    evaluator = StaticRunner(stale_evaluator, "evaluate")
-    graph_optimizer = StaticRunner(_optimizer_response, "optimize")
+    graph_agent = StaticRunner(stale_graph_agent, "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert any(entry.action == "abort" and "candidate_fingerprint" in entry.summary for entry in result.trace)
     assert any(node.target == torch.sigmoid for node in gm.graph.nodes)
@@ -744,16 +967,18 @@ def test_stale_metadata_only_candidate_response_cannot_accept_a_different_edit(m
     gm, ctx = _context(config)
     first_candidate_fingerprint = []
 
-    def evaluator_callback(prompt, role, _call_index):
-        assert role == "evaluator"
+    def graph_agent_callback(prompt, role, call_index):
+        assert role == "graph_agent"
         snapshot = prompt["accepted_graph"]["snapshot"]
         if prompt["stage"] == "accepted_graph":
+            graph_edit = _metadata_graph_edit(prompt, role, call_index)
+            graph_edit["operations"][0]["meta"] = {"candidate_state_probe": True, "attempt": [call_index]}
             return {
-                "schema_version": 3,
+                "schema_version": 4,
                 "based_on": snapshot,
                 "decision": "continue",
                 "summary": "Try a metadata-only edit",
-                "optimizer_brief": "Patch data-only metadata",
+                "graph_edit": graph_edit,
                 "candidate_generation": None,
                 "candidate_fingerprint": None,
             }
@@ -767,58 +992,46 @@ def test_stale_metadata_only_candidate_response_cannot_accept_a_different_edit(m
             decision = "accept"
             response_fingerprint = first_candidate_fingerprint[0]
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "based_on": snapshot,
             "decision": decision,
             "summary": "Candidate decision",
-            "optimizer_brief": "",
+            "graph_edit": None,
             "candidate_generation": prompt["candidate"]["generation"],
             "candidate_fingerprint": response_fingerprint,
         }
 
-    def optimizer_callback(prompt, role, call_index):
-        response = _metadata_optimizer_response(prompt, role, call_index)
-        response["operations"][0]["meta"] = {"candidate_state_probe": True, "attempt": [call_index]}
-        return response
-
-    evaluator = StaticRunner(evaluator_callback, "evaluate")
-    graph_optimizer = StaticRunner(optimizer_callback, "optimize")
+    graph_agent = StaticRunner(graph_agent_callback, "agent")
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert any(entry.action == "abort" and "candidate_fingerprint" in entry.summary for entry in result.trace)
-    assert len(graph_optimizer.calls) == 2
+    assert len([prompt for _, prompt in graph_agent.calls if prompt["stage"] == "accepted_graph"]) == 2
     assert not any("attempt" in node.meta for node in gm.graph.nodes)
 
 
-def test_nonzero_rank_never_invokes_evaluator_or_optimizer(monkeypatch):
+def test_nonzero_rank_never_invokes_graph_agent(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
 
     def unexpected_agent_call(*args, **kwargs):
         raise AssertionError("nonzero rank invoked an agent")
 
-    evaluator = StaticRunner(unexpected_agent_call, "evaluate")
-    graph_optimizer = StaticRunner(unexpected_agent_call, "optimize")
+    graph_agent = StaticRunner(unexpected_agent_call, "agent")
     monkeypatch.setattr(optimizer_module, "_rank", lambda: 1)
-    monkeypatch.setattr(TwoAgentLoopOptimizer, "_snapshot_consensus", lambda self, tracker: (True, []))
-    monkeypatch.setattr(TwoAgentLoopOptimizer, "_profile_accepted_graph", lambda self, profile_ctx: (True, []))
-    monkeypatch.setattr(optimizer_module, "broadcast_json_payload",
-                        lambda payload: {
-                            "continue": False,
-                            "error": None
-                        })
+    monkeypatch.setattr(GraphAgentLoopOptimizer, "_snapshot_consensus", lambda self, tracker: (True, []))
+    monkeypatch.setattr(GraphAgentLoopOptimizer, "_profile_accepted_graph", lambda self, profile_ctx: (True, []))
+    monkeypatch.setattr(optimizer_module, "broadcast_json_payload", lambda payload: {"continue": False, "error": None})
 
-    result = TwoAgentLoopOptimizer(evaluator, graph_optimizer, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
 
     assert not result.trace
-    assert not evaluator.calls
-    assert not graph_optimizer.calls
+    assert not graph_agent.calls
 
 
-def test_backend_marker_runs_z3_pass_then_two_agent_loop_and_baseline_stays_direct(monkeypatch):
+def test_backend_marker_runs_z3_pass_then_graph_agent_loop_and_baseline_stays_direct(monkeypatch):
     config = _config()
     gm, ctx = _context(config)
     structural_pass = lambda *args, **kwargs: None
@@ -828,29 +1041,28 @@ def test_backend_marker_runs_z3_pass_then_two_agent_loop_and_baseline_stays_dire
     def fake_run_opt_passes(passes, *args, **kwargs):
         pass_calls.append(list(passes))
 
-    class FakeTwoAgent:
+    class FakeGraphAgent:
 
-        def __init__(self, evaluator_runner, optimizer_runner, compile_config):
-            agent_calls.append((evaluator_runner.config.command, optimizer_runner.config.command, compile_config))
+        def __init__(self, graph_agent_runner, compile_config):
+            agent_calls.append((graph_agent_runner.config.command, compile_config))
 
         def optimize(self, graph_module, optimization_context):
             assert graph_module is gm
             return OptimizationResult()
 
     monkeypatch.setattr(backend, "run_opt_passes", fake_run_opt_passes)
-    monkeypatch.setattr(optimizer_module, "TwoAgentLoopOptimizer", FakeTwoAgent)
+    monkeypatch.setattr(optimizer_module, "GraphAgentLoopOptimizer", FakeGraphAgent)
 
     result = backend.run_optimization([structural_pass, backend.agent_optimization_loop], gm, 11, (0, "fwd"),
                                       ctx.graph_order, ctx.profiling_results, ctx.create_inputs_fn, 0.0,
                                       {11: object()}, False, config)
     assert isinstance(result, OptimizationResult)
     assert pass_calls == [[structural_pass]]
-    assert agent_calls[0][:2] == (["evaluate"], ["optimize"])
+    assert agent_calls[0][0] == ["agent"]
 
     pass_calls.clear()
-    assert backend.run_optimization([structural_pass], gm, 11, (0, "fwd"), ctx.graph_order,
-                                    ctx.profiling_results, ctx.create_inputs_fn, 0.0, {11: object()}, False,
-                                    CompileConfig()) is None
+    assert backend.run_optimization([structural_pass], gm, 11, (0, "fwd"), ctx.graph_order, ctx.profiling_results,
+                                    ctx.create_inputs_fn, 0.0, {11: object()}, False, CompileConfig()) is None
     assert pass_calls == [[structural_pass]]
 
 
@@ -860,7 +1072,7 @@ def test_agent_config_has_no_zero_stage_offload_or_custom_pass_bans():
                            passes=["z3"],
                            offload_parameters=True)
 
-    assert config.agent_architecture == "two_agent"
+    assert config.agent_architecture == "graph_agent"
     assert config.passes == ["z3"]
     assert config.offload_parameters
     assert not hasattr(config, "validate_zero_stage")
@@ -971,8 +1183,8 @@ def test_agent_timeout_terminates_wrapper_process_group(tmp_path, monkeypatch):
         return process
 
     monkeypatch.setattr(agent_runner_module.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(agent_runner_module.os, "killpg", lambda process_group, sig: signals.append((process_group,
-                                                                                                    sig)))
+    monkeypatch.setattr(agent_runner_module.os, "killpg", lambda process_group, sig: signals.append(
+        (process_group, sig)))
     monkeypatch.setattr(agent_runner_module.time, "sleep", lambda _seconds: None)
     runner = AgentRunner(AgentRunnerConfig(command=["agent"], timeout_sec=1, debug_log=False, terminate_grace_sec=1))
 
@@ -985,18 +1197,17 @@ def test_agent_timeout_terminates_wrapper_process_group(tmp_path, monkeypatch):
 
 def test_agent_timeout_stops_a_real_descendant_process(tmp_path):
     child_pid_path = tmp_path / "child.pid"
-    child = (
-        "from pathlib import Path; import os, signal, sys, time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-        "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)")
-    wrapper = (
-        "from pathlib import Path; import subprocess, sys, time; "
-        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]]); "
-        "deadline = time.monotonic() + 5; "
-        "\nwhile not Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
-        "time.sleep(60)")
+    child = ("from pathlib import Path; import os, signal, sys, time; "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+             "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)")
+    wrapper = ("from pathlib import Path; import subprocess, sys, time; "
+               "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]]); "
+               "deadline = time.monotonic() + 5; "
+               "\nwhile not Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
+               "time.sleep(60)")
     runner = AgentRunner(
-        AgentRunnerConfig(command=[sys.executable, "-c", wrapper, str(child_pid_path), child],
+        AgentRunnerConfig(command=[sys.executable, "-c", wrapper,
+                                   str(child_pid_path), child],
                           timeout_sec=1,
                           debug_log=False,
                           terminate_grace_sec=1))

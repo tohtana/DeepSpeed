@@ -2242,15 +2242,15 @@ and the pass reuses the same tensor-parallel group.
 DeepCompile uses its fixed prefetch and selective-persistence passes by default. ZeRO-3 jobs can opt into an
 external agent at the warmup tuning step by setting `zero3_tuning_strategy` to `"agent"`. The initial structural
 ZeRO-3 graph pass remains host-controlled in either mode. Agent mode runs `add_z3_gather_release` at step 0 and
-`add_z3_gather_release` followed by the evaluator/optimizer loop at the warmup point; prefetch and selective-gather
-style transformations are choices available to the optimizer rather than automatic passes. When parameter,
+`add_z3_gather_release` followed by the graph-agent loop at the warmup point; prefetch and selective-gather style
+transformations are choices available to the agent rather than automatic passes. When parameter,
 optimizer-state, or activation offload is configured, its existing initialization and structural passes remain in the
 schedule and the agent loop follows the corresponding warmup passes. An explicit schedule is also preserved: the
 agent marker is appended after its warmup passes. As a small experimental fallback, an explicit schedule with no
 warmup entry reuses its latest pre-warmup structural pass set at warmup and then runs the agent.
 
 Agent commands are argv arrays. DeepCompile writes a JSON prompt to the command's standard input and reads one JSON
-response from standard output. Only rank 0 invokes either agent. Every rank first verifies the same normalized post-Z3
+response from standard output. Only rank 0 invokes the agent. Every rank first verifies the same normalized post-Z3
 topology, and rank 0 broadcasts a complete JSON/data-only FX operation log. Each rank replays that log against a clone
 of its accepted local graph, preserving its local callable/module/get-attr bindings, parameters, and metadata.
 Rank-local graph IDs are represented in prompts and edit logs as `{"runtime_local": "graph_id"}`. Each rank replaces
@@ -2263,7 +2263,7 @@ equivalent graphs agree across ranks.
     "compile": {
         "deepcompile": true,
         "zero3_tuning_strategy": "agent",
-        "agent_architecture": "two_agent",
+        "agent_architecture": "graph_agent",
         "agent_command": ["/absolute/path/to/agent-wrapper"],
         "agent_max_iterations": 3,
         "agent_max_retries_per_iteration": 1,
@@ -2272,10 +2272,15 @@ equivalent graphs agree across ranks.
 }
 ```
 
-`agent_architecture="two_agent"` first asks the evaluator whether to finish or continue, then asks the optimizer for one
-generic edit, profiles the candidate on every rank, and asks the evaluator to accept or reject it.
-`agent_evaluator_command` and `agent_optimizer_command` can provide separate argv arrays; either falls back to
-`agent_command` when omitted.
+`agent_architecture="graph_agent"` invokes one external graph agent. Before the graph invocation has a recorded
+candidate outcome, the accepted-graph response must continue with one exact generic edit; missing candidate
+measurements are not a valid reason to finish because measurements require executing that edit first. A premature
+finish is returned through `mechanical_feedback` and retried like other protocol or edit errors. After one candidate
+outcome is recorded, the accepted-graph response may finish tuning or continue with another edit. DeepCompile
+deterministically finalizes and broadcasts each edit, profiles the replayed candidate on every rank, and invokes the
+same graph agent to accept or reject it. Candidate responses cannot contain another edit; a subsequent accepted-graph
+iteration proposes the next one. Mechanical edit errors are also returned verbatim in `mechanical_feedback` when the
+accepted-graph agent is retried.
 
 Base nodes use stable IDs derived from their topological position; names are included only as hints. The edit log can
 create every FX node kind (`placeholder`, `get_attr`, `call_function`, `call_method`, `call_module`, and `output`),
@@ -2289,13 +2294,14 @@ fingerprints across ranks. Candidate timing and memory metadata is refreshed by 
 rank 0. Unchanged opaque local callables use rank-stable descriptors while every rank retains its own callable object.
 
 Accepted-baseline and candidate profiling snapshot local registered parameters and buffers plus all real tensor inputs
-captured for their profiling calls, including nested AOTAutograd-lifted state. They restore them before agent or
-evaluator decisions, so profiling mutations do not leak into accepted or rejected runtime state. A restore failure is
+captured for their profiling calls, including nested AOTAutograd-lifted state. They restore them before graph-agent
+decisions, so profiling mutations do not leak into accepted or rejected runtime state. A restore failure is
 synchronized and raises on every rank. Other external side effects remain the responsibility of the experimental rewrite.
 Rejected or mechanically failed candidates never replace the accepted graph. Accepted candidates become the base for
 the next generation. The synchronized payload contains its generation, graph slot, base fingerprint, complete
 operations, and the expected result fingerprint computed from both the replayed structural result and the canonical
-finalized data-only edit payload. Candidate evaluator responses must echo that exact fingerprint. An agent invocation timeout terminates the wrapper
+finalized data-only edit payload. Candidate graph-agent responses must echo that exact fingerprint and contain no graph
+edit. An agent invocation timeout terminates the wrapper
 and, after a grace period, force-kills any surviving descendants in their dedicated process group.
 
 Generic candidate execution intentionally has no operator policy. A malformed distributed collective can therefore
@@ -2303,8 +2309,8 @@ hang inside the live training process group before Python can aggregate a failur
 should run under an external job watchdog; DeepCompile does not attempt unsafe in-process NCCL cancellation.
 
 Set `DEEPCOMPILE_AGENT_ARTIFACT_ROOT` to an existing or creatable parent directory to opt into inspection artifacts.
-Rank 0 creates a unique session containing session metadata and, for each graph iteration, raw evaluator/optimizer
-prompts and responses, the accepted snapshot, finalized graph edit, candidate profile/error aggregation, evaluator
+Rank 0 creates a unique session containing session metadata and, for each graph iteration, raw graph-agent prompts and
+responses, the accepted snapshot, finalized graph edit, candidate profile/error aggregation, graph-agent
 decision, and outcome.
 
 

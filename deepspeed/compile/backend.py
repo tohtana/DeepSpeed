@@ -314,7 +314,7 @@ def run_optimization(opt_passes: List[Callable],
 
     import copy
     from .agent_runner import AgentRunner, AgentRunnerConfig
-    from .optimizer import OptimizationContext, TwoAgentLoopOptimizer
+    from .optimizer import GraphAgentLoopOptimizer, OptimizationContext
 
     warmup_trace = copy.deepcopy(optimization_trace)
     structural_ctx = OptimizationContext(gm=gm,
@@ -331,11 +331,8 @@ def run_optimization(opt_passes: List[Callable],
         "timeout_sec": compile_config.agent_timeout_sec,
         "debug_log": compile_config.debug_log,
     }
-    evaluator_command = compile_config.agent_evaluator_command or compile_config.agent_command
-    optimizer_command = compile_config.agent_optimizer_command or compile_config.agent_command
-    evaluator_runner = AgentRunner(AgentRunnerConfig(command=evaluator_command, **runner_config))
-    optimizer_runner = AgentRunner(AgentRunnerConfig(command=optimizer_command, **runner_config))
-    return TwoAgentLoopOptimizer(evaluator_runner, optimizer_runner, compile_config).optimize(gm, structural_ctx)
+    graph_agent_runner = AgentRunner(AgentRunnerConfig(command=compile_config.agent_command, **runner_config))
+    return GraphAgentLoopOptimizer(graph_agent_runner, compile_config).optimize(gm, structural_ctx)
 
 
 def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
