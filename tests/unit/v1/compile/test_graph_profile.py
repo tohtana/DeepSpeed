@@ -146,6 +146,8 @@ def test_profiling_interpreter_wall_time_excludes_warmup(monkeypatch):
 
     call_node = next(node for node in gm.graph.nodes if node.op == "call_function")
     assert call_node.meta["wall_time"] == pytest.approx((4 / 3) * 1000)
+    assert call_node.meta["local_wall_time"] == pytest.approx((4 / 3) * 1000)
+    assert call_node.meta["local_device_time"] == call_node.meta["device_time"]
 
 
 def test_memory_profiling_interpreter_clears_gathered_params_after_failure(monkeypatch):
@@ -163,10 +165,12 @@ def test_memory_profiling_interpreter_clears_gathered_params_after_failure(monke
 
     interpreter = graph_profile.MemoryProfilingInterpreter(_make_empty_graph_module())
     interpreter.mem_record.append(("partial", 1, 1, 1))
+    interpreter.local_mem_record.append(("local_partial", 1, 1, 1))
 
     assert interpreter.run() is None
     assert not interpreter.profile_complete
     assert interpreter.mem_record == []
+    assert interpreter.local_mem_record == []
     assert fake_handle.events == [("enable", True), ("clear", None), ("enable", False)]
 
 

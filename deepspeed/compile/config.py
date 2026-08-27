@@ -82,19 +82,19 @@ class CompileConfig(DeepSpeedConfigModel):
     """ Controls how ZeRO-3 warmup tuning decisions are made. """
 
     agent_architecture: AgentArchitecture = "graph_agent"
-    """ Selects the graph proposal and evaluation agent. """
+    """ Selects the experimental generated-pass coding-agent path. """
 
     agent_command: Optional[List[str]] = None
-    """ Command argv for the external graph agent. """
+    """ Command argv for the rank-zero coding agent. """
 
     agent_max_iterations: int = Field(3, gt=0)
-    """ Maximum tuning iterations per graph invocation. """
+    """ Maximum complete pass-source candidates evaluated per graph invocation. """
 
     agent_timeout_sec: int = Field(300, gt=0)
     """ Timeout in seconds for each external agent invocation. """
 
     agent_max_retries_per_iteration: int = Field(1, ge=0)
-    """ Number of graph-agent retries after mechanical edit finalization fails. """
+    """ Number of coding-agent response retries after mechanical protocol validation fails. """
 
     @staticmethod
     def _validate_command(command, field_name):

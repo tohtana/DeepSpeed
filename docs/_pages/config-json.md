@@ -2239,23 +2239,17 @@ and the pass reuses the same tensor-parallel group.
 
 ### DeepCompile ZeRO-3 agent tuning
 
-DeepCompile uses its fixed prefetch and selective-persistence passes by default. ZeRO-3 jobs can opt into an
-external agent at the warmup tuning step by setting `zero3_tuning_strategy` to `"agent"`. The initial structural
-ZeRO-3 graph pass remains host-controlled in either mode. Agent mode runs `add_z3_gather_release` at step 0 and
-`add_z3_gather_release` followed by the graph-agent loop at the warmup point; prefetch and selective-gather style
-transformations are choices available to the agent rather than automatic passes. When parameter,
-optimizer-state, or activation offload is configured, its existing initialization and structural passes remain in the
-schedule and the agent loop follows the corresponding warmup passes. An explicit schedule is also preserved: the
-agent marker is appended after its warmup passes. As a small experimental fallback, an explicit schedule with no
-warmup entry reuses its latest pre-warmup structural pass set at warmup and then runs the agent.
+DeepCompile uses its fixed prefetch and selective-persistence passes by default. ZeRO-3 jobs can opt into the
+experimental generated-pass search at the warmup tuning step by setting `zero3_tuning_strategy` to `"agent"`. Required
+ZeRO-3 and configured offload passes remain host-controlled and run before the search marker. Explicit schedules retain
+the same ordering: the generated-pass loop is appended after the warmup structural passes.
 
-Agent commands are argv arrays. DeepCompile writes a JSON prompt to the command's standard input and reads one JSON
-response from standard output. Only rank 0 invokes the agent. Every rank first verifies the same normalized post-Z3
-topology, and rank 0 broadcasts a complete JSON/data-only FX operation log. Each rank replays that log against a clone
-of its accepted local graph, preserving its local callable/module/get-attr bindings, parameters, and metadata.
-Rank-local graph IDs are represented in prompts and edit logs as `{"runtime_local": "graph_id"}`. Each rank replaces
-that symbol with its own registered graph ID during replay, while normalized structural fingerprints use the symbol so
-equivalent graphs agree across ranks.
+Only rank 0 invokes one coding agent. Each response either supplies a complete Python file with the fixed
+`deepcompile_pass` entrypoint or explicitly finishes and selects the baseline or a previously evaluated mechanically
+valid candidate. Rank 0 broadcasts the exact source, entrypoint, source SHA-256, candidate/proposal identity, and frozen
+base identity. Every rank writes and dynamically loads those same bytes, binds the ordinary eight-argument DeepCompile
+pass callable, and applies it to a fresh clone of the same frozen post-required-pass graph. Candidate graphs never
+accumulate: revised ideas must appear in the next complete source.
 
 ```json
 {
@@ -2272,46 +2266,34 @@ equivalent graphs agree across ranks.
 }
 ```
 
-`agent_architecture="graph_agent"` invokes one external graph agent. Before the graph invocation has a recorded
-candidate outcome, the accepted-graph response must continue with one exact generic edit; missing candidate
-measurements are not a valid reason to finish because measurements require executing that edit first. A premature
-finish is returned through `mechanical_feedback` and retried like other protocol or edit errors. After one candidate
-outcome is recorded, the accepted-graph response may finish tuning or continue with another edit. DeepCompile
-deterministically finalizes and broadcasts each edit, profiles the replayed candidate on every rank, and invokes the
-same graph agent to accept or reject it. Candidate responses cannot contain another edit; a subsequent accepted-graph
-iteration proposes the next one. Mechanical edit errors are also returned verbatim in `mechanical_feedback` when the
-accepted-graph agent is retried.
+The first turn must propose and evaluate one complete source. After its result, the coding agent may propose another
+complete source or finish; DeepCompile imposes no two-candidate minimum. `agent_max_iterations` counts parsed source
+candidates, including mechanically invalid candidates. Response retries do not consume that budget. If the final
+candidate exhausts the budget, one additional selection-only call lets the coding agent see its result. A missing,
+invalid, or stale final selection aborts while the live graph is still frozen; it is never converted to an implicit
+baseline choice.
 
-Base nodes use stable IDs derived from their topological position; names are included only as hints. The edit log can
-create every FX node kind (`placeholder`, `get_attr`, `call_function`, `call_method`, `call_module`, and `output`),
-rewire arbitrary recursively encoded arguments and keyword arguments, delete nodes after rewiring their uses, patch
-recursively JSON/data-only metadata using scalars, lists, and string-keyed objects, and give the complete final
-topological order. Callable targets are import-resolvable symbolic paths.
-There are no operator semantic allowlists or special bans on collectives, replacements, or reorderings. Validation is
-mechanical: JSON parsing, generation and base fingerprint, local target/reference resolution, replay, graph lint and
-recompile, compatibility with the captured positional-input and output-pytree AOT caller ABI, and matching result
-fingerprints across ranks. Candidate timing and memory metadata is refreshed by real profiling rather than copied from
-rank 0. Unchanged opaque local callables use rank-stable descriptors while every rank retains its own callable object.
+The evaluator is deterministic host execution/profiling code, not another agent. It reports syntax/import/callable/
+signature, return-contract, lint/recompile, runtime-ABI, source identity, graph fingerprint, rank-local timing/memory,
+and aggregate observations. It has no automatic latency threshold and no per-candidate correctness oracle. Slow valid
+candidates remain selectable. The final selected source is replayed from its exact stored bytes on each live graph and
+mechanically revalidated; only then does its fresh live profile replace the baseline profile.
 
-Accepted-baseline and candidate profiling snapshot local registered parameters and buffers plus all real tensor inputs
-captured for their profiling calls, including nested AOTAutograd-lifted state. They restore them before graph-agent
-decisions, so profiling mutations do not leak into accepted or rejected runtime state. A restore failure is
-synchronized and raises on every rank. Other external side effects remain the responsibility of the experimental rewrite.
-Rejected or mechanically failed candidates never replace the accepted graph. Accepted candidates become the base for
-the next generation. The synchronized payload contains its generation, graph slot, base fingerprint, complete
-operations, and the expected result fingerprint computed from both the replayed structural result and the canonical
-finalized data-only edit payload. Candidate graph-agent responses must echo that exact fingerprint and contain no graph
-edit. An agent invocation timeout terminates the wrapper
-and, after a grace period, force-kills any surviving descendants in their dedicated process group.
+Generated Python is trusted experimental code. There is no sandbox and no import, operator, or optimization allowlist.
+Fresh graph clones plus the existing tensor snapshot/restore protect graph topology and covered tensors only. Arbitrary
+Python globals, files, installed parameters/submodules, native state, `param_manager`, and pass-body collectives are not
+generally rollback-safe. A pass-body collective or hang may stall the job. Failure after selected source starts running
+on the live graph is fail-closed after best-effort graph restoration; training does not continue under a claimed
+pristine rollback.
 
-Generic candidate execution intentionally has no operator policy. A malformed distributed collective can therefore
-hang inside the live training process group before Python can aggregate a failure. Experimental distributed validation
-should run under an external job watchdog; DeepCompile does not attempt unsafe in-process NCCL cancellation.
+Set `DEEPSPEED_TIMEOUT` before process-group initialization to at least
+`ceil(2 * (agent_max_retries_per_iteration + 1) * agent_timeout_sec / 60)` minutes. This covers non-zero ranks waiting
+in the control collective across a complete rank-0 response retry window. An individual agent invocation timeout still
+terminates the wrapper and, after a grace period, force-kills surviving descendants in its process group.
 
 Set `DEEPCOMPILE_AGENT_ARTIFACT_ROOT` to an existing or creatable parent directory to opt into inspection artifacts.
-Rank 0 creates a unique session containing session metadata and, for each graph iteration, raw graph-agent prompts and
-responses, the accepted snapshot, finalized graph edit, candidate profile/error aggregation, graph-agent
-decision, and outcome.
+Rank 0 records the live reference-pass inventory, frozen-base identity, exact turn prompts/responses, each complete
+candidate source and evaluation packet, explicit selection, and final live application result per graph slot.
 
 
 ### DeepCompile activation offload

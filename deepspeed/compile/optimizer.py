@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import copy
 import gc
+import hashlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -32,10 +34,11 @@ from deepspeed.accelerator import get_accelerator
 
 from .agent_runner import AgentRunner
 from .config import CompileConfig
-from .evaluation_context import (AgentResponseError, GraphSlotRef, GraphVersionTracker, candidate_evaluation_payload,
-                                 parse_evaluation_decision, serialize_evaluation_context)
-from .graph_edit import (GraphEditPayload, apply_graph_edit, candidate_fingerprint, finalize_graph_edit,
-                         structural_fingerprint)
+from .evaluation_context import (AgentResponseError, GeneratedPassProposal, GeneratedPassSelection,
+                                 aggregate_rank_metrics, build_evaluation_packet, build_reference_pass_inventory,
+                                 parse_search_response, sanitize_json_value, serialize_search_context,
+                                 validate_selection, verify_proposal_identity)
+from .graph_edit import (clone_graph_module, generated_graph_fingerprint_details, structural_fingerprint)
 from .profilers import ProfilingResult
 from .profilers.graph_profile import MemoryProfilingInterpreter, ProfilingInterpreter, is_profile_incomplete
 
@@ -51,11 +54,25 @@ class OptimizationContext:
     graph_order: List[Tuple[int, bool]]
     profiling_results: Dict[int, ProfilingResult]
     create_inputs_fn: Callable
+    mem_budget: float
+    param_manager: Any
     bwd: bool
     debug_log: bool
     compile_config: Optional[CompileConfig]
     warmup_trace: List[Dict[str, Any]] = field(default_factory=list)
     runtime_abi: Optional[_RuntimeABIDescriptor] = None
+
+
+@dataclass
+class FrozenGraphContext:
+    graph_module: GraphModule
+    graph_fingerprint: str
+    graph_slot: Tuple[int, str]
+    graph_order: List[Tuple[int, bool]]
+    baseline_rank_results: List[Dict[str, Any]]
+    baseline_aggregate: Dict[str, Any]
+    mem_budget: float
+    param_manager: Any
 
 
 @dataclass
@@ -143,14 +160,6 @@ def gather_rank_records(local_record: Dict[str, Any]) -> List[Dict[str, Any]]:
     with unset_fake_temporarily():
         dist.all_gather_object(records, local_record)
     return records
-
-
-def broadcast_edit_payload(payload: Optional[GraphEditPayload]) -> Optional[GraphEditPayload]:
-    envelope = {"edit": None if payload is None else payload.to_dict()} if _rank() == 0 else None
-    received = broadcast_json_payload(envelope)
-    if received.get("edit") is None:
-        return None
-    return GraphEditPayload.from_dict(received["edit"], require_result_fingerprint=True)
 
 
 def _set_profile_from_graph(profile: ProfilingResult, graph_id: int, gm: GraphModule, memory, bwd: bool,
@@ -282,14 +291,24 @@ def _profile_graph(
     if memory_abi != runtime_abi:
         raise _RuntimeABIError("Timing and memory profiling produced different runtime output ABI descriptors")
     memory = [(name, current, delta, peak) for name, current, delta, peak in memory_profiler.mem_record]
+    local_mem_record = getattr(memory_profiler, "local_mem_record", memory_profiler.mem_record)
+    local_memory = [(name, current, delta, peak) for name, current, delta, peak in local_mem_record]
     profile = copy.deepcopy(ctx.profiling_results[ctx.graph_id])
     _set_profile_from_graph(profile, ctx.graph_id, gm, memory, ctx.bwd, True)
+    local_memory_field = "_deepcompile_local_bwd_mem" if ctx.bwd else "_deepcompile_local_fwd_mem"
+    setattr(profile, local_memory_field, local_memory)
     return profile, runtime_abi
 
 
-def _profile_metrics(profile: ProfilingResult, bwd: bool) -> Dict[str, float]:
+def _profile_metrics(profile: ProfilingResult, bwd: bool, local: bool = False) -> Dict[str, float]:
     times = profile.bwd_time if bwd else profile.fwd_time
     memory = profile.bwd_mem if bwd else profile.fwd_mem
+    if local:
+        graph = profile.bwd_graph if bwd else profile.fwd_graph
+        times = [(node.name, node.meta.get("local_device_time", 0.0), node.meta.get("local_wall_time", 0.0))
+                 for node in graph.nodes]
+        local_memory_field = "_deepcompile_local_bwd_mem" if bwd else "_deepcompile_local_fwd_mem"
+        memory = getattr(profile, local_memory_field, memory)
     return {
         "device_time": float(sum(row[1] for row in times)),
         "peak_memory": float(max([row[3] for row in memory], default=0)),
@@ -394,6 +413,93 @@ def _reset_inspection_session_root() -> None:
     _INSPECTION_SESSION_ROOT = None
 
 
+class GeneratedPassValidationError(RuntimeError):
+
+    def __init__(self, phase: str, message: str):
+        super().__init__(message)
+        self.phase = phase
+
+
+def _hard_write_source(path: Path, source: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(source.encode("utf-8"))
+        written_source = path.read_bytes()
+    except OSError as exc:
+        raise GeneratedPassValidationError("write", f"Unable to write exact generated source: {exc}") from exc
+    if written_source != source.encode("utf-8"):
+        raise GeneratedPassValidationError("write", "Generated source bytes changed while writing the local file")
+
+
+def load_generated_pass(proposal: GeneratedPassProposal, source_path: Path) -> Callable:
+    if hashlib.sha256(proposal.source.encode("utf-8")).hexdigest() != proposal.source_sha256:
+        raise GeneratedPassValidationError("source_identity", "Generated source SHA-256 does not match its envelope")
+    _hard_write_source(source_path, proposal.source)
+    try:
+        compile(proposal.source, str(source_path), "exec")
+    except SyntaxError as exc:
+        raise GeneratedPassValidationError("syntax", str(exc)) from exc
+
+    spec = importlib.util.spec_from_file_location(proposal.module_name, source_path)
+    if spec is None or spec.loader is None:
+        raise GeneratedPassValidationError("import", "Unable to construct a generated-pass module spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[proposal.module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        sys.modules.pop(proposal.module_name, None)
+        raise GeneratedPassValidationError("import", str(exc)) from exc
+
+    entrypoint = getattr(module, proposal.entrypoint, None)
+    if entrypoint is None:
+        raise GeneratedPassValidationError("callable", f"Generated module has no {proposal.entrypoint} entrypoint")
+    if not callable(entrypoint):
+        raise GeneratedPassValidationError("callable",
+                                           f"Generated module entrypoint {proposal.entrypoint} is not callable")
+    return entrypoint
+
+
+def _generated_pass_arguments(gm: GraphModule, ctx: OptimizationContext) -> Tuple[Any, ...]:
+    return (gm, ctx.graph_id, ctx.graph_order, ctx.profiling_results, ctx.create_inputs_fn, ctx.mem_budget,
+            ctx.param_manager, ctx.bwd)
+
+
+def apply_generated_pass(proposal: GeneratedPassProposal,
+                         gm: GraphModule,
+                         ctx: OptimizationContext,
+                         source_path: Path,
+                         entrypoint: Optional[Callable] = None) -> Tuple[GraphModule, Callable]:
+    if entrypoint is None:
+        entrypoint = load_generated_pass(proposal, source_path)
+    arguments = _generated_pass_arguments(gm, ctx)
+    try:
+        inspect.signature(entrypoint).bind(*arguments)
+    except (TypeError, ValueError) as exc:
+        raise GeneratedPassValidationError("signature", str(exc)) from exc
+    try:
+        result = entrypoint(*arguments)
+    except Exception as exc:
+        raise GeneratedPassValidationError("call", str(exc)) from exc
+    if result is not None and result is not gm:
+        raise GeneratedPassValidationError("return_contract", "deepcompile_pass must return None or the identical gm")
+    try:
+        gm.graph.lint()
+    except Exception as exc:
+        raise GeneratedPassValidationError("lint", str(exc)) from exc
+    try:
+        gm.recompile()
+    except Exception as exc:
+        raise GeneratedPassValidationError("recompile", str(exc)) from exc
+    return gm, entrypoint
+
+
+def restore_frozen_base(gm: GraphModule, frozen: FrozenGraphContext) -> None:
+    restored = clone_graph_module(frozen.graph_module)
+    gm.graph = restored.graph
+    gm.recompile()
+
+
 class GraphAgentLoopOptimizer:
 
     def __init__(self, graph_agent_runner: AgentRunner, compile_config: CompileConfig):
@@ -451,15 +557,15 @@ class GraphAgentLoopOptimizer:
             })
 
     @staticmethod
-    def _snapshot_consensus(tracker: GraphVersionTracker) -> Tuple[bool, List[Dict[str, Any]]]:
+    def _snapshot_consensus(ctx: OptimizationContext) -> Tuple[bool, List[Dict[str, Any]]]:
         try:
-            snapshot = asdict(tracker.current_ref())
-            local = {"rank": _rank(), "success": True, "snapshot": snapshot, "error": None}
+            fingerprint = structural_fingerprint(ctx.gm, ctx.graph_id)
+            local = {"rank": _rank(), "success": True, "fingerprint": fingerprint, "error": None}
         except Exception as exc:
-            local = {"rank": _rank(), "success": False, "snapshot": None, "error": str(exc)}
+            local = {"rank": _rank(), "success": False, "fingerprint": None, "error": str(exc)}
         records = gather_rank_records(local)
-        snapshots = [record["snapshot"] for record in records if record["success"]]
-        return len(snapshots) == len(records) and all(snapshot == snapshots[0] for snapshot in snapshots), records
+        fingerprints = {record["fingerprint"] for record in records if record["success"]}
+        return all(record["success"] for record in records) and len(fingerprints) == 1, records
 
     @staticmethod
     def _profile_accepted_graph(ctx: OptimizationContext) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -495,10 +601,15 @@ class GraphAgentLoopOptimizer:
                 restore_error = str(exc)
 
         if profile_error is None and restore_error is None:
+            local_metrics = _profile_metrics(local_profile, ctx.bwd, local=True)
+            reduced_metrics = _profile_metrics(local_profile, ctx.bwd)
             local = {
                 "rank": _rank(),
                 "success": True,
-                "metrics": _profile_metrics(local_profile, ctx.bwd),
+                "local_device_time": local_metrics["device_time"],
+                "local_peak_memory": local_metrics["peak_memory"],
+                "reduced_device_time": reduced_metrics["device_time"],
+                "reduced_peak_memory": reduced_metrics["peak_memory"],
                 "error": None,
                 "abi": asdict(local_abi),
                 "state_restore_failed": False,
@@ -512,12 +623,15 @@ class GraphAgentLoopOptimizer:
             local = {
                 "rank": _rank(),
                 "success": False,
-                "metrics": None,
+                "local_device_time": None,
+                "local_peak_memory": None,
+                "reduced_device_time": None,
+                "reduced_peak_memory": None,
                 "error": "; ".join(errors),
                 "abi": None,
                 "state_restore_failed": restore_error is not None,
             }
-        records = gather_rank_records(local)
+        records = gather_rank_records(sanitize_json_value(local))
         if any(record.get("state_restore_failed", False) for record in records):
             raise RuntimeError("Accepted graph state restoration failed; live tensor state may be corrupted")
         abi_descriptors = {json.dumps(record["abi"], sort_keys=True) for record in records if record["success"]}
@@ -528,37 +642,137 @@ class GraphAgentLoopOptimizer:
         return success, records
 
     @staticmethod
-    def _apply_and_profile_candidate(ctx: OptimizationContext, payload: GraphEditPayload):
+    def _failed_rank_results(records: List[Dict[str, Any]], fallback_error: str) -> List[Dict[str, Any]]:
+        failed = []
+        for record in records:
+            failed.append({
+                "rank": record["rank"],
+                "success": False,
+                "fingerprint": record.get("fingerprint"),
+                "local_device_time": None,
+                "local_peak_memory": None,
+                "reduced_device_time": None,
+                "reduced_peak_memory": None,
+                "error": record.get("error") or fallback_error,
+                "abi": None,
+                "abi_compatible": None,
+                "state_restore_failed": False,
+            })
+        return failed
+
+    @staticmethod
+    def _apply_and_profile_candidate(ctx: OptimizationContext, frozen: FrozenGraphContext,
+                                     proposal: GeneratedPassProposal, proposal_index: int, source_path: Path):
+        validation = {}
         candidate = None
         candidate_profile = None
+        entrypoint = None
+
         try:
-            candidate = apply_graph_edit(ctx.gm, payload, ctx.graph_id)
-            fingerprint = candidate_fingerprint(candidate, payload, ctx.graph_id)
-            local_apply = {
-                "rank": _rank(),
-                "success": fingerprint == payload.expected_result_fingerprint,
-                "fingerprint": fingerprint,
-                "error": None,
-            }
+            verify_proposal_identity(proposal, ctx.graph_slot, proposal_index)
+            live_fingerprint = structural_fingerprint(ctx.gm, ctx.graph_id)
+            frozen_fingerprint = structural_fingerprint(frozen.graph_module, ctx.graph_id)
+            identity_success = live_fingerprint == frozen.graph_fingerprint == frozen_fingerprint
+            identity_error = None if identity_success else "Local live/frozen graph identity changed"
         except Exception as exc:
-            local_apply = {
-                "rank": _rank(),
-                "success": False,
-                "fingerprint": None,
-                "error": str(exc),
-            }
+            live_fingerprint = None
+            frozen_fingerprint = None
+            identity_success = False
+            identity_error = str(exc)
+        local_identity = {
+            "rank": _rank(),
+            "success": identity_success,
+            "candidate_id": proposal.candidate_id,
+            "entrypoint": proposal.entrypoint,
+            "source_sha256": proposal.source_sha256,
+            "proposal_hash": proposal.proposal_hash,
+            "live_frozen_base_fingerprint": live_fingerprint,
+            "clone_frozen_base_fingerprint": frozen_fingerprint,
+            "error": identity_error,
+        }
+        identity_records = gather_rank_records(local_identity)
+        identity_values = {(record["candidate_id"], record["entrypoint"], record["source_sha256"],
+                            record["proposal_hash"])
+                           for record in identity_records if record["success"]}
+        identity_success = all(record["success"] for record in identity_records) and len(identity_values) == 1
+        validation["source_consensus"] = {"success": identity_success, "rank_results": identity_records}
+        validation["frozen_base_identity"] = {
+            "success": identity_success,
+            "fingerprint": frozen.graph_fingerprint,
+        }
+        if not identity_success:
+            rank_results = GraphAgentLoopOptimizer._failed_rank_results(identity_records,
+                                                                        "All-rank source/base identity failed")
+            packet = build_evaluation_packet(proposal, rank_results, frozen.baseline_aggregate,
+                                             frozen.graph_fingerprint, validation)
+            return candidate, candidate_profile, entrypoint, packet
+
+        phase_order = [
+            "clone", "write", "syntax", "import", "callable", "signature", "call", "return_contract", "lint",
+            "recompile", "fingerprint"
+        ]
+        local_validation = {phase: {"success": False, "skipped": True, "error": None} for phase in phase_order}
+        local_error = None
+        fingerprint_details = None
+        try:
+            candidate = clone_graph_module(frozen.graph_module)
+            local_validation["clone"] = {"success": True, "skipped": False, "error": None}
+            entrypoint = load_generated_pass(proposal, source_path)
+            for phase in ("write", "syntax", "import", "callable"):
+                local_validation[phase] = {"success": True, "skipped": False, "error": None}
+            candidate, entrypoint = apply_generated_pass(proposal, candidate, ctx, source_path, entrypoint)
+            for phase in ("signature", "call", "return_contract", "lint", "recompile"):
+                local_validation[phase] = {"success": True, "skipped": False, "error": None}
+            fingerprint_details = generated_graph_fingerprint_details(candidate, ctx.graph_id)
+            local_validation["fingerprint"] = {"success": True, "skipped": False, "error": None}
+        except GeneratedPassValidationError as exc:
+            local_error = f"{exc.phase}: {exc}"
+            if exc.phase in local_validation:
+                failed_index = phase_order.index(exc.phase)
+                for phase in phase_order[:failed_index]:
+                    if local_validation[phase]["skipped"]:
+                        local_validation[phase] = {"success": True, "skipped": False, "error": None}
+                local_validation[exc.phase] = {"success": False, "skipped": False, "error": str(exc)}
+        except Exception as exc:
+            local_error = f"clone_or_fingerprint: {exc}"
+            phase = "fingerprint" if candidate is not None else "clone"
+            local_validation[phase] = {"success": False, "skipped": False, "error": str(exc)}
+
+        local_apply = {
+            "rank": _rank(),
+            "success": local_error is None,
+            "fingerprint": None if fingerprint_details is None else fingerprint_details["fingerprint"],
+            "fingerprint_details": fingerprint_details,
+            "validation": local_validation,
+            "error": local_error,
+        }
         apply_records = gather_rank_records(local_apply)
-        apply_success = all(record["success"] for record in apply_records)
         fingerprints = {record["fingerprint"] for record in apply_records if record["success"]}
-        apply_success = apply_success and fingerprints == {payload.expected_result_fingerprint}
-        if not apply_success:
-            return candidate, candidate_profile, apply_records
+        fingerprint_success = all(record["success"] for record in apply_records) and len(fingerprints) == 1
+        validation["rank_mechanical"] = apply_records
+        for phase in phase_order:
+            phase_records = [{"rank": record["rank"], **record["validation"][phase]} for record in apply_records]
+            validation[phase] = {
+                "success": all(record["success"] for record in phase_records),
+                "rank_results": phase_records,
+            }
+        validation["candidate_fingerprint_consensus"] = {
+            "success": fingerprint_success,
+            "fingerprint": next(iter(fingerprints)) if fingerprint_success else None,
+            "opaque_fallbacks": [record.get("fingerprint_details") for record in apply_records],
+        }
+        if not fingerprint_success:
+            rank_results = GraphAgentLoopOptimizer._failed_rank_results(
+                apply_records, "Candidate fingerprint differed across ranks or another rank failed validation")
+            packet = build_evaluation_packet(proposal, rank_results, frozen.baseline_aggregate,
+                                             frozen.graph_fingerprint, validation)
+            return candidate, candidate_profile, entrypoint, packet
 
         profile_calls = None
         snapshots = None
         try:
             profile_calls = _capture_profile_calls(ctx)
-            snapshots = _snapshot_candidate_state(ctx.gm, profile_calls)
+            snapshots = _snapshot_candidate_state(candidate, profile_calls)
             local_snapshot = {"rank": _rank(), "success": True, "phase": "state_snapshot", "error": None}
         except Exception as exc:
             local_snapshot = {
@@ -568,8 +782,16 @@ class GraphAgentLoopOptimizer:
                 "error": str(exc),
             }
         snapshot_records = gather_rank_records(local_snapshot)
+        validation["state_snapshot"] = {
+            "success": all(record["success"] for record in snapshot_records),
+            "rank_results": snapshot_records
+        }
         if not all(record["success"] for record in snapshot_records):
-            return candidate, candidate_profile, snapshot_records
+            rank_results = GraphAgentLoopOptimizer._failed_rank_results(snapshot_records,
+                                                                        "Candidate state snapshot failed")
+            packet = build_evaluation_packet(proposal, rank_results, frozen.baseline_aggregate,
+                                             frozen.graph_fingerprint, validation)
+            return candidate, candidate_profile, entrypoint, packet
 
         profile_error = None
         restore_error = None
@@ -592,11 +814,16 @@ class GraphAgentLoopOptimizer:
                 restore_error = str(exc)
 
         if profile_error is None and restore_error is None:
+            local_metrics = _profile_metrics(candidate_profile, ctx.bwd, local=True)
+            reduced_metrics = _profile_metrics(candidate_profile, ctx.bwd)
             local_profile = {
                 "rank": _rank(),
                 "success": True,
-                "fingerprint": payload.expected_result_fingerprint,
-                "metrics": _profile_metrics(candidate_profile, ctx.bwd),
+                "fingerprint": next(iter(fingerprints)),
+                "local_device_time": local_metrics["device_time"],
+                "local_peak_memory": local_metrics["peak_memory"],
+                "reduced_device_time": reduced_metrics["device_time"],
+                "reduced_peak_memory": reduced_metrics["peak_memory"],
                 "error": None,
                 "abi": asdict(candidate_abi),
                 "abi_compatible": True,
@@ -612,55 +839,163 @@ class GraphAgentLoopOptimizer:
             local_profile = {
                 "rank": _rank(),
                 "success": False,
-                "fingerprint": payload.expected_result_fingerprint,
-                "metrics": None,
+                "fingerprint": next(iter(fingerprints)),
+                "local_device_time": None,
+                "local_peak_memory": None,
+                "reduced_device_time": None,
+                "reduced_peak_memory": None,
                 "error": "; ".join(errors),
                 "abi": None,
                 "abi_compatible": abi_error is None,
                 "state_restore_failed": restore_error is not None,
             }
-        profile_records = gather_rank_records(local_profile)
-        return candidate, candidate_profile, profile_records
+        profile_records = gather_rank_records(sanitize_json_value(local_profile))
+        if any(record.get("state_restore_failed", False) for record in profile_records):
+            raise RuntimeError("Candidate state restoration failed; frozen graph tensor state may be corrupted")
+        validation["runtime_abi"] = {
+            "success": all(record["success"] and record["abi_compatible"] for record in profile_records),
+            "rank_results": profile_records,
+        }
+        packet = build_evaluation_packet(proposal, profile_records, frozen.baseline_aggregate,
+                                         frozen.graph_fingerprint, validation)
+        return candidate, candidate_profile, entrypoint, packet
 
     @staticmethod
-    def _commit_candidate(ctx: OptimizationContext, tracker: GraphVersionTracker, candidate: GraphModule,
-                          candidate_profile: ProfilingResult) -> Tuple[bool, List[Dict[str, Any]]]:
-        previous_graph = ctx.gm.graph
+    def _restore_after_final_failure(ctx: OptimizationContext, frozen: FrozenGraphContext) -> List[Dict[str, Any]]:
         try:
-            ctx.gm.graph = candidate.graph
-            ctx.gm.recompile()
-            local = {
+            restore_frozen_base(ctx.gm, frozen)
+            local = {"rank": _rank(), "success": True, "error": None}
+        except Exception as exc:
+            local = {"rank": _rank(), "success": False, "error": str(exc)}
+        return gather_rank_records(local)
+
+    @staticmethod
+    def _finalize_candidate(ctx: OptimizationContext, frozen: FrozenGraphContext, proposal: GeneratedPassProposal,
+                            evaluation: Dict[str, Any], entrypoint: Callable, source_path: Path) -> Dict[str, Any]:
+        try:
+            proposal_index = int(proposal.candidate_id.split("_")[1])
+            verify_proposal_identity(proposal, ctx.graph_slot, proposal_index)
+            live_fingerprint = structural_fingerprint(ctx.gm, ctx.graph_id)
+            _hard_write_source(source_path, proposal.source)
+            source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            local_preflight = {
                 "rank": _rank(),
-                "success": True,
-                "fingerprint": structural_fingerprint(ctx.gm, ctx.graph_id),
+                "success": live_fingerprint == frozen.graph_fingerprint and source_hash == proposal.source_sha256,
+                "candidate_id": proposal.candidate_id,
+                "entrypoint": proposal.entrypoint,
+                "proposal_hash": proposal.proposal_hash,
+                "live_frozen_base_fingerprint": live_fingerprint,
+                "source_sha256": source_hash,
                 "error": None,
             }
         except Exception as exc:
-            local = {"rank": _rank(), "success": False, "fingerprint": None, "error": str(exc)}
-        records = gather_rank_records(local)
-        fingerprints = {record["fingerprint"] for record in records if record["success"]}
-        success = all(record["success"] for record in records) and len(fingerprints) == 1
-        if not success:
-            ctx.gm.graph = previous_graph
-            ctx.gm.recompile()
-            return False, records
-        ctx.profiling_results[ctx.graph_id] = candidate_profile
-        tracker.accept(ctx.gm)
-        return True, records
+            local_preflight = {
+                "rank": _rank(),
+                "success": False,
+                "candidate_id": proposal.candidate_id,
+                "entrypoint": proposal.entrypoint,
+                "proposal_hash": proposal.proposal_hash,
+                "live_frozen_base_fingerprint": None,
+                "source_sha256": None,
+                "error": str(exc),
+            }
+        preflight_records = gather_rank_records(local_preflight)
+        if not all(record["success"] for record in preflight_records):
+            return {"success": False, "live_source_executed": False, "preflight": preflight_records}
+
+        local_error = None
+        fingerprint_details = None
+        try:
+            apply_generated_pass(proposal, ctx.gm, ctx, source_path, entrypoint)
+            fingerprint_details = generated_graph_fingerprint_details(ctx.gm, ctx.graph_id)
+        except Exception as exc:
+            local_error = str(exc)
+        apply_records = gather_rank_records({
+            "rank":
+            _rank(),
+            "success":
+            local_error is None,
+            "fingerprint":
+            None if fingerprint_details is None else fingerprint_details["fingerprint"],
+            "fingerprint_details":
+            fingerprint_details,
+            "error":
+            local_error,
+        })
+        expected_fingerprint = evaluation["validation"]["candidate_fingerprint_consensus"]["fingerprint"]
+        final_fingerprints = {record["fingerprint"] for record in apply_records if record["success"]}
+        apply_success = (all(record["success"] for record in apply_records)
+                         and final_fingerprints == {expected_fingerprint})
+        if not apply_success:
+            restore_records = GraphAgentLoopOptimizer._restore_after_final_failure(ctx, frozen)
+            raise RuntimeError("Final generated-pass application failed after live source execution; "
+                               f"apply={apply_records}, graph_restore={restore_records}")
+
+        profile_calls = None
+        snapshots = None
+        try:
+            profile_calls = _capture_profile_calls(ctx)
+            snapshots = _snapshot_candidate_state(ctx.gm, profile_calls)
+            local_snapshot = {"rank": _rank(), "success": True, "error": None}
+        except Exception as exc:
+            local_snapshot = {"rank": _rank(), "success": False, "error": str(exc)}
+        snapshot_records = gather_rank_records(local_snapshot)
+        if not all(record["success"] for record in snapshot_records):
+            restore_records = GraphAgentLoopOptimizer._restore_after_final_failure(ctx, frozen)
+            raise RuntimeError("Final live state snapshot failed after source execution; "
+                               f"snapshot={snapshot_records}, graph_restore={restore_records}")
+
+        final_profile = None
+        final_abi = None
+        profile_error = None
+        tensor_restore_error = None
+        try:
+            final_profile, final_abi = _profile_graph(ctx.gm, ctx, profile_calls, expected_abi=ctx.runtime_abi)
+        except Exception as exc:
+            profile_error = str(exc)
+        finally:
+            try:
+                _restore_candidate_state(snapshots)
+            except Exception as exc:
+                tensor_restore_error = str(exc)
+        local_profile = {
+            "rank": _rank(),
+            "success": profile_error is None and tensor_restore_error is None,
+            "error": profile_error or tensor_restore_error,
+            "state_restore_failed": tensor_restore_error is not None,
+            "abi": None if final_abi is None else asdict(final_abi),
+            "local_metrics": None if final_profile is None else _profile_metrics(final_profile, ctx.bwd, local=True),
+            "reduced_metrics": None if final_profile is None else _profile_metrics(final_profile, ctx.bwd),
+        }
+        profile_records = gather_rank_records(sanitize_json_value(local_profile))
+        if not all(record["success"] for record in profile_records):
+            restore_records = GraphAgentLoopOptimizer._restore_after_final_failure(ctx, frozen)
+            raise RuntimeError("Final live profiling/restoration failed after source execution; "
+                               f"profile={profile_records}, graph_restore={restore_records}")
+
+        ctx.profiling_results[ctx.graph_id] = final_profile
+        ctx.runtime_abi = final_abi
+        return {
+            "success": True,
+            "live_source_executed": True,
+            "candidate_id": proposal.candidate_id,
+            "source_sha256": proposal.source_sha256,
+            "fingerprint": expected_fingerprint,
+            "preflight": preflight_records,
+            "apply": apply_records,
+            "profile": profile_records,
+        }
 
     def optimize(self, gm: GraphModule, ctx: OptimizationContext) -> OptimizationResult:
         trace = []
-        history = list(ctx.warmup_trace)
-        candidate_outcome_recorded = False
+        history = []
         is_rank_zero = _rank() == 0
-        slot = GraphSlotRef(index=ctx.graph_slot[0], direction=ctx.graph_slot[1])
-        tracker = GraphVersionTracker(slot, gm, ctx.graph_id)
         iteration_root, session_root, inspection_enabled = self._iteration_root(ctx, is_rank_zero)
         retain_temporary_root = self.debug_log
         if is_rank_zero and inspection_enabled:
             self._write_session_metadata(session_root, ctx)
 
-        consensus, consensus_records = self._snapshot_consensus(tracker)
+        consensus, consensus_records = self._snapshot_consensus(ctx)
         if not consensus:
             if is_rank_zero:
                 trace.append(
@@ -682,171 +1017,255 @@ class GraphAgentLoopOptimizer:
             retain_temporary_root = True
             return OptimizationResult(trace=trace)
 
-        for iteration in range(self.max_iterations):
-            iteration_dir = iteration_root / f"iter_{iteration}" if is_rank_zero else None
-            if is_rank_zero and inspection_enabled:
-                _safe_write_json(iteration_dir / "accepted_snapshot.json", asdict(tracker.current_ref()))
-                _safe_write_text(iteration_dir / "accepted_graph.py", ctx.gm.code)
+        frozen_graph = None
+        frozen_error = None
+        try:
+            frozen_graph = clone_graph_module(ctx.gm)
+            frozen_fingerprint = structural_fingerprint(frozen_graph, ctx.graph_id)
+            if frozen_fingerprint != structural_fingerprint(ctx.gm, ctx.graph_id):
+                raise RuntimeError("Frozen graph clone changed the post-required-pass topology")
+        except Exception as exc:
+            frozen_fingerprint = None
+            frozen_error = str(exc)
+        frozen_records = gather_rank_records({
+            "rank": _rank(),
+            "success": frozen_error is None,
+            "fingerprint": frozen_fingerprint,
+            "error": frozen_error,
+        })
+        frozen_fingerprints = {record["fingerprint"] for record in frozen_records if record["success"]}
+        if not all(record["success"] for record in frozen_records) or len(frozen_fingerprints) != 1:
+            if is_rank_zero:
+                trace.append(
+                    OptimizationTraceEntry(iteration=0,
+                                           action="abort",
+                                           summary="Unable to freeze one equivalent post-required-pass graph",
+                                           details={"rank_results": frozen_records}))
+            return OptimizationResult(trace=trace)
 
-            evaluation = None
-            edit = None
-            rank_zero_candidate = None
+        frozen = FrozenGraphContext(graph_module=frozen_graph,
+                                    graph_fingerprint=frozen_fingerprint,
+                                    graph_slot=ctx.graph_slot,
+                                    graph_order=list(ctx.graph_order),
+                                    baseline_rank_results=profile_records,
+                                    baseline_aggregate=aggregate_rank_metrics(profile_records),
+                                    mem_budget=ctx.mem_budget,
+                                    param_manager=ctx.param_manager)
+        reference_inventory = build_reference_pass_inventory() if is_rank_zero else None
+        if is_rank_zero:
+            inventory_path = (session_root if inspection_enabled else iteration_root) / "reference_pass_inventory.json"
+            _safe_write_json(inventory_path, reference_inventory)
+            _safe_write_json(
+                iteration_root / "frozen_base.json", {
+                    "graph_slot": list(ctx.graph_slot),
+                    "graph_fingerprint": frozen.graph_fingerprint,
+                    "baseline_rank_results": profile_records,
+                    "baseline_aggregate": frozen.baseline_aggregate,
+                    "required_pass_trace": ctx.warmup_trace,
+                })
+
+        rank_source_root = Path(tempfile.mkdtemp(prefix=f"deepcompile_generated_rank_{_rank()}_"))
+        loaded_entrypoints = {}
+        source_paths = {}
+        turn_index = 0
+        while True:
+            selection_only = len(history) >= self.max_iterations
+            turn_dir = iteration_root / f"turn_{turn_index:03d}" if is_rank_zero else None
             mechanical_feedback = []
             if is_rank_zero:
-                proposal_ready = False
-                proposal_error = None
+                response = None
+                response_error = None
+                selection_proposal = None
                 for attempt in range(self.max_retries + 1):
                     try:
-                        prompt = serialize_evaluation_context(ctx,
-                                                              tracker,
-                                                              history,
-                                                              mechanical_feedback=mechanical_feedback,
-                                                              candidate_required=not candidate_outcome_recorded)
-                        prefix = "accepted_graph_agent" if attempt == 0 else f"accepted_graph_agent_retry_{attempt}"
+                        prompt = serialize_search_context(ctx,
+                                                          frozen,
+                                                          reference_inventory,
+                                                          history,
+                                                          mechanical_feedback=mechanical_feedback,
+                                                          selection_only=selection_only)
+                        prefix = "search" if attempt == 0 else f"search_retry_{attempt}"
                         result = self._checked_run(self.graph_agent_runner,
                                                    prompt,
-                                                   iteration_dir,
-                                                   "graph_agent",
+                                                   turn_dir,
+                                                   "coding_agent",
                                                    artifact_prefix=prefix)
-                        evaluation = parse_evaluation_decision(result.stdout, tracker.current_ref(), "accepted_graph")
-                        if not candidate_outcome_recorded and evaluation.decision == "finish":
-                            raise AgentResponseError(
-                                "First accepted_graph decision must continue with one graph_edit before any candidate "
-                                "is executed; absence of candidate measurements is not a valid reason to finish")
-                        if evaluation.graph_edit is not None:
-                            edit, rank_zero_candidate = finalize_graph_edit(ctx.gm, evaluation.graph_edit,
-                                                                            ctx.graph_id)
-                            _safe_write_json(iteration_dir / "graph_edit.json", edit.to_dict())
-                        _safe_write_json(iteration_dir / "evaluation.json", evaluation.to_dict())
-                        trace.append(
-                            OptimizationTraceEntry(iteration=iteration,
-                                                   action="evaluate",
-                                                   summary=evaluation.summary,
-                                                   details={"decision": evaluation.decision}))
-                        proposal_ready = True
+                        response = parse_search_response(result.stdout, len(history), history, ctx.graph_slot)
+                        if selection_only and isinstance(response, GeneratedPassProposal):
+                            raise AgentResponseError("Candidate budget is exhausted; this turn must finish and select")
+                        if isinstance(response, GeneratedPassSelection):
+                            selection_proposal = validate_selection(response, history, frozen.graph_fingerprint)
                         break
                     except Exception as exc:
-                        proposal_error = str(exc)
-                        mechanical_feedback.append(proposal_error)
+                        response = None
+                        response_error = str(exc)
+                        mechanical_feedback.append(response_error)
                         trace.append(
-                            OptimizationTraceEntry(iteration=iteration,
-                                                   action="graph_agent_retry",
-                                                   summary=f"Mechanical graph proposal failed: {exc}",
+                            OptimizationTraceEntry(iteration=turn_index,
+                                                   action="coding_agent_retry",
+                                                   summary=f"Mechanical coding-agent response failed: {exc}",
                                                    details={"attempt": attempt + 1}))
-                evaluation_envelope = {
-                    "continue": proposal_ready and evaluation.decision == "continue",
-                    "error": None if proposal_ready else proposal_error,
-                }
-                if not proposal_ready:
+                if isinstance(response, GeneratedPassProposal):
+                    control_envelope = {"action": "evaluate", "proposal": response.to_dict(), "error": None}
+                elif isinstance(response, GeneratedPassSelection):
+                    control_envelope = {
+                        "action": "finish",
+                        "selection": response.to_dict(),
+                        "proposal": None if selection_proposal is None else selection_proposal.to_dict(),
+                        "error": None,
+                    }
+                else:
+                    control_envelope = {"action": "abort", "error": response_error}
                     retain_temporary_root = True
             else:
-                evaluation_envelope = None
-            evaluation_envelope = broadcast_json_payload(evaluation_envelope)
-            if not evaluation_envelope["continue"]:
-                break
+                control_envelope = None
+            control_envelope = broadcast_json_payload(control_envelope)
 
-            edit = broadcast_edit_payload(edit)
-            if edit is None:
-                break
-
-            candidate, candidate_profile, rank_results = self._apply_and_profile_candidate(ctx, edit)
-            candidate_success = all(record["success"] for record in rank_results)
-            candidate_context = None
-            if is_rank_zero:
-                display_candidate = candidate if candidate is not None else rank_zero_candidate
-                candidate_context = candidate_evaluation_payload(edit.to_dict(), display_candidate, rank_results,
-                                                                 ctx.graph_id)
-                _safe_write_json(iteration_dir / "candidate_result.json", candidate_context)
-                if display_candidate is not None and inspection_enabled:
-                    _safe_write_text(iteration_dir / "candidate_graph.py", display_candidate.code)
-
-            state_restore_failed = any(record.get("state_restore_failed", False) for record in rank_results)
-            if state_restore_failed:
-                retain_temporary_root = True
+            if control_envelope["action"] == "abort":
                 if is_rank_zero:
                     trace.append(
-                        OptimizationTraceEntry(iteration=iteration,
+                        OptimizationTraceEntry(iteration=turn_index,
                                                action="abort",
-                                               summary="Candidate state restoration failed",
-                                               details={"rank_results": rank_results}))
-                raise RuntimeError("Candidate state restoration failed; accepted tensor state may be corrupted")
+                                               summary="Coding-agent response retries exhausted; no selection made",
+                                               details={"error": control_envelope.get("error")}))
+                break
 
-            abi_incompatible = any(record.get("abi_compatible") is False for record in rank_results)
-            stop_after_candidate = False
-            if is_rank_zero:
-                candidate_decision = None
-                if abi_incompatible:
-                    accept = False
-                    candidate_summary = "Candidate runtime ABI is incompatible with the accepted AOT caller"
-                else:
-                    try:
-                        prompt = serialize_evaluation_context(ctx, tracker, history, candidate=candidate_context)
-                        result = self._checked_run(self.graph_agent_runner,
-                                                   prompt,
-                                                   iteration_dir,
-                                                   "graph_agent",
-                                                   artifact_prefix="candidate_graph_agent")
-                        candidate_result_fingerprint = edit.expected_result_fingerprint
-                        candidate_decision = parse_evaluation_decision(
-                            result.stdout,
-                            tracker.current_ref(),
-                            "candidate",
-                            candidate_generation=edit.generation,
-                            candidate_fingerprint=candidate_result_fingerprint)
-                        accept = candidate_decision.decision == "accept" and candidate_success
-                        if candidate_decision.decision == "accept" and not candidate_success:
-                            candidate_decision.summary += " (mechanical apply/profile failure forced rejection)"
-                        _safe_write_json(iteration_dir / "candidate_evaluation.json", candidate_decision.to_dict())
-                        candidate_summary = candidate_decision.summary
-                    except Exception as exc:
-                        accept = False
-                        stop_after_candidate = True
-                        retain_temporary_root = True
-                        candidate_summary = None
+            if control_envelope["action"] == "finish":
+                selection = GeneratedPassSelection(**control_envelope["selection"])
+                selected_proposal = None
+                selection_error = None
+                finalization_error = None
+                try:
+                    selected_proposal = validate_selection(selection, history, frozen.graph_fingerprint)
+                    rebroadcast_proposal = control_envelope.get("proposal")
+                    expected_proposal = None if selected_proposal is None else selected_proposal.to_dict()
+                    if rebroadcast_proposal != expected_proposal:
+                        raise AgentResponseError("Final selected source envelope does not match stored exact bytes")
+                    local_selection = {"rank": _rank(), "success": True, "error": None}
+                except Exception as exc:
+                    selection_error = str(exc)
+                    local_selection = {"rank": _rank(), "success": False, "error": selection_error}
+                selection_records = gather_rank_records(local_selection)
+                if not all(record["success"] for record in selection_records):
+                    if is_rank_zero:
                         trace.append(
-                            OptimizationTraceEntry(iteration=iteration,
+                            OptimizationTraceEntry(iteration=turn_index,
                                                    action="abort",
-                                                   summary=f"Candidate graph agent failed: {exc}"))
-                decision_envelope = {
-                    "accept": accept,
-                    "stop": stop_after_candidate,
-                    "summary": candidate_summary,
-                }
-            else:
-                decision_envelope = None
-            decision_envelope = broadcast_json_payload(decision_envelope)
+                                                   summary="Final selection identity was invalid",
+                                                   details={"rank_results": selection_records}))
+                    break
 
-            accepted = False
-            commit_records = []
-            if decision_envelope["accept"]:
-                if candidate is not None and candidate_profile is not None:
-                    accepted, commit_records = self._commit_candidate(ctx, tracker, candidate, candidate_profile)
-                if not accepted:
+                if selection.kind == "baseline":
+                    live_fingerprint = None
+                    baseline_error = None
+                    try:
+                        live_fingerprint = structural_fingerprint(ctx.gm, ctx.graph_id)
+                        if live_fingerprint != frozen.graph_fingerprint:
+                            raise RuntimeError("Live graph no longer matches the frozen baseline")
+                    except Exception as exc:
+                        baseline_error = str(exc)
+                    final_record = {
+                        "rank": _rank(),
+                        "success": baseline_error is None,
+                        "fingerprint": live_fingerprint,
+                        "error": baseline_error,
+                    }
+                    final_records = gather_rank_records(final_record)
+                    final_application = {
+                        "selection": selection.to_dict(),
+                        "success": all(record["success"] for record in final_records),
+                        "live_source_executed": False,
+                        "rank_results": final_records,
+                    }
+                else:
+                    entrypoint = loaded_entrypoints.get(selected_proposal.candidate_id)
+                    selected_history = next(record for record in history
+                                            if record["proposal"]["candidate_id"] == selected_proposal.candidate_id)
+                    loaded_records = gather_rank_records({
+                        "rank":
+                        _rank(),
+                        "success":
+                        entrypoint is not None,
+                        "error":
+                        None if entrypoint is not None else "Selected generated-pass module is not loaded",
+                    })
+                    if not all(record["success"] for record in loaded_records):
+                        final_application = {
+                            "success": False,
+                            "live_source_executed": False,
+                            "error": "Selected generated-pass module is not loaded on every rank",
+                            "rank_results": loaded_records,
+                        }
+                    else:
+                        try:
+                            final_application = self._finalize_candidate(ctx, frozen, selected_proposal,
+                                                                         selected_history["evaluation"], entrypoint,
+                                                                         source_paths[selected_proposal.candidate_id])
+                        except Exception as exc:
+                            finalization_error = exc
+                            final_application = {
+                                "success": False,
+                                "live_source_executed": True,
+                                "candidate_id": selected_proposal.candidate_id,
+                                "source_sha256": selected_proposal.source_sha256,
+                                "error": str(exc),
+                            }
+
+                if is_rank_zero:
+                    _safe_write_json(iteration_root / "selection.json", selection.to_dict())
+                    _safe_write_json(iteration_root / "final_application.json", final_application)
+                    action = "selected" if final_application["success"] else "abort"
+                    summary = selection.summary if final_application["success"] else "Final selection failed"
+                    trace.append(
+                        OptimizationTraceEntry(iteration=turn_index,
+                                               action=action,
+                                               summary=summary,
+                                               details=final_application))
+                if not final_application["success"]:
                     retain_temporary_root = True
-            outcome = "accepted" if accepted else "rejected"
+                if finalization_error is not None:
+                    raise finalization_error
+                break
+
+            proposal = GeneratedPassProposal(**control_envelope["proposal"])
+            proposal_index = len(history)
+            source_path = rank_source_root / proposal.candidate_id / "generated_pass.py"
+            source_paths[proposal.candidate_id] = source_path
+            candidate, candidate_profile, entrypoint, evaluation = self._apply_and_profile_candidate(
+                ctx, frozen, proposal, proposal_index, source_path)
+            if entrypoint is not None:
+                loaded_entrypoints[proposal.candidate_id] = entrypoint
             history_entry = {
-                "generation": edit.generation,
-                "outcome": outcome,
-                "reason": edit.reason,
-                "edit": edit.to_dict(),
-                "rank_results": rank_results,
-                "commit_results": commit_records,
-                "evaluator_summary": decision_envelope["summary"],
+                "turn_index": turn_index,
+                "summary": proposal.summary,
+                "proposal": proposal.to_dict(),
+                "evaluation": evaluation,
             }
             history.append(history_entry)
-            candidate_outcome_recorded = True
             if is_rank_zero:
-                _safe_write_json(iteration_dir / "outcome.json", history_entry)
+                candidate_dir = iteration_root / f"candidate_{proposal_index:03d}"
+                _safe_write_text(candidate_dir / "generated_pass.py", proposal.source)
+                _safe_write_json(
+                    candidate_dir / "proposal.json", {
+                        **proposal.to_dict(),
+                        "source": "stored in generated_pass.py",
+                        "turn_index": turn_index,
+                        "frozen_base_fingerprint": frozen.graph_fingerprint,
+                        "inventory_sha256": reference_inventory["inventory_sha256"],
+                    })
+                _safe_write_json(candidate_dir / "validation.json", evaluation["validation"])
+                _safe_write_json(candidate_dir / "evaluation.json", evaluation)
+                if candidate is not None and inspection_enabled:
+                    _safe_write_text(candidate_dir / "candidate_graph.py", candidate.code)
                 trace.append(
-                    OptimizationTraceEntry(iteration=iteration,
-                                           action=outcome,
-                                           summary=decision_envelope["summary"] or outcome,
+                    OptimizationTraceEntry(iteration=proposal_index,
+                                           action="evaluated",
+                                           summary=proposal.summary,
                                            details={
-                                               "generation": edit.generation,
-                                               "rank_results": rank_results,
+                                               "candidate_id": proposal.candidate_id,
+                                               "valid": evaluation["valid"],
+                                               "result_fingerprint": evaluation["result_fingerprint"],
                                            }))
-            if decision_envelope["stop"]:
-                break
 
             cleanup_error = None
             try:
@@ -862,11 +1281,12 @@ class GraphAgentLoopOptimizer:
                 retain_temporary_root = True
                 if is_rank_zero:
                     trace.append(
-                        OptimizationTraceEntry(iteration=iteration,
+                        OptimizationTraceEntry(iteration=proposal_index,
                                                action="abort",
                                                summary="Post-candidate cleanup failed",
                                                details={"rank_results": cleanup_records}))
                 break
+            turn_index += 1
 
         if is_rank_zero and not inspection_enabled and not retain_temporary_root and iteration_root.exists():
             shutil.rmtree(iteration_root, ignore_errors=True)

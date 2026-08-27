@@ -4,15 +4,52 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
-from typing import Any, Dict, List, Optional
+import math
+from pathlib import Path
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from torch.fx import GraphModule
+from .graph_edit import RUNTIME_GRAPH_ID, normalized_graph, normalized_graph_order
 
-from .graph_edit import (RUNTIME_GRAPH_ID, SCHEMA_VERSION, GraphEditPayload, normalized_graph, normalized_graph_order,
-                         structural_fingerprint)
+GENERATED_PASS_SCHEMA_VERSION = 1
+GENERATED_PASS_ENTRYPOINT = "deepcompile_pass"
+BASE_COMMIT_INFORMATIONAL = "55a0d29ac5292fab89c03eece4dab77195b37a17"
 
-EVALUATION_SCHEMA_VERSION = 4
+_REFERENCE_PASS_FILES = (
+    "passes/contract.py",
+    "passes/zero3_compile.py",
+    "passes/prefetch.py",
+    "passes/selective_gather.py",
+    "passes/offload_activation.py",
+    "passes/offload_parameters.py",
+    "passes/offload_adam_states.py",
+    "passes/long_context_checkpointing.py",
+    "passes/zero_1_and_2_compile.py",
+    "passes/tp_compile.py",
+    "passes/sp_compile.py",
+    "list_schedule.py",
+)
+_REFERENCE_ENTRYPOINTS = {
+    "passes/contract.py": ["validate_schedule"],
+    "passes/zero3_compile.py": ["add_z3_gather_release"],
+    "passes/prefetch.py": ["schedule_prefetch"],
+    "passes/selective_gather.py": ["selective_gather"],
+    "passes/offload_activation.py": ["offload_activation", "offload_activation_floor"],
+    "passes/offload_parameters.py": ["offload_parameter_fwd"],
+    "passes/offload_adam_states.py": ["offload_adam_states_for_init", "move_opt_states", "move_opt_states_sync"],
+    "passes/long_context_checkpointing.py": ["register_long_context_checkpointing"],
+    "passes/zero_1_and_2_compile.py": ["add_z1_reduce"],
+    "passes/tp_compile.py": ["apply_autotp"],
+    "passes/sp_compile.py": ["apply_autosp"],
+    "list_schedule.py": ["list_schedule", "simple_prefetch", "fast_free_schedule"],
+}
+_PROMPT_REFERENCE_FILES = (
+    "passes/zero3_compile.py",
+    "passes/prefetch.py",
+    "passes/selective_gather.py",
+)
 
 
 class AgentResponseError(ValueError):
@@ -58,149 +95,187 @@ def extract_json_object(raw_stdout: str) -> str:
     raise AgentResponseError("Agent output contains an unterminated JSON object")
 
 
-@dataclass(frozen=True)
-class GraphSlotRef:
-    index: int
-    direction: str
+def _canonical_json(payload: Any) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _payload_hash(payload: Any) -> str:
+    return _sha256_text(_canonical_json(payload))
 
 
 @dataclass(frozen=True)
-class GraphSnapshotRef:
-    graph_slot: GraphSlotRef
-    generation: int
-    graph_fingerprint: str
-
-
-class GraphVersionTracker:
-
-    def __init__(self, slot: GraphSlotRef, gm: GraphModule, runtime_graph_id: int):
-        self._slot = slot
-        self._generation = 0
-        self._gm = gm
-        self._runtime_graph_id = runtime_graph_id
-
-    def current_ref(self) -> GraphSnapshotRef:
-        return GraphSnapshotRef(graph_slot=self._slot,
-                                generation=self._generation,
-                                graph_fingerprint=structural_fingerprint(self._gm, self._runtime_graph_id))
-
-    def accept(self, gm: GraphModule) -> GraphSnapshotRef:
-        self._generation += 1
-        self._gm = gm
-        return self.current_ref()
-
-
-@dataclass
-class EvaluationDecision:
-    schema_version: int
-    based_on: GraphSnapshotRef
-    decision: str
+class GeneratedPassProposal:
+    candidate_id: str
     summary: str
-    graph_edit: Optional[GraphEditPayload] = None
-    candidate_generation: Optional[int] = None
-    candidate_fingerprint: Optional[str] = None
+    entrypoint: str
+    source: str
+    source_sha256: str
+    module_name: str
+    proposal_hash: str
 
     def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        payload["graph_edit"] = None if self.graph_edit is None else self.graph_edit.to_dict()
-        return payload
+        return asdict(self)
 
 
-def _slot_from_dict(payload: Any) -> GraphSlotRef:
+@dataclass(frozen=True)
+class GeneratedPassSelection:
+    summary: str
+    kind: str
+    candidate_id: Optional[str] = None
+    source_sha256: Optional[str] = None
+    entrypoint: Optional[str] = None
+    frozen_base_fingerprint: Optional[str] = None
+    result_fingerprint: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _build_proposal(summary: str, source: str, graph_slot: Tuple[int, str], proposal_index: int):
+    source_sha256 = _sha256_text(source)
+    candidate_id = f"candidate_{proposal_index:03d}_{source_sha256[:8]}"
+    slot = re.sub(r"[^0-9A-Za-z_]", "_", f"{graph_slot[0]}_{graph_slot[1]}")
+    module_name = f"deepcompile_generated_pass_{slot}_{proposal_index:03d}_{source_sha256}"
+    identity = {
+        "candidate_id": candidate_id,
+        "entrypoint": GENERATED_PASS_ENTRYPOINT,
+        "module_name": module_name,
+        "source": source,
+    }
+    return GeneratedPassProposal(candidate_id=candidate_id,
+                                 summary=summary,
+                                 entrypoint=GENERATED_PASS_ENTRYPOINT,
+                                 source=source,
+                                 source_sha256=source_sha256,
+                                 module_name=module_name,
+                                 proposal_hash=_payload_hash(identity))
+
+
+def verify_proposal_identity(proposal: GeneratedPassProposal, graph_slot: Tuple[int, str],
+                             proposal_index: int) -> None:
+    expected = _build_proposal(proposal.summary, proposal.source, graph_slot, proposal_index)
+    if proposal != expected:
+        raise ValueError(f"Generated-pass identity mismatch for {proposal.candidate_id}")
+
+
+def _required_string(payload: Dict[str, Any], name: str, allow_empty: bool = False) -> str:
+    value = payload.get(name)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise AgentResponseError(f"{name} must be a {'string' if allow_empty else 'non-empty string'}")
+    return value
+
+
+def _parse_selection(payload: Any, summary: str) -> GeneratedPassSelection:
     if not isinstance(payload, dict):
-        raise AgentResponseError("graph_slot must be an object")
-    index = payload.get("index")
-    direction = payload.get("direction")
-    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-        raise AgentResponseError("graph_slot.index must be a non-negative integer")
-    if direction not in {"fwd", "bwd"}:
-        raise AgentResponseError("graph_slot.direction must be 'fwd' or 'bwd'")
-    return GraphSlotRef(index=index, direction=direction)
+        raise AgentResponseError("finish.selection must be an object")
+    kind = payload.get("kind")
+    if kind == "baseline":
+        if set(payload) != {"kind", "frozen_base_fingerprint"}:
+            raise AgentResponseError("baseline selection requires only kind and frozen_base_fingerprint")
+        return GeneratedPassSelection(summary=summary,
+                                      kind=kind,
+                                      frozen_base_fingerprint=_required_string(payload, "frozen_base_fingerprint"))
+    if kind == "candidate":
+        expected_fields = {"kind", "candidate_id", "source_sha256", "entrypoint", "result_fingerprint"}
+        if set(payload) != expected_fields:
+            raise AgentResponseError(f"candidate selection requires exactly {sorted(expected_fields)}")
+        entrypoint = _required_string(payload, "entrypoint")
+        if entrypoint != GENERATED_PASS_ENTRYPOINT:
+            raise AgentResponseError(f"entrypoint must be '{GENERATED_PASS_ENTRYPOINT}'")
+        return GeneratedPassSelection(summary=summary,
+                                      kind=kind,
+                                      candidate_id=_required_string(payload, "candidate_id"),
+                                      source_sha256=_required_string(payload, "source_sha256"),
+                                      entrypoint=entrypoint,
+                                      result_fingerprint=_required_string(payload, "result_fingerprint"))
+    raise AgentResponseError("selection.kind must be 'baseline' or 'candidate'")
 
 
-def graph_snapshot_from_dict(payload: Any) -> GraphSnapshotRef:
-    if not isinstance(payload, dict):
-        raise AgentResponseError("based_on must be an object")
-    generation = payload.get("generation")
-    fingerprint = payload.get("graph_fingerprint")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
-        raise AgentResponseError("based_on.generation must be a non-negative integer")
-    if not isinstance(fingerprint, str) or not fingerprint:
-        raise AgentResponseError("based_on.graph_fingerprint must be a non-empty string")
-    return GraphSnapshotRef(graph_slot=_slot_from_dict(payload.get("graph_slot")),
-                            generation=generation,
-                            graph_fingerprint=fingerprint)
-
-
-def _graph_edit_from_dict(payload: Any, expected_ref: GraphSnapshotRef) -> GraphEditPayload:
-    try:
-        graph_edit = GraphEditPayload.from_dict(payload)
-    except ValueError as exc:
-        raise AgentResponseError(str(exc)) from exc
-    expected_slot = (expected_ref.graph_slot.index, expected_ref.graph_slot.direction)
-    if graph_edit.graph_slot != expected_slot:
-        raise AgentResponseError(f"Graph edit targets graph slot {graph_edit.graph_slot}, expected {expected_slot}")
-    if graph_edit.generation != expected_ref.generation + 1:
-        raise AgentResponseError(f"Graph edit generation {graph_edit.generation} does not follow accepted generation "
-                                 f"{expected_ref.generation}")
-    if graph_edit.base_fingerprint != expected_ref.graph_fingerprint:
-        raise AgentResponseError(f"Graph edit base {graph_edit.base_fingerprint} does not match accepted graph "
-                                 f"{expected_ref.graph_fingerprint}")
-    if graph_edit.expected_result_fingerprint is not None:
-        raise AgentResponseError("Graph agent must leave expected_result_fingerprint null for rank-zero finalization")
-    return graph_edit
-
-
-def parse_evaluation_decision(raw_stdout: str,
-                              expected_ref: GraphSnapshotRef,
-                              stage: str,
-                              candidate_generation: Optional[int] = None,
-                              candidate_fingerprint: Optional[str] = None) -> EvaluationDecision:
+def parse_search_response(raw_stdout: str, evaluated_count: int, history: List[Dict[str, Any]],
+                          graph_slot: Tuple[int, str]) -> Union[GeneratedPassProposal, GeneratedPassSelection]:
     try:
         payload = json.loads(extract_json_object(raw_stdout))
     except json.JSONDecodeError as exc:
-        raise AgentResponseError(f"Graph agent returned invalid JSON: {exc}") from exc
+        raise AgentResponseError(f"Coding agent returned invalid JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise AgentResponseError("Graph agent decision must be an object")
-    if payload.get("schema_version") != EVALUATION_SCHEMA_VERSION:
-        raise AgentResponseError(f"Unsupported evaluation schema_version {payload.get('schema_version')}")
-    based_on = graph_snapshot_from_dict(payload.get("based_on"))
-    if based_on != expected_ref:
-        raise AgentResponseError(f"Stale evaluation decision: expected {asdict(expected_ref)}, "
-                                 f"received {asdict(based_on)}")
-    decision = payload.get("decision")
-    allowed = {"continue", "finish"} if stage == "accepted_graph" else {"accept", "reject"}
-    if decision not in allowed:
-        raise AgentResponseError(f"Graph agent decision for stage '{stage}' must be one of {sorted(allowed)}")
-    summary = payload.get("summary")
-    if not isinstance(summary, str):
-        raise AgentResponseError("summary must be a string")
-    graph_edit_payload = payload.get("graph_edit")
-    if stage == "accepted_graph" and decision == "continue":
-        if graph_edit_payload is None:
-            raise AgentResponseError("continue requires one graph_edit object")
-        graph_edit = _graph_edit_from_dict(graph_edit_payload, expected_ref)
-    else:
-        if graph_edit_payload is not None:
-            raise AgentResponseError(f"{decision} requires graph_edit to be null or absent")
-        graph_edit = None
-    response_generation = payload.get("candidate_generation")
-    response_fingerprint = payload.get("candidate_fingerprint")
-    if stage == "candidate":
-        if response_generation != candidate_generation:
-            raise AgentResponseError(f"Graph agent candidate_generation must be {candidate_generation}")
-        if response_fingerprint != candidate_fingerprint:
-            raise AgentResponseError(f"Graph agent candidate_fingerprint must be {candidate_fingerprint}")
-    elif response_generation is not None or response_fingerprint is not None:
-        raise AgentResponseError("candidate_generation and candidate_fingerprint must be null when evaluating the "
-                                 "accepted graph")
-    return EvaluationDecision(schema_version=EVALUATION_SCHEMA_VERSION,
-                              based_on=based_on,
-                              decision=decision,
-                              summary=summary,
-                              graph_edit=graph_edit,
-                              candidate_generation=response_generation,
-                              candidate_fingerprint=response_fingerprint)
+        raise AgentResponseError("Coding-agent response must be an object")
+    if payload.get("schema_version") != GENERATED_PASS_SCHEMA_VERSION:
+        raise AgentResponseError(f"Unsupported generated-pass schema_version {payload.get('schema_version')}")
+    summary = _required_string(payload, "summary", allow_empty=True)
+    action = payload.get("action")
+    if action == "evaluate":
+        if set(payload) != {"schema_version", "action", "summary", "entrypoint", "source"}:
+            raise AgentResponseError("evaluate requires exactly schema_version, action, summary, entrypoint, source")
+        if payload.get("entrypoint") != GENERATED_PASS_ENTRYPOINT:
+            raise AgentResponseError(f"entrypoint must be '{GENERATED_PASS_ENTRYPOINT}'")
+        source = _required_string(payload, "source")
+        return _build_proposal(summary, source, graph_slot, evaluated_count)
+    if action == "finish":
+        if evaluated_count == 0:
+            raise AgentResponseError("The first coding-agent turn must evaluate one complete pass source")
+        if set(payload) != {"schema_version", "action", "summary", "selection"}:
+            raise AgentResponseError("finish requires exactly schema_version, action, summary, and selection")
+        selection = _parse_selection(payload.get("selection"), summary)
+        validate_selection(selection, history)
+        return selection
+    raise AgentResponseError("action must be 'evaluate' or 'finish'")
+
+
+def validate_selection(selection: GeneratedPassSelection,
+                       history: List[Dict[str, Any]],
+                       frozen_base_fingerprint: Optional[str] = None) -> Optional[GeneratedPassProposal]:
+    if selection.kind == "baseline":
+        expected = frozen_base_fingerprint
+        if expected is None and history:
+            expected = history[0]["evaluation"].get("frozen_base_fingerprint")
+        if expected is None or selection.frozen_base_fingerprint != expected:
+            raise AgentResponseError("Baseline selection does not match the exact frozen-base fingerprint")
+        return None
+
+    for record in history:
+        proposal_payload = record.get("proposal", {})
+        evaluation = record.get("evaluation", {})
+        if proposal_payload.get("candidate_id") != selection.candidate_id:
+            continue
+        required = {
+            "source_sha256": selection.source_sha256,
+            "entrypoint": selection.entrypoint,
+        }
+        for field, expected in required.items():
+            if proposal_payload.get(field) != expected:
+                raise AgentResponseError(f"Selected candidate has a stale {field}")
+        if not evaluation.get("valid"):
+            raise AgentResponseError("Selected candidate was not mechanically valid on every rank")
+        if evaluation.get("result_fingerprint") != selection.result_fingerprint:
+            raise AgentResponseError("Selected candidate has a stale result_fingerprint")
+        return GeneratedPassProposal(**proposal_payload)
+    raise AgentResponseError(f"Selected candidate '{selection.candidate_id}' was not evaluated in this graph slot")
+
+
+def build_reference_pass_inventory(source_root: Optional[Path] = None) -> Dict[str, Any]:
+    root = Path(__file__).resolve().parent if source_root is None else Path(source_root).resolve()
+    files = []
+    for relative_path in _REFERENCE_PASS_FILES:
+        path = root / relative_path
+        source = path.read_text(encoding="utf-8")
+        files.append({
+            "path": f"deepspeed/compile/{relative_path}",
+            "sha256": _sha256_text(source),
+            "entrypoints": list(_REFERENCE_ENTRYPOINTS[relative_path]),
+            "source": source,
+        })
+    inventory = {
+        "schema_version": GENERATED_PASS_SCHEMA_VERSION,
+        "source_root": str(root),
+        "base_commit_informational": BASE_COMMIT_INFORMATIONAL,
+        "files": files,
+    }
+    inventory["inventory_sha256"] = _payload_hash(inventory)
+    return inventory
 
 
 def _profile_payload(profile, bwd: bool) -> Dict[str, Any]:
@@ -221,191 +296,174 @@ def _profile_payload(profile, bwd: bool) -> Dict[str, Any]:
     }
 
 
-def _aggregate_candidate_profiles(rank_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    successful = [
-        result for result in rank_results if result.get("success") and isinstance(result.get("metrics"), dict)
-    ]
-    device_times = [result["metrics"]["device_time"] for result in successful]
-    peak_memory = [result["metrics"]["peak_memory"] for result in successful]
+def _inventory_prompt_context(inventory: Dict[str, Any]) -> Dict[str, Any]:
+    manifest = [{key: value for key, value in item.items() if key != "source"} for item in inventory["files"]]
+    prompt_paths = {f"deepspeed/compile/{path}" for path in _PROMPT_REFERENCE_FILES}
+    examples = [{
+        "path": item["path"],
+        "sha256": item["sha256"],
+        "source": item["source"],
+    } for item in inventory["files"] if item["path"] in prompt_paths]
     return {
-        "rank_results": rank_results,
-        "successful_rank_count": len(successful),
+        "source_root": inventory["source_root"],
+        "inventory_sha256": inventory["inventory_sha256"],
+        "manifest": manifest,
+        "closest_complete_sources": examples,
+    }
+
+
+def serialize_search_context(ctx,
+                             frozen,
+                             inventory: Dict[str, Any],
+                             history: List[Dict[str, Any]],
+                             mechanical_feedback: Optional[List[str]] = None,
+                             selection_only: bool = False) -> str:
+    evaluated_count = len(history)
+    if selection_only:
+        allowed_actions = ["finish"]
+    elif evaluated_count == 0:
+        allowed_actions = ["evaluate"]
+    else:
+        allowed_actions = ["evaluate", "finish"]
+    payload = {
+        "role": "deepcompile_coding_agent",
+        "objective": "Write complete Python source for an experimental DeepCompile optimization pass, then use "
+        "observed evaluations to revise the complete source or explicitly select a result.",
+        "graph_slot": {
+            "index": ctx.graph_slot[0],
+            "direction": ctx.graph_slot[1],
+        },
+        "frozen_base": {
+            "fingerprint": frozen.graph_fingerprint,
+            "nodes": normalized_graph(frozen.graph_module, include_hints=True, runtime_graph_id=ctx.graph_id),
+            "profile": _profile_payload(ctx.profiling_results[ctx.graph_id], ctx.bwd),
+            "baseline_rank_results": frozen.baseline_rank_results,
+        },
+        "graph_runtime": {
+            "graph_id": dict(RUNTIME_GRAPH_ID),
+            "graph_order": normalized_graph_order(ctx.graph_order, ctx.graph_id),
+            "direction": "bwd" if ctx.bwd else "fwd",
+            "mem_budget": ctx.mem_budget,
+            "param_manager_type": type(ctx.param_manager).__module__ + "." + type(ctx.param_manager).__qualname__,
+        },
+        "required_pass_trace": ctx.warmup_trace,
+        "reference_passes": _inventory_prompt_context(inventory),
+        "history": history,
+        "mechanical_feedback": list(mechanical_feedback or []),
+        "selection_only": selection_only,
+        "response_contract": {
+            "schema_version":
+            GENERATED_PASS_SCHEMA_VERSION,
+            "allowed_actions":
+            allowed_actions,
+            "evaluate": {
+                "fields": ["schema_version", "action=evaluate", "summary", "entrypoint", "source"],
+                "entrypoint": GENERATED_PASS_ENTRYPOINT,
+                "source": "complete Python file source, not a patch or edit sequence",
+            },
+            "finish": {
+                "baseline": ["kind=baseline", "frozen_base_fingerprint"],
+                "candidate": ["kind=candidate", "candidate_id", "source_sha256", "entrypoint", "result_fingerprint"],
+            },
+            "instructions": [
+                "Return exactly one JSON object and no prose.",
+                "The first turn must evaluate one complete source. Later turns may evaluate another complete source "
+                "or finish; there is no minimum of two candidates.",
+                "Each source runs from a fresh clone of this frozen base. Revised source must contain every change "
+                "you want evaluated; candidates do not accumulate.",
+                "The fixed deepcompile_pass callable receives gm, graph_id, graph_order, profiling_results, "
+                "create_inputs_fn, mem_budget, param_manager, and bwd. Return None or the identical gm.",
+                "Do not call collectives in the pass body. Rank-dependent graph rewrites fail fingerprint consensus; "
+                "inserting collective nodes into the graph is allowed.",
+                "Evaluation reports observations and has no automatic latency threshold or correctness oracle.",
+                "Generated source is trusted code with no sandbox or import/operator allowlist.",
+                "Graph cloning does not roll back arbitrary Python, module-global, filesystem, native, param_manager, "
+                "or rank-divergent collective side effects. The selected pass body executes again on the live graph.",
+            ],
+        },
+    }
+    return json.dumps(sanitize_json_value(payload), indent=2, default=str, allow_nan=False)
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"non_finite_float": str(value)}
+    if isinstance(value, dict):
+        return {str(key): sanitize_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json_value(item) for item in value]
+    return value
+
+
+def aggregate_rank_metrics(rank_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    successful = [record for record in rank_results if record.get("success")]
+    device_times = [
+        record["local_device_time"] for record in successful
+        if isinstance(record.get("local_device_time"), (int, float))
+    ]
+    peak_memory = [
+        record["local_peak_memory"] for record in successful
+        if isinstance(record.get("local_peak_memory"), (int, float))
+    ]
+    return {
         "device_time": {
             "mean": sum(device_times) / len(device_times) if device_times else None,
             "min": min(device_times) if device_times else None,
             "max": max(device_times) if device_times else None,
         },
         "peak_memory": {
-            "max": max(peak_memory) if peak_memory else None
+            "max": max(peak_memory) if peak_memory else None,
         },
     }
 
 
-def _graph_edit_contract(ctx, snapshot: GraphSnapshotRef) -> Dict[str, Any]:
-    return {
+def build_evaluation_packet(proposal: GeneratedPassProposal, rank_results: List[Dict[str, Any]],
+                            baseline_aggregate: Dict[str, Any], frozen_base_fingerprint: str,
+                            validation: Dict[str, Any]) -> Dict[str, Any]:
+    rank_results = sanitize_json_value(rank_results)
+    valid = bool(rank_results) and all(record.get("success") for record in rank_results)
+    packet = {
         "schema_version":
-        SCHEMA_VERSION,
-        "identity": {
-            "generation": snapshot.generation + 1,
-            "graph_slot": list(ctx.graph_slot),
-            "base_fingerprint": snapshot.graph_fingerprint,
-            "expected_result_fingerprint": None,
-        },
-        "operations": {
-            "create_node": {
-                "fields": [
-                    "op=create_node", "id", "node_op", "target", "args", "kwargs", "name_hint(optional)",
-                    "copy_meta_from(optional)", "meta(optional recursively JSON/data-only patches)"
-                ],
-                "node_ops": ["placeholder", "get_attr", "call_function", "call_method", "call_module", "output"],
-                "targets":
-                "call_function uses an importable symbolic path such as torch.neg, operator.getitem, "
-                "or torch.ops.dc.prefetch_params_fused.default; other node kinds use their normal FX string target",
-            },
-            "set_args_kwargs": "Set complete args and/or kwargs for any existing or new node. 'rewire' is an alias.",
-            "delete_node": "Delete a node after all uses have been rewired.",
-            "patch_meta": "Apply recursively JSON/data-only metadata patches using scalars, lists, and string-keyed "
-            "objects; new nodes may instead copy metadata from a local node.",
-            "reorder": "The final operation, naming every final node ID exactly once in target topological order.",
-        },
-        "argument_encoding": {
-            "node_reference": {
-                "node": "base:topological_position or new ID"
-            },
-            "json_scalars_and_lists": "encoded directly and recursively",
-            "tuple": {
-                "tuple": []
-            },
-            "dictionary": {
-                "dict": [["encoded key", "encoded value"]]
-            },
-            "slice": {
-                "slice": ["start", "stop", "step"]
-            },
-            "ellipsis": {
-                "ellipsis": True
-            },
-            "torch_dtype": {
-                "torch_dtype": "float32"
-            },
-            "torch_device": {
-                "torch_device": {
-                    "type": "cuda",
-                    "index": "current"
-                }
-            },
-            "python_symbol": {
-                "python_symbol": "importable.module.symbol"
-            },
-            "runtime_graph_id": dict(RUNTIME_GRAPH_ID),
-        },
-        "mechanical_rules": [
-            "Use stable base IDs from accepted_graph.nodes; name_hint is never node identity.",
-            "Leave expected_result_fingerprint null; rank 0 computes it from the replayed result topology and the "
-            "canonical finalized data-only edit payload.",
-            "Create operations must precede references to their new IDs.",
-            "Rewire uses before deleting nodes, then finish with the complete topological reorder.",
-            "All callable/module/get_attr targets must resolve locally and graph.lint/recompile must succeed.",
-            "Use the runtime_graph_id encoding wherever a new or rewired operation needs this rank's graph ID.",
-            "There are no semantic operator allowlists or bans: collectives, compute, replacements, and arbitrary "
-            "valid FX reorderings use the same generic operations.",
-            "Existing local nodes retain rank-local callables, parameters, modules, metadata, and get_attr values.",
-            "The edit must remain callable with the existing positional AOT inputs and preserve the output "
-            "pytree/container and leaf-kind ABI; placeholder names may differ and outputs may be rewired.",
-            "Do not serialize tensors or FakeTensors. Copy local metadata and let profiling refresh timing/memory.",
-        ],
-        "required_fields": [
-            "schema_version", "generation", "graph_slot", "base_fingerprint", "expected_result_fingerprint", "reason",
-            "operations"
-        ],
-    }
-
-
-def serialize_evaluation_context(ctx,
-                                 tracker: GraphVersionTracker,
-                                 history: List[Dict[str, Any]],
-                                 candidate: Optional[Dict[str, Any]] = None,
-                                 mechanical_feedback: Optional[List[str]] = None,
-                                 candidate_required: Optional[bool] = None) -> str:
-    snapshot = tracker.current_ref()
-    stage = "candidate" if candidate is not None else "accepted_graph"
-    if candidate_required is None:
-        candidate_required = candidate is None and not history
-    if candidate is not None:
-        allowed = ["accept", "reject"]
-    elif candidate_required:
-        allowed = ["continue"]
-    else:
-        allowed = ["continue", "finish"]
-    profile = ctx.profiling_results[ctx.graph_id]
-    payload = {
-        "role": "deepcompile_graph_agent",
-        "stage": stage,
-        "objective": "Propose and evaluate experimental FX scheduling and graph rewrites using measured execution.",
-        "accepted_graph": {
-            "snapshot": asdict(snapshot),
-            "nodes": normalized_graph(ctx.gm, include_hints=True, runtime_graph_id=ctx.graph_id),
-            "profile": _profile_payload(profile, ctx.bwd),
-        },
-        "candidate": candidate,
-        "graph_runtime": {
-            "graph_id": dict(RUNTIME_GRAPH_ID),
-            "graph_order": normalized_graph_order(ctx.graph_order, ctx.graph_id),
-            "direction": "bwd" if ctx.bwd else "fwd",
-        },
-        "history": history,
-        "candidate_required": candidate_required,
-        "mechanical_feedback": list(mechanical_feedback or []),
-        "edit_contract": _graph_edit_contract(ctx, snapshot) if candidate is None else None,
-        "response_contract": {
-            "schema_version":
-            EVALUATION_SCHEMA_VERSION,
-            "allowed_decisions":
-            allowed,
-            "instructions": [
-                "Return exactly one JSON object and no prose.",
-                "Copy accepted_graph.snapshot into based_on.",
-                "Before this graph invocation has a recorded candidate outcome, accepted_graph must continue with "
-                "one exact graph_edit. Candidate measurements cannot exist before that edit is executed, so their "
-                "absence is not a valid reason to finish.",
-                "At accepted_graph stage, continue requires one exact raw graph_edit satisfying edit_contract; "
-                "finish is allowed only when candidate_required is false, ends tuning, and requires graph_edit to be "
-                "null or absent.",
-                "At candidate stage, accept commits the measured candidate and reject keeps the accepted graph.",
-                "At candidate stage, graph_edit must be null or absent; propose another edit only in a subsequent "
-                "accepted_graph stage.",
-                "At candidate stage, copy candidate.generation and candidate.fingerprint into candidate_generation "
-                "and candidate_fingerprint. The fingerprint binds both result topology and the exact finalized "
-                "data-only edit payload. Set both fields to null at accepted_graph stage.",
-                "When mechanical_feedback is non-empty, correct every reported parsing, identity, finalization, "
-                "lint, or recompile error in the next exact graph_edit.",
-            ],
-            "fields": {
-                "schema_version": EVALUATION_SCHEMA_VERSION,
-                "based_on": "accepted graph snapshot object",
-                "decision": " | ".join(allowed),
-                "summary": "evaluation summary",
-                "graph_edit": "exact raw GraphEditPayload for accepted_graph continue; otherwise null or absent",
-                "candidate_generation": "candidate generation or null",
-                "candidate_fingerprint": "exact topology-plus-finalized-edit candidate fingerprint or null",
-            },
-        },
-    }
-    return json.dumps(payload, indent=2, default=str)
-
-
-def candidate_evaluation_payload(edit_payload: Dict[str, Any], candidate_gm: Optional[GraphModule],
-                                 rank_results: List[Dict[str, Any]], runtime_graph_id: int) -> Dict[str, Any]:
-    return {
-        "generation":
-        edit_payload["generation"],
-        "fingerprint":
-        edit_payload["expected_result_fingerprint"],
-        "edit":
-        edit_payload,
-        "nodes":
-        None if candidate_gm is None else normalized_graph(
-            candidate_gm, include_hints=True, runtime_graph_id=runtime_graph_id),
+        GENERATED_PASS_SCHEMA_VERSION,
+        "candidate_id":
+        proposal.candidate_id,
+        "source_sha256":
+        proposal.source_sha256,
+        "entrypoint":
+        proposal.entrypoint,
+        "module_name":
+        proposal.module_name,
+        "proposal_hash":
+        proposal.proposal_hash,
+        "result_fingerprint":
+        None,
+        "frozen_base_fingerprint":
+        frozen_base_fingerprint,
+        "valid":
+        valid,
+        "validation":
+        sanitize_json_value(validation),
+        "rank_results":
+        rank_results,
         "aggregate":
-        _aggregate_candidate_profiles(rank_results),
+        aggregate_rank_metrics(rank_results),
+        "baseline_aggregate":
+        sanitize_json_value(baseline_aggregate),
+        "measurement_method": {
+            "timing": "one profiling run per rank with freshly captured inputs; local readings captured before "
+            "the existing per-node AVG reductions",
+            "memory": "one profiling run per rank with freshly captured inputs; local readings captured before "
+            "the existing per-node MAX reductions",
+            "rank_spread": "device_time min/max describe ranks, not repeated-run variance",
+        },
+        "correctness_available":
+        False,
+        "side_effect_boundary":
+        "Only graph topology and covered tensor state are restored between candidates; "
+        "arbitrary Python, files, globals, native state, param_manager, and pass-body collectives are not generally "
+        "rollback-safe.",
     }
+    fingerprint_payload = dict(packet)
+    fingerprint_payload.pop("result_fingerprint")
+    packet["result_fingerprint"] = _payload_hash(fingerprint_payload)
+    return packet

@@ -4,34 +4,30 @@
 import copy
 from datetime import timedelta
 import importlib
+import inspect
 import json
 import multiprocessing
-import operator
 from pathlib import Path
 import queue
-import signal
-import subprocess
-import sys
-import time
-import traceback
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import deepspeed.compile.agent_runner as agent_runner_module
 import deepspeed.compile.backend as backend
 import deepspeed.compile.optimizer as optimizer_module
 import deepspeed.comm as dist
-from deepspeed.compile.agent_runner import AgentRunner, AgentRunnerConfig
 from deepspeed.compile.config import CompileConfig
-from deepspeed.compile.graph_edit import (GraphEditPayload, RUNTIME_GRAPH_ID, finalize_graph_edit,
-                                          structural_fingerprint)
-from deepspeed.compile.optimizer import GraphAgentLoopOptimizer, OptimizationContext, OptimizationResult
+from deepspeed.compile.evaluation_context import (GENERATED_PASS_ENTRYPOINT, AgentResponseError, GeneratedPassProposal,
+                                                  build_evaluation_packet, build_reference_pass_inventory,
+                                                  parse_search_response, serialize_search_context, validate_selection)
+from deepspeed.compile.graph_edit import clone_graph_module, structural_fingerprint
+from deepspeed.compile.optimizer import (FrozenGraphContext, GraphAgentLoopOptimizer, OptimizationContext,
+                                         OptimizationResult, apply_generated_pass, load_generated_pass)
 from deepspeed.compile.profilers import ProfilingResult
 
 init_z3_module = importlib.import_module("deepspeed.compile.init_z3")
-_DISTRIBUTED_MEMORY_PROFILE_ENTERED = False
 
 
 class ChainModule(torch.nn.Module):
@@ -40,54 +36,11 @@ class ChainModule(torch.nn.Module):
         return torch.sigmoid(torch.relu(x))
 
 
-class StatefulModule(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.tensor(2.0))
-        self.register_buffer("running", torch.tensor(3.0))
-
-    def forward(self, x):
-        return torch.sigmoid(torch.relu(x * self.weight + self.running))
-
-
-class TwoInputModule(torch.nn.Module):
-
-    def forward(self, value, unused):
-        return torch.relu(value)
-
-
-class _GlooTimingProfiler:
-
-    def __init__(self, gm, debug_log=False):
-        self.gm = gm
-
-    def run(self, *args):
-        return self.gm(*args)
-
-
-class _GlooMemoryProfiler:
-
-    def __init__(self, gm, debug_log=False):
-        self.gm = gm
-        self.profile_complete = True
-        self.mem_record = []
-
-    def run(self, *args):
-        global _DISTRIBUTED_MEMORY_PROFILE_ENTERED
-        _DISTRIBUTED_MEMORY_PROFILE_ENTERED = True
-        phase_token = torch.tensor([1])
-        dist.all_reduce(phase_token)
-        output = self.gm(*args)
-        self.mem_record = [(node.name, 1, 0, 1) for node in self.gm.graph.nodes]
-        return output
-
-
 class StaticRunner:
 
-    def __init__(self, callback, command):
+    def __init__(self, callback):
         self.callback = callback
-        self.config = SimpleNamespace(command=[command])
+        self.config = SimpleNamespace(command=["agent"])
         self.calls = []
 
     def run(self, prompt, iteration_dir, role=None, artifact_prefix=None):
@@ -117,7 +70,7 @@ def _config(**kwargs):
         "zero3_tuning_strategy": "agent",
         "agent_architecture": "graph_agent",
         "agent_command": ["agent"],
-        "agent_max_iterations": 1,
+        "agent_max_iterations": 2,
         "agent_max_retries_per_iteration": 1,
         "agent_timeout_sec": 5,
     }
@@ -125,7 +78,9 @@ def _config(**kwargs):
     return CompileConfig(**values)
 
 
-def _context_from_gm(config, gm, create_inputs_fn):
+def _context(config=None):
+    config = config or _config()
+    gm = torch.fx.symbolic_trace(ChainModule())
     names = [node.name for node in gm.graph.nodes]
     profile = ProfilingResult(fwd_graph=gm.graph,
                               fwd_mem=[(name, 1, 0, 1) for name in names],
@@ -133,174 +88,19 @@ def _context_from_gm(config, gm, create_inputs_fn):
                               fwd_tensor_sizes=[(name, 4) for name in names],
                               fwd_mem_complete=True,
                               needs_backward=False)
+    manager = object()
     ctx = OptimizationContext(gm=gm,
                               graph_id=11,
                               graph_slot=(0, "fwd"),
                               graph_order=[(11, False)],
                               profiling_results={11: profile},
-                              create_inputs_fn=create_inputs_fn,
+                              create_inputs_fn=lambda: (torch.tensor([-2.0, 3.0]), ),
+                              mem_budget=1234.0,
+                              param_manager=manager,
                               bwd=False,
                               debug_log=False,
                               compile_config=config)
     return gm, ctx
-
-
-def _context(config, module=None):
-    gm = torch.fx.symbolic_trace(module or ChainModule())
-    return _context_from_gm(config, gm, lambda: (torch.tensor([-2.0, 3.0]), ))
-
-
-def _aot_lifted_context(config):
-    graph = torch.fx.Graph()
-    state = graph.placeholder("state")
-    weights = graph.call_function(operator.getitem, (state, "weights"))
-    weight = graph.call_function(operator.getitem, (weights, 0))
-    value = graph.placeholder("value")
-    result_node = graph.call_function(operator.mul, (value, weight))
-    graph.output(result_node)
-    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-    lifted_parameter = torch.nn.Parameter(torch.tensor(2.0))
-
-    def create_inputs():
-        return ({"weights": [lifted_parameter]}, torch.tensor(3.0))
-
-    _, ctx = _context_from_gm(config, gm, create_inputs)
-    return gm, ctx, lifted_parameter
-
-
-def _rank_divergent_output_abi_worker(rank, init_method, result_queue):
-    global _DISTRIBUTED_MEMORY_PROFILE_ENTERED
-    _DISTRIBUTED_MEMORY_PROFILE_ENTERED = False
-    try:
-        dist.init_distributed(dist_backend="gloo",
-                              auto_mpi_discovery=False,
-                              init_method=init_method,
-                              rank=rank,
-                              world_size=2,
-                              timeout=timedelta(seconds=10),
-                              verbose=False)
-
-        def rank_local_output(value):
-            return value if rank == 0 else [value]
-
-        graph = torch.fx.Graph()
-        value = graph.placeholder("value")
-        local_result = graph.call_function(rank_local_output, (value, ))
-        output = graph.output(value)
-        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
-        _, ctx = _context_from_gm(_config(), gm, lambda: (torch.tensor([1.0]), ))
-        accepted_calls = optimizer_module._capture_profile_calls(ctx)
-        accepted_output = gm(*accepted_calls[0].args)
-        ctx.runtime_abi = optimizer_module._runtime_abi_descriptor(gm, accepted_calls, accepted_output)
-
-        raw = GraphEditPayload(generation=1,
-                               graph_slot=ctx.graph_slot,
-                               base_fingerprint=structural_fingerprint(gm, ctx.graph_id),
-                               expected_result_fingerprint=None,
-                               operations=[{
-                                   "op": "set_args_kwargs",
-                                   "id": "base:2",
-                                   "args": [{
-                                       "node": "base:1"
-                                   }],
-                               }, {
-                                   "op": "reorder",
-                                   "order": ["base:0", "base:1", "base:2"],
-                               }],
-                               reason="Exercise rank-divergent local output ABI synchronization")
-        payload, _ = finalize_graph_edit(gm, raw, ctx.graph_id)
-        optimizer_module.ProfilingInterpreter = _GlooTimingProfiler
-        optimizer_module.MemoryProfilingInterpreter = _GlooMemoryProfiler
-        optimizer_module.is_profile_incomplete = lambda _graph: False
-
-        _, candidate_profile, records = GraphAgentLoopOptimizer._apply_and_profile_candidate(ctx, payload)
-        result_queue.put({
-            "rank": rank,
-            "success": candidate_profile is None and all(not record["success"] for record in records),
-            "abi_incompatible": all(record["abi_compatible"] is False for record in records),
-            "memory_entered": _DISTRIBUTED_MEMORY_PROFILE_ENTERED,
-            "error": None,
-        })
-    except Exception:
-        result_queue.put({
-            "rank": rank,
-            "success": False,
-            "abi_incompatible": False,
-            "memory_entered": _DISTRIBUTED_MEMORY_PROFILE_ENTERED,
-            "error": traceback.format_exc(),
-        })
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
-def _fake_mode_rank_sync_worker(rank, init_method, result_queue):
-    try:
-        dist.init_distributed(dist_backend="gloo",
-                              auto_mpi_discovery=False,
-                              init_method=init_method,
-                              rank=rank,
-                              world_size=2,
-                              timeout=timedelta(seconds=10),
-                              verbose=False)
-        from torch._subclasses.fake_tensor import FakeTensorMode
-
-        gm = torch.fx.symbolic_trace(ChainModule())
-        local_edit = None
-        if rank == 0:
-            raw_edit = GraphEditPayload(generation=1,
-                                        graph_slot=(0, "fwd"),
-                                        base_fingerprint=structural_fingerprint(gm, 11),
-                                        expected_result_fingerprint=None,
-                                        operations=[{
-                                            "op": "create_node",
-                                            "id": "new:neg",
-                                            "node_op": "call_function",
-                                            "target": "torch.neg",
-                                            "args": [{
-                                                "node": "base:1"
-                                            }],
-                                            "kwargs": {},
-                                            "copy_meta_from": "base:2",
-                                        }, {
-                                            "op": "set_args_kwargs",
-                                            "id": "base:3",
-                                            "args": [{
-                                                "node": "new:neg"
-                                            }],
-                                        }, {
-                                            "op": "delete_node",
-                                            "id": "base:2",
-                                        }, {
-                                            "op": "reorder",
-                                            "order": ["base:0", "base:1", "new:neg", "base:3"],
-                                        }],
-                                        reason="Exercise rank-zero generic edit replay")
-            local_edit, _ = finalize_graph_edit(gm, raw_edit, 11)
-        with FakeTensorMode(allow_non_fake_inputs=True):
-            records = optimizer_module.gather_rank_records({"rank": rank, "generated": local_edit is not None})
-            edit = optimizer_module.broadcast_edit_payload(local_edit)
-        candidate = optimizer_module.apply_graph_edit(gm, edit, 11)
-        result_queue.put({
-            "rank": rank,
-            "records": records,
-            "fingerprint": optimizer_module.candidate_fingerprint(candidate, edit, 11),
-            "expected_fingerprint": edit.expected_result_fingerprint,
-            "output": candidate(torch.tensor([-2.0, 3.0])).tolist(),
-            "error": None,
-        })
-    except Exception:
-        result_queue.put({
-            "rank": rank,
-            "records": None,
-            "fingerprint": None,
-            "expected_fingerprint": None,
-            "output": None,
-            "error": traceback.format_exc(),
-        })
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def _fake_profile(gm, ctx, profile_calls=None, expected_abi=None):
@@ -310,919 +110,526 @@ def _fake_profile(gm, ctx, profile_calls=None, expected_abi=None):
     output = gm(*profile_calls[0].args, **profile_calls[0].kwargs)
     runtime_abi = optimizer_module._runtime_abi_descriptor(gm, profile_calls, output)
     if expected_abi is not None and runtime_abi != expected_abi:
-        raise optimizer_module._RuntimeABIError("Candidate output ABI differs from the accepted graph")
+        raise optimizer_module._RuntimeABIError("Candidate output ABI differs from the frozen graph")
     profile = copy.deepcopy(ctx.profiling_results[ctx.graph_id])
     names = [node.name for node in gm.graph.nodes]
     for node in gm.graph.nodes:
-        node.meta.update({"device_time": 1.0, "wall_time": 1.0, "tensor_size": 4})
+        node.meta.update({
+            "device_time": 2.0,
+            "wall_time": 3.0,
+            "tensor_size": 4,
+            "local_device_time": 1.5,
+            "local_wall_time": 2.5,
+        })
     profile.fwd_graph = gm.graph
-    profile.fwd_mem = [(name, 1, 0, 1) for name in names]
-    profile.fwd_time = [(name, 1.0, 1.0) for name in names]
+    profile.fwd_mem = [(name, 20, 0, 30) for name in names]
+    profile.fwd_time = [(name, 2.0, 3.0) for name in names]
     profile.fwd_tensor_sizes = [(name, 4) for name in names]
     profile.fwd_mem_complete = True
+    profile._deepcompile_local_fwd_mem = [(name, 10, 0, 15) for name in names]
     return profile, runtime_abi
 
 
-def test_profile_graph_single_rank_runs_timing_then_memory(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    phases = []
+NOOP_SOURCE = """def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    return gm
+"""
 
-    class TimingProfiler:
+NEG_SOURCE = """import torch
 
-        def __init__(self, profile_gm, debug_log=False):
-            self.gm = profile_gm
+def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    assert mem_budget == 1234.0
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target is torch.sigmoid:
+            node.target = torch.neg
+    return gm
+"""
 
-        def run(self, *args):
-            phases.append("timing")
-            return self.gm(*args)
+COS_SOURCE = """import torch
 
-    class MemoryProfiler:
-
-        def __init__(self, profile_gm, debug_log=False):
-            self.gm = profile_gm
-            self.profile_complete = True
-            self.mem_record = []
-
-        def run(self, *args):
-            phases.append("memory")
-            output = self.gm(*args)
-            self.mem_record = [(node.name, 1, 0, 1) for node in self.gm.graph.nodes]
-            return output
-
-    monkeypatch.setattr(optimizer_module, "ProfilingInterpreter", TimingProfiler)
-    monkeypatch.setattr(optimizer_module, "MemoryProfilingInterpreter", MemoryProfiler)
-    monkeypatch.setattr(optimizer_module, "is_profile_incomplete", lambda _graph: False)
-
-    profile, runtime_abi = optimizer_module._profile_graph(gm, ctx)
-
-    assert phases == ["timing", "memory"]
-    assert profile.fwd_mem_complete
-    assert runtime_abi.output_leaf_kinds == ("tensor", )
+def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    if any(node.target is torch.neg for node in gm.graph.nodes if node.op == "call_function"):
+        raise RuntimeError("candidate inherited an earlier graph")
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target is torch.sigmoid:
+            node.target = torch.cos
+    return gm
+"""
 
 
-def _metadata_graph_edit(prompt, role, _call_index):
-    assert role == "graph_agent"
-    snapshot = prompt["accepted_graph"]["snapshot"]
-    node_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"]]
-    return {
-        "schema_version":
-        1,
-        "generation":
-        snapshot["generation"] + 1,
-        "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint":
-        snapshot["graph_fingerprint"],
-        "expected_result_fingerprint":
-        None,
-        "reason":
-        "Probe rollback of profiling state",
-        "operations": [{
-            "op": "patch_meta",
-            "id": node_ids[0],
-            "meta": {
-                "candidate_state_probe": True
-            },
-        }, {
-            "op": "reorder",
-            "order": node_ids,
-        }],
-    }
-
-
-def _graph_agent_response(accept_candidate, edit_callback=None):
-
-    if edit_callback is None:
-        edit_callback = _generic_graph_edit
-
-    def callback(prompt, role, _call_index):
-        assert role == "graph_agent"
-        snapshot = prompt["accepted_graph"]["snapshot"]
-        if prompt["stage"] == "accepted_graph":
-            return {
-                "schema_version": 4,
-                "based_on": snapshot,
-                "decision": "continue",
-                "summary": "Try a generic replacement",
-                "graph_edit": edit_callback(prompt, role, _call_index),
-                "candidate_generation": None,
-                "candidate_fingerprint": None,
-            }
-        return {
-            "schema_version": 4,
-            "based_on": snapshot,
-            "decision": "accept" if accept_candidate else "reject",
-            "summary": "Candidate decision",
-            "graph_edit": None,
-            "candidate_generation": prompt["candidate"]["generation"],
-            "candidate_fingerprint": prompt["candidate"]["fingerprint"],
-        }
-
-    return callback
-
-
-def _generic_graph_edit(prompt, role, _call_index):
-    assert role == "graph_agent"
-    snapshot = prompt["accepted_graph"]["snapshot"]
-    return {
-        "schema_version":
-        1,
-        "generation":
-        snapshot["generation"] + 1,
-        "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint":
-        snapshot["graph_fingerprint"],
-        "expected_result_fingerprint":
-        None,
-        "reason":
-        "Replace sigmoid with negation",
-        "operations": [{
-            "op": "create_node",
-            "id": "new:neg",
-            "node_op": "call_function",
-            "target": "torch.neg",
-            "args": [{
-                "node": "base:1"
-            }],
-            "kwargs": {},
-            "copy_meta_from": "base:2",
-        }, {
-            "op": "set_args_kwargs",
-            "id": "base:3",
-            "args": [{
-                "node": "new:neg"
-            }],
-        }, {
-            "op": "delete_node",
-            "id": "base:2",
-        }, {
-            "op": "reorder",
-            "order": ["base:0", "base:1", "new:neg", "base:3"],
-        }],
-    }
-
-
-def _delete_placeholder_graph_edit(prompt, role, _call_index):
-    assert role == "graph_agent"
-    snapshot = prompt["accepted_graph"]["snapshot"]
-    placeholder_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"] if node["op"] == "placeholder"]
-    deleted_id = placeholder_ids[-1]
-    remaining_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"] if node["id"] != deleted_id]
+def _evaluate_response(source, summary="candidate"):
     return {
         "schema_version": 1,
-        "generation": snapshot["generation"] + 1,
-        "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint": snapshot["graph_fingerprint"],
-        "expected_result_fingerprint": None,
-        "reason": "Delete an unused placeholder",
-        "operations": [{
-            "op": "delete_node",
-            "id": deleted_id,
-        }, {
-            "op": "reorder",
-            "order": remaining_ids,
-        }],
+        "action": "evaluate",
+        "summary": summary,
+        "entrypoint": GENERATED_PASS_ENTRYPOINT,
+        "source": source,
     }
 
 
-def _change_output_structure_graph_edit(prompt, role, _call_index):
-    assert role == "graph_agent"
-    snapshot = prompt["accepted_graph"]["snapshot"]
-    node_ids = [node["id"] for node in prompt["accepted_graph"]["nodes"]]
-    output_id = next(node["id"] for node in prompt["accepted_graph"]["nodes"] if node["op"] == "output")
-    output_value = prompt["accepted_graph"]["nodes"][-1]["args"][0]
+def _candidate_finish(prompt, index=0):
+    record = prompt["history"][index]
+    proposal = record["proposal"]
+    evaluation = record["evaluation"]
     return {
-        "schema_version":
-        1,
-        "generation":
-        snapshot["generation"] + 1,
-        "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint":
-        snapshot["graph_fingerprint"],
-        "expected_result_fingerprint":
-        None,
-        "reason":
-        "Wrap the existing output in a tuple",
-        "operations": [{
-            "op": "set_args_kwargs",
-            "id": output_id,
-            "args": [{
-                "tuple": [output_value]
-            }],
-        }, {
-            "op": "reorder",
-            "order": node_ids,
-        }],
+        "schema_version": 1,
+        "action": "finish",
+        "summary": f"select {proposal['candidate_id']}",
+        "selection": {
+            "kind": "candidate",
+            "candidate_id": proposal["candidate_id"],
+            "source_sha256": proposal["source_sha256"],
+            "entrypoint": proposal["entrypoint"],
+            "result_fingerprint": evaluation["result_fingerprint"],
+        },
     }
 
 
-def _rename_placeholder_graph_edit(prompt, role, _call_index):
-    assert role == "graph_agent"
-    snapshot = prompt["accepted_graph"]["snapshot"]
+def _baseline_finish(prompt):
     return {
-        "schema_version":
-        1,
-        "generation":
-        snapshot["generation"] + 1,
-        "graph_slot": [snapshot["graph_slot"]["index"], snapshot["graph_slot"]["direction"]],
-        "base_fingerprint":
-        snapshot["graph_fingerprint"],
-        "expected_result_fingerprint":
-        None,
-        "reason":
-        "Replace the positional placeholder with a differently named one",
-        "operations": [{
-            "op": "create_node",
-            "id": "new:renamed_input",
-            "node_op": "placeholder",
-            "target": "renamed_input",
-            "args": [],
-            "kwargs": {},
-        }, {
-            "op": "set_args_kwargs",
-            "id": "base:1",
-            "args": [{
-                "node": "new:renamed_input"
-            }],
-        }, {
-            "op": "delete_node",
-            "id": "base:0",
-        }, {
-            "op": "reorder",
-            "order": ["new:renamed_input", "base:1", "base:2", "base:3"],
-        }],
+        "schema_version": 1,
+        "action": "finish",
+        "summary": "select baseline graph",
+        "selection": {
+            "kind": "baseline",
+            "frozen_base_fingerprint": prompt["frozen_base"]["fingerprint"],
+        },
     }
 
 
-def test_graph_agent_proposes_and_evaluates_generic_edit_without_optimizer_call(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    graph_agent = StaticRunner(_graph_agent_response(True), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+def test_search_response_requires_complete_source_on_first_turn():
+    finish = {
+        "schema_version": 1,
+        "action": "finish",
+        "summary": "premature",
+        "selection": {
+            "kind": "baseline",
+            "frozen_base_fingerprint": "base",
+        },
+    }
+    with pytest.raises(AgentResponseError, match="first coding-agent turn"):
+        parse_search_response(json.dumps(finish), 0, [], (0, "fwd"))
 
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+    proposal = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], (0, "fwd"))
 
-    assert torch.equal(gm(torch.tensor([-2.0, 3.0])), torch.tensor([0.0, -3.0]))
-    assert [entry.action for entry in result.trace] == ["evaluate", "accepted"]
-    assert [role for role, _ in graph_agent.calls] == ["graph_agent", "graph_agent"]
-    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "candidate"]
-    assert graph_agent.calls[0][1]["candidate_required"]
-    assert graph_agent.calls[0][1]["response_contract"]["allowed_decisions"] == ["continue"]
-    edit_contract = graph_agent.calls[0][1]["edit_contract"]
-    assert set(
-        edit_contract["operations"]) == {"create_node", "set_args_kwargs", "delete_node", "patch_meta", "reorder"}
-    assert "rewire" in edit_contract["operations"]["set_args_kwargs"]
-    assert "registered operator" not in json.dumps(edit_contract).lower()
-    assert any("There are no semantic operator allowlists or bans" in rule
-               for rule in edit_contract["mechanical_rules"])
-    assert graph_agent.calls[0][1]["graph_runtime"]["graph_id"] == RUNTIME_GRAPH_ID
-    assert graph_agent.calls[1][1]["edit_contract"] is None
+    assert proposal.candidate_id.startswith("candidate_000_")
+    assert len(proposal.source_sha256) == 64
+    assert proposal.module_name.endswith(proposal.source_sha256)
 
 
-def test_graph_agent_retries_finish_before_first_candidate_with_same_runner(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    expected_error = ("First accepted_graph decision must continue with one graph_edit before any candidate is "
-                      "executed; absence of candidate measurements is not a valid reason to finish")
+def test_identical_source_has_distinct_candidate_and_module_identity():
+    first = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], (0, "fwd"))
+    second = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 1, [], (0, "fwd"))
+    other_slot = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], (1, "bwd"))
 
-    def retrying_graph_agent(prompt, role, call_index):
-        response = _graph_agent_response(False)(prompt, role, call_index)
-        if prompt["stage"] == "candidate":
-            return response
-        assert prompt["candidate_required"]
-        assert prompt["response_contract"]["allowed_decisions"] == ["continue"]
+    assert first.source_sha256 == second.source_sha256 == other_slot.source_sha256
+    assert len({first.candidate_id, second.candidate_id}) == 2
+    assert len({first.module_name, second.module_name, other_slot.module_name}) == 3
+
+
+def test_selection_requires_exact_valid_evaluation_identity():
+    proposal = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], (0, "fwd"))
+    evaluation = {
+        "valid": True,
+        "result_fingerprint": "result",
+        "frozen_base_fingerprint": "base",
+    }
+    history = [{"proposal": proposal.to_dict(), "evaluation": evaluation}]
+    finish = {
+        "schema_version": 1,
+        "action": "finish",
+        "summary": "select candidate",
+        "selection": {
+            "kind": "candidate",
+            "candidate_id": proposal.candidate_id,
+            "source_sha256": proposal.source_sha256,
+            "entrypoint": proposal.entrypoint,
+            "result_fingerprint": "result",
+        },
+    }
+
+    selection = parse_search_response(json.dumps(finish), 1, history, (0, "fwd"))
+
+    assert validate_selection(selection, history) == proposal
+    stale = copy.deepcopy(finish)
+    stale["selection"]["result_fingerprint"] = "stale"
+    with pytest.raises(AgentResponseError, match="stale result_fingerprint"):
+        parse_search_response(json.dumps(stale), 1, history, (0, "fwd"))
+
+
+def test_reference_inventory_uses_exact_live_source_bytes():
+    compile_root = Path(optimizer_module.__file__).resolve().parent
+    inventory = build_reference_pass_inventory(compile_root)
+
+    assert len(inventory["files"]) == 12
+    assert inventory["source_root"] == str(compile_root)
+    assert len(inventory["inventory_sha256"]) == 64
+    for record in inventory["files"]:
+        path = compile_root / record["path"].removeprefix("deepspeed/compile/")
+        assert record["source"] == path.read_text(encoding="utf-8")
+        assert len(record["sha256"]) == 64
+
+
+def test_reference_inventory_includes_move_opt_states_sync():
+    inventory = build_reference_pass_inventory()
+    offload_adam_states = next(record for record in inventory["files"]
+                               if record["path"].endswith("passes/offload_adam_states.py"))
+    offload_module = importlib.import_module("deepspeed.compile.passes.offload_adam_states")
+    entrypoint = getattr(offload_module, "move_opt_states_sync")
+
+    assert "move_opt_states_sync" in offload_adam_states["entrypoints"]
+    assert len(inspect.signature(entrypoint).parameters) == 8
+
+
+def test_search_prompt_contains_three_complete_reference_sources_and_exact_history():
+    gm, ctx = _context()
+    frozen = FrozenGraphContext(graph_module=clone_graph_module(gm),
+                                graph_fingerprint=structural_fingerprint(gm, ctx.graph_id),
+                                graph_slot=ctx.graph_slot,
+                                graph_order=ctx.graph_order,
+                                baseline_rank_results=[],
+                                baseline_aggregate={},
+                                mem_budget=ctx.mem_budget,
+                                param_manager=ctx.param_manager)
+    history = [{"proposal": {"source": "exact prior source"}, "evaluation": {"valid": False}}]
+
+    prompt = json.loads(serialize_search_context(ctx, frozen, build_reference_pass_inventory(), history))
+
+    references = prompt["reference_passes"]["closest_complete_sources"]
+    assert len(references) == 3
+    assert all(reference["source"] for reference in references)
+    assert prompt["history"] == history
+    assert prompt["response_contract"]["allowed_actions"] == ["evaluate", "finish"]
+    assert "threshold" in " ".join(prompt["response_contract"]["instructions"])
+
+
+@pytest.mark.parametrize("return_line", ["return None", "return gm"])
+def test_generated_pass_loads_exact_bytes_and_accepts_valid_return_contract(tmp_path, return_line):
+    gm, ctx = _context()
+    source = NOOP_SOURCE.replace("return gm", return_line)
+    proposal = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+    source_path = tmp_path / "rank_0" / "generated_pass.py"
+
+    candidate, entrypoint = apply_generated_pass(proposal, clone_graph_module(gm), ctx, source_path)
+
+    assert source_path.read_bytes() == source.encode("utf-8")
+    assert callable(entrypoint)
+    candidate.graph.lint()
+
+
+@pytest.mark.parametrize("source,phase", [("def deepcompile_pass(:\n", "syntax"),
+                                          ("deepcompile_pass = 1\n", "callable"),
+                                          ("def deepcompile_pass(gm):\n    return gm\n", "signature"),
+                                          (NOOP_SOURCE.replace("return gm", "return object()"), "return_contract")])
+def test_generated_pass_reports_mechanical_failure_phase(tmp_path, source, phase):
+    gm, ctx = _context()
+    proposal = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+
+    with pytest.raises(optimizer_module.GeneratedPassValidationError) as error:
+        apply_generated_pass(proposal, clone_graph_module(gm), ctx, tmp_path / "generated.py")
+
+    assert error.value.phase == phase
+
+
+def test_same_source_candidates_do_not_share_module_globals(tmp_path):
+    gm, ctx = _context()
+    source = NOOP_SOURCE.replace("def deepcompile_pass", "calls = 0\n\ndef deepcompile_pass").replace(
+        "    return gm", "    global calls\n    calls += 1\n    return gm")
+    first = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+    second = parse_search_response(json.dumps(_evaluate_response(source)), 1, [], ctx.graph_slot)
+    first_fn = load_generated_pass(first, tmp_path / "first.py")
+    second_fn = load_generated_pass(second, tmp_path / "second.py")
+
+    apply_generated_pass(first, clone_graph_module(gm), ctx, tmp_path / "first.py", first_fn)
+
+    assert first_fn.__globals__["calls"] == 1
+    assert second_fn.__globals__["calls"] == 0
+
+
+def test_generated_pass_can_install_graph_referenced_modules_without_allowlist(tmp_path):
+    gm, ctx = _context()
+    source = """import torch
+
+def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    gm.add_module("generated_relu", torch.nn.ReLU())
+    output = next(node for node in gm.graph.nodes if node.op == "output")
+    with gm.graph.inserting_before(output):
+        result = gm.graph.call_module("generated_relu", (output.args[0],))
+    output.args = (result,)
+    return gm
+"""
+    proposal = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+
+    candidate, _ = apply_generated_pass(proposal, clone_graph_module(gm), ctx, tmp_path / "generated_module.py")
+
+    assert isinstance(candidate.generated_relu, torch.nn.ReLU)
+    assert any(node.op == "call_module" and node.target == "generated_relu" for node in candidate.graph.nodes)
+
+
+def test_evaluation_packet_is_observational_and_sanitizes_nonfinite_metrics():
+    proposal = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], (0, "fwd"))
+    rank_results = [{
+        "rank": 0,
+        "success": True,
+        "local_device_time": float("nan"),
+        "local_peak_memory": 4,
+        "error": None,
+    }]
+
+    packet = build_evaluation_packet(proposal, rank_results, {}, "base", {"runtime_abi": {"success": True}})
+
+    assert packet["valid"]
+    assert "accept" not in packet and "reject" not in packet and "winner" not in packet
+    assert packet["rank_results"][0]["local_device_time"] == {"non_finite_float": "nan"}
+    assert packet["aggregate"]["device_time"]["mean"] is None
+    assert packet["correctness_available"] is False
+
+
+def test_two_complete_candidates_start_fresh_and_agent_selects_earlier_source(monkeypatch, tmp_path):
+    gm, ctx = _context(_config(agent_max_iterations=2))
+
+    def callback(prompt, role, call_index):
+        assert role == "coding_agent"
         if call_index == 0:
-            assert prompt["mechanical_feedback"] == []
-            response["decision"] = "finish"
-            response["summary"] = "No candidate measurements exist"
-            response["graph_edit"] = None
-        else:
-            assert prompt["mechanical_feedback"] == [expected_error]
-        return response
+            return _evaluate_response(NEG_SOURCE, "candidate one")
+        if call_index == 1:
+            assert prompt["history"][0]["proposal"]["source"] == NEG_SOURCE
+            assert prompt["history"][0]["evaluation"]["valid"]
+            return _evaluate_response(COS_SOURCE, "candidate two from frozen base")
+        assert prompt["selection_only"]
+        assert len(prompt["history"]) == 2
+        return _candidate_finish(prompt, 0)
 
-    graph_agent = StaticRunner(retrying_graph_agent, "agent")
+    runner = StaticRunner(callback)
+    monkeypatch.setenv("DEEPCOMPILE_AGENT_ARTIFACT_ROOT", str(tmp_path))
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+    optimizer_module._reset_inspection_session_root()
 
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
 
-    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "accepted_graph", "candidate"]
-    assert [entry.action for entry in result.trace] == ["graph_agent_retry", "evaluate", "rejected"]
-
-
-def test_graph_agent_allows_finish_after_one_candidate_outcome(monkeypatch):
-    config = _config(agent_max_iterations=2)
-    gm, ctx = _context(config)
-
-    def finishing_graph_agent(prompt, role, call_index):
-        response = _graph_agent_response(False)(prompt, role, call_index)
-        if call_index < 2:
-            return response
-        assert prompt["stage"] == "accepted_graph"
-        assert not prompt["candidate_required"]
-        assert prompt["response_contract"]["allowed_decisions"] == ["continue", "finish"]
-        assert len(prompt["history"]) == 1
-        assert prompt["history"][0]["outcome"] == "rejected"
-        response["decision"] = "finish"
-        response["summary"] = "Stop after measuring one candidate"
-        response["graph_edit"] = None
-        return response
-
-    graph_agent = StaticRunner(finishing_graph_agent, "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "candidate", "accepted_graph"]
-    assert [entry.action for entry in result.trace] == ["evaluate", "rejected", "evaluate"]
+    assert [entry.action for entry in result.trace if entry.action == "evaluated"] == ["evaluated", "evaluated"]
+    assert result.trace[-1].action == "selected"
+    assert any(node.target is torch.neg for node in gm.graph.nodes)
+    assert not any(node.target is torch.cos for node in gm.graph.nodes)
+    assert len(runner.calls) == 3
+    session = next(tmp_path.iterdir())
+    assert (session / "graph_0_fwd" / "candidate_000" / "generated_pass.py").read_text() == NEG_SOURCE
 
 
-def test_graph_agent_retries_exact_mechanical_error_with_same_runner(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
+def test_invalid_candidate_packet_can_lead_to_another_proposal(monkeypatch):
+    gm, ctx = _context(_config(agent_max_iterations=2))
+    invalid_source = "def deepcompile_pass(:\n"
 
-    def retrying_graph_agent(prompt, role, call_index):
-        response = _graph_agent_response(True)(prompt, role, call_index)
-        if prompt["stage"] == "candidate":
-            return response
-        snapshot = prompt["accepted_graph"]["snapshot"]
-        expected_error = (f"Graph edit base stale-base does not match accepted graph "
-                          f"{snapshot['graph_fingerprint']}")
+    def callback(prompt, _role, call_index):
         if call_index == 0:
-            assert prompt["mechanical_feedback"] == []
-            response["graph_edit"]["base_fingerprint"] = "stale-base"
-        else:
-            assert prompt["mechanical_feedback"] == [expected_error]
+            return _evaluate_response(invalid_source, "invalid syntax")
+        if call_index == 1:
+            assert prompt["history"][0]["proposal"]["source"] == invalid_source
+            assert not prompt["history"][0]["evaluation"]["valid"]
+            return _evaluate_response(NOOP_SOURCE, "try another source")
+        return _baseline_finish(prompt)
+
+    runner = StaticRunner(callback)
+    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
+    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
+
+    evaluated = [entry for entry in result.trace if entry.action == "evaluated"]
+    assert [entry.details["valid"] for entry in evaluated] == [False, True]
+    assert result.trace[-1].action == "selected"
+    assert len(runner.calls) == 3
+
+
+def test_agent_can_finish_after_exactly_one_evaluated_candidate(monkeypatch):
+    gm, ctx = _context(_config(agent_max_iterations=3))
+
+    def callback(prompt, _role, call_index):
+        if call_index == 0:
+            return _evaluate_response(NOOP_SOURCE)
+        assert not prompt["selection_only"]
+        return _baseline_finish(prompt)
+
+    runner = StaticRunner(callback)
+    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
+    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
+
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
+
+    assert len(runner.calls) == 2
+    assert result.trace[-1].action == "selected"
+    assert result.trace[-1].details["live_source_executed"] is False
+
+
+def test_invalid_selection_response_aborts_without_implicit_baseline(monkeypatch):
+    gm, ctx = _context(_config(agent_max_iterations=1, agent_max_retries_per_iteration=0))
+    original = structural_fingerprint(gm, ctx.graph_id)
+
+    def callback(prompt, _role, call_index):
+        if call_index == 0:
+            return _evaluate_response(NOOP_SOURCE)
+        response = _candidate_finish(prompt)
+        response["selection"]["result_fingerprint"] = "stale"
         return response
 
-    graph_agent = StaticRunner(retrying_graph_agent, "agent")
+    runner = StaticRunner(callback)
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
 
-    assert [prompt["stage"] for _, prompt in graph_agent.calls] == ["accepted_graph", "accepted_graph", "candidate"]
-    assert [entry.action for entry in result.trace] == ["graph_agent_retry", "evaluate", "accepted"]
+    assert result.trace[-1].action == "abort"
+    assert "no selection made" in result.trace[-1].summary
+    assert structural_fingerprint(gm, ctx.graph_id) == original
+    assert not any(entry.action == "selected" for entry in result.trace)
 
 
-def test_rejected_candidate_leaves_accepted_graph_intact(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    original_fingerprint = structural_fingerprint(gm)
-    graph_agent = StaticRunner(_graph_agent_response(False), "agent")
+def test_final_live_failure_restores_graph_and_raises_fail_closed(monkeypatch):
+    gm, ctx = _context(_config(agent_max_iterations=1))
+    source = """import torch
+
+calls = 0
+
+def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    global calls
+    calls += 1
+    for node in gm.graph.nodes:
+        if node.op == "call_function" and node.target is torch.sigmoid:
+            node.target = torch.neg
+    if calls == 2:
+        raise RuntimeError("fail during live replay")
+    return gm
+"""
+
+    def callback(prompt, _role, call_index):
+        return _evaluate_response(source) if call_index == 0 else _candidate_finish(prompt)
+
+    runner = StaticRunner(callback)
     monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
     monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
 
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+    with pytest.raises(RuntimeError, match="after live source execution"):
+        GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
 
-    assert structural_fingerprint(gm) == original_fingerprint
-    assert any(node.target == torch.sigmoid for node in gm.graph.nodes)
-    assert result.trace[-1].action == "rejected"
+    assert any(node.target is torch.sigmoid for node in gm.graph.nodes)
+    assert not any(node.target is torch.neg for node in gm.graph.nodes)
 
 
-def test_placeholder_removal_is_rejected_before_candidate_graph_agent(monkeypatch):
-    config = _config()
-    gm = torch.fx.symbolic_trace(TwoInputModule())
-    gm, ctx = _context_from_gm(config, gm, lambda: (torch.tensor([-1.0, 2.0]), torch.tensor(0.0)))
-    graph_agent = StaticRunner(_graph_agent_response(True, _delete_placeholder_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert result.trace[-1].action == "rejected"
-    assert "runtime ABI" in result.trace[-1].summary
-    assert len(graph_agent.calls) == 1
-    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
-    assert len([node for node in gm.graph.nodes if node.op == "placeholder"]) == 2
-
-
-def test_output_structure_change_is_rejected_before_candidate_graph_agent(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    graph_agent = StaticRunner(_graph_agent_response(True, _change_output_structure_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert result.trace[-1].action == "rejected"
-    assert "runtime ABI" in result.trace[-1].summary
-    assert len(graph_agent.calls) == 1
-    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
-    assert isinstance(gm(torch.tensor([-1.0, 2.0])), torch.Tensor)
-
-
-def test_rank_divergent_output_abi_stops_before_memory_collectives(tmp_path):
-    process_context = multiprocessing.get_context("spawn")
-    result_queue = process_context.Queue()
-    init_method = f"file://{tmp_path / 'abi-phase-store'}"
-    processes = [
-        process_context.Process(target=_rank_divergent_output_abi_worker, args=(rank, init_method, result_queue))
-        for rank in range(2)
-    ]
-    for process in processes:
-        process.start()
-
-    deadline = time.monotonic() + 20
-    for process in processes:
-        process.join(max(0, deadline - time.monotonic()))
-    alive = [process for process in processes if process.is_alive()]
-    if alive:
-        for process in alive:
-            process.terminate()
-        for process in alive:
-            process.join(5)
-        pytest.fail(f"rank-divergent ABI workers hung: {[process.pid for process in alive]}")
-
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=2))
-    except queue.Empty:
-        pytest.fail(f"distributed ABI workers exited without results: {[process.exitcode for process in processes]}")
-
-    assert all(process.exitcode == 0 for process in processes)
-    assert {result["rank"] for result in results} == {0, 1}
-    assert all(result["error"] is None for result in results), results
-    assert all(result["success"] for result in results)
-    assert all(result["abi_incompatible"] for result in results)
-    assert all(not result["memory_entered"] for result in results)
-
-
-def test_rank_sync_collectives_run_outside_active_fake_mode(tmp_path):
-    process_context = multiprocessing.get_context("fork")
-    result_queue = process_context.Queue()
-    init_method = f"file://{tmp_path / 'fake-mode-rank-sync-store'}"
-    processes = [
-        process_context.Process(target=_fake_mode_rank_sync_worker, args=(rank, init_method, result_queue))
-        for rank in range(2)
-    ]
-    for process in processes:
-        process.start()
-
-    deadline = time.monotonic() + 20
-    for process in processes:
-        process.join(max(0, deadline - time.monotonic()))
-    alive = [process for process in processes if process.is_alive()]
-    if alive:
-        for process in alive:
-            process.terminate()
-        for process in alive:
-            process.join(5)
-        pytest.fail(f"fake-mode rank-sync workers hung: {[process.pid for process in alive]}")
-
-    results = []
-    try:
-        for _ in processes:
-            results.append(result_queue.get(timeout=2))
-    except queue.Empty:
-        exit_codes = [process.exitcode for process in processes]
-        pytest.fail(f"fake-mode rank-sync workers exited without results: {exit_codes}")
-
-    expected_records = [{"rank": 0, "generated": True}, {"rank": 1, "generated": False}]
-    assert all(process.exitcode == 0 for process in processes)
-    assert {result["rank"] for result in results} == {0, 1}
-    assert all(result["error"] is None for result in results), results
-    assert all(result["records"] == expected_records for result in results)
-    assert all(result["fingerprint"] == result["expected_fingerprint"] for result in results)
-    assert len({result["fingerprint"] for result in results}) == 1
-    assert all(result["output"] == [0.0, -3.0] for result in results)
-
-
-def test_placeholder_name_change_with_same_positional_abi_can_be_accepted(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    graph_agent = StaticRunner(_graph_agent_response(True, _rename_placeholder_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert result.trace[-1].action == "accepted"
-    placeholder = next(node for node in gm.graph.nodes if node.op == "placeholder")
-    assert placeholder.target == "renamed_input"
-    assert torch.equal(gm(torch.tensor([-1.0, 2.0])), torch.sigmoid(torch.relu(torch.tensor([-1.0, 2.0]))))
-
-
-def test_rejected_candidate_restores_registered_parameters_and_buffers(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config, StatefulModule())
-    original_parameter = next(gm.parameters()).detach().clone()
-    original_buffer = next(gm.buffers()).detach().clone()
-
-    def mutating_profile(profile_gm, profile_ctx, profile_calls=None, expected_abi=None):
-        if any(node.meta.get("candidate_state_probe") for node in profile_gm.graph.nodes):
-            with torch.no_grad():
-                next(profile_gm.parameters()).add_(5)
-                next(profile_gm.buffers()).add_(7)
-        return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
-
-    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert result.trace[-1].action == "rejected"
-    assert torch.equal(next(gm.parameters()), original_parameter)
-    assert torch.equal(next(gm.buffers()), original_buffer)
-
-
-def test_rejected_candidate_restores_nested_aot_lifted_parameter_input(monkeypatch):
-    config = _config()
-    gm, ctx, lifted_parameter = _aot_lifted_context(config)
-    assert not list(gm.parameters())
-    assert not list(gm.buffers())
-
-    def mutating_profile(profile_gm, profile_ctx, profile_calls=None, expected_abi=None):
-        if any(node.meta.get("candidate_state_probe") for node in profile_gm.graph.nodes):
-            assert profile_calls is not None
-            captured_parameter = profile_calls[0].args[0]["weights"][0]
-            assert captured_parameter is lifted_parameter
-            with torch.no_grad():
-                captured_parameter.add_(10)
-        return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
-
-    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert result.trace[-1].action == "rejected"
-    assert torch.equal(lifted_parameter, torch.tensor(2.0))
-
-
-def test_accepted_profile_restores_registered_state_on_success(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config, StatefulModule())
-    original_parameter = next(gm.parameters()).detach().clone()
-    original_buffer = next(gm.buffers()).detach().clone()
-
-    def mutating_profile(profile_gm, profile_ctx, profile_calls=None, expected_abi=None):
-        with torch.no_grad():
-            next(profile_gm.parameters()).add_(5)
-            next(profile_gm.buffers()).add_(7)
-        return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
-
-    monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
-
-    success, records = GraphAgentLoopOptimizer._profile_accepted_graph(ctx)
-
-    assert success
-    assert all(record["success"] for record in records)
-    assert torch.equal(next(gm.parameters()), original_parameter)
-    assert torch.equal(next(gm.buffers()), original_buffer)
-    assert ctx.runtime_abi is not None
-
-
-def test_accepted_profile_restores_lifted_state_after_profiling_failure(monkeypatch):
-    config = _config()
-    _, ctx, lifted_parameter = _aot_lifted_context(config)
-
-    def failing_profile(_gm, _ctx, profile_calls=None, expected_abi=None):
-        with torch.no_grad():
-            profile_calls[0].args[0]["weights"][0].add_(9)
-        raise RuntimeError("profile failed after mutation")
-
-    monkeypatch.setattr(optimizer_module, "_profile_graph", failing_profile)
-
-    success, records = GraphAgentLoopOptimizer._profile_accepted_graph(ctx)
-
-    assert not success
-    assert "profile failed after mutation" in records[0]["error"]
-    assert torch.equal(lifted_parameter, torch.tensor(2.0))
-
-
-def test_accepted_profile_restore_failure_raises_before_any_agent(monkeypatch):
-    config = _config()
-    gm, ctx, lifted_parameter = _aot_lifted_context(config)
-    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
-
-    def mutating_profile(profile_gm, profile_ctx, profile_calls=None, expected_abi=None):
-        with torch.no_grad():
-            profile_calls[0].args[0]["weights"][0].add_(4)
-        return _fake_profile(profile_gm, profile_ctx, profile_calls, expected_abi)
-
-    monkeypatch.setattr(optimizer_module, "_profile_graph", mutating_profile)
-    monkeypatch.setattr(optimizer_module, "_restore_candidate_state", lambda snapshots:
-                        (_ for _ in ()).throw(RuntimeError("restore failed")))
-
-    with pytest.raises(RuntimeError, match="Accepted graph state restoration failed"):
-        GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert not graph_agent.calls
-    assert not torch.equal(lifted_parameter, torch.tensor(2.0))
-
-
-def test_candidate_restore_failure_stops_before_candidate_evaluation(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    graph_agent = StaticRunner(_graph_agent_response(False, _metadata_graph_edit), "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    original_restore = optimizer_module._restore_candidate_state
-    restore_calls = []
-
-    def fail_candidate_restore(snapshots):
-        restore_calls.append(snapshots)
-        if len(restore_calls) == 1:
-            original_restore(snapshots)
-            return
-        raise RuntimeError("restore failed")
-
-    monkeypatch.setattr(optimizer_module, "_restore_candidate_state", fail_candidate_restore)
-
-    with pytest.raises(RuntimeError, match="Candidate state restoration failed"):
-        GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert len(graph_agent.calls) == 1
-    assert graph_agent.calls[0][1]["stage"] == "accepted_graph"
-
-
-def test_stale_candidate_fingerprint_cannot_be_accepted(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-
-    def stale_graph_agent(prompt, role, _call_index):
-        response = _graph_agent_response(True)(prompt, role, _call_index)
-        if prompt["stage"] == "candidate":
-            response["candidate_fingerprint"] = "stale-fingerprint"
-        return response
-
-    graph_agent = StaticRunner(stale_graph_agent, "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert any(entry.action == "abort" and "candidate_fingerprint" in entry.summary for entry in result.trace)
-    assert any(node.target == torch.sigmoid for node in gm.graph.nodes)
-
-
-def test_stale_metadata_only_candidate_response_cannot_accept_a_different_edit(monkeypatch):
-    config = _config(agent_max_iterations=2)
-    gm, ctx = _context(config)
-    first_candidate_fingerprint = []
-
-    def graph_agent_callback(prompt, role, call_index):
-        assert role == "graph_agent"
-        snapshot = prompt["accepted_graph"]["snapshot"]
-        if prompt["stage"] == "accepted_graph":
-            graph_edit = _metadata_graph_edit(prompt, role, call_index)
-            graph_edit["operations"][0]["meta"] = {"candidate_state_probe": True, "attempt": [call_index]}
-            return {
-                "schema_version": 4,
-                "based_on": snapshot,
-                "decision": "continue",
-                "summary": "Try a metadata-only edit",
-                "graph_edit": graph_edit,
-                "candidate_generation": None,
-                "candidate_fingerprint": None,
-            }
-        current_fingerprint = prompt["candidate"]["fingerprint"]
-        if not first_candidate_fingerprint:
-            first_candidate_fingerprint.append(current_fingerprint)
-            decision = "reject"
-            response_fingerprint = current_fingerprint
-        else:
-            assert current_fingerprint != first_candidate_fingerprint[0]
-            decision = "accept"
-            response_fingerprint = first_candidate_fingerprint[0]
-        return {
-            "schema_version": 4,
-            "based_on": snapshot,
-            "decision": decision,
-            "summary": "Candidate decision",
-            "graph_edit": None,
-            "candidate_generation": prompt["candidate"]["generation"],
-            "candidate_fingerprint": response_fingerprint,
-        }
-
-    graph_agent = StaticRunner(graph_agent_callback, "agent")
-    monkeypatch.setattr(optimizer_module, "_profile_graph", _fake_profile)
-    monkeypatch.setattr(optimizer_module, "_cleanup_after_candidate", lambda: None)
-
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
-
-    assert any(entry.action == "abort" and "candidate_fingerprint" in entry.summary for entry in result.trace)
-    assert len([prompt for _, prompt in graph_agent.calls if prompt["stage"] == "accepted_graph"]) == 2
-    assert not any("attempt" in node.meta for node in gm.graph.nodes)
-
-
-def test_nonzero_rank_never_invokes_graph_agent(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-
-    def unexpected_agent_call(*args, **kwargs):
-        raise AssertionError("nonzero rank invoked an agent")
-
-    graph_agent = StaticRunner(unexpected_agent_call, "agent")
+def test_nonzero_rank_never_invokes_coding_agent(monkeypatch):
+    gm, ctx = _context()
+    runner = StaticRunner(lambda *_args: pytest.fail("nonzero rank invoked coding agent"))
     monkeypatch.setattr(optimizer_module, "_rank", lambda: 1)
-    monkeypatch.setattr(GraphAgentLoopOptimizer, "_snapshot_consensus", lambda self, tracker: (True, []))
-    monkeypatch.setattr(GraphAgentLoopOptimizer, "_profile_accepted_graph", lambda self, profile_ctx: (True, []))
-    monkeypatch.setattr(optimizer_module, "broadcast_json_payload", lambda payload: {"continue": False, "error": None})
+    monkeypatch.setattr(GraphAgentLoopOptimizer, "_snapshot_consensus", lambda _self, _ctx: (False, []))
 
-    result = GraphAgentLoopOptimizer(graph_agent, config).optimize(gm, ctx)
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
 
-    assert not result.trace
-    assert not graph_agent.calls
+    assert result.trace == []
+    assert runner.calls == []
 
 
-def test_backend_marker_runs_z3_pass_then_graph_agent_loop_and_baseline_stays_direct(monkeypatch):
-    config = _config()
-    gm, ctx = _context(config)
-    structural_pass = lambda *args, **kwargs: None
-    pass_calls = []
-    agent_calls = []
+def test_backend_passes_real_mem_budget_and_param_manager_to_private_context(monkeypatch):
+    gm, ctx = _context()
+    manager = object()
+    observed = []
 
-    def fake_run_opt_passes(passes, *args, **kwargs):
-        pass_calls.append(list(passes))
+    class FakeOptimizer:
 
-    class FakeGraphAgent:
-
-        def __init__(self, graph_agent_runner, compile_config):
-            agent_calls.append((graph_agent_runner.config.command, compile_config))
+        def __init__(self, _runner, _config):
+            pass
 
         def optimize(self, graph_module, optimization_context):
-            assert graph_module is gm
+            observed.append((graph_module, optimization_context.mem_budget, optimization_context.param_manager))
             return OptimizationResult()
 
-    monkeypatch.setattr(backend, "run_opt_passes", fake_run_opt_passes)
-    monkeypatch.setattr(optimizer_module, "GraphAgentLoopOptimizer", FakeGraphAgent)
+    monkeypatch.setattr(backend, "run_opt_passes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(optimizer_module, "GraphAgentLoopOptimizer", FakeOptimizer)
 
-    result = backend.run_optimization([structural_pass, backend.agent_optimization_loop], gm, 11, (0, "fwd"),
-                                      ctx.graph_order, ctx.profiling_results, ctx.create_inputs_fn, 0.0,
-                                      {11: object()}, False, config)
+    result = backend.run_optimization([backend.agent_optimization_loop], gm, 11, (0, "fwd"), ctx.graph_order,
+                                      ctx.profiling_results, ctx.create_inputs_fn, 987.0, manager, False,
+                                      ctx.compile_config)
+
     assert isinstance(result, OptimizationResult)
-    assert pass_calls == [[structural_pass]]
-    assert agent_calls[0][0] == ["agent"]
-
-    pass_calls.clear()
-    assert backend.run_optimization([structural_pass], gm, 11, (0, "fwd"), ctx.graph_order, ctx.profiling_results,
-                                    ctx.create_inputs_fn, 0.0, {11: object()}, False, CompileConfig()) is None
-    assert pass_calls == [[structural_pass]]
+    assert observed == [(gm, 987.0, manager)]
 
 
-def test_agent_config_has_no_zero_stage_offload_or_custom_pass_bans():
-    config = CompileConfig(zero3_tuning_strategy="agent",
-                           agent_command=["agent"],
-                           passes=["z3"],
-                           offload_parameters=True)
-
-    assert config.agent_architecture == "graph_agent"
-    assert config.passes == ["z3"]
-    assert config.offload_parameters
-    assert not hasattr(config, "validate_zero_stage")
+def test_required_z3_and_offload_passes_still_precede_agent_marker(monkeypatch):
+    monkeypatch.setattr(init_z3_module.offload_activation, "register_activation_offload_ops", lambda: None)
+    for options in ({}, {"offload_parameters": True}, {"offload_opt_states": True}, {"offload_activation": True}):
+        schedule = init_z3_module._default_z3_schedule(_config(**options))
+        warmup_passes = schedule[-1][1]
+        assert warmup_passes[-1] is backend.agent_optimization_loop
+        assert init_z3_module.zero3_compile.add_z3_gather_release in warmup_passes
 
 
-def test_non_agent_default_schedule_retains_fixed_master_passes():
-    schedule = init_z3_module._default_z3_schedule(CompileConfig())
+def _rank_divergent_source_worker(rank, init_method, result_queue):
+    try:
+        dist.init_distributed(dist_backend="gloo",
+                              auto_mpi_discovery=False,
+                              init_method=init_method,
+                              rank=rank,
+                              world_size=2,
+                              timeout=timedelta(seconds=10),
+                              verbose=False)
+        gm, ctx = _context(_config())
+        frozen_graph = clone_graph_module(gm)
+        fingerprint = structural_fingerprint(frozen_graph, ctx.graph_id)
+        frozen = FrozenGraphContext(graph_module=frozen_graph,
+                                    graph_fingerprint=fingerprint,
+                                    graph_slot=ctx.graph_slot,
+                                    graph_order=ctx.graph_order,
+                                    baseline_rank_results=[],
+                                    baseline_aggregate={},
+                                    mem_budget=ctx.mem_budget,
+                                    param_manager=ctx.param_manager)
+        source = """import deepspeed.comm as dist
+import torch
 
-    assert schedule == [
-        (0, [init_z3_module.zero3_compile.add_z3_gather_release]),
-        (init_z3_module.WARMUP, [
-            init_z3_module.zero3_compile.add_z3_gather_release, init_z3_module.prefetch.schedule_prefetch,
-            init_z3_module.selective_gather.selective_gather
-        ]),
+def deepcompile_pass(gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget, param_manager, bwd):
+    if dist.get_rank() == 0:
+        for node in gm.graph.nodes:
+            if node.op == "call_function" and node.target is torch.sigmoid:
+                node.target = torch.neg
+    return gm
+"""
+        local_proposal = None
+        if rank == 0:
+            local_proposal = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+        envelope = optimizer_module.broadcast_json_payload({"proposal": local_proposal.to_dict()} if rank ==
+                                                           0 else None)
+        proposal = GeneratedPassProposal(**envelope["proposal"])
+        source_path = Path(tempfile.mkdtemp(prefix=f"deepcompile_rank_divergent_{rank}_")) / "generated_pass.py"
+        _, _, _, packet = GraphAgentLoopOptimizer._apply_and_profile_candidate(ctx, frozen, proposal, 0, source_path)
+        result_queue.put({"rank": rank, "valid": packet["valid"], "error": None})
+    except Exception as exc:
+        result_queue.put({"rank": rank, "valid": None, "error": repr(exc)})
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_two_rank_source_consensus_rejects_rank_dependent_graph(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    init_method = f"file://{tmp_path / 'gloo_init'}"
+    processes = [
+        context.Process(target=_rank_divergent_source_worker, args=(rank, init_method, result_queue))
+        for rank in range(2)
     ]
-
-
-def test_non_agent_explicit_schedule_is_returned_unchanged():
-    custom_pass = lambda *args, **kwargs: None
-    schedule = [(0, [init_z3_module.zero3_compile.add_z3_gather_release]),
-                (init_z3_module.WARMUP, [custom_pass, init_z3_module.prefetch.schedule_prefetch])]
-    original = [(step, list(passes)) for step, passes in schedule]
-
-    composed = init_z3_module._compose_agent_schedule(schedule, CompileConfig())
-
-    assert composed is schedule
-    assert composed == original
-
-
-def test_agent_is_appended_after_all_explicit_warmup_passes():
-    first_pass = lambda *args, **kwargs: None
-    second_pass = lambda *args, **kwargs: None
-    schedule = [(0, [init_z3_module.zero3_compile.add_z3_gather_release]),
-                (init_z3_module.WARMUP, [first_pass, second_pass])]
-
-    composed = init_z3_module._compose_agent_schedule(schedule, _config())
-
-    assert schedule[-1][1] == [first_pass, second_pass]
-    assert composed[-1][1] == [first_pass, second_pass, backend.agent_optimization_loop]
-
-
-def test_agent_adds_warmup_to_explicit_schedule_without_one():
-    structural_pass = lambda *args, **kwargs: None
-    later_pass = lambda *args, **kwargs: None
-    schedule = [(0, [init_z3_module.zero3_compile.add_z3_gather_release, structural_pass]), (7, [later_pass])]
-
-    composed = init_z3_module._compose_agent_schedule(schedule, _config())
-
-    assert composed == [
-        schedule[0],
-        (init_z3_module.WARMUP,
-         [init_z3_module.zero3_compile.add_z3_gather_release, structural_pass, backend.agent_optimization_loop]),
-        schedule[1],
-    ]
-
-
-@pytest.mark.parametrize("offload_kind", ["parameters", "optimizer", "activation"])
-def test_agent_schedule_preserves_each_supported_offload_path(offload_kind, monkeypatch):
-    options = {
-        "offload_parameters": offload_kind == "parameters",
-        "offload_opt_states": offload_kind == "optimizer",
-        "offload_activation": offload_kind == "activation",
-    }
-    if offload_kind == "activation":
-        monkeypatch.setattr(init_z3_module.offload_activation, "register_activation_offload_ops", lambda: None)
-    schedule = init_z3_module._default_z3_schedule(_config(**options))
-
-    assert schedule[0][0] == 0
-    assert init_z3_module.zero3_compile.add_z3_gather_release in schedule[0][1]
-    assert schedule[-1][0] == init_z3_module.WARMUP
-    assert schedule[-1][1][-1] is backend.agent_optimization_loop
-    if offload_kind == "parameters":
-        assert init_z3_module.offload_parameters.offload_parameter_fwd in schedule[0][1]
-        assert init_z3_module.offload_parameters.offload_parameter_fwd in schedule[-1][1]
-    elif offload_kind == "optimizer":
-        offload_module = importlib.import_module("deepspeed.compile.passes.offload_adam_states")
-        assert schedule[1][0] == 1
-        assert offload_module.offload_adam_states_for_init in schedule[1][1]
-        assert offload_module.offload_adam_states_for_init in schedule[-1][1]
-        assert offload_module.move_opt_states in schedule[-1][1]
-    else:
-        assert init_z3_module.offload_activation.offload_activation_floor in schedule[0][1]
-        assert init_z3_module.offload_activation.offload_activation in schedule[-1][1]
-
-
-def test_agent_timeout_terminates_wrapper_process_group(tmp_path, monkeypatch):
-    popen_kwargs = {}
-    signals = []
-
-    class FakeProcess:
-        pid = 43210
-        returncode = None
-
-        def __init__(self):
-            self.wait_count = 0
-
-        def wait(self, timeout=None):
-            self.wait_count += 1
-            if self.wait_count < 3:
-                raise subprocess.TimeoutExpired(["agent"], timeout)
-            self.returncode = -signal.SIGKILL
-            return self.returncode
-
-    process = FakeProcess()
-
-    def fake_popen(*args, **kwargs):
-        popen_kwargs.update(kwargs)
-        return process
-
-    monkeypatch.setattr(agent_runner_module.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(agent_runner_module.os, "killpg", lambda process_group, sig: signals.append(
-        (process_group, sig)))
-    monkeypatch.setattr(agent_runner_module.time, "sleep", lambda _seconds: None)
-    runner = AgentRunner(AgentRunnerConfig(command=["agent"], timeout_sec=1, debug_log=False, terminate_grace_sec=1))
-
-    result = runner.run("prompt", tmp_path)
-
-    assert result.timed_out
-    assert popen_kwargs["start_new_session"] is True
-    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
-
-
-def test_agent_timeout_stops_a_real_descendant_process(tmp_path):
-    child_pid_path = tmp_path / "child.pid"
-    child = ("from pathlib import Path; import os, signal, sys, time; "
-             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-             "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)")
-    wrapper = ("from pathlib import Path; import subprocess, sys, time; "
-               "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]]); "
-               "deadline = time.monotonic() + 5; "
-               "\nwhile not Path(sys.argv[1]).exists() and time.monotonic() < deadline: time.sleep(0.01)\n"
-               "time.sleep(60)")
-    runner = AgentRunner(
-        AgentRunnerConfig(command=[sys.executable, "-c", wrapper,
-                                   str(child_pid_path), child],
-                          timeout_sec=1,
-                          debug_log=False,
-                          terminate_grace_sec=1))
-
-    result = runner.run("prompt", tmp_path / "real_process_group")
-
-    assert result.timed_out
-    assert child_pid_path.exists()
-    child_pid = int(child_pid_path.read_text())
-    child_stat = Path(f"/proc/{child_pid}/stat")
-    for _ in range(50):
-        if not child_stat.exists():
+    for process in processes:
+        process.start()
+    results = []
+    for _ in processes:
+        try:
+            results.append(result_queue.get(timeout=20))
+        except queue.Empty:
             break
-        state = child_stat.read_text(encoding="utf-8").split()[2]
-        if state in {"X", "Z"}:
-            break
-        time.sleep(0.02)
-    assert not child_stat.exists() or child_stat.read_text(encoding="utf-8").split()[2] in {"X", "Z"}
+    for process in processes:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert len(results) == 2
+    assert all(result["error"] is None for result in results), results
+    assert all(result["valid"] is False for result in results)

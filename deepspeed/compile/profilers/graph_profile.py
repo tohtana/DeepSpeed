@@ -231,6 +231,11 @@ class ProfilingInterpreter(Interpreter):
             n.meta["alloc_mem"] = 0
             n.meta["max_mem"] = 0
             n.meta["tensor_size"] = _node_size(n)
+            n.meta["local_device_time"] = 0.0
+            n.meta["local_wall_time"] = 0.0
+            n.meta["local_alloc_mem"] = 0
+            n.meta["local_max_mem"] = 0
+            n.meta["local_tensor_size"] = n.meta["tensor_size"]
             return super().run_node(n)
 
         args, kwargs = self.fetch_args_kwargs_from_env(n)
@@ -262,12 +267,18 @@ class ProfilingInterpreter(Interpreter):
         cache_hit = cache_hit_flag.item() == 0
 
         if cache_hit:
-            device_time, wall_time, alloc_mem, max_mem, tensor_size = self.cache[cache_key]
+            (device_time, wall_time, alloc_mem, max_mem, tensor_size, local_device_time, local_wall_time,
+             local_alloc_mem, local_max_mem, local_tensor_size) = self.cache[cache_key]
             n.meta["device_time"] = device_time
             n.meta["wall_time"] = wall_time
             n.meta["alloc_mem"] = alloc_mem
             n.meta["max_mem"] = max_mem
             n.meta["tensor_size"] = tensor_size
+            n.meta["local_device_time"] = local_device_time
+            n.meta["local_wall_time"] = local_wall_time
+            n.meta["local_alloc_mem"] = local_alloc_mem
+            n.meta["local_max_mem"] = local_max_mem
+            n.meta["local_tensor_size"] = local_tensor_size
 
         # Running the node is where profiling runs out of memory in practice, and it sits between
         # two collectives every rank must reach. Record a failure and keep going to the vote at the
@@ -332,6 +343,7 @@ class ProfilingInterpreter(Interpreter):
                 wall_time = 0.0
 
             with unset_fake_temporarily():
+                local_values = (device_time, wall_time, alloc_mem, max_memory, tensor_size)
                 vals_to_bcast = torch.tensor([device_time, wall_time, alloc_mem, max_memory, tensor_size],
                                              device=self.device)
                 if self.distributed:
@@ -342,8 +354,15 @@ class ProfilingInterpreter(Interpreter):
                     n.meta["alloc_mem"] = int(vals_to_bcast[2].item())
                     n.meta["max_mem"] = int(vals_to_bcast[3].item())
                     n.meta["tensor_size"] = int(vals_to_bcast[4].item())
+                    n.meta["local_device_time"] = local_values[0]
+                    n.meta["local_wall_time"] = local_values[1]
+                    n.meta["local_alloc_mem"] = local_values[2]
+                    n.meta["local_max_mem"] = local_values[3]
+                    n.meta["local_tensor_size"] = local_values[4]
                     self.cache[cache_key] = (n.meta["device_time"], n.meta["wall_time"], n.meta["alloc_mem"],
-                                             n.meta["max_mem"], n.meta["tensor_size"])
+                                             n.meta["max_mem"], n.meta["tensor_size"], n.meta["local_device_time"],
+                                             n.meta["local_wall_time"], n.meta["local_alloc_mem"],
+                                             n.meta["local_max_mem"], n.meta["local_tensor_size"])
 
         _abort_if_any_rank_failed(error, self.device, self.distributed)
 
@@ -375,7 +394,9 @@ class MemoryProfilingInterpreter(Interpreter):
         self.nz3 = get_deepcompile_handle()
         self.device = torch.device(get_accelerator().current_device())
         self.mem_record = []
+        self.local_mem_record = []
         self.last_alloc = get_accelerator().memory_allocated()
+        self.local_last_alloc = self.last_alloc
         self.profile_complete = True
 
         self.node_counter = 0
@@ -396,6 +417,7 @@ class MemoryProfilingInterpreter(Interpreter):
         except Exception as e:
             self.profile_complete = False
             self.mem_record.clear()
+            self.local_mem_record.clear()
             print(f"MemoryProfiling error {e}")
         finally:
             try:
@@ -428,6 +450,8 @@ class MemoryProfilingInterpreter(Interpreter):
 
         current_alloc = get_accelerator().memory_allocated() + self.mem_usage_out_of_torch
         max_alloc = get_accelerator().max_memory_allocated() + self.mem_usage_out_of_torch
+        local_current_alloc = current_alloc
+        local_max_alloc = max_alloc
         vals_to_bcast = torch.tensor([current_alloc, max_alloc], device=self.device, dtype=torch.int64)
         dist.all_reduce(vals_to_bcast, dist.ReduceOp.MAX)
         current_alloc = vals_to_bcast[0].item()
@@ -436,6 +460,8 @@ class MemoryProfilingInterpreter(Interpreter):
         _abort_if_any_rank_failed(error, self.device)
 
         self.mem_record.append((n.name, current_alloc, current_alloc - self.last_alloc, max_alloc))
+        self.local_mem_record.append(
+            (n.name, local_current_alloc, local_current_alloc - self.local_last_alloc, local_max_alloc))
 
         self.node_counter += 1
         if self.debug_log and dist.get_rank() == 0:
@@ -444,6 +470,7 @@ class MemoryProfilingInterpreter(Interpreter):
             )
 
         self.last_alloc = current_alloc
+        self.local_last_alloc = local_current_alloc
 
         return ret
 
