@@ -686,6 +686,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         for hook in self._grad_acc_hooks:
             hook.remove()
         self.print_rank_0("Removed grad acc hooks")
+        if get_accelerator().is_available():
+            get_accelerator().synchronize()
         self._unpin_offload_buffers()
 
     def _unpin_offload_buffers(self):
