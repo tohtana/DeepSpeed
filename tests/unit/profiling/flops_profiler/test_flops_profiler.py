@@ -85,6 +85,33 @@ def test_conv_transpose_flops(groups, stride, padding, output_padding):
     assert flops == 2 * expected_macs + expected_bias_flops
 
 
+@pytest.mark.sequential
+def test_conv_transpose_flops_with_output_size():
+    """An explicit output size makes PyTorch pass output_padding as a list."""
+    in_channels, out_channels, kernel_size = 4, 8, 3
+    model = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=2, padding=1)
+    inputs = torch.randn(2, in_channels, 8, 8)
+    output_size = [inputs.shape[0], out_channels, 16, 16]
+
+    prof = FlopsProfiler(model)
+    prof.start_profile()
+    try:
+        outputs = model(inputs, output_size=output_size)
+        flops, macs = prof.get_total_flops(), prof.get_total_macs()
+    finally:
+        prof.stop_profile()
+        prof.end_profile()
+
+    input_elements = inputs.shape[0] * inputs[0, 0].numel()
+    output_elements = outputs.shape[0] * outputs[0, 0].numel()
+    expected_macs = input_elements * in_channels * out_channels * kernel_size * kernel_size
+    expected_bias_flops = out_channels * output_elements
+
+    assert tuple(outputs.shape) == tuple(output_size)
+    assert macs == expected_macs
+    assert flops == 2 * expected_macs + expected_bias_flops
+
+
 class LeNet5(torch.nn.Module):
 
     def __init__(self, n_classes):
