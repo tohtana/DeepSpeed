@@ -29,7 +29,8 @@ from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStat
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 import deepspeed.runtime.zenflow.engine_stage3 as zf_engine_stage3
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer, defragment, get_norm_dtype
-from deepspeed.runtime.zero.offload_states import offload_adam_states, reload_adam_states
+from deepspeed.runtime.zero.offload_states import (offload_adam_states, reload_adam_states,
+                                                   unpin_offloaded_optimizer_states)
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from deepspeed.runtime.swap_tensor.partitioned_param_swapper import PartitionedParamStatus
 from deepspeed.runtime.swap_tensor.optimizer_utils import OptimizerSwapper
@@ -531,6 +532,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             hook.remove()
         print_rank_0("Removed grad acc hooks", force=False)
         self.ipg_buckets.clear()
+        if get_accelerator().is_available():
+            get_accelerator().synchronize()
         self._unpin_offload_buffers()
 
     def _unpin_offload_buffers(self):
@@ -547,6 +550,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 accelerator.unpin_memory(buffer)
         for buffer in getattr(self, 'hp_params_pin_buffers', []):
             accelerator.unpin_memory(buffer)
+        unpin_offloaded_optimizer_states(self.optimizer)
         if self.offload_optimizer_pin_memory:
             for fp32_partition in self.fp32_partitioned_groups_flat:
                 if fp32_partition.grad is not None:
