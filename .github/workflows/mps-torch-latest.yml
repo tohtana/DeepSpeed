@@ -47,9 +47,12 @@ jobs:
           ds_report
 
       - name: Unit tests
+        # Spawn-based DistributedTest cases cost 60-75s each on the shared arm64 runners, so run
+        # them across xdist workers and fail hung launches fast instead of eating the job budget.
         run: |
           cd tests
-          DS_ACCELERATOR=mps python -m pytest -p no:randomly --verbose \
+          DS_ACCELERATOR=mps DS_UNITTEST_TIMEOUT=300 python -m pytest -p no:randomly --verbose \
+            -n 3 --max-worker-restart=2 \
             unit/ops/adam/test_adamw.py \
             unit/comm/test_dist.py \
             unit/runtime/test_ds_config_dict.py
