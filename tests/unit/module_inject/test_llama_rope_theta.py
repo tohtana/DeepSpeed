@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -31,11 +31,11 @@ def test_reads_rope_parameters_when_the_attribute_is_gone():
     assert _get_rope_theta(self_attn) == 10000.0
 
 
-def test_prefers_the_attribute_when_both_are_present():
+def test_prefers_rope_parameters_when_both_are_present():
     config = SimpleNamespace(rope_theta=500000.0, rope_parameters={"rope_theta": 10000.0})
     self_attn = SimpleNamespace(config=config)
 
-    assert _get_rope_theta(self_attn) == 500000.0
+    assert _get_rope_theta(self_attn) == 10000.0
 
 
 def test_falls_back_to_the_module_attribute():
@@ -55,3 +55,25 @@ def test_falls_back_when_rope_parameters_carries_no_theta():
 def test_raises_when_nothing_carries_it():
     with pytest.raises(AttributeError):
         _get_rope_theta(SimpleNamespace(config=SimpleNamespace()))
+
+
+def test_rejects_scaled_rope_parameters():
+    config = SimpleNamespace(
+        rope_parameters={
+            "rope_theta": 500000.0,
+            "rope_type": "llama3",
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+        })
+
+    with pytest.raises(ValueError, match="only supports default RoPE, got rope_type='llama3'"):
+        _get_rope_theta(SimpleNamespace(config=config))
+
+
+def test_rejects_legacy_rope_scaling():
+    config = SimpleNamespace(rope_theta=10000.0, rope_scaling={"type": "linear", "factor": 2.0})
+
+    with pytest.raises(ValueError, match="only supports default RoPE, got rope_type='linear'"):
+        _get_rope_theta(SimpleNamespace(config=config))

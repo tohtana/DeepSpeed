@@ -24,17 +24,25 @@ def _get_rope_theta(self_attn):
     """Read rope_theta from whichever place the installed transformers keeps it.
 
     transformers < 5.0 exposes it as ``config.rope_theta``; 5.0 moved the rotary
-    settings into the ``rope_parameters`` dict and dropped the attribute, so the
-    older reads raise AttributeError against a stock LlamaConfig. Very old
-    versions kept it on the attention module itself.
+    settings into the ``rope_parameters`` dict and dropped the attribute. Kernel
+    injection only supports default RoPE, so scaled variants must fail before
+    constructing a module that would use different rotary frequencies. Very old
+    versions kept theta on the attention module itself.
     """
     config = getattr(self_attn, 'config', None)
     if config is not None:
+        rope_parameters = getattr(config, 'rope_parameters', None)
+        if rope_parameters is None:
+            rope_parameters = getattr(config, 'rope_scaling', None)
+        if rope_parameters is not None:
+            rope_type = rope_parameters.get('rope_type', rope_parameters.get('type', 'default'))
+            if rope_type != 'default':
+                raise ValueError(
+                    f"DeepSpeed Llama kernel injection only supports default RoPE, got rope_type={rope_type!r}")
+            if 'rope_theta' in rope_parameters:
+                return rope_parameters['rope_theta']
         if hasattr(config, 'rope_theta'):
             return config.rope_theta
-        rope_parameters = getattr(config, 'rope_parameters', None)
-        if rope_parameters is not None and 'rope_theta' in rope_parameters:
-            return rope_parameters['rope_theta']
     return self_attn.rope_theta
 
 
