@@ -38,7 +38,8 @@ from .evaluation_context import (AgentResponseError, GeneratedPassProposal, Gene
                                  aggregate_rank_metrics, build_evaluation_packet, build_reference_pass_inventory,
                                  parse_search_response, sanitize_json_value, serialize_search_context,
                                  validate_selection, verify_proposal_identity)
-from .graph_edit import (clone_graph_module, generated_graph_fingerprint_details, structural_fingerprint)
+from .graph_edit import (clone_graph_module, generated_graph_fingerprint_details, normalized_graph,
+                         structural_fingerprint)
 from .profilers import ProfilingResult
 from .profilers.graph_profile import MemoryProfilingInterpreter, ProfilingInterpreter, is_profile_incomplete
 
@@ -61,6 +62,7 @@ class OptimizationContext:
     compile_config: Optional[CompileConfig]
     warmup_trace: List[Dict[str, Any]] = field(default_factory=list)
     runtime_abi: Optional[_RuntimeABIDescriptor] = None
+    backend_compile_fn: Optional[Callable[[GraphModule], Any]] = None
 
 
 @dataclass
@@ -565,7 +567,35 @@ class GraphAgentLoopOptimizer:
             local = {"rank": _rank(), "success": False, "fingerprint": None, "error": str(exc)}
         records = gather_rank_records(local)
         fingerprints = {record["fingerprint"] for record in records if record["success"]}
-        return all(record["success"] for record in records) and len(fingerprints) == 1, records
+        consensus = all(record["success"] for record in records) and len(fingerprints) == 1
+        if consensus:
+            return True, records
+
+        try:
+            description = normalized_graph(ctx.gm, runtime_graph_id=ctx.graph_id)
+            description_error = None
+        except Exception as exc:
+            description = None
+            description_error = str(exc)
+        evidence = gather_rank_records({
+            **local,
+            "normalized_graph": description,
+            "description_error": description_error,
+        })
+        return False, evidence
+
+    @staticmethod
+    def _record_early_abort(iteration_root: Path, ctx: OptimizationContext, guard: str, summary: str,
+                            rank_results: List[Dict[str, Any]]) -> None:
+        evidence_path = iteration_root / "early_abort.json"
+        _safe_write_json(evidence_path, {
+            "graph_slot": list(ctx.graph_slot),
+            "guard": guard,
+            "summary": summary,
+            "rank_results": rank_results,
+        })
+        _logger.warning("DeepCompile generated-pass loop aborted at %s for graph slot %s; evidence: %s", guard,
+                        ctx.graph_slot, evidence_path)
 
     @staticmethod
     def _profile_accepted_graph(ctx: OptimizationContext) -> Tuple[bool, List[Dict[str, Any]]]:
@@ -764,6 +794,33 @@ class GraphAgentLoopOptimizer:
         if not fingerprint_success:
             rank_results = GraphAgentLoopOptimizer._failed_rank_results(
                 apply_records, "Candidate fingerprint differed across ranks or another rank failed validation")
+            packet = build_evaluation_packet(proposal, rank_results, frozen.baseline_aggregate,
+                                             frozen.graph_fingerprint, validation)
+            return candidate, candidate_profile, entrypoint, packet
+
+        backend_compile_error = None
+        try:
+            if ctx.backend_compile_fn is not None:
+                compiled_candidate = ctx.backend_compile_fn(clone_graph_module(candidate))
+                if not callable(compiled_candidate):
+                    raise RuntimeError("Downstream backend compiler did not return a callable")
+        except Exception as exc:
+            backend_compile_error = str(exc)
+        local_backend_compile = {
+            "rank": _rank(),
+            "success": backend_compile_error is None,
+            "skipped": ctx.backend_compile_fn is None,
+            "error": backend_compile_error,
+        }
+        backend_compile_records = gather_rank_records(local_backend_compile)
+        backend_compile_success = all(record["success"] for record in backend_compile_records)
+        validation["backend_compile"] = {
+            "success": backend_compile_success,
+            "rank_results": backend_compile_records,
+        }
+        if not backend_compile_success:
+            rank_results = GraphAgentLoopOptimizer._failed_rank_results(
+                backend_compile_records, "Candidate failed downstream backend compilation")
             packet = build_evaluation_packet(proposal, rank_results, frozen.baseline_aggregate,
                                              frozen.graph_fingerprint, validation)
             return candidate, candidate_profile, entrypoint, packet
@@ -998,22 +1055,27 @@ class GraphAgentLoopOptimizer:
         consensus, consensus_records = self._snapshot_consensus(ctx)
         if not consensus:
             if is_rank_zero:
+                summary = "Post-Z3 graph topology differs across ranks"
                 trace.append(
                     OptimizationTraceEntry(iteration=0,
                                            action="abort",
-                                           summary="Post-Z3 graph topology differs across ranks",
+                                           summary=summary,
                                            details={"rank_results": consensus_records}))
+                self._record_early_abort(iteration_root, ctx, "post_z3_structural_consensus", summary,
+                                         consensus_records)
             retain_temporary_root = True
             return OptimizationResult(trace=trace)
 
         profile_success, profile_records = self._profile_accepted_graph(ctx)
         if not profile_success:
             if is_rank_zero:
+                summary = "Post-Z3 accepted graph profiling failed"
                 trace.append(
                     OptimizationTraceEntry(iteration=0,
                                            action="abort",
-                                           summary="Post-Z3 accepted graph profiling failed",
+                                           summary=summary,
                                            details={"rank_results": profile_records}))
+                self._record_early_abort(iteration_root, ctx, "accepted_graph_profiling", summary, profile_records)
             retain_temporary_root = True
             return OptimizationResult(trace=trace)
 
@@ -1036,11 +1098,13 @@ class GraphAgentLoopOptimizer:
         frozen_fingerprints = {record["fingerprint"] for record in frozen_records if record["success"]}
         if not all(record["success"] for record in frozen_records) or len(frozen_fingerprints) != 1:
             if is_rank_zero:
+                summary = "Unable to freeze one equivalent post-required-pass graph"
                 trace.append(
                     OptimizationTraceEntry(iteration=0,
                                            action="abort",
-                                           summary="Unable to freeze one equivalent post-required-pass graph",
+                                           summary=summary,
                                            details={"rank_results": frozen_records}))
+                self._record_early_abort(iteration_root, ctx, "frozen_clone_consensus", summary, frozen_records)
             return OptimizationResult(trace=trace)
 
         frozen = FrozenGraphContext(graph_module=frozen_graph,

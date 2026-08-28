@@ -5,6 +5,7 @@ import operator
 
 import torch
 
+import deepspeed.compile.graph_edit as graph_edit_module
 from deepspeed.compile.graph_edit import (RUNTIME_GRAPH_ID, clone_graph_module, generated_graph_fingerprint_details,
                                           normalized_graph, structural_fingerprint)
 
@@ -70,6 +71,21 @@ def test_rank_local_graph_ids_have_one_frozen_base_identity():
     assert normalized_graph(rank_one_graph, runtime_graph_id=rank_one_id)[1]["args"][1] == RUNTIME_GRAPH_ID
 
 
+def test_structural_fingerprint_encodes_torch_memory_format_and_layout_constants():
+    graph = torch.fx.Graph()
+    value = graph.placeholder("value")
+    cloned = graph.call_function(torch.ops.aten.clone.default, (value, ), {"memory_format": torch.contiguous_format})
+    allocated = graph.call_function(torch.ops.aten.empty.memory_format, ([2], ), {"layout": torch.strided})
+    graph.output((cloned, allocated))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    description = normalized_graph(gm)
+
+    assert description[1]["kwargs"]["memory_format"] == {"torch_memory_format": "contiguous_format"}
+    assert description[2]["kwargs"]["layout"] == {"torch_layout": "strided"}
+    assert structural_fingerprint(gm)
+
+
 def test_graph_clone_deep_copies_nested_node_metadata():
     frozen = torch.fx.symbolic_trace(ChainModule())
     frozen_node = list(frozen.graph.nodes)[1]
@@ -83,6 +99,20 @@ def test_graph_clone_deep_copies_nested_node_metadata():
 
     assert frozen_node.meta["profile"]["samples"][1]["nested"] == [2]
     assert second_node.meta["profile"]["samples"][1]["nested"] == [2]
+
+
+def test_graph_clone_preserves_tensor_metadata_without_copying_opaque_storage():
+    frozen = torch.fx.symbolic_trace(ChainModule())
+    frozen_node = list(frozen.graph.nodes)[1]
+    functional_tensor = torch._to_functional_tensor(torch.ones(1))
+    frozen_node.meta["compiler_values"] = {"nested": [functional_tensor]}
+
+    cloned = clone_graph_module(frozen)
+    cloned_values = list(cloned.graph.nodes)[1].meta["compiler_values"]
+
+    assert cloned_values is not frozen_node.meta["compiler_values"]
+    assert cloned_values["nested"] is not frozen_node.meta["compiler_values"]["nested"]
+    assert cloned_values["nested"][0] is functional_tensor
 
 
 def test_generated_fingerprint_is_total_for_tensor_constants():
@@ -100,6 +130,35 @@ def test_generated_fingerprint_is_total_for_tensor_constants():
     assert len(first["fingerprint"]) == 64
     assert first["opaque_fallback_count"] == 1
     assert first["opaque_fallback_types"] == ["tensor_constant"]
+
+
+def test_generated_fingerprint_normalizes_rank_current_device_and_torch_constants(monkeypatch):
+    current_device = [0]
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            return current_device[0]
+
+    def graph_for_rank(rank):
+        graph = torch.fx.Graph()
+        allocated = graph.call_function(torch.ops.aten.empty.memory_format, ([2], ), {
+            "device": torch.device("cuda", rank),
+            "layout": torch.strided,
+            "memory_format": torch.contiguous_format,
+        })
+        graph.output(allocated)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    monkeypatch.setattr(graph_edit_module, "get_accelerator", lambda: FakeAccelerator())
+    current_device[0] = 0
+    rank_zero = generated_graph_fingerprint_details(graph_for_rank(0))
+    current_device[0] = 1
+    rank_one = generated_graph_fingerprint_details(graph_for_rank(1))
+
+    assert rank_zero["fingerprint"] == rank_one["fingerprint"]
+    assert "torch.layout" not in rank_zero["opaque_fallback_types"]
+    assert "torch.memory_format" not in rank_zero["opaque_fallback_types"]
 
 
 def test_generated_fingerprint_reports_opaque_local_callable():

@@ -48,39 +48,47 @@ def _mark_output_never_reuse(out, *, enabled):
 def patch_compiler(original_compiler, dc_compiler, z3_partition: bool, graph_id, graph_param_manager, bwd: bool):
 
     def wrapped_compiler(gm, fake_inputs):
-        mod_graph = dc_compiler(gm, fake_inputs)
+
+        def compiler_inputs():
+            if z3_partition:
+                # Inductor validates input size estimated by the first trace, where ds tensor is materialized.
+                # We need to patch the input tensors to avoid the validation error.
+                patched_inputs = []
+                if bwd:
+                    param_nodes_bw, _ = graph_param_manager[graph_id].get_bwd_mapping(gm.graph)
+                    param_names = [n.name for n in param_nodes_bw]
+                else:
+                    param_names = graph_param_manager[graph_id].param_names
+                input_nodes = get_input_nodes(gm.graph)
+
+                for in_node, in_v in zip(input_nodes, fake_inputs):
+                    ds_param = in_node.name in param_names
+                    if ds_param:
+                        from torch._subclasses.fake_tensor import is_fake
+                        from torch._dynamo.utils import to_fake_tensor
+                        assert is_fake(in_v), f"Input {in_v} should be fake tensor"
+                        patched_inputs.append(
+                            to_fake_tensor(torch.empty([0], dtype=in_v.dtype, device=in_v.device), in_v.fake_mode))
+                    else:
+                        patched_inputs.append(in_v)
+
+                return tuple(patched_inputs)
+            return fake_inputs
+
+        def backend_compile_fn(candidate):
+            # AOTAutograd uses this context field to receive output strides from the one graph it will run.
+            # Isolate speculative candidate compilation so it cannot consume that single-write channel.
+            from torch._guards import TracingContext
+            with TracingContext.report_output_strides():
+                return original_compiler(candidate, compiler_inputs())
+
+        mod_graph = dc_compiler(gm, fake_inputs, backend_compile_fn)
 
         # For symint case
         if mod_graph is None:
             return None
 
-        if z3_partition:
-            # Inductor validates input size estimated by the first trace, where ds tensor is materialized.
-            # We need to patch the input tensors to avoid the validation error.
-            patched_inputs = []
-            if bwd:
-                param_nodes_bw, _ = graph_param_manager[graph_id].get_bwd_mapping(gm.graph)
-                param_names = [n.name for n in param_nodes_bw]
-            else:
-                param_names = graph_param_manager[graph_id].param_names
-            input_nodes = get_input_nodes(gm.graph)
-
-            for in_node, in_v in zip(input_nodes, fake_inputs):
-                ds_param = in_node.name in param_names
-                if ds_param:
-                    from torch._subclasses.fake_tensor import is_fake
-                    from torch._dynamo.utils import to_fake_tensor
-                    assert is_fake(in_v), f"Input {in_v} should be fake tensor"
-                    patched_inputs.append(
-                        to_fake_tensor(torch.empty([0], dtype=in_v.dtype, device=in_v.device), in_v.fake_mode))
-                else:
-                    patched_inputs.append(in_v)
-
-            patched_inputs = tuple(patched_inputs)
-        else:
-            patched_inputs = fake_inputs
-
-        return original_compiler(gm, patched_inputs)
+        return original_compiler(gm, compiler_inputs())
 
     return wrapped_compiler
 

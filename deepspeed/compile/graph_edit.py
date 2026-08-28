@@ -73,6 +73,13 @@ def _is_current_cuda_device(device: torch.device) -> bool:
         return False
 
 
+def _torch_constant_name(value: Any) -> str:
+    name = str(value).removeprefix("torch.")
+    if not name or getattr(torch, name, None) is not value:
+        raise GraphDescriptionError(f"PyTorch constant '{value}' has no stable torch attribute name")
+    return name
+
+
 def encode_argument(value: Any, node_ids: Dict[Node, str], runtime_graph_id: Optional[int] = None) -> Any:
     """Encode the known post-structural-pass graph used in the coding-agent prompt."""
     if isinstance(value, Node):
@@ -111,6 +118,10 @@ def encode_argument(value: Any, node_ids: Dict[Node, str], runtime_graph_id: Opt
     if isinstance(value, torch.device):
         index = "current" if _is_current_cuda_device(value) else value.index
         return {"torch_device": {"type": value.type, "index": index}}
+    if isinstance(value, torch.memory_format):
+        return {"torch_memory_format": _torch_constant_name(value)}
+    if isinstance(value, torch.layout):
+        return {"torch_layout": _torch_constant_name(value)}
 
     try:
         path = _callable_path(value)
@@ -218,6 +229,32 @@ def _mutable_container_ids(value: Any, seen: Optional[Set[int]] = None) -> Set[i
     return identities
 
 
+def _tensor_identity_memo(value: Any,
+                          memo: Optional[Dict[int, Any]] = None,
+                          seen: Optional[Set[int]] = None) -> Dict[int, Any]:
+    if memo is None:
+        memo = {}
+    if seen is None:
+        seen = set()
+    identity = id(value)
+    if identity in seen:
+        return memo
+    seen.add(identity)
+
+    if isinstance(value, torch.Tensor):
+        memo[identity] = value
+        return memo
+    if isinstance(value, dict):
+        children = list(value.keys()) + list(value.values())
+    elif isinstance(value, (list, set, tuple)):
+        children = list(value)
+    else:
+        children = []
+    for child in children:
+        _tensor_identity_memo(child, memo, seen)
+    return memo
+
+
 def clone_graph_module(gm: GraphModule) -> GraphModule:
     """Clone graph topology and make all per-node metadata containers independent."""
     graph = copy.deepcopy(gm.graph)
@@ -227,12 +264,13 @@ def clone_graph_module(gm: GraphModule) -> GraphModule:
     if len(source_nodes) != len(cloned_nodes):
         raise RuntimeError("Cloned FX graph has a different node count")
     for source_node, cloned_node in zip(source_nodes, cloned_nodes):
-        cloned_node.meta = copy.deepcopy(source_node.meta)
+        cloned_node.meta = copy.deepcopy(source_node.meta, memo=_tensor_identity_memo(source_node.meta))
         source_containers = _mutable_container_ids(source_node.meta)
         cloned_containers = _mutable_container_ids(cloned_node.meta)
         if source_containers.intersection(cloned_containers):
             raise RuntimeError(f"Cloned metadata for node '{source_node.name}' aliases the frozen graph")
-    clone.meta = copy.deepcopy(getattr(gm, "meta", {}))
+    module_meta = getattr(gm, "meta", {})
+    clone.meta = copy.deepcopy(module_meta, memo=_tensor_identity_memo(module_meta))
     clone.recompile()
     return clone
 
@@ -292,6 +330,10 @@ def _stable_binding_value(value: Any, opaque_types: List[str], seen: Optional[Se
         return {"torch_dtype": str(value).removeprefix("torch.")}
     if isinstance(value, torch.device):
         return {"torch_device": {"type": value.type}}
+    if isinstance(value, torch.memory_format):
+        return {"torch_memory_format": _torch_constant_name(value)}
+    if isinstance(value, torch.layout):
+        return {"torch_layout": _torch_constant_name(value)}
     if isinstance(value, torch.Tensor):
         opaque_types.append("tensor_binding")
         shape = [dimension if isinstance(dimension, int) else str(dimension) for dimension in value.shape]
@@ -465,7 +507,12 @@ def _total_argument(value: Any, node_ids: Dict[Node, str], opaque_types: List[st
     if isinstance(value, torch.dtype):
         return {"torch_dtype": str(value).removeprefix("torch.")}
     if isinstance(value, torch.device):
-        return {"torch_device": {"type": value.type, "index": value.index}}
+        index = "current" if _is_current_cuda_device(value) else value.index
+        return {"torch_device": {"type": value.type, "index": index}}
+    if isinstance(value, torch.memory_format):
+        return {"torch_memory_format": _torch_constant_name(value)}
+    if isinstance(value, torch.layout):
+        return {"torch_layout": _torch_constant_name(value)}
     if isinstance(value, torch.Tensor):
         opaque_types.append("tensor_constant")
         shape = [dimension if isinstance(dimension, int) else str(dimension) for dimension in value.shape]

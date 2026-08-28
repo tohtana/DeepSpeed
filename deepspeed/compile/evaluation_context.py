@@ -362,11 +362,33 @@ def serialize_search_context(ctx,
                 "source": "complete Python file source, not a patch or edit sequence",
             },
             "finish": {
-                "baseline": ["kind=baseline", "frozen_base_fingerprint"],
-                "candidate": ["kind=candidate", "candidate_id", "source_sha256", "entrypoint", "result_fingerprint"],
+                "fields": ["schema_version", "action=finish", "summary", "selection"],
+                "baseline_example": {
+                    "schema_version": GENERATED_PASS_SCHEMA_VERSION,
+                    "action": "finish",
+                    "summary": "why baseline is selected after evaluating candidates",
+                    "selection": {
+                        "kind": "baseline",
+                        "frozen_base_fingerprint": frozen.graph_fingerprint,
+                    },
+                },
+                "candidate_example": {
+                    "schema_version": GENERATED_PASS_SCHEMA_VERSION,
+                    "action": "finish",
+                    "summary": "why this evaluated candidate is selected",
+                    "selection": {
+                        "kind": "candidate",
+                        "candidate_id": "copy exact candidate_id from a valid history entry",
+                        "source_sha256": "copy exact source_sha256 from the same history entry",
+                        "entrypoint": GENERATED_PASS_ENTRYPOINT,
+                        "result_fingerprint": "copy exact result_fingerprint from the same history entry",
+                    },
+                },
             },
             "instructions": [
                 "Return exactly one JSON object and no prose.",
+                "For action=finish, exactly follow one finish example's object nesting: kind and all selection "
+                "identity fields belong inside the top-level selection object, never beside it.",
                 "The first turn must evaluate one complete source. Later turns may evaluate another complete source "
                 "or finish; there is no minimum of two candidates.",
                 "Each source runs from a fresh clone of this frozen base. Revised source must contain every change "

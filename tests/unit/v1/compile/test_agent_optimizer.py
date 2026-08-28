@@ -23,6 +23,7 @@ from deepspeed.compile.evaluation_context import (GENERATED_PASS_ENTRYPOINT, Age
                                                   build_evaluation_packet, build_reference_pass_inventory,
                                                   parse_search_response, serialize_search_context, validate_selection)
 from deepspeed.compile.graph_edit import clone_graph_module, structural_fingerprint
+from deepspeed.compile.inductor import patch_compiler
 from deepspeed.compile.optimizer import (FrozenGraphContext, GraphAgentLoopOptimizer, OptimizationContext,
                                          OptimizationResult, apply_generated_pass, load_generated_pass)
 from deepspeed.compile.profilers import ProfilingResult
@@ -302,6 +303,36 @@ def test_search_prompt_contains_three_complete_reference_sources_and_exact_histo
     assert "threshold" in " ".join(prompt["response_contract"]["instructions"])
 
 
+def test_search_context_advertises_nested_finish_selection_shape():
+    gm, ctx = _context()
+    frozen = FrozenGraphContext(graph_module=clone_graph_module(gm),
+                                graph_fingerprint=structural_fingerprint(gm, ctx.graph_id),
+                                graph_slot=ctx.graph_slot,
+                                graph_order=ctx.graph_order,
+                                baseline_rank_results=[],
+                                baseline_aggregate={},
+                                mem_budget=ctx.mem_budget,
+                                param_manager=ctx.param_manager)
+
+    prompt = json.loads(
+        serialize_search_context(ctx, frozen, build_reference_pass_inventory(), [], selection_only=True))
+    finish = prompt["response_contract"]["finish"]
+
+    assert finish["fields"] == ["schema_version", "action=finish", "summary", "selection"]
+    assert finish["baseline_example"] == {
+        "schema_version": 1,
+        "action": "finish",
+        "summary": "why baseline is selected after evaluating candidates",
+        "selection": {
+            "kind": "baseline",
+            "frozen_base_fingerprint": frozen.graph_fingerprint,
+        },
+    }
+    assert finish["candidate_example"]["selection"]["kind"] == "candidate"
+    assert any("inside the top-level selection object" in instruction
+               for instruction in prompt["response_contract"]["instructions"])
+
+
 @pytest.mark.parametrize("return_line", ["return None", "return gm"])
 def test_generated_pass_loads_exact_bytes_and_accepts_valid_return_contract(tmp_path, return_line):
     gm, ctx = _context()
@@ -441,6 +472,39 @@ def test_invalid_candidate_packet_can_lead_to_another_proposal(monkeypatch):
     assert len(runner.calls) == 3
 
 
+def test_downstream_backend_compile_failure_rejects_candidate_before_profiling(tmp_path):
+    gm, ctx = _context()
+    frozen_graph = clone_graph_module(gm)
+    frozen = FrozenGraphContext(graph_module=frozen_graph,
+                                graph_fingerprint=structural_fingerprint(frozen_graph, ctx.graph_id),
+                                graph_slot=ctx.graph_slot,
+                                graph_order=ctx.graph_order,
+                                baseline_rank_results=[],
+                                baseline_aggregate={},
+                                mem_budget=ctx.mem_budget,
+                                param_manager=ctx.param_manager)
+    compiled_graphs = []
+
+    def fail_backend_compile(candidate):
+        compiled_graphs.append(candidate)
+        raise AssertionError("both a fallback and a decomp for same op: aten.silu.default")
+
+    ctx.backend_compile_fn = fail_backend_compile
+    proposal = parse_search_response(json.dumps(_evaluate_response(NOOP_SOURCE)), 0, [], ctx.graph_slot)
+
+    _, candidate_profile, _, packet = GraphAgentLoopOptimizer._apply_and_profile_candidate(
+        ctx, frozen, proposal, 0, tmp_path / "generated.py")
+
+    backend_validation = packet["validation"]["backend_compile"]
+    assert not packet["valid"]
+    assert candidate_profile is None
+    assert len(compiled_graphs) == 1
+    assert compiled_graphs[0] is not gm and compiled_graphs[0] is not frozen_graph
+    assert not backend_validation["success"]
+    assert not backend_validation["rank_results"][0]["skipped"]
+    assert "both a fallback and a decomp" in backend_validation["rank_results"][0]["error"]
+
+
 def test_agent_can_finish_after_exactly_one_evaluated_candidate(monkeypatch):
     gm, ctx = _context(_config(agent_max_iterations=3))
 
@@ -527,9 +591,78 @@ def test_nonzero_rank_never_invokes_coding_agent(monkeypatch):
     assert runner.calls == []
 
 
+def test_structural_consensus_failure_gathers_normalized_rank_graphs(monkeypatch):
+    gm, ctx = _context()
+    first_records = [{
+        "rank": 0,
+        "success": True,
+        "fingerprint": "rank-zero",
+        "error": None,
+    }, {
+        "rank": 1,
+        "success": True,
+        "fingerprint": "rank-one",
+        "error": None,
+    }]
+    gathered = []
+
+    def fake_gather(local):
+        gathered.append(local)
+        if len(gathered) == 1:
+            return first_records
+        return [{**local, "rank": rank} for rank in range(2)]
+
+    monkeypatch.setattr(optimizer_module, "gather_rank_records", fake_gather)
+
+    consensus, records = GraphAgentLoopOptimizer._snapshot_consensus(ctx)
+
+    assert not consensus
+    assert len(gathered) == 2
+    assert records[0]["normalized_graph"] == optimizer_module.normalized_graph(gm, runtime_graph_id=ctx.graph_id)
+    assert records[0]["description_error"] is None
+
+
+def test_pre_inventory_abort_is_persisted_with_guard_and_rank_evidence(monkeypatch, tmp_path):
+    gm, ctx = _context()
+    records = [{
+        "rank": 0,
+        "success": True,
+        "fingerprint": "rank-zero",
+        "error": None,
+        "normalized_graph": [{
+            "id": "base:0"
+        }],
+        "description_error": None,
+    }, {
+        "rank": 1,
+        "success": True,
+        "fingerprint": "rank-one",
+        "error": None,
+        "normalized_graph": [{
+            "id": "base:1"
+        }],
+        "description_error": None,
+    }]
+    runner = StaticRunner(lambda *_args: pytest.fail("early abort invoked coding agent"))
+    monkeypatch.setenv("DEEPCOMPILE_AGENT_ARTIFACT_ROOT", str(tmp_path))
+    monkeypatch.setattr(GraphAgentLoopOptimizer, "_snapshot_consensus", lambda _self, _ctx: (False, records))
+    optimizer_module._reset_inspection_session_root()
+
+    result = GraphAgentLoopOptimizer(runner, ctx.compile_config).optimize(gm, ctx)
+
+    evidence_path = next(tmp_path.iterdir()) / "graph_0_fwd" / "early_abort.json"
+    evidence = json.loads(evidence_path.read_text())
+    assert result.trace[-1].action == "abort"
+    assert evidence["guard"] == "post_z3_structural_consensus"
+    assert evidence["graph_slot"] == [0, "fwd"]
+    assert evidence["rank_results"] == records
+    assert runner.calls == []
+
+
 def test_backend_passes_real_mem_budget_and_param_manager_to_private_context(monkeypatch):
     gm, ctx = _context()
     manager = object()
+    backend_compile_fn = object()
     observed = []
 
     class FakeOptimizer:
@@ -538,18 +671,63 @@ def test_backend_passes_real_mem_budget_and_param_manager_to_private_context(mon
             pass
 
         def optimize(self, graph_module, optimization_context):
-            observed.append((graph_module, optimization_context.mem_budget, optimization_context.param_manager))
+            observed.append((graph_module, optimization_context.mem_budget, optimization_context.param_manager,
+                             optimization_context.backend_compile_fn))
             return OptimizationResult()
 
     monkeypatch.setattr(backend, "run_opt_passes", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(optimizer_module, "GraphAgentLoopOptimizer", FakeOptimizer)
 
-    result = backend.run_optimization([backend.agent_optimization_loop], gm, 11, (0, "fwd"), ctx.graph_order,
-                                      ctx.profiling_results, ctx.create_inputs_fn, 987.0, manager, False,
-                                      ctx.compile_config)
+    result = backend.run_optimization([backend.agent_optimization_loop],
+                                      gm,
+                                      11, (0, "fwd"),
+                                      ctx.graph_order,
+                                      ctx.profiling_results,
+                                      ctx.create_inputs_fn,
+                                      987.0,
+                                      manager,
+                                      False,
+                                      ctx.compile_config,
+                                      backend_compile_fn=backend_compile_fn)
 
     assert isinstance(result, OptimizationResult)
-    assert observed == [(gm, 987.0, manager)]
+    assert observed == [(gm, 987.0, manager, backend_compile_fn)]
+
+
+def test_inductor_wrapper_exposes_exact_downstream_compiler_and_inputs():
+    gm, _ = _context()
+    fake_inputs = (object(), )
+    compile_calls = []
+    tracing_context = torch._guards.TracingContext(None)
+    tracing_context.output_strides = []
+
+    def original_compiler(candidate, compiler_inputs):
+        compile_calls.append((candidate, compiler_inputs))
+        torch._guards.TracingContext.get().output_strides.append(candidate is gm)
+        return lambda: candidate
+
+    def deepcompile_compiler(graph_module, sample_inputs, backend_compile_fn):
+        assert graph_module is gm
+        assert sample_inputs is fake_inputs
+        candidate = clone_graph_module(graph_module)
+        assert callable(backend_compile_fn(candidate))
+        return graph_module.graph
+
+    wrapped = patch_compiler(original_compiler,
+                             deepcompile_compiler,
+                             z3_partition=False,
+                             graph_id=11,
+                             graph_param_manager={},
+                             bwd=False)
+
+    with torch._guards.tracing(tracing_context):
+        result = wrapped(gm, fake_inputs)
+
+    assert callable(result)
+    assert [record[1] for record in compile_calls] == [fake_inputs, fake_inputs]
+    assert compile_calls[0][0] is not gm
+    assert compile_calls[1][0] is gm
+    assert tracing_context.output_strides == [True]
 
 
 def test_required_z3_and_offload_passes_still_precede_agent_marker(monkeypatch):

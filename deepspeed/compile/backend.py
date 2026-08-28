@@ -304,6 +304,7 @@ def run_optimization(opt_passes: List[Callable],
                      param_manager,
                      bwd: bool,
                      compile_config,
+                     backend_compile_fn=None,
                      debug_log=False):
     use_agent = agent_optimization_loop in opt_passes
     structural_passes = [opt_pass for opt_pass in opt_passes if opt_pass is not agent_optimization_loop]
@@ -328,7 +329,8 @@ def run_optimization(opt_passes: List[Callable],
                                          bwd=bwd,
                                          debug_log=debug_log,
                                          compile_config=compile_config,
-                                         warmup_trace=warmup_trace)
+                                         warmup_trace=warmup_trace,
+                                         backend_compile_fn=backend_compile_fn)
     runner_config = {
         "timeout_sec": compile_config.agent_timeout_sec,
         "debug_log": compile_config.debug_log,
@@ -390,7 +392,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
             profiling_results[graph_id] = ProfilingResult()
             profiling_results[graph_id].param_indices = param_indices
 
-        def make_fw_graph(gm, sample_inputs):
+        def make_fw_graph(gm, sample_inputs, backend_compile_fn=None):
             time_start = time.time()
             graph_index = len(graph_order_with_frame_id) - 1
 
@@ -423,6 +425,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
                                       param_manager=param_manager,
                                       bwd=False,
                                       compile_config=compile_config,
+                                      backend_compile_fn=backend_compile_fn,
                                       debug_log=debug_log)
             if result is not None:
                 optimization_trace.extend({
@@ -437,7 +440,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
 
             return gm.graph
 
-        def make_bw_graph(gm, sample_inputs):
+        def make_bw_graph(gm, sample_inputs, backend_compile_fn=None):
             time_start = time.time()
 
             graph_order = graph_order_with_frame_id.get_graph_order()
@@ -468,6 +471,7 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
                                       param_manager=param_manager,
                                       bwd=True,
                                       compile_config=compile_config,
+                                      backend_compile_fn=backend_compile_fn,
                                       debug_log=debug_log)
             if result is not None:
                 optimization_trace.extend({
