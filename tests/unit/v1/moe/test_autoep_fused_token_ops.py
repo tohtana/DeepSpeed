@@ -28,7 +28,8 @@ def _device():
 @pytest.mark.parametrize("top_k", [2, 4, 6, 8])
 @pytest.mark.parametrize("hidden", [128, 130])
 @pytest.mark.parametrize("score_dtype", [torch.float32, torch.bfloat16])
-def test_fused_weighted_restore_matches_eager_including_gradients(top_k, hidden, score_dtype):
+@pytest.mark.parametrize("row_dtype", [torch.float16, torch.bfloat16])
+def test_fused_weighted_restore_matches_eager_including_gradients(top_k, hidden, score_dtype, row_dtype):
     device = _device()
     num_tokens, num_experts = 24, 8
     generator = torch.Generator(device=device).manual_seed(20260824)
@@ -37,9 +38,9 @@ def test_fused_weighted_restore_matches_eager_including_gradients(top_k, hidden,
     token_indices_sorted = torch.argsort(selected_experts.view(-1), stable=True)
     assert not torch.equal(token_indices_sorted, torch.arange(num_tokens * top_k, device=device))
 
-    rows = torch.randn(num_tokens * top_k, hidden, device=device, dtype=torch.bfloat16, generator=generator)
+    rows = torch.randn(num_tokens * top_k, hidden, device=device, dtype=row_dtype, generator=generator)
     scores = torch.rand(num_tokens, top_k, device=device, dtype=score_dtype, generator=generator)
-    upstream = torch.randn(1, num_tokens, hidden, device=device, dtype=torch.bfloat16, generator=generator)
+    upstream = torch.randn(1, num_tokens, hidden, device=device, dtype=row_dtype, generator=generator)
 
     eager_rows = rows.clone().requires_grad_(True)
     eager_scores = scores.clone().requires_grad_(True)
