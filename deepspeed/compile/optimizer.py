@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -45,6 +46,18 @@ from .profilers.graph_profile import MemoryProfilingInterpreter, ProfilingInterp
 
 _logger = logging.getLogger(__name__)
 _INSPECTION_SESSION_ROOT = None
+_EXTERNAL_GENERATED_SOURCE_CACHE = {}
+_EXTERNAL_GENERATED_PASS_EVIDENCE = []
+_GENERATED_PASS_PARAMETER_NAMES = (
+    "gm",
+    "graph_id",
+    "graph_order",
+    "profiling_results",
+    "create_inputs_fn",
+    "mem_budget",
+    "param_manager",
+    "bwd",
+)
 
 
 @dataclass
@@ -476,7 +489,14 @@ def apply_generated_pass(proposal: GeneratedPassProposal,
         entrypoint = load_generated_pass(proposal, source_path)
     arguments = _generated_pass_arguments(gm, ctx)
     try:
-        inspect.signature(entrypoint).bind(*arguments)
+        signature = inspect.signature(entrypoint)
+        parameters = tuple(signature.parameters.values())
+        parameter_names = tuple(parameter.name for parameter in parameters)
+        positional_kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        if parameter_names != _GENERATED_PASS_PARAMETER_NAMES or any(parameter.kind not in positional_kinds
+                                                                     for parameter in parameters):
+            raise TypeError(f"deepcompile_pass must declare exactly {_GENERATED_PASS_PARAMETER_NAMES}")
+        signature.bind(*arguments)
     except (TypeError, ValueError) as exc:
         raise GeneratedPassValidationError("signature", str(exc)) from exc
     try:
@@ -494,6 +514,167 @@ def apply_generated_pass(proposal: GeneratedPassProposal,
     except Exception as exc:
         raise GeneratedPassValidationError("recompile", str(exc)) from exc
     return gm, entrypoint
+
+
+def _external_source_envelope(compile_config) -> Dict[str, Any]:
+    cache_key = (compile_config.generated_pass_candidate_id, compile_config.generated_pass_sha256,
+                 compile_config.generated_pass_source)
+    local_payload = None
+    if _rank() == 0:
+        local_payload = _EXTERNAL_GENERATED_SOURCE_CACHE.get(cache_key)
+        if local_payload is None:
+            try:
+                source_path = Path(compile_config.generated_pass_source)
+                source = source_path.read_text(encoding="utf-8")
+                source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                error = None
+            except Exception as exc:
+                source = ""
+                source_sha256 = None
+                error = f"{type(exc).__name__}: {exc}"
+            local_payload = {
+                "authority_rank": 0,
+                "candidate_id": compile_config.generated_pass_candidate_id,
+                "source": source,
+                "source_sha256": source_sha256,
+                "error": error,
+            }
+            _EXTERNAL_GENERATED_SOURCE_CACHE[cache_key] = local_payload
+
+    payload = broadcast_json_payload(local_payload)
+    expected_fields = {"authority_rank", "candidate_id", "source", "source_sha256", "error"}
+    if set(payload) != expected_fields:
+        raise GeneratedPassValidationError("source_identity", "Rank-zero source envelope has unexpected fields")
+    if payload["authority_rank"] != 0:
+        raise GeneratedPassValidationError("source_identity", "Generated source authority must be rank zero")
+    if payload["candidate_id"] != compile_config.generated_pass_candidate_id:
+        raise GeneratedPassValidationError("source_identity", "Generated candidate identity changed in broadcast")
+    if payload["error"] is not None:
+        raise GeneratedPassValidationError("source_authority", payload["error"])
+    source = payload["source"]
+    if not isinstance(source, str):
+        raise GeneratedPassValidationError("source_identity", "Broadcast generated source must be text")
+    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    if source_sha256 != payload["source_sha256"] or source_sha256 != compile_config.generated_pass_sha256:
+        raise GeneratedPassValidationError("source_identity", "Broadcast generated source SHA-256 mismatch")
+    _EXTERNAL_GENERATED_SOURCE_CACHE[cache_key] = payload
+    return payload
+
+
+def _external_generated_proposal(payload: Dict[str, Any], graph_slot: Tuple[int, str]) -> GeneratedPassProposal:
+    slot = re.sub(r"[^0-9A-Za-z_]", "_", f"{graph_slot[0]}_{graph_slot[1]}")
+    candidate = re.sub(r"[^0-9A-Za-z_]", "_", payload["candidate_id"])
+    module_name = f"deepcompile_external_pass_{candidate}_{slot}_{payload['source_sha256']}"
+    identity = {
+        "candidate_id": payload["candidate_id"],
+        "entrypoint": "deepcompile_pass",
+        "module_name": module_name,
+        "source": payload["source"],
+    }
+    proposal_hash = hashlib.sha256(json.dumps(identity, sort_keys=True,
+                                              separators=(",", ":")).encode("utf-8")).hexdigest()
+    return GeneratedPassProposal(candidate_id=payload["candidate_id"],
+                                 summary="externally generated end-to-end candidate",
+                                 entrypoint="deepcompile_pass",
+                                 source=payload["source"],
+                                 source_sha256=payload["source_sha256"],
+                                 module_name=module_name,
+                                 proposal_hash=proposal_hash)
+
+
+def _external_source_path(candidate_id: str, graph_slot: Tuple[int, str]) -> Path:
+    configured_root = os.environ.get("DEEPCOMPILE_GENERATED_PASS_ARTIFACT_ROOT", "").strip()
+    if configured_root:
+        root = Path(configured_root)
+    else:
+        root = Path(tempfile.gettempdir()) / "deepcompile_generated_pass"
+    candidate = re.sub(r"[^0-9A-Za-z_.-]", "_", candidate_id)
+    return root / f"rank_{_rank()}" / f"graph_{graph_slot[0]}_{graph_slot[1]}" / candidate / "generated_pass.py"
+
+
+def _record_external_generated_pass_evidence(record: Dict[str, Any]) -> None:
+    if _rank() != 0:
+        return
+    _EXTERNAL_GENERATED_PASS_EVIDENCE.append(record)
+    configured = os.environ.get("DEEPCOMPILE_GENERATED_PASS_EVIDENCE", "").strip()
+    if configured:
+        _safe_write_json(Path(configured), {
+            "schema_version": 1,
+            "source_authority_rank": 0,
+            "applications": _EXTERNAL_GENERATED_PASS_EVIDENCE,
+        })
+
+
+def apply_external_generated_pass(gm: GraphModule, graph_id: int, graph_slot: Tuple[int, str], graph_order,
+                                  profiling_results, create_inputs_fn, mem_budget: float, param_manager, bwd: bool,
+                                  compile_config) -> None:
+    """Load rank zero's candidate source and apply it to this post-Z3 graph on every rank."""
+    payload = _external_source_envelope(compile_config)
+    proposal = _external_generated_proposal(payload, graph_slot)
+    profile = profiling_results[graph_id]
+    profile_times = profile.bwd_time if bwd else profile.fwd_time
+    profile_memory = profile.bwd_mem if bwd else profile.fwd_mem
+    post_z3_profile = {
+        "node_count": len(list(gm.graph.nodes)),
+        "device_time": float(sum(row[1] for row in profile_times)),
+        "peak_memory": float(max([row[3] for row in profile_memory], default=0)),
+    }
+    ctx = OptimizationContext(gm=gm,
+                              graph_id=graph_id,
+                              graph_slot=graph_slot,
+                              graph_order=graph_order,
+                              profiling_results=profiling_results,
+                              create_inputs_fn=create_inputs_fn,
+                              mem_budget=mem_budget,
+                              param_manager=param_manager,
+                              bwd=bwd,
+                              debug_log=compile_config.debug_log,
+                              compile_config=compile_config)
+    error = None
+    fingerprint_details = None
+    source_path = _external_source_path(proposal.candidate_id, graph_slot)
+    try:
+        apply_generated_pass(proposal, gm, ctx, source_path)
+        fingerprint_details = generated_graph_fingerprint_details(gm, graph_id)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+
+    local_record = {
+        "rank": _rank(),
+        "success": error is None,
+        "authority_rank": payload["authority_rank"],
+        "candidate_id": proposal.candidate_id,
+        "source_sha256": proposal.source_sha256,
+        "entrypoint": proposal.entrypoint,
+        "callable_abi": list(_GENERATED_PASS_PARAMETER_NAMES),
+        "graph_slot": list(graph_slot),
+        "bwd": bwd,
+        "post_z3_profile": post_z3_profile,
+        "source_path": str(source_path),
+        "fingerprint": None if fingerprint_details is None else fingerprint_details["fingerprint"],
+        "fingerprint_details": fingerprint_details,
+        "error": error,
+    }
+    rank_records = gather_rank_records(local_record)
+    fingerprints = {record["fingerprint"] for record in rank_records if record["success"]}
+    identities = {(record["candidate_id"], record["source_sha256"], record["entrypoint"],
+                   tuple(record["callable_abi"]))
+                  for record in rank_records}
+    success = all(record["success"] for record in rank_records) and len(fingerprints) == 1 and len(identities) == 1
+    evidence = {
+        "candidate_id": proposal.candidate_id,
+        "source_sha256": proposal.source_sha256,
+        "graph_slot": list(graph_slot),
+        "bwd": bwd,
+        "post_add_z3": True,
+        "post_z3_profile": post_z3_profile,
+        "replaces_standard_optimization_stage": True,
+        "success": success,
+        "rank_results": rank_records,
+    }
+    _record_external_generated_pass_evidence(evidence)
+    if not success:
+        raise RuntimeError(f"External generated pass failed distributed validation: {rank_records}")
 
 
 def restore_frozen_base(gm: GraphModule, frozen: FrozenGraphContext) -> None:

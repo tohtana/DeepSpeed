@@ -2295,6 +2295,26 @@ Set `DEEPCOMPILE_AGENT_ARTIFACT_ROOT` to an existing or creatable parent directo
 Rank 0 records the live reference-pass inventory, frozen-base identity, exact turn prompts/responses, each complete
 candidate source and evaluation packet, explicit selection, and final live application result per graph slot.
 
+An external end-to-end evaluator can instead set `zero3_tuning_strategy` to `"generated"` and provide
+`generated_pass_source`, `generated_pass_sha256`, and `generated_pass_candidate_id`. This mode does not invoke the
+per-graph agent loop. At the warmup step, rank 0 reads the complete source once and broadcasts its exact text and
+identity; every rank dynamically loads the same source and applies its eight-argument `deepcompile_pass` entrypoint
+after `add_z3_gather_release` for both forward and backward. The generated source replaces the default prefetch and
+selective-gather stage. Each end-to-end candidate should run in a fresh training subprocess because unrestricted
+trusted Python can have effects outside the FX graph.
+
+```json
+{
+    "compile": {
+        "deepcompile": true,
+        "zero3_tuning_strategy": "generated",
+        "generated_pass_source": "/absolute/path/to/candidate.py",
+        "generated_pass_sha256": "complete 64-character SHA-256",
+        "generated_pass_candidate_id": "candidate_00_0123456789ab"
+    }
+}
+```
+
 
 ### DeepCompile activation offload
 

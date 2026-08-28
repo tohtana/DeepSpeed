@@ -83,6 +83,11 @@ def agent_optimization_loop(*args, **kwargs):
     raise RuntimeError("agent_optimization_loop is a schedule marker and must not run as an ordinary pass")
 
 
+def generated_pass(*args, **kwargs):
+    """Schedule marker for one externally supplied complete generated-pass source."""
+    raise RuntimeError("generated_pass is a schedule marker and must not run as an ordinary pass")
+
+
 fwd_real_inputs = []
 
 
@@ -307,9 +312,18 @@ def run_optimization(opt_passes: List[Callable],
                      backend_compile_fn=None,
                      debug_log=False):
     use_agent = agent_optimization_loop in opt_passes
-    structural_passes = [opt_pass for opt_pass in opt_passes if opt_pass is not agent_optimization_loop]
+    use_generated = generated_pass in opt_passes
+    if use_agent and use_generated:
+        raise ValueError("A DeepCompile schedule cannot use both agent and external generated-pass markers")
+    markers = {agent_optimization_loop, generated_pass}
+    structural_passes = [opt_pass for opt_pass in opt_passes if opt_pass not in markers]
     run_opt_passes(structural_passes, gm, graph_id, graph_order, profiling_results, create_inputs_fn, mem_budget,
                    param_manager, bwd, debug_log)
+    if use_generated:
+        from .optimizer import apply_external_generated_pass
+        apply_external_generated_pass(gm, graph_id, graph_slot, graph_order, profiling_results, create_inputs_fn,
+                                      mem_budget, param_manager, bwd, compile_config)
+        return None
     if not use_agent:
         return None
 

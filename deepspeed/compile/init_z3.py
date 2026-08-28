@@ -14,7 +14,7 @@ from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToMo
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
 from .passes import zero3_compile, prefetch, selective_gather, offload_parameters, offload_activation
-from .backend import agent_optimization_loop, make_backend, launch_compile_passes, init_schedule
+from .backend import agent_optimization_loop, generated_pass, make_backend, launch_compile_passes, init_schedule
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
@@ -86,6 +86,7 @@ def _resolve_expected_grad_dtype(param):
 
 def _default_z3_schedule(compile_config):
     use_agent = compile_config.zero3_tuning_strategy == "agent"
+    use_generated = compile_config.zero3_tuning_strategy == "generated"
     schedule = []
     if compile_config.offload_parameters:
         parameter_passes = [zero3_compile.add_z3_gather_release, offload_parameters.offload_parameter_fwd]
@@ -114,6 +115,9 @@ def _default_z3_schedule(compile_config):
     elif use_agent:
         schedule.append((0, [zero3_compile.add_z3_gather_release]))
         schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, agent_optimization_loop]))
+    elif use_generated:
+        schedule.append((0, [zero3_compile.add_z3_gather_release]))
+        schedule.append((WARMUP, [zero3_compile.add_z3_gather_release, generated_pass]))
     else:
         schedule.append((0, [zero3_compile.add_z3_gather_release]))
         schedule.append(

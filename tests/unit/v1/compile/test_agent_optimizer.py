@@ -25,7 +25,8 @@ from deepspeed.compile.evaluation_context import (GENERATED_PASS_ENTRYPOINT, Age
 from deepspeed.compile.graph_edit import clone_graph_module, structural_fingerprint
 from deepspeed.compile.inductor import patch_compiler
 from deepspeed.compile.optimizer import (FrozenGraphContext, GraphAgentLoopOptimizer, OptimizationContext,
-                                         OptimizationResult, apply_generated_pass, load_generated_pass)
+                                         OptimizationResult, apply_external_generated_pass, apply_generated_pass,
+                                         load_generated_pass)
 from deepspeed.compile.profilers import ProfilingResult
 
 init_z3_module = importlib.import_module("deepspeed.compile.init_z3")
@@ -737,6 +738,94 @@ def test_required_z3_and_offload_passes_still_precede_agent_marker(monkeypatch):
         warmup_passes = schedule[-1][1]
         assert warmup_passes[-1] is backend.agent_optimization_loop
         assert init_z3_module.zero3_compile.add_z3_gather_release in warmup_passes
+
+
+def test_external_generated_schedule_replaces_prefetch_and_selective_gather(tmp_path):
+    source_path = tmp_path / "candidate.py"
+    source_path.write_text(NOOP_SOURCE)
+    config = CompileConfig(zero3_tuning_strategy="generated",
+                           generated_pass_source=str(source_path),
+                           generated_pass_sha256=optimizer_module.hashlib.sha256(NOOP_SOURCE.encode()).hexdigest(),
+                           generated_pass_candidate_id="candidate_00")
+
+    schedule = init_z3_module._default_z3_schedule(config)
+
+    assert schedule[0][1] == [init_z3_module.zero3_compile.add_z3_gather_release]
+    assert schedule[1][1] == [init_z3_module.zero3_compile.add_z3_gather_release, backend.generated_pass]
+    assert init_z3_module.prefetch.schedule_prefetch not in schedule[1][1]
+    assert init_z3_module.selective_gather.selective_gather not in schedule[1][1]
+
+
+def test_one_external_source_is_authoritative_for_forward_and_backward(monkeypatch, tmp_path):
+    source_path = tmp_path / "candidate.py"
+    source_path.write_text(NOOP_SOURCE)
+    source_sha256 = optimizer_module.hashlib.sha256(NOOP_SOURCE.encode()).hexdigest()
+    config = CompileConfig(zero3_tuning_strategy="generated",
+                           generated_pass_source=str(source_path),
+                           generated_pass_sha256=source_sha256,
+                           generated_pass_candidate_id="candidate_00")
+    reads = []
+    original_read_text = Path.read_text
+
+    def tracked_read_text(path, *args, **kwargs):
+        if path == source_path:
+            reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+    monkeypatch.setenv("DEEPCOMPILE_GENERATED_PASS_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("DEEPCOMPILE_GENERATED_PASS_EVIDENCE", str(tmp_path / "evidence.json"))
+    optimizer_module._EXTERNAL_GENERATED_SOURCE_CACHE.clear()
+    optimizer_module._EXTERNAL_GENERATED_PASS_EVIDENCE.clear()
+    gm, ctx = _context(config)
+
+    apply_external_generated_pass(gm, ctx.graph_id, (0, "fwd"), ctx.graph_order, ctx.profiling_results,
+                                  ctx.create_inputs_fn, ctx.mem_budget, ctx.param_manager, False, config)
+    apply_external_generated_pass(gm, ctx.graph_id, (0, "bwd"), ctx.graph_order, ctx.profiling_results,
+                                  ctx.create_inputs_fn, ctx.mem_budget, ctx.param_manager, True, config)
+
+    evidence = json.loads((tmp_path / "evidence.json").read_text())
+    assert reads == [source_path]
+    assert [item["bwd"] for item in evidence["applications"]] == [False, True]
+    assert {item["source_sha256"] for item in evidence["applications"]} == {source_sha256}
+    assert all(item["post_add_z3"] and item["replaces_standard_optimization_stage"]
+               for item in evidence["applications"])
+
+
+def test_nonzero_rank_uses_only_rank_zero_broadcast_source(monkeypatch, tmp_path):
+    source_sha256 = optimizer_module.hashlib.sha256(NOOP_SOURCE.encode()).hexdigest()
+    config = CompileConfig(zero3_tuning_strategy="generated",
+                           generated_pass_source=str(tmp_path / "rank_zero_only.py"),
+                           generated_pass_sha256=source_sha256,
+                           generated_pass_candidate_id="candidate_00")
+    payload = {
+        "authority_rank": 0,
+        "candidate_id": "candidate_00",
+        "source": NOOP_SOURCE,
+        "source_sha256": source_sha256,
+        "error": None,
+    }
+    monkeypatch.setattr(optimizer_module, "_rank", lambda: 1)
+    monkeypatch.setattr(optimizer_module, "broadcast_json_payload", lambda local: payload)
+    monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: pytest.fail("nonzero rank read source"))
+    optimizer_module._EXTERNAL_GENERATED_SOURCE_CACHE.clear()
+
+    received = optimizer_module._external_source_envelope(config)
+
+    assert received == payload
+
+
+def test_generated_pass_requires_exact_named_eight_argument_abi(tmp_path):
+    gm, ctx = _context()
+    source = """def deepcompile_pass(*args):
+    return args[0]
+"""
+    proposal = parse_search_response(json.dumps(_evaluate_response(source)), 0, [], ctx.graph_slot)
+
+    with pytest.raises(optimizer_module.GeneratedPassValidationError) as error:
+        apply_generated_pass(proposal, gm, ctx, tmp_path / "generated.py")
+
+    assert error.value.phase == "signature"
 
 
 def _rank_divergent_source_worker(rank, init_method, result_queue):

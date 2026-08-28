@@ -10,7 +10,7 @@ from pydantic import Field, model_validator
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
 
 PassName = Literal["z1", "z3", "autosp", "autotp"]
-Zero3TuningStrategy = Literal["baseline", "agent"]
+Zero3TuningStrategy = Literal["baseline", "agent", "generated"]
 AgentArchitecture = Literal["graph_agent"]
 
 
@@ -81,6 +81,15 @@ class CompileConfig(DeepSpeedConfigModel):
     zero3_tuning_strategy: Zero3TuningStrategy = "baseline"
     """ Controls how ZeRO-3 warmup tuning decisions are made. """
 
+    generated_pass_source: Optional[str] = None
+    """ Complete pass-source path read by rank zero for an externally evaluated candidate. """
+
+    generated_pass_sha256: Optional[str] = None
+    """ Expected SHA-256 for the externally evaluated complete pass source. """
+
+    generated_pass_candidate_id: Optional[str] = None
+    """ Stable identity assigned by the external end-to-end campaign controller. """
+
     agent_architecture: AgentArchitecture = "graph_agent"
     """ Selects the experimental generated-pass coding-agent path. """
 
@@ -105,6 +114,23 @@ class CompileConfig(DeepSpeedConfigModel):
 
     @model_validator(mode="after")
     def validate_agent_mode(self):
+        if self.zero3_tuning_strategy == "generated":
+            required = {
+                "generated_pass_source": self.generated_pass_source,
+                "generated_pass_sha256": self.generated_pass_sha256,
+                "generated_pass_candidate_id": self.generated_pass_candidate_id,
+            }
+            missing = [name for name, value in required.items() if not isinstance(value, str) or not value]
+            if missing:
+                raise ValueError(f"compile.zero3_tuning_strategy=generated requires {', '.join(missing)}")
+            if len(self.generated_pass_sha256) != 64:
+                raise ValueError("compile.generated_pass_sha256 must be a complete SHA-256 hex digest")
+            try:
+                int(self.generated_pass_sha256, 16)
+            except ValueError as exc:
+                raise ValueError("compile.generated_pass_sha256 must be a complete SHA-256 hex digest") from exc
+            return self
+
         if self.zero3_tuning_strategy != "agent":
             return self
 
