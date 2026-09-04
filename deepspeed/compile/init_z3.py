@@ -20,6 +20,8 @@ from .util import add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
 
 WARMUP = 5
+DEFAULT_Z3_OPTIMIZATION_PASSES = (zero3_compile.add_z3_gather_release, selective_gather.selective_gather,
+                                  prefetch.schedule_prefetch)
 
 _MISSING = object()
 _DYNAMO_CONFIG_NAMES = ("force_parameter_static_shapes", "force_nn_module_property_static_shapes")
@@ -179,9 +181,7 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
             ]))
         else:
             schedule.append((0, [zero3_compile.add_z3_gather_release]))
-            schedule.append(
-                (WARMUP,
-                 [zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch, selective_gather.selective_gather]))
+            schedule.append((WARMUP, list(DEFAULT_Z3_OPTIMIZATION_PASSES)))
 
     init_schedule(schedule)
 

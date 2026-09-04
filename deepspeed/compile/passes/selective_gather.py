@@ -183,10 +183,9 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     # The profile models transient peaks, while current allocator state captures
     # memory retained since profiling.  Persistence must satisfy both views.
     available_mem = min(profiled_available_mem, current_available_headroom)
-    live_budget = int(mem_budget) if mem_budget > 0 else DEFAULT_LIVE_BUDGET
     frozen_persistence = freeze_persistence(((ds_id, ds_id_to_size[ds_id]) for ds_id in ds_ids),
                                             headroom_bytes=available_mem,
-                                            live_budget=live_budget)
+                                            live_budget=DEFAULT_LIVE_BUDGET)
 
     ds_id_to_param = {}
     for g_id, g_pm in param_manager.items():
@@ -233,6 +232,11 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         param_obj = ds_id_to_param[ds_id]
 
         nz3.set_persistent(ds_id)
+        param_obj.ds_persist = True
+        if hasattr(gm, "graph"):
+            for node in gm.graph.nodes:
+                if node.target == torch.ops.dc.allgather_param.default and node.args[2] == ds_id:
+                    node.meta["deepcompile_arena_fallback_reason"] = "persistent_param"
         print_rank_0(
             f"Set persistent: {ds_id} size: {size} persistent_mem: {persistent_mem} shape: {param_obj.ds_shape}")
 

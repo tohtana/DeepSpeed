@@ -217,10 +217,10 @@ def _add(graph, lhs, rhs, name, device_time=0):
                       device_time=device_time)
 
 
-def _release(graph, arg, ds_id, name):
+def _release(graph, arg, ds_id, name, n_users=1):
     return _with_meta(
         graph.create_node('call_function',
-                          torch.ops.dc.release_param.default, (arg, 0, ds_id, 1), {},
+                          torch.ops.dc.release_param.default, (arg, 0, ds_id, n_users), {},
                           name=f"release_ds_param_{name}_{ds_id}"))
 
 
@@ -252,6 +252,7 @@ def test_fused_prefetch_outputs_replace_ordinary_allgather_edges():
     assert all(wait.args[0].target == operator.getitem for wait in waits)
     assert all(wait.args[0].args[0] is fused[0] for wait in waits)
     assert [wait.args[0].args[1] for wait in waits] == [0, 1]
+    assert all(len(wait.args) == 3 for wait in waits)
     arena_plan = executor_arena_mod.plan_graph_executor_arena(rewritten)
     assert [(entry.ds_id, entry.occurrence) for entry in arena_plan.packed.entries] == [(1, 0), (2, 0)]
     assert arena_plan.packed.fallbacks == ()
@@ -279,6 +280,25 @@ def test_fused_prefetch_mixed_dtype_group_preserves_independent_allgathers():
     assert len([node for node in rewritten.nodes if node.target == torch.ops.dc.allgather_param.default]) == 2
 
 
+def test_fused_prefetch_duplicate_ds_id_preserves_single_lease_semantics():
+    graph = Graph()
+    param = _placeholder(graph, "duplicate_param")
+    first_ag = _allgather(graph, param, 3, "duplicate_first")
+    second_ag = _allgather(graph, param, 3, "duplicate_second")
+    first_wait = _wait(graph, first_ag, 3, "duplicate_first")
+    second_wait = _wait(graph, second_ag, 3, "duplicate_second")
+    use = _add(graph, first_wait, second_wait, "duplicate_use")
+    release = _release(graph, use, 3, "duplicate")
+    output = graph.output((release, ))
+    graph.lint()
+
+    rewritten = prefetch_mod._rewrite_fused_prefetch(
+        (param, [first_ag, second_ag], first_ag, second_ag, first_wait, second_wait, use, release, output), graph_id=0)
+
+    assert not any(node.target == torch.ops.dc.prefetch_params_fused.default for node in rewritten.nodes)
+    assert len([node for node in rewritten.nodes if node.target == torch.ops.dc.allgather_param.default]) == 2
+
+
 def test_graph_executor_arena_excludes_wait_tensor_that_escapes_as_output():
     graph = Graph()
     param = _placeholder(graph, "escaping_param")
@@ -293,6 +313,85 @@ def test_graph_executor_arena_excludes_wait_tensor_that_escapes_as_output():
     assert plan.packed.entries == ()
     assert len(plan.packed.fallbacks) == 1
     assert plan.packed.fallbacks[0].fallback_reason == "graph_output_escape"
+
+
+def test_graph_executor_arena_lifetime_ends_at_final_multi_user_release():
+    graph = Graph()
+    param = _placeholder(graph, "multi_user_param")
+    ag = _allgather(graph, param, 12, "multi_user", tensor_size=256)
+    wait = _wait(graph, ag, 12, "multi_user")
+    first_use = _neg(graph, wait, "multi_user_first")
+    second_use = _neg(graph, wait, "multi_user_second")
+    first_release = _release(graph, first_use, 12, "multi_user_first", n_users=2)
+    second_release = _release(graph, second_use, 12, "multi_user_second", n_users=2)
+    graph.output((first_release, second_release))
+    graph.lint()
+
+    plan = executor_arena_mod.plan_graph_executor_arena(graph)
+    positions = {node: index for index, node in enumerate(graph.nodes)}
+
+    assert len(plan.packed.entries) == 1
+    assert plan.packed.entries[0].release == positions[second_release]
+
+
+def test_graph_executor_arena_reuses_slice_for_repeated_ds_id_after_release():
+    graph = Graph()
+    param = _placeholder(graph, "repeated_param")
+    first_ag = _allgather(graph, param, 14, "repeated_first", tensor_size=256)
+    first_wait = _wait(graph, first_ag, 14, "repeated_first")
+    first_use = _neg(graph, first_wait, "repeated_first_use")
+    first_release = _release(graph, first_use, 14, "repeated_first")
+    second_ag = _allgather(graph, param, 14, "repeated_second", tensor_size=256)
+    second_wait = _wait(graph, second_ag, 14, "repeated_second")
+    second_use = _add(graph, first_release, second_wait, "repeated_second_use")
+    second_release = _release(graph, second_use, 14, "repeated_second")
+    graph.output((second_release, ))
+    graph.lint()
+
+    plan = executor_arena_mod.plan_graph_executor_arena(graph)
+
+    assert [(entry.ds_id, entry.occurrence, entry.offset) for entry in plan.packed.entries] == [(14, 0, 0), (14, 1, 0)]
+
+
+def test_graph_executor_arena_excludes_alias_view_saved_as_output():
+    graph = Graph()
+    param = _placeholder(graph, "alias_escape_param")
+    ag = _allgather(graph, param, 13, "alias_escape", tensor_size=256)
+    wait = _wait(graph, ag, 13, "alias_escape")
+    view = graph.call_method("view", args=(wait, -1))
+    _release(graph, view, 13, "alias_escape")
+    graph.output((view, ))
+    graph.lint()
+
+    plan = executor_arena_mod.plan_graph_executor_arena(graph)
+
+    assert plan.packed.entries == ()
+    assert plan.packed.fallbacks[0].fallback_reason == "graph_output_alias_escape"
+
+
+def test_graph_executor_arena_excludes_getitem_alias_saved_as_output():
+    graph = Graph()
+    param = _placeholder(graph, "getitem_escape_param")
+    ag = _allgather(graph, param, 15, "getitem_escape", tensor_size=256)
+    wait = _wait(graph, ag, 15, "getitem_escape")
+    view = graph.call_function(operator.getitem, args=(wait, slice(None)))
+    _release(graph, view, 15, "getitem_escape")
+    graph.output((view, ))
+    graph.lint()
+
+    plan = executor_arena_mod.plan_graph_executor_arena(graph)
+
+    assert plan.packed.entries == ()
+    assert plan.packed.fallbacks[0].fallback_reason == "graph_output_alias_escape"
+
+
+def test_prefetch_size_bounds_exclude_oversized_single_gather(monkeypatch):
+    monkeypatch.setattr(prefetch_mod, "MAX_BUFFERED_SIZE", 1024)
+    monkeypatch.setattr(prefetch_mod, "MAX_FUSE_SIZE", 512)
+
+    assert prefetch_mod._prefetch_size_admissible(512)
+    assert not prefetch_mod._prefetch_size_admissible(513)
+    assert not prefetch_mod._prefetch_size_admissible(0)
 
 
 def _scheduled_graph(graph, scheduler_budget=None):
