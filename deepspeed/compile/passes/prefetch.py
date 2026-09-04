@@ -13,10 +13,11 @@ from deepspeed.accelerator import get_accelerator
 import deepspeed.comm as dist
 
 from ..executor_arena import (DEFAULT_FUSE_BUDGET, DEFAULT_LIVE_BUDGET, admit_executor_arena,
-                              plan_graph_executor_arena)
+                              plan_graph_executor_arena, register_executor_arena)
 from ..profilers.comm_profile import create_predictor
 from ..profilers.graph_profile import is_profile_incomplete
 from ..graph_param import DSGraphParamManager
+from ..util import get_deepcompile_handle
 from .contract import PassContract, CAP_Z3_GATHER_RELEASE
 
 NAME = "prefetch"
@@ -50,6 +51,10 @@ def _fused_group_dtypes(ag_nodes: List[Node]):
     return dtypes
 
 
+def _prefetch_size_admissible(nbytes: int) -> bool:
+    return 0 < nbytes <= MAX_BUFFERED_SIZE and nbytes <= MAX_FUSE_SIZE
+
+
 def _rewrite_fused_prefetch(ordered_nodes: Iterable, graph_id: int) -> Graph:
     """Replace scheduled all-gathers with Tensor-producing fused prefetch edges."""
     new_graph = Graph()
@@ -78,6 +83,8 @@ def _rewrite_fused_prefetch(ordered_nodes: Iterable, graph_id: int) -> Graph:
             raise RuntimeError("fused prefetch was scheduled before its parameter inputs")
         param_nodes_copy = [env[param_node.name] for param_node in param_nodes]
         ds_ids = [get_ds_id(ag_node) for ag_node in ag_nodes]
+        if len(set(ds_ids)) != len(ds_ids):
+            continue
         fused_node = new_graph.call_function(torch.ops.dc.prefetch_params_fused.default,
                                              args=(graph_id, param_nodes_copy, ds_ids, dtypes))
         fused_node.meta["deepcompile_fused_ds_ids"] = tuple(ds_ids)
@@ -86,6 +93,7 @@ def _rewrite_fused_prefetch(ordered_nodes: Iterable, graph_id: int) -> Graph:
             output = new_graph.call_function(operator.getitem, args=(fused_node, index))
             output.meta.update(ag_node.meta)
             output.meta["deepcompile_arena_ds_id"] = get_ds_id(ag_node)
+            output.meta["deepcompile_arena_dtype"] = ag_node.kwargs.get("dtype")
             env[ag_node.name] = output
             replaced_allgathers.add(ag_node.name)
 
@@ -179,13 +187,29 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
             if node.target == torch.ops.dc.allgather_param.default:
 
+                node_size = tensor_size_dict[node.name]
+                if not _prefetch_size_admissible(node_size):
+                    new_order_rev.append(node)
+                    continue
+
+                while ag_tensor_size_sum + node_size > MAX_BUFFERED_SIZE:
+                    if prefetch_ag_groups:
+                        bounded_group = prefetch_ag_groups.pop(0)
+                    elif prefetch_ags:
+                        bounded_group = prefetch_ags
+                        prefetch_ags = []
+                    else:
+                        break
+                    new_order_rev.append(bounded_group)
+                    ag_tensor_size_sum -= sum(tensor_size_dict[ag_node.name] for ag_node in bounded_group)
+
                 current_ag_size = sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
                 pred_time_current = comm_predictor(current_ag_size)
-                pred_time_next = comm_predictor(tensor_size_dict[node.name])
-                pred_time_fused = comm_predictor(current_ag_size + tensor_size_dict[node.name])
+                pred_time_next = comm_predictor(node_size)
+                pred_time_fused = comm_predictor(current_ag_size + node_size)
 
                 do_fuse = max(pred_time_current, pred_time_next) * 1.2 > pred_time_fused and (
-                    current_ag_size + tensor_size_dict[node.name]) < MAX_FUSE_SIZE
+                    current_ag_size + node_size) <= MAX_FUSE_SIZE
                 # print_rank_0(
                 #     f"found allgather_param do_fuse={do_fuse} current_ag_size={current_ag_size} tensor_size_dict[node.name]={tensor_size_dict[node.name]} pred_time_current={pred_time_current} pred_time_next={pred_time_next} pred_time_fused={pred_time_fused}"
                 # )
@@ -201,7 +225,7 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 #         f"continue fusing ag_tensor_size_sum={ag_tensor_size_sum} ag_size={tensor_size_dict[node.name]} prefetch_ags={prefetch_ags} prefetch_ag_groups={prefetch_ag_groups}"
                 #     )
                 prefetch_ags.append(node)
-                ag_tensor_size_sum += tensor_size_dict[node.name]
+                ag_tensor_size_sum += node_size
 
         new_order_rev.append(node)
 
@@ -238,5 +262,9 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                                          live_budget=int(MAX_BUFFERED_SIZE))
     gm._deepcompile_executor_arena_plan = final_plan
     gm._deepcompile_executor_arena_admission = admission
+    gm._deepcompile_executor_arena_registration = register_executor_arena(get_deepcompile_handle(),
+                                                                          graph_id,
+                                                                          final_plan,
+                                                                          process_group=process_group)
 
     return gm
