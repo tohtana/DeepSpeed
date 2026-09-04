@@ -10,8 +10,10 @@ import pytest
 import torch
 
 from deepspeed.compile import backend as backend_mod
+from deepspeed.compile import util as compile_util
 import deepspeed.compile.patch_fake_tensor as patch_fake_tensor_mod
-from deepspeed.compile.init_z3 import (DEFAULT_Z3_OPTIMIZATION_PASSES, _allow_dynamo_dynamic_parameter_shapes_for_z3,
+from deepspeed.compile.init_z3 import (DEFAULT_Z3_OPTIMIZATION_PASSES, DEFAULT_Z3_PERSISTENCE_PASSES,
+                                       DEFAULT_Z3_SCHEDULE, WARMUP, _allow_dynamo_dynamic_parameter_shapes_for_z3,
                                        _resolve_expected_grad_dtype)
 from deepspeed.compile.patch_fake_tensor import _resolve_zero3_guarded_value, patch_fake_tensor
 from deepspeed.compile.passes import prefetch, selective_gather, zero3_compile
@@ -47,8 +49,14 @@ def test_explicit_grad_dtype_is_preserved():
 
 
 def test_default_z3_schedule_selects_persistence_before_prefetch():
-    assert DEFAULT_Z3_OPTIMIZATION_PASSES == (zero3_compile.add_z3_gather_release, selective_gather.selective_gather,
-                                              prefetch.schedule_prefetch)
+    assert WARMUP == 5
+    assert DEFAULT_Z3_PERSISTENCE_PASSES == (zero3_compile.add_z3_gather_release, selective_gather.selective_gather)
+    assert DEFAULT_Z3_OPTIMIZATION_PASSES == (zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch)
+    assert DEFAULT_Z3_SCHEDULE == (
+        (0, (zero3_compile.add_z3_gather_release, )),
+        (WARMUP, (zero3_compile.add_z3_gather_release, selective_gather.selective_gather)),
+        (WARMUP + 1, (zero3_compile.add_z3_gather_release, prefetch.schedule_prefetch)),
+    )
 
 
 def test_deepcompile_forward_uses_native_phase_lifecycle(monkeypatch):
@@ -88,6 +96,22 @@ def test_deepcompile_forward_uses_native_phase_lifecycle(monkeypatch):
 
     assert output.item() == 1.0
     assert events == ["start_forward", "module", "end_forward"]
+
+
+def test_deepcompile_backward_epilogue_ends_native_phase(monkeypatch):
+    events = []
+
+    class FakeNative:
+
+        def end_backward_phase(self):
+            events.append("end_backward_phase")
+
+    monkeypatch.setattr(compile_util, "post_backward_hooks", [lambda: events.append("post_backward_hook")])
+    monkeypatch.setattr(compile_util, "get_deepcompile_handle", lambda: FakeNative())
+
+    compile_util.deepcompile_backward_epilogue()
+
+    assert events == ["post_backward_hook", "end_backward_phase"]
 
 
 def test_zero3_allows_dynamo_dynamic_parameter_shapes(monkeypatch):
