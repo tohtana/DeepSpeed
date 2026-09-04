@@ -63,13 +63,13 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         values = values[:math.prod(shape)].reshape(-1)
         return values.narrow(0, 0, values.numel() - 1).sum()
 
-    def _configure_arena(self, dc, graph_id, ds_id, shape, occurrence_count):
+    def _configure_arena(self, dc, graph_id, ds_id, shape, occurrence_count, *, bwd=False, offset=0):
         world_size = dist.get_world_size()
         padded_numel = world_size * math.ceil(math.prod(shape) / world_size)
         nbytes = padded_numel * torch.empty((), dtype=torch.float32).element_size()
-        capacity = math.ceil(nbytes / 256) * 256
-        dc.configure_z3_gather_arena(graph_id, capacity, 256, [ds_id] * occurrence_count,
-                                     list(range(occurrence_count)), [0] * occurrence_count,
+        capacity = math.ceil((offset + nbytes) / 256) * 256
+        dc.configure_z3_gather_arena(graph_id, bwd, capacity, 256, [ds_id] * occurrence_count,
+                                     list(range(occurrence_count)), [offset] * occurrence_count,
                                      [nbytes] * occurrence_count, [torch.float32] * occurrence_count,
                                      "test-executor-arena")
         return capacity
@@ -147,6 +147,7 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
         try:
             shard = self._register_param(dc, graph_id, ds_id, shape)
             capacity = self._configure_arena(dc, graph_id, ds_id, shape, occurrence_count=2)
+            dc.start_forward()
 
             prefetched = torch.ops.dc.prefetch_params_fused.default(graph_id, [shard], [ds_id], [torch.float32])
             first = torch.ops.dc.wait_allgather.default(prefetched[0], graph_id, ds_id)
@@ -169,5 +170,77 @@ class TestDeepCompileZ3ReleaseStorage(DistributedTest):
             self._release(unplanned, graph_id, ds_id, 1)
             assert unplanned_storage.nbytes() == 0
             assert first_storage.nbytes() == capacity
+            dc.end_forward()
+        finally:
+            dc.cleanup()
+
+    def test_executor_arena_keeps_phase_plans_and_tears_down_each_phase_backing(self):
+        graph_id, ds_id = 9060, 9061
+        shape = [4097]
+        backward_offset = 256
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, shape)
+            forward_capacity = self._configure_arena(dc, graph_id, ds_id, shape, occurrence_count=1, bwd=False)
+            backward_capacity = self._configure_arena(dc,
+                                                      graph_id,
+                                                      ds_id,
+                                                      shape,
+                                                      occurrence_count=1,
+                                                      bwd=True,
+                                                      offset=backward_offset)
+
+            dc.start_forward()
+            forward = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            forward = torch.ops.dc.wait_allgather.default(forward, graph_id, ds_id)
+            forward_storage = forward.untyped_storage()
+            assert forward_storage.nbytes() == forward_capacity
+            assert forward.data_ptr() == forward_storage.data_ptr()
+            with pytest.raises(RuntimeError, match="active leases"):
+                dc.end_forward()
+            self._release(forward, graph_id, ds_id, 1)
+            dc.end_forward()
+            assert forward_storage.nbytes() == forward_capacity
+
+            dc.start_backward(False)
+            backward = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            backward = torch.ops.dc.wait_allgather.default(backward, graph_id, ds_id)
+            backward_storage = backward.untyped_storage()
+            assert backward_storage.nbytes() == backward_capacity
+            assert backward.data_ptr() == backward_storage.data_ptr() + backward_offset
+            assert backward_storage.data_ptr() != forward_storage.data_ptr()
+            self._release(backward, graph_id, ds_id, 1)
+            torch.ops.dc.end_backward.default([], graph_id, False)
+
+            dc.start_forward()
+            next_forward = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            next_forward = torch.ops.dc.wait_allgather.default(next_forward, graph_id, ds_id)
+            next_forward_storage = next_forward.untyped_storage()
+            assert next_forward_storage.nbytes() == forward_capacity
+            assert next_forward_storage.data_ptr() not in {
+                forward_storage.data_ptr(),
+                backward_storage.data_ptr(),
+            }
+            self._release(next_forward, graph_id, ds_id, 1)
+            dc.end_forward()
+        finally:
+            dc.cleanup()
+
+    def test_disabled_executor_arena_phase_uses_independent_storage(self):
+        graph_id, ds_id = 9070, 9071
+        shape = [4097]
+        dc = self._init_dc()
+        try:
+            shard = self._register_param(dc, graph_id, ds_id, shape)
+            dc.configure_z3_gather_arena(graph_id, False, 0, 256, [], [], [], [], [], "disabled-test")
+            dc.start_forward()
+
+            gathered = torch.ops.dc.allgather_param.default(shard, graph_id, ds_id, dtype=torch.float32)
+            gathered = torch.ops.dc.wait_allgather.default(gathered, graph_id, ds_id)
+            storage = gathered.untyped_storage()
+            assert storage.nbytes() > 0
+            self._release(gathered, graph_id, ds_id, 1)
+            assert storage.nbytes() == 0
+            dc.end_forward()
         finally:
             dc.cleanup()

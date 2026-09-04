@@ -25,6 +25,13 @@ struct GatherArenaLease {
     int64_t nbytes;
 };
 
+struct GatherArenaConfig {
+    int64_t capacity_bytes = 0;
+    int64_t alignment = 256;
+    std::string signature;
+    std::unordered_map<long, std::vector<GatherArenaPlanEntry>> plan;
+};
+
 class Z3CustomOpExecutor : public CustomOpExecutor {
 public:
     Z3CustomOpExecutor(c10::intrusive_ptr<c10d::ProcessGroup> process_group,
@@ -58,15 +65,20 @@ public:
 
             param_use_count_[ds_id] = 0;
         }
+        // Graph registration is performed by the forward compiler, which may
+        // create this executor after the engine's forward prologue has run.
+        active_gather_arena_config_ = &forward_gather_arena_config_;
     }
     ~Z3CustomOpExecutor() {}
 
-    void startForward() override { resetGatherArenaCycle(); }
+    void startForward() override { startGatherArenaCycle(false); }
+
+    void endForward() override { endGatherArenaCycle(); }
 
     void startBackward(bool update) override
     {
         CustomOpExecutor::startBackward(update);
-        resetGatherArenaCycle();
+        startGatherArenaCycle(true);
     }
 
     void endBackward() override
@@ -84,9 +96,11 @@ public:
             it.second.record_stream(at::cuda::getCurrentCUDAStream());
         }
         reload_buffers_.clear();
+        endGatherArenaCycle();
     }
 
-    void configureGatherArena(int64_t capacity_bytes,
+    void configureGatherArena(bool bwd,
+                              int64_t capacity_bytes,
                               int64_t alignment,
                               const std::vector<long>& ds_ids,
                               const std::vector<long>& occurrences,
@@ -107,12 +121,18 @@ public:
             throw std::runtime_error("Cannot reconfigure ZeRO-3 gather arena with active leases");
         }
 
-        gather_arena_backing_ = at::Tensor();
-        gather_arena_plan_.clear();
-        gather_arena_occurrence_cursors_.clear();
-        gather_arena_capacity_bytes_ = capacity_bytes;
-        gather_arena_alignment_ = alignment;
-        gather_arena_signature_ = signature;
+        GatherArenaConfig& config = bwd ? backward_gather_arena_config_
+                                        : forward_gather_arena_config_;
+        if (active_gather_arena_config_ == &config && gather_arena_backing_.defined()) {
+            throw std::runtime_error(
+                "Cannot reconfigure active ZeRO-3 gather arena after backing allocation");
+        }
+
+        config = GatherArenaConfig();
+        config.capacity_bytes = capacity_bytes;
+        config.alignment = alignment;
+        config.signature = signature;
+        if (active_gather_arena_config_ == &config) { gather_arena_occurrence_cursors_.clear(); }
 
         std::unordered_map<long, long> next_occurrence;
         for (size_t i = 0; i < size; ++i) {
@@ -128,7 +148,7 @@ public:
                 throw std::runtime_error(
                     "ZeRO-3 gather arena slice is misaligned or over capacity");
             }
-            gather_arena_plan_[ds_id].push_back({occurrences[i], offsets[i], nbytes[i], dtypes[i]});
+            config.plan[ds_id].push_back({occurrences[i], offsets[i], nbytes[i], dtypes[i]});
         }
     }
 
@@ -534,22 +554,45 @@ public:
     bool hasParam(long ds_id) const { return hasKey(has_acc_grad_, ds_id); }
 
 private:
-    void resetGatherArenaCycle()
+    void startGatherArenaCycle(bool bwd)
+    {
+        if (!gather_arena_active_leases_.empty()) {
+            throw std::runtime_error(
+                "ZeRO-3 gather arena reached lifecycle boundary with active leases");
+        }
+        GatherArenaConfig* next_config = bwd ? &backward_gather_arena_config_
+                                             : &forward_gather_arena_config_;
+        if (active_gather_arena_config_ != next_config && gather_arena_backing_.defined()) {
+            throw std::runtime_error("ZeRO-3 gather arena changed phase before backing teardown");
+        }
+        active_gather_arena_config_ = next_config;
+        gather_arena_occurrence_cursors_.clear();
+    }
+
+    void endGatherArenaCycle()
     {
         if (!gather_arena_active_leases_.empty()) {
             throw std::runtime_error(
                 "ZeRO-3 gather arena reached lifecycle boundary with active leases");
         }
         gather_arena_occurrence_cursors_.clear();
+        if (gather_arena_backing_.defined()) {
+            // All planned views have been released. Record the executor's
+            // consumer stream before dropping the last executor-owned handle.
+            gather_arena_backing_.record_stream(at::cuda::getCurrentCUDAStream());
+            gather_arena_backing_ = at::Tensor();
+        }
+        active_gather_arena_config_ = nullptr;
     }
 
     at::Tensor acquireGatherArenaSlice(long ds_id,
                                        int64_t padded_numel,
                                        at::ScalarType target_dtype)
     {
-        if (profile || gather_arena_capacity_bytes_ == 0) { return at::Tensor(); }
-        auto plan = gather_arena_plan_.find(ds_id);
-        if (plan == gather_arena_plan_.end() || plan->second.empty()) { return at::Tensor(); }
+        const GatherArenaConfig* config = active_gather_arena_config_;
+        if (profile || config == nullptr || config->capacity_bytes == 0) { return at::Tensor(); }
+        auto plan = config->plan.find(ds_id);
+        if (plan == config->plan.end() || plan->second.empty()) { return at::Tensor(); }
         if (hasKey(gather_arena_active_leases_, ds_id)) {
             throw std::runtime_error(
                 "ZeRO-3 gather arena attempted overlapping leases for one parameter");
@@ -568,7 +611,7 @@ private:
         const int64_t actual_nbytes = padded_numel * element_size;
         if (entry.dtype != target_dtype || entry.nbytes != actual_nbytes ||
             entry.offset_bytes % element_size != 0 ||
-            entry.offset_bytes + actual_nbytes > gather_arena_capacity_bytes_) {
+            entry.offset_bytes + actual_nbytes > config->capacity_bytes) {
             return at::Tensor();
         }
         for (const auto& active : gather_arena_active_leases_) {
@@ -586,7 +629,7 @@ private:
         if (!gather_arena_backing_.defined()) {
             at::cuda::CUDAStreamGuard guard(ag_stream_);
             gather_arena_backing_ =
-                torch::empty({gather_arena_capacity_bytes_}, ds_tensor.options().dtype(at::kByte));
+                torch::empty({config->capacity_bytes}, ds_tensor.options().dtype(at::kByte));
         }
 
         at::Tensor output = torch::empty({0}, ds_tensor.options().dtype(target_dtype));
@@ -617,11 +660,10 @@ private:
 
     std::unordered_map<long, long> param_use_count_;
 
-    int64_t gather_arena_capacity_bytes_ = 0;
-    int64_t gather_arena_alignment_ = 256;
-    std::string gather_arena_signature_;
+    GatherArenaConfig forward_gather_arena_config_;
+    GatherArenaConfig backward_gather_arena_config_;
+    GatherArenaConfig* active_gather_arena_config_ = nullptr;
     at::Tensor gather_arena_backing_;
-    std::unordered_map<long, std::vector<GatherArenaPlanEntry>> gather_arena_plan_;
     std::unordered_map<long, size_t> gather_arena_occurrence_cursors_;
     std::unordered_map<long, GatherArenaLease> gather_arena_active_leases_;
 };
@@ -676,6 +718,7 @@ void register_graph_z3(long graph_id, const std::vector<long>& ds_ids)
 }
 
 void configure_z3_gather_arena(long graph_id,
+                               bool bwd,
                                int64_t capacity_bytes,
                                int64_t alignment,
                                const std::vector<long>& ds_ids,
@@ -687,7 +730,7 @@ void configure_z3_gather_arena(long graph_id,
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
     executor->configureGatherArena(
-        capacity_bytes, alignment, ds_ids, occurrences, offsets, nbytes, dtypes, signature);
+        bwd, capacity_bytes, alignment, ds_ids, occurrences, offsets, nbytes, dtypes, signature);
 }
 
 void register_z3_param(long ds_id,

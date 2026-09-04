@@ -5,6 +5,7 @@
 
 import torch
 
+import deepspeed.compile.executor_arena as executor_arena_mod
 from deepspeed.compile.executor_arena import (ArenaOccurrence, DEFAULT_FUSE_BUDGET, DEFAULT_LIVE_BUDGET,
                                               EXECUTOR_ARENA_ALIGNMENT, GraphArenaPlan, admit_executor_arena,
                                               executor_plan_signature, freeze_persistence, pack_executor_arena,
@@ -15,9 +16,11 @@ class FakeNativeZ3:
 
     def __init__(self):
         self.arena_config = None
+        self.arena_configs = {}
 
     def configure_z3_gather_arena(self, *args):
         self.arena_config = args
+        self.arena_configs[args[1]] = args
 
 
 def test_executor_arena_interval_pack_aligns_and_reuses_released_storage():
@@ -112,8 +115,9 @@ def test_executor_arena_registration_keeps_fallback_occurrences_in_runtime_seque
     registration = register_executor_arena(native, graph_id=11, graph_plan=graph_plan)
 
     assert registration.enabled
-    graph_id, capacity, alignment, ds_ids, occurrence_ids, offsets, nbytes, dtypes, signature = native.arena_config
+    graph_id, bwd, capacity, alignment, ds_ids, occurrence_ids, offsets, nbytes, dtypes, signature = native.arena_config
     assert graph_id == 11
+    assert not bwd
     assert capacity == 256
     assert alignment == 256
     assert ds_ids == [7, 7, 7]
@@ -131,5 +135,71 @@ def test_executor_arena_disabled_registration_has_no_runtime_backing_plan():
 
     assert not registration.enabled
     assert registration.reason == "incomplete_profile"
-    assert native.arena_config[0:3] == (12, 0, 256)
-    assert native.arena_config[3:8] == ([], [], [], [], [])
+    assert native.arena_config[0:4] == (12, False, 0, 256)
+    assert native.arena_config[4:9] == ([], [], [], [], [])
+
+
+def test_executor_arena_phase_registration_preserves_forward_plan_after_backward_registration():
+    forward_occurrences = (ArenaOccurrence(ds_id=21,
+                                           occurrence=0,
+                                           first_use=0,
+                                           release=1,
+                                           nbytes=256,
+                                           dtype=torch.float16), )
+    backward_occurrences = (ArenaOccurrence(ds_id=22,
+                                            occurrence=0,
+                                            first_use=0,
+                                            release=1,
+                                            nbytes=512,
+                                            dtype=torch.float32), )
+    forward_plan = GraphArenaPlan(occurrences=forward_occurrences, packed=pack_executor_arena(forward_occurrences))
+    backward_plan = GraphArenaPlan(occurrences=backward_occurrences, packed=pack_executor_arena(backward_occurrences))
+    native = FakeNativeZ3()
+
+    forward_registration = register_executor_arena(native, graph_id=13, graph_plan=forward_plan, bwd=False)
+    forward_config = native.arena_configs[False]
+    backward_registration = register_executor_arena(native, graph_id=13, graph_plan=backward_plan, bwd=True)
+
+    assert forward_registration.enabled
+    assert backward_registration.enabled
+    assert native.arena_configs[False] == forward_config
+    assert native.arena_configs[False][2:4] == (256, 256)
+    assert native.arena_configs[False][4] == [21]
+    assert native.arena_configs[True][2:4] == (512, 256)
+    assert native.arena_configs[True][4] == [22]
+
+
+def test_executor_arena_rejected_admission_registers_disabled_phase_config():
+    occurrences = (ArenaOccurrence(ds_id=31, occurrence=0, first_use=0, release=1, nbytes=512, dtype=torch.float16), )
+    graph_plan = GraphArenaPlan(occurrences=occurrences, packed=pack_executor_arena(occurrences))
+    admission = admit_executor_arena(graph_plan.packed, demand_profile_bytes=0, live_budget=256)
+    native = FakeNativeZ3()
+
+    registration = register_executor_arena(native, graph_id=14, graph_plan=graph_plan, bwd=True, admission=admission)
+
+    assert not admission.accepted
+    assert not registration.enabled
+    assert registration.reason == "live_budget_exceeded"
+    assert native.arena_configs[True][0:4] == (14, True, 0, 256)
+    assert native.arena_configs[True][4:9] == ([], [], [], [], [])
+
+
+def test_executor_arena_rank_consensus_uses_device_name_when_current_device_is_index(monkeypatch):
+
+    class FakeAccelerator:
+
+        def current_device(self):
+            raise AssertionError("integer current_device must not be passed to torch.device")
+
+        def current_device_name(self):
+            return "cpu"
+
+    native = FakeNativeZ3()
+    monkeypatch.setattr(executor_arena_mod, "get_accelerator", lambda: FakeAccelerator())
+    monkeypatch.setattr(executor_arena_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(executor_arena_mod.dist, "all_reduce", lambda tensor, op, group=None: tensor)
+
+    registration = register_executor_arena(native, graph_id=15, graph_plan=None, disabled_reason="test_disabled")
+
+    assert not registration.enabled
+    assert registration.reason == "test_disabled"

@@ -11,6 +11,7 @@ namespace dc {
 
 void register_graph_z3(long graph_id, const std::vector<long>& ds_ids);
 void configure_z3_gather_arena(long graph_id,
+                               bool bwd,
                                int64_t capacity_bytes,
                                int64_t alignment,
                                const std::vector<long>& ds_ids,
