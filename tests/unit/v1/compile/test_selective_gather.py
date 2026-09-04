@@ -27,6 +27,9 @@ class FakeAccelerator:
     def current_device(self):
         return self._device
 
+    def current_device_name(self):
+        return self._device
+
 
 class FakeDeepCompileHandle:
 

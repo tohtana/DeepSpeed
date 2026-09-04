@@ -412,15 +412,22 @@ def register_executor_arena(nz3,
                             graph_id: int,
                             graph_plan: Optional[GraphArenaPlan],
                             process_group=None,
-                            disabled_reason: str = "no_plan") -> ArenaRegistration:
+                            disabled_reason: str = "no_plan",
+                            *,
+                            bwd: bool = False,
+                            admission: Optional[ArenaAdmission] = None) -> ArenaRegistration:
     """Register metadata only; the native executor materializes backing on first real gather."""
     packed = graph_plan.packed if graph_plan is not None else None
+    if admission is not None and not admission.accepted:
+        graph_plan = None
+        packed = None
+        disabled_reason = admission.reason
     signature = executor_plan_signature(packed, disabled_reason)
     reason = "accepted" if packed is not None else disabled_reason
 
     if dist.is_initialized():
         fingerprint = _signature_int(signature)
-        device = torch.device(get_accelerator().current_device())
+        device = torch.device(get_accelerator().current_device_name())
         minimum = torch.tensor([fingerprint], device=device, dtype=torch.int64)
         maximum = minimum.clone()
         dist.all_reduce(minimum, dist.ReduceOp.MIN, group=process_group)
@@ -432,7 +439,7 @@ def register_executor_arena(nz3,
             signature = executor_plan_signature(None, reason)
 
     if graph_plan is None or packed is None or packed.capacity == 0:
-        nz3.configure_z3_gather_arena(graph_id, 0, EXECUTOR_ARENA_ALIGNMENT, [], [], [], [], [], signature)
+        nz3.configure_z3_gather_arena(graph_id, bwd, 0, EXECUTOR_ARENA_ALIGNMENT, [], [], [], [], [], signature)
         return ArenaRegistration(enabled=False, reason=reason if packed is None else "empty_plan", signature=signature)
 
     entries = {(entry.ds_id, entry.occurrence): entry for entry in packed.entries}
@@ -449,6 +456,6 @@ def register_executor_arena(nz3,
         nbytes.append(occurrence.nbytes)
         dtypes.append(occurrence.dtype if occurrence.dtype is not None else torch.uint8)
 
-    nz3.configure_z3_gather_arena(graph_id, packed.capacity, packed.alignment, ds_ids, occurrences, offsets, nbytes,
-                                  dtypes, signature)
+    nz3.configure_z3_gather_arena(graph_id, bwd, packed.capacity, packed.alignment, ds_ids, occurrences, offsets,
+                                  nbytes, dtypes, signature)
     return ArenaRegistration(enabled=True, reason=reason, signature=signature)
