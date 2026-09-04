@@ -22,7 +22,7 @@ from .contract import PassContract, CAP_Z3_GATHER_RELEASE
 
 NAME = "prefetch"
 # Reorders the all-gathers that zero3_compile emits, so it must run after that pass.
-CONTRACT = PassContract(requires=frozenset({CAP_Z3_GATHER_RELEASE}))
+CONTRACT = PassContract(requires=frozenset({CAP_Z3_GATHER_RELEASE}), conflicts_with=frozenset({"selective_gather"}))
 
 FUSE_FACTOR = 0.8
 MARGIN = 0.1

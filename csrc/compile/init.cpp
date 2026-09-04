@@ -111,6 +111,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("start_forward", &dc::start_forward, "Start forward pass");
     m.def("end_forward", &dc::end_forward, "End forward pass");
     m.def("start_backward", &dc::start_backward, "Start backward pass");
+    m.def("end_backward_phase", &dc::end_backward_phase, "End backward phase");
     m.def("cleanup", &dc::cleanup, "Clean up DeepCompile");
     m.def("reset", &dc::reset, "Reset the state");
     m.def("invalidate_gathered_param", &dc::invalidate_gathered_param, "Invalidate gathered param");

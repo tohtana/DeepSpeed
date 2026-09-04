@@ -94,6 +94,17 @@ def _placeholder(graph, name):
     return _with_meta(graph.placeholder(name))
 
 
+def test_end_backward_is_not_added_without_reduce_nodes():
+    graph = Graph()
+    grad = graph.placeholder("grad")
+    graph.output((grad, ))
+
+    before = list(graph.nodes)
+    zero3_compile_mod.add_end_backward(graph, 7)
+
+    assert list(graph.nodes) == before
+
+
 def test_sync_memory_profile_complete_noops_without_distributed(monkeypatch):
     monkeypatch.setattr(backend_mod.dist, "is_initialized", lambda: False)
 
@@ -388,6 +399,25 @@ def test_graph_executor_arena_excludes_getitem_alias_saved_as_output():
 
     assert plan.packed.entries == ()
     assert plan.packed.fallbacks[0].fallback_reason == "graph_output_alias_escape"
+
+
+def test_final_arena_planning_excludes_frozen_persistent_param():
+    graph = Graph()
+    param = graph.placeholder("frozen_param")
+    param.meta["val"] = torch.empty(4, dtype=torch.float16)
+    use = graph.call_function(operator.neg, (param, ))
+    graph.output((use, ))
+
+    registered_param = SimpleNamespace(numel=4, dtype=torch.float16, param=SimpleNamespace(ds_persist=True))
+    param_manager = SimpleNamespace(params={"frozen_param": registered_param}, ds_ids={"frozen_param": 77})
+
+    rewritten = zero3_compile_mod.add_gather_and_release(0, graph, param_manager, [param])
+    plan = executor_arena_mod.plan_graph_executor_arena(rewritten)
+
+    assert plan.packed.entries == ()
+    assert len(plan.packed.fallbacks) == 1
+    assert plan.packed.fallbacks[0].ds_id == 77
+    assert plan.packed.fallbacks[0].fallback_reason == "persistent_param"
 
 
 def test_prefetch_size_bounds_exclude_oversized_single_gather(monkeypatch):
