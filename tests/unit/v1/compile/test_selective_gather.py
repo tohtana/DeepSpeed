@@ -71,6 +71,7 @@ def test_compute_persistence_budget_clamps_when_transient_peak_exceeds_budget():
 def test_selective_gather_sets_persistent_params_when_transient_headroom_exists(monkeypatch):
     fake_handle = FakeDeepCompileHandle()
 
+    monkeypatch.setattr(selective_gather_pass, "DEFAULT_LIVE_BUDGET", 0)
     monkeypatch.setattr(selective_gather_pass, "get_accelerator", lambda: FakeAccelerator(available_mem=220))
     monkeypatch.setattr(selective_gather_pass, "get_deepcompile_handle", lambda: fake_handle)
     monkeypatch.setattr(selective_gather_pass.dist, "get_rank", lambda group=None: 0)
@@ -112,6 +113,7 @@ def test_selective_gather_sets_persistent_params_when_transient_headroom_exists(
 def test_selective_gather_uses_profiled_headroom_instead_of_current_available_memory(monkeypatch):
     fake_handle = FakeDeepCompileHandle()
 
+    monkeypatch.setattr(selective_gather_pass, "DEFAULT_LIVE_BUDGET", 0)
     monkeypatch.setattr(selective_gather_pass, "get_accelerator", lambda: FakeAccelerator(available_mem=1000))
     monkeypatch.setattr(selective_gather_pass, "get_deepcompile_handle", lambda: fake_handle)
     monkeypatch.setattr(selective_gather_pass.dist, "get_rank", lambda group=None: 0)

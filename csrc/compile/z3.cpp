@@ -163,9 +163,10 @@ public:
             .view(param.getShape());
     }
 
-    void prefetchParamsFused(const std::vector<long>& ds_ids,
-                             const std::optional<std::vector<at::ScalarType>> dtypes,
-                             c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
+    std::vector<at::Tensor> prefetchParamsFused(
+        const std::vector<long>& ds_ids,
+        const std::optional<std::vector<at::ScalarType>> dtypes,
+        c10::intrusive_ptr<c10d::symmetric_memory::SymmetricMemory> symm_mem)
     {
         std::vector<std::tuple<long, std::optional<at::ScalarType>>> invalid_params;
         for (int i = 0; i < ds_ids.size(); i++) {
@@ -211,6 +212,22 @@ public:
         for (const auto& [ds_id, _] : invalid_params) {
             ag_comm_done_events_[ds_id]->record(ag_stream_);
         }
+
+        std::vector<at::Tensor> outputs;
+        outputs.reserve(ds_ids.size());
+        for (int i = 0; i < ds_ids.size(); i++) {
+            const long ds_id = ds_ids[i];
+            const DSParam& param = param_registry_->getParam(ds_id);
+            const auto target_dtype = dtypes ? dtypes.value()[i]
+                                             : param.getDSTensor().scalar_type();
+            const int64_t true_numel = static_cast<int64_t>(productDim(param.getShape()));
+            auto gathered = param_registry_->getGatheredParam(ds_id);
+            outputs.push_back(gathered.flatten()
+                                  .to(target_dtype)
+                                  .index({torch::indexing::Slice(0, true_numel)})
+                                  .view(param.getShape()));
+        }
+        return outputs;
     }
 
     void releaseParam(long ds_id, long n_users)
@@ -567,20 +584,30 @@ void set_persistent(long ds_id)
     }
 }
 
-void prefetch_params_fused(long graph_id,
-                           const std::vector<at::Tensor>& params,
-                           const std::vector<long>& ds_ids,
-                           const std::optional<std::vector<at::ScalarType>>& dtypes)
+std::vector<at::Tensor> prefetch_params_fused(
+    long graph_id,
+    const std::vector<at::Tensor>& params,
+    const std::vector<long>& ds_ids,
+    const std::optional<std::vector<at::ScalarType>>& dtypes)
 {
     auto executor = getExecutor<Z3CustomOpExecutor>(graph_id, executors);
-    executor->prefetchParamsFused(ds_ids, dtypes, symm_mem);
+    return executor->prefetchParamsFused(ds_ids, dtypes, symm_mem);
 }
 
-void prefetch_params_fused_meta(long graph_id,
-                                const std::vector<at::Tensor>& params,
-                                const std::vector<long>& ds_ids,
-                                const std::optional<std::vector<at::ScalarType>>& dtypes)
+std::vector<at::Tensor> prefetch_params_fused_meta(
+    long graph_id,
+    const std::vector<at::Tensor>& params,
+    const std::vector<long>& ds_ids,
+    const std::optional<std::vector<at::ScalarType>>& dtypes)
 {
+    std::vector<at::Tensor> outputs;
+    outputs.reserve(ds_ids.size());
+    for (int i = 0; i < ds_ids.size(); i++) {
+        auto dtype = dtypes ? std::optional<at::ScalarType>(dtypes.value()[i])
+                            : std::optional<at::ScalarType>();
+        outputs.push_back(allgather_param_meta(params[i], graph_id, ds_ids[i], dtype));
+    }
+    return outputs;
 }
 
 // for profiling
