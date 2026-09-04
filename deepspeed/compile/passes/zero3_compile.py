@@ -13,6 +13,7 @@ import _operator
 import torch
 from torch.fx import Graph, Node, GraphModule
 
+from ..executor_arena import admit_executor_arena, plan_graph_executor_arena
 from ..util import get_input_nodes, get_param_nodes, get_index_by_graph_id, get_deepcompile_handle, get_real_uses, is_cast_op
 from ..fx import (add_postprocess, _make_node_meta, get_output_node, move_primals_to_head, add_end_backward,
                   replace_reduce_outputs_with_none, should_release_reduce_buckets)
@@ -469,6 +470,10 @@ def add_z3_gather_release_fw(gm: GraphModule,
     if rank == 0 and debug_log:
         print(f"Fwd after scheduling graph {graph_index} graph_id={graph_id} {gm.graph}")
 
+    gm._deepcompile_executor_arena_plan = plan_graph_executor_arena(gm.graph)
+    gm._deepcompile_executor_arena_admission = admit_executor_arena(
+        gm._deepcompile_executor_arena_plan.packed,
+        demand_profile_bytes=gm._deepcompile_executor_arena_plan.packed.capacity)
     return gm
 
 
@@ -520,6 +525,10 @@ def add_z3_gather_release_bw(gm: GraphModule,
     replace_reduce_outputs_with_none(gm.graph)
     _validate_final_schedule_fingerprint(gm.graph, graph_id, bwd=True, process_group=process_group)
 
+    gm._deepcompile_executor_arena_plan = plan_graph_executor_arena(gm.graph)
+    gm._deepcompile_executor_arena_admission = admit_executor_arena(
+        gm._deepcompile_executor_arena_plan.packed,
+        demand_profile_bytes=gm._deepcompile_executor_arena_plan.packed.capacity)
     return gm
 
 

@@ -13,6 +13,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import log_dist
 
+from ..executor_arena import DEFAULT_LIVE_BUDGET, freeze_persistence
 from ..util import get_deepcompile_handle
 from ..graph_param import DSGraphParamManager
 from ..profilers.graph_profile import is_profile_incomplete
@@ -182,6 +183,10 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
     # The profile models transient peaks, while current allocator state captures
     # memory retained since profiling.  Persistence must satisfy both views.
     available_mem = min(profiled_available_mem, current_available_headroom)
+    live_budget = int(mem_budget) if mem_budget > 0 else DEFAULT_LIVE_BUDGET
+    frozen_persistence = freeze_persistence(((ds_id, ds_id_to_size[ds_id]) for ds_id in ds_ids),
+                                            headroom_bytes=available_mem,
+                                            live_budget=live_budget)
 
     ds_id_to_param = {}
     for g_id, g_pm in param_manager.items():
@@ -197,6 +202,8 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         f"transient_peak={budget['transient_peak']} current_available_mem={current_available_mem} "
         f"current_available_headroom={current_available_headroom} "
         f"profiled_transient_available_mem={profiled_available_mem} effective_available_mem={available_mem} "
+        f"reserved_live_bytes={frozen_persistence.reserved_live_bytes} "
+        f"persistence_available_bytes={frozen_persistence.available_bytes} "
         f"persistent_count={len(persistent_ds_ids)} persistent_bytes={persistent_bytes} "
         f"candidate_count={len(ds_ids)} candidate_bytes={candidate_bytes}")
 
@@ -208,17 +215,18 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
         print_rank_0("selective_gather no candidates to persist")
         return gm
 
-    if available_mem == 0:
+    if frozen_persistence.available_bytes == 0:
         print_rank_0("selective_gather no effective headroom for new persistent params")
         return gm
 
     persistent_mem = 0
     selected_count = 0
+    selected_ds_ids = set(frozen_persistence.selected_ds_ids)
     nz3 = get_deepcompile_handle()
     for ds_id in ds_ids:
+        if ds_id not in selected_ds_ids:
+            continue
         size = ds_id_to_size[ds_id]
-        if persistent_mem + size > available_mem:
-            break
         persistent_mem += size
         selected_count += 1
 
@@ -230,7 +238,7 @@ def selective_gather(gm: GraphModule, graph_id: int, graph_order: List[Tuple[int
 
     if selected_count == 0:
         smallest_candidate = min(ds_id_to_size[ds_id] for ds_id in ds_ids)
-        print_rank_0(f"selective_gather selected no new params: available_mem={available_mem} "
+        print_rank_0(f"selective_gather selected no new params: available_mem={frozen_persistence.available_bytes} "
                      f"smallest_candidate={smallest_candidate}")
     else:
         print_rank_0(f"selective_gather selected_count={selected_count} selected_bytes={persistent_mem}")

@@ -12,6 +12,7 @@ from torch.fx import Graph, GraphModule
 
 import deepspeed.compile.util as compile_util
 from deepspeed.compile import backend as backend_mod
+from deepspeed.compile import executor_arena as executor_arena_mod
 from deepspeed.compile import inductor as inductor_mod
 from deepspeed.compile import list_schedule as schedule_mod
 from deepspeed.compile.passes import prefetch as prefetch_mod
@@ -28,6 +29,7 @@ def _define_dc_ops():
     test_dc_ops = getattr(torch.ops, _TEST_DC_NAMESPACE)
     try:
         test_dc_ops.allgather_param.default
+        test_dc_ops.prefetch_params_fused.default
         test_dc_ops.wait_allgather.default
         test_dc_ops.release_param.default
         test_dc_ops.reduce_grad.default
@@ -39,6 +41,8 @@ def _define_dc_ops():
     lib = torch.library.Library(_TEST_DC_NAMESPACE, "DEF")
     for schema in (
             "allgather_param(Tensor a, int graph_id, int id, ScalarType? dtype = None) -> Tensor",
+            "prefetch_params_fused(int graph_id, Tensor[] params, int[] ids, "
+            "ScalarType[]? dtypes = None) -> Tensor[]",
             "wait_allgather(Tensor(a) a, int graph_id, int id) -> Tensor(a)",
             "release_param(Tensor(a) a, int graph_id, int id, int n_users) -> Tensor(a)",
             "reduce_grad(Tensor a, int graph_id, int id) -> Tensor",
@@ -218,6 +222,77 @@ def _release(graph, arg, ds_id, name):
         graph.create_node('call_function',
                           torch.ops.dc.release_param.default, (arg, 0, ds_id, 1), {},
                           name=f"release_ds_param_{name}_{ds_id}"))
+
+
+def test_fused_prefetch_outputs_replace_ordinary_allgather_edges():
+    graph = Graph()
+    first = _placeholder(graph, "first")
+    second = _placeholder(graph, "second")
+    first_ag = _allgather(graph, first, 1, "first", tensor_size=256)
+    second_ag = _allgather(graph, second, 2, "second", tensor_size=512)
+    first_wait = _wait(graph, first_ag, 1, "first")
+    second_wait = _wait(graph, second_ag, 2, "second")
+    use = _add(graph, first_wait, second_wait, "use")
+    first_release = _release(graph, use, 1, "first")
+    second_release = _release(graph, first_release, 2, "second")
+    output = graph.output((second_release, ))
+    graph.lint()
+
+    ordered_nodes = (first, second, [first_ag, second_ag], first_ag, second_ag, first_wait, second_wait, use,
+                     first_release, second_release, output)
+    rewritten = prefetch_mod._rewrite_fused_prefetch(ordered_nodes, graph_id=0)
+    fused = [node for node in rewritten.nodes if node.target == torch.ops.dc.prefetch_params_fused.default]
+    waits = [node for node in rewritten.nodes if node.target == torch.ops.dc.wait_allgather.default]
+
+    assert len(fused) == 1
+    assert fused[0].args[2] == [1, 2]
+    assert fused[0].args[3] == [torch.float16, torch.float16]
+    assert not any(node.target == torch.ops.dc.allgather_param.default for node in rewritten.nodes)
+    assert len(waits) == 2
+    assert all(wait.args[0].target == operator.getitem for wait in waits)
+    assert all(wait.args[0].args[0] is fused[0] for wait in waits)
+    assert [wait.args[0].args[1] for wait in waits] == [0, 1]
+    arena_plan = executor_arena_mod.plan_graph_executor_arena(rewritten)
+    assert [(entry.ds_id, entry.occurrence) for entry in arena_plan.packed.entries] == [(1, 0), (2, 0)]
+    assert arena_plan.packed.fallbacks == ()
+
+
+def test_fused_prefetch_mixed_dtype_group_preserves_independent_allgathers():
+    graph = Graph()
+    first = _placeholder(graph, "mixed_first")
+    second = _placeholder(graph, "mixed_second")
+    first_ag = _allgather(graph, first, 1, "mixed_first")
+    second_ag = _allgather(graph, second, 2, "mixed_second")
+    second_ag.kwargs = {}
+    first_wait = _wait(graph, first_ag, 1, "mixed_first")
+    second_wait = _wait(graph, second_ag, 2, "mixed_second")
+    use = _add(graph, first_wait, second_wait, "mixed_use")
+    release = _release(graph, use, 1, "mixed")
+    output = graph.output((release, ))
+    graph.lint()
+
+    rewritten = prefetch_mod._rewrite_fused_prefetch(
+        (first, second, [first_ag, second_ag], first_ag, second_ag, first_wait, second_wait, use, release, output),
+        graph_id=0)
+
+    assert not any(node.target == torch.ops.dc.prefetch_params_fused.default for node in rewritten.nodes)
+    assert len([node for node in rewritten.nodes if node.target == torch.ops.dc.allgather_param.default]) == 2
+
+
+def test_graph_executor_arena_excludes_wait_tensor_that_escapes_as_output():
+    graph = Graph()
+    param = _placeholder(graph, "escaping_param")
+    ag = _allgather(graph, param, 11, "escaping", tensor_size=256)
+    wait = _wait(graph, ag, 11, "escaping")
+    _release(graph, wait, 11, "escaping")
+    graph.output((wait, ))
+    graph.lint()
+
+    plan = executor_arena_mod.plan_graph_executor_arena(graph)
+
+    assert plan.packed.entries == ()
+    assert len(plan.packed.fallbacks) == 1
+    assert plan.packed.fallbacks[0].fallback_reason == "graph_output_escape"
 
 
 def _scheduled_graph(graph, scheduler_budget=None):
