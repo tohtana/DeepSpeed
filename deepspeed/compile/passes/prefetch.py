@@ -257,6 +257,9 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
     else:
         gm.graph = graph
         final_plan = demand_plan
+        admission = admit_executor_arena(final_plan.packed,
+                                         demand_profile_bytes=final_plan.packed.capacity,
+                                         live_budget=int(MAX_BUFFERED_SIZE))
     gm._deepcompile_executor_arena_plan = final_plan
     gm._deepcompile_executor_arena_admission = admission
     gm._deepcompile_executor_arena_registration = register_executor_arena(get_deepcompile_handle(),
