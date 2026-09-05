@@ -11,6 +11,7 @@ import torch.nn as nn
 import deepspeed.runtime.engine as ds_engine
 from deepspeed import set_optimizer_flags
 from deepspeed.module_inject.auto_ep import AutoEP
+from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
 from deepspeed.runtime.engine import DeepSpeedEngine
 
 
@@ -150,3 +151,28 @@ def test_autoep_zero3_partitioned_experts_keep_muon_assignment(monkeypatch):
 
     assert all(param.use_muon for param in replacement.experts.parameters())
     assert not replacement.ordinary_partition.use_muon
+
+
+def test_autoep_zero3_partitioned_experts_keep_optimizer_grouping():
+
+    def make_experts(partitioned):
+        params = []
+        for _ in range(4):
+            param = nn.Parameter(torch.empty(0) if partitioned else torch.ones(4))
+            param.allreduce = False
+            param.group_name = "ep_size_2"
+            if partitioned:
+                param.ds_numel = 4
+            params.append(param)
+        return params
+
+    def group_lengths(params):
+        groups = split_params_into_different_moe_groups_for_optimizer({
+            "name": "dense-params",
+            "params": params,
+        },
+                                                                      max_group_size=10)
+        return [len(group["params"]) for group in groups if group.get("moe")]
+
+    assert group_lengths(make_experts(partitioned=False)) == [2, 2]
+    assert group_lengths(make_experts(partitioned=True)) == [2, 2]
