@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import deepspeed.runtime.engine as ds_engine
+from deepspeed import set_optimizer_flags
 from deepspeed.module_inject.auto_ep import AutoEP
 from deepspeed.runtime.engine import DeepSpeedEngine
 
@@ -129,3 +130,23 @@ def test_autoep_zero3_eager_conversion_gates():
 
     ordinary_source = nn.Linear(2, 2, bias=False)
     assert engine._autoep_zero3_param_converter(ordinary_source) is None
+
+
+def test_autoep_zero3_partitioned_experts_keep_muon_assignment(monkeypatch):
+    replacement = _Replacement(0)
+    replacement.ordinary_partition = nn.Parameter(torch.empty(0))
+    replacement.ordinary_partition.ds_shape = torch.Size((2, 2))
+    monkeypatch.setattr(ds_engine.groups, "_get_expert_data_parallel_group", lambda group_name: object())
+
+    def convert_to_zero_parameters(param_list):
+        for param in param_list:
+            param.ds_shape = param.shape
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+
+    DeepSpeedEngine._partition_autoep_zero3_experts(replacement, convert_to_zero_parameters)
+    assert all(param.ndim == 1 for param in replacement.experts.parameters())
+
+    set_optimizer_flags(SimpleNamespace(optimizer_name="muon"), replacement)
+
+    assert all(param.use_muon for param in replacement.experts.parameters())
+    assert not replacement.ordinary_partition.use_muon
