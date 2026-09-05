@@ -83,6 +83,13 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
 
     comm_predictor = create_predictor()
 
+    return plan_prefetch(gm, graph_id, mem_dict, tensor_size_dict, max_mem, comm_predictor)
+
+
+def plan_prefetch(gm, graph_id, mem_dict, tensor_size_dict, max_mem, comm_predictor):
+    """Pure graph rewrite with an already prepared, read-only communication lookup."""
+    graph = gm.graph
+
     order_rev = list(reversed(graph.nodes))
     new_order_rev = []
     prefetch_ags = []
@@ -125,10 +132,9 @@ def schedule_prefetch(gm: GraphModule, graph_id: int, graph_order: List[Tuple[in
                 current_ag_size = sum([tensor_size_dict[ag_node.name] for ag_node in prefetch_ags])
                 pred_time_current = comm_predictor(current_ag_size)
                 pred_time_next = comm_predictor(tensor_size_dict[node.name])
-                pred_time_fused = comm_predictor(current_ag_size + tensor_size_dict[node.name])
-
-                do_fuse = max(pred_time_current, pred_time_next) * 1.2 > pred_time_fused and (
-                    current_ag_size + tensor_size_dict[node.name]) < MAX_FUSE_SIZE
+                fused_size = current_ag_size + tensor_size_dict[node.name]
+                do_fuse = (fused_size < MAX_FUSE_SIZE
+                           and max(pred_time_current, pred_time_next) * 1.2 > comm_predictor(fused_size))
                 # print_rank_0(
                 #     f"found allgather_param do_fuse={do_fuse} current_ag_size={current_ag_size} tensor_size_dict[node.name]={tensor_size_dict[node.name]} pred_time_current={pred_time_current} pred_time_next={pred_time_next} pred_time_fused={pred_time_fused}"
                 # )

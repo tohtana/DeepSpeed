@@ -14,7 +14,7 @@ from deepspeed.runtime.zero.partition_parameters import InsertPostInitMethodToMo
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload
 
 from .passes import zero3_compile, prefetch, selective_gather, offload_parameters, offload_activation
-from .backend import make_backend, launch_compile_passes, init_schedule
+from .backend import make_backend, launch_compile_passes, init_schedule, SEARCH_PASSES, opt_passes
 from .patch_fake_tensor import patch_fake_tensor
 from .util import get_deepcompile_handle, add_pre_backward_hook, add_post_backward_hook
 from .z3_eager_fallback import DeepCompileZ3EagerFallback
@@ -85,6 +85,26 @@ def _resolve_expected_grad_dtype(param):
 
 
 def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
+
+    from .simulation.core import auto_requested
+    search_session = None
+    if auto_requested(compile_config.pass_mode, compile_config.passes, schedule):
+        from .simulation.session import SearchSession
+        if any((compile_config.offload_parameters, compile_config.offload_opt_states,
+                compile_config.offload_activation, compile_config.free_activation, compile_config.symmetric_memory)):
+            raise ValueError('v0 auto search requires offload, free_activation and symmetric_memory disabled')
+        if backend != 'eager':
+            raise ValueError('v0 auto search currently supports the eager backend')
+        if dist.get_world_size(engine.data_parallel_group) != dist.get_world_size():
+            raise ValueError('v0 auto search requires a single global data-parallel group')
+        if schedule and any(passes for _, passes in schedule):
+            from .util import log_rank0
+            log_rank0('Auto search uses its mandatory baseline schedule instead of the supplied nonempty passes', True)
+        search_step = max([WARMUP] + [step for step, passes in schedule or [] if not passes])
+        schedule = [(0, [zero3_compile.add_z3_gather_release]), (search_step, [])]
+        compile_config.keep_all_input_tensors = True
+        search_session = SearchSession(compile_config, SEARCH_PASSES, tuple(opt_passes), search_step - 1,
+                                       engine.zero_reduce_bucket_size())
 
     # Validate before touching the engine: everything below removes hooks and unpatches modules,
     # so raising later would leave a half-converted engine behind.
@@ -205,7 +225,10 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
                 init_offload_opt_states(optimizer, dc)
 
     engine._deepcompile_owned_frames = set()
-    engine.launch_compile_passes = partial(launch_compile_passes, owned_frames=engine._deepcompile_owned_frames)
+    engine.launch_compile_passes = partial(launch_compile_passes,
+                                           owned_frames=engine._deepcompile_owned_frames,
+                                           search_session=search_session)
+    engine._deepcompile_search_session = search_session
 
     patch_fake_tensor()
     torch._inductor.config.size_asserts = False
@@ -221,4 +244,5 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
     return make_backend(backend,
                         compile_config,
                         compile_kwargs=compile_kwargs,
-                        owned_frames=engine._deepcompile_owned_frames)
+                        owned_frames=engine._deepcompile_owned_frames,
+                        search_session=search_session)

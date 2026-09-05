@@ -236,3 +236,25 @@ def add_z3_gather_release(gm: GraphModule, graph_id: int, graph_order: List[Tupl
                                     create_inputs_fn,
                                     param_manager,
                                     debug_log=False)
+
+
+def restore_z3_structure(gm, graph_id, graph_order, profiling_results, param_manager, bwd):
+    """Recreate mandatory ops before replaying a previously profiled node order.
+
+    The initial path above still profiles and runs fast_free_schedule. Replay
+    uses that saved order and does not profile or make new scheduling decisions.
+    """
+    manager = param_manager[graph_id]
+    if bwd:
+        nodes, gradients = manager.get_bwd_mapping(gm.graph)
+        gm.graph = add_gather_and_reduce(graph_id, gm.graph, manager, nodes, gradients)
+        add_end_backward(gm.graph, graph_id, should_release_reduce_buckets(graph_order, graph_id))
+        replace_reduce_outputs_with_none(gm.graph)
+    else:
+        indices = profiling_results[graph_id].param_indices
+        gm.graph = add_gather_and_release(graph_id, gm.graph, manager, get_param_nodes(gm.graph, indices))
+        get_deepcompile_handle().register_graph_z3(graph_id, [value[1] for value in indices])
+        for node in gm.graph.nodes:
+            if node.name in manager.ds_ids and 'val' in node.meta:
+                value = node.meta['val']
+                node.meta['val'] = torch.empty([0], dtype=value.dtype, device=value.device)

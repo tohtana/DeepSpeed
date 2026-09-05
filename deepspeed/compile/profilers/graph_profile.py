@@ -370,7 +370,7 @@ class ProfilingInterpreter(Interpreter):
 
 class MemoryProfilingInterpreter(Interpreter):
 
-    def __init__(self, gm: GraphModule, debug_log=False):
+    def __init__(self, gm: GraphModule, debug_log=False, capture_storage=False):
         super().__init__(gm)
         self.nz3 = get_deepcompile_handle()
         self.device = torch.device(get_accelerator().current_device())
@@ -381,6 +381,8 @@ class MemoryProfilingInterpreter(Interpreter):
         self.node_counter = 0
         self.node_num = len(gm.graph.nodes)
         self.debug_log = debug_log
+        self.capture_storage = capture_storage
+        self.capture_runtime = False
 
     def run(self, *args) -> Any:
         return_val = None
@@ -389,6 +391,10 @@ class MemoryProfilingInterpreter(Interpreter):
             assert _all_real_if_tensor(args), "Inputs must be real tensors"
             self.nz3.enable_profiling(True)
             self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
+
+            if self.capture_storage:
+                self.graph._simulation_start_bytes = (get_accelerator().memory_allocated() +
+                                                      self.mem_usage_out_of_torch)
 
             with unset_fake_temporarily():
                 with get_accelerator().random().fork_rng(devices=[self.device]):
@@ -407,10 +413,15 @@ class MemoryProfilingInterpreter(Interpreter):
 
     def run_node(self, n: torch.fx.Node) -> Any:
         get_accelerator().reset_peak_memory_stats()
+        before = get_accelerator().memory_allocated() + self.mem_usage_out_of_torch
 
         ret = None
         error = None
         try:
+            if self.capture_runtime:
+                start = get_accelerator().Event(enable_timing=True)
+                end = get_accelerator().Event(enable_timing=True)
+                start.record()
             if n.op in {"placeholder", "output"}:
                 ret = super().run_node(n)
             else:
@@ -420,6 +431,14 @@ class MemoryProfilingInterpreter(Interpreter):
                 ret = getattr(self, n.op)(n.target, args, kwargs)
 
                 del args, kwargs
+            if self.capture_runtime:
+                get_accelerator().synchronize()
+                end.record()
+                get_accelerator().synchronize()
+                n.meta['device_time'] = 0.0 if n.op in ('placeholder', 'output') else start.elapsed_time(end)
+            if self.capture_storage:
+                from ..simulation.storage import record_storage
+                record_storage(n, ret, self.env)
         except Exception as e:
             # Leaving the node loop here would skip the collectives below, which every rank has to
             # reach. Carry the error to the vote instead; running out of memory is the usual reason
@@ -428,6 +447,8 @@ class MemoryProfilingInterpreter(Interpreter):
 
         current_alloc = get_accelerator().memory_allocated() + self.mem_usage_out_of_torch
         max_alloc = get_accelerator().max_memory_allocated() + self.mem_usage_out_of_torch
+        if self.capture_storage:
+            n.meta['sim_workspace_bytes'] = max(0, max_alloc - max(before, current_alloc))
         vals_to_bcast = torch.tensor([current_alloc, max_alloc], device=self.device, dtype=torch.int64)
         dist.all_reduce(vals_to_bcast, dist.ReduceOp.MAX)
         current_alloc = vals_to_bcast[0].item()
@@ -451,3 +472,20 @@ class MemoryProfilingInterpreter(Interpreter):
         import pandas as pd
         df = pd.DataFrame(self.mem_record, columns=["node", "memory", "delta", "max_mem"])
         df.to_csv(path, index=False)
+
+
+class BaselineRecordingInterpreter(MemoryProfilingInterpreter):
+    """Record one actual training execution, including gradient reductions.
+
+    No profiling-mode switch, RNG restoration, extra graph replay, or gradient
+    cleanup: the returned values are consumed by the ordinary training step.
+    """
+
+    def __init__(self, gm):
+        super().__init__(gm, capture_storage=True)
+        self.capture_runtime = True
+
+    def run(self, *args):
+        self.mem_usage_out_of_torch = _get_mem_usage_out_of_torch()
+        self.graph._simulation_start_bytes = (get_accelerator().memory_allocated() + self.mem_usage_out_of_torch)
+        return Interpreter.run(self, *args)

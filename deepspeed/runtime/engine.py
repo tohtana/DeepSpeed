@@ -1330,7 +1330,8 @@ class DeepSpeedEngine(Module):
 
     def compile_zero_optimization_stage(self):
         """Determines if zero-pass is set in deepcompile's passes attributes."""
-        return "z1" in self._config.compile_config.passes or "z3" in self._config.compile_config.passes
+        passes = self._config.compile_config.passes or []
+        return "z1" in passes or "z3" in passes
 
     def compile_autosp(self):
         """Determines if AutoSP is set in deepcompile's passes attributes."""
@@ -5772,6 +5773,13 @@ class DeepSpeedEngine(Module):
 
     def get_deepspeed_compile_backend(self, backend, compile_kwargs, schedule):
         resolved_backend = None
+
+        from deepspeed.compile.simulation.core import auto_requested
+        compile_config = self._config.compile_config
+        if auto_requested(compile_config.pass_mode, compile_config.passes, schedule):
+            if self.zero_optimization_stage() != ZeroStageEnum.weights or self.compile_autosp() or self.compile_autotp(
+            ):
+                raise ValueError('v0 auto pass search requires ZeRO stage 3 without AutoSP/AutoTP')
 
         if schedule is not None:
 

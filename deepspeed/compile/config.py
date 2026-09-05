@@ -12,6 +12,13 @@ PassName = Literal["z1", "z3", "autosp", "autotp"]
 class CompileConfig(DeepSpeedConfigModel):
     """ Configure compile settings """
 
+    def __init__(self, **data):
+        # The base model strips generic HF "auto" placeholders. Here "auto"
+        # is a literal mode, so preserve it and use assignment validation.
+        pass_mode = data.pop('pass_mode', 'fixed')
+        super().__init__(**data)
+        self.pass_mode = pass_mode
+
     deepcompile: bool = False
     """ Turn on/off the DeepCompile mode """
 
@@ -72,3 +79,9 @@ class CompileConfig(DeepSpeedConfigModel):
 
     passes: Optional[List[PassName]] = None
     """ Composes different optimizations. """
+
+    pass_mode: Literal['fixed', 'auto'] = 'fixed'
+    """ Experimental ZeRO-3 pass search after mandatory baseline profiling. """
+
+    search_output_dir: str = 'deepcompile-search'
+    """ Communication cache and serial simulation results for the current run. """

@@ -75,6 +75,9 @@ profiling_results: Dict[int, ProfilingResult] = {}
 opt_pass_times = []
 opt_passes = {}
 
+# Deliberately duplicated allowlist for the initial research/debugging flow.
+SEARCH_PASSES = ('prefetch', )
+
 fwd_real_inputs = []
 
 
@@ -118,13 +121,19 @@ def init_schedule(schedule):
     remaining_schedule = deque(schedule)
 
 
-def launch_compile_passes(global_steps: int, owned_frames=None):
+def launch_compile_passes(global_steps: int, owned_frames=None, search_session=None):
     """Advance the pass schedule and discard state owned by the previous compile cycle."""
     global next_pass_step, next_passes
+
+    if search_session is not None:
+        search_session.current_step = global_steps
 
     if len(remaining_schedule) > 0 and global_steps == remaining_schedule[0][0]:
         _, next_passes = remaining_schedule.popleft()
         log_rank0(f"Launching compile passes: global_steps={global_steps} passes={next_passes}", True)
+
+        if search_session is not None and not next_passes:
+            search_session.prepare(profiling_results, param_manager, graph_order_with_frame_id.get_graph_order())
 
         torch._dynamo.reset()
         get_deepcompile_handle().reset()
@@ -248,7 +257,12 @@ def run_opt_passes(opt_passes: List[Callable],
                    mem_budget: float,
                    param_manager,
                    bwd: bool,
-                   debug_log=False) -> None:
+                   debug_log=False,
+                   search_session=None) -> None:
+
+    if search_session is not None and search_session.selected is not None:
+        search_session.apply(gm, graph_id, graph_order, profiling_results, param_manager, bwd)
+        return
 
     with unset_fake_temporarily():
         get_accelerator().synchronize()
@@ -265,7 +279,7 @@ def run_opt_passes(opt_passes: List[Callable],
             gm.graph.lint()
             gm.recompile()
 
-            mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log)
+            mem_prof = MemoryProfilingInterpreter(gm, debug_log=debug_log, capture_storage=search_session is not None)
             mem_prof.run(*create_inputs_fn())
             profile_complete = _sync_memory_profile_complete(mem_prof.profile_complete)
             if profile_complete:
@@ -281,7 +295,7 @@ def run_opt_passes(opt_passes: List[Callable],
             get_accelerator().empty_cache()
 
 
-def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
+def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None, search_session=None):
 
     register_custom_ops()
 
@@ -366,7 +380,8 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
                 mem_budget=.0,  # unused
                 param_manager=param_manager,
                 bwd=False,
-                debug_log=debug_log)
+                debug_log=debug_log,
+                search_session=search_session)
 
             opt_pass_times.append(("fwd", graph_index, graph_id, time.time() - time_start))
 
@@ -405,7 +420,8 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
                 mem_budget=.0,  # unused
                 param_manager=param_manager,
                 bwd=True,
-                debug_log=debug_log)
+                debug_log=debug_log,
+                search_session=search_session)
 
             # assert graph_id in param_manager, f"Graph {graph_id} not found in param_manager"
 
@@ -430,7 +446,18 @@ def make_backend(backend, compile_config, compile_kwargs={}, owned_frames=None):
             def make_compiler_fn(make_graph_fn):
 
                 def compiler_fn(gm, sample_inputs):
-                    return None if make_graph_fn(gm, sample_inputs) is None else make_boxed_func(gm.forward)
+                    if make_graph_fn(gm, sample_inputs) is None:
+                        return None
+                    if search_session is None:
+                        return make_boxed_func(gm.forward)
+
+                    def run(*inputs):
+                        if search_session.should_record():
+                            return search_session.record(gm, graph_id, make_graph_fn is make_bw_graph, inputs,
+                                                         profiling_results)
+                        return gm.forward(*inputs)
+
+                    return make_boxed_func(run)
 
                 return compiler_fn
 
