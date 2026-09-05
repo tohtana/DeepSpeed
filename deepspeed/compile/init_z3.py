@@ -90,6 +90,9 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
     search_session = None
     if auto_requested(compile_config.pass_mode, compile_config.passes, schedule):
         from .simulation.session import SearchSession
+        if compile_config.simulation_mode == 'overlap' and any(
+            (compile_config.sync_before_allgather, compile_config.sync_after_allgather)):
+            raise ValueError('Overlap search requires all-gather debug synchronization disabled')
         if any((compile_config.offload_parameters, compile_config.offload_opt_states,
                 compile_config.offload_activation, compile_config.free_activation, compile_config.symmetric_memory)):
             raise ValueError('v0 auto search requires offload, free_activation and symmetric_memory disabled')

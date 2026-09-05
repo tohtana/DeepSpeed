@@ -419,6 +419,7 @@ class MemoryProfilingInterpreter(Interpreter):
         error = None
         try:
             if self.capture_runtime:
+                n.meta.setdefault('sim_compute_time_ms', n.meta.get('device_time', 0.0))
                 start = get_accelerator().Event(enable_timing=True)
                 end = get_accelerator().Event(enable_timing=True)
                 start.record()

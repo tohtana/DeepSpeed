@@ -84,13 +84,20 @@ def auto_requested(pass_mode, configured_passes, schedule):
     return configured_passes == []
 
 
-def simulate(graphs, profile, *, initial_memory_bytes=0, memory_limit_bytes=None):
-    """Sum serial operator costs and storage lifetimes without executing a tensor op.
+def simulate(graphs, profile, *, initial_memory_bytes=0, memory_limit_bytes=None, mode='serial'):
+    """Estimate execution time and storage lifetimes without executing a tensor op.
 
     Graphs contain ordered events. Storage aliases use the same stable key across
     forward/backward; managed all-gather storage is freed by the final release.
     Workspace is transient, and resident state is counted only in initial memory.
+    Serial remains the default for replaying v0 profiles. Overlap models compute
+    and all-gather streams, explicit waits, and conservative reduction barriers.
     """
+    if mode == 'overlap':
+        from .overlap import simulate_overlap
+        return simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes)
+    if mode != 'serial':
+        raise ValueError(f'Unknown simulation mode: {mode}')
     events = [event for graph in graphs for event in graph['events']]
     storage_sizes = profile['storage_bytes']
     table = CommTable(**profile['communication'])

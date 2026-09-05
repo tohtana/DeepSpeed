@@ -101,7 +101,8 @@ class SearchSession:
                             int(values[1]),
                             self.optional_passes,
                             self.available_passes,
-                            runtime_memory=self.runtime_memory)
+                            runtime_memory=self.runtime_memory,
+                            simulation_mode=self.config.simulation_mode)
             result['baseline_measured_memory'] = {
                 'fw': profiles[graph_order[0][0]].fwd_mem,
                 'bw': profiles[graph_order[0][0]].bwd_mem

@@ -21,7 +21,8 @@ def search(graphs,
            available_passes,
            max_candidates=100,
            timeout_s=30,
-           runtime_memory=None):
+           runtime_memory=None,
+           simulation_mode='overlap'):
     """Only graph copies and table lookups are permitted inside this function."""
     from ..passes.contract import validate_schedule
     from ..passes.prefetch import plan_prefetch
@@ -43,8 +44,13 @@ def search(graphs,
             break
         validate_schedule([(0, list(pass_names))])
         modules = [copy_module(graph) for graph in graphs]
-        exported, profile = export_graphs([gm.graph for gm in modules], specs, communication, runtime_memory)
-        result = simulate(exported, profile, initial_memory_bytes=resident_bytes, memory_limit_bytes=limit_bytes)
+        exported, profile = export_graphs([gm.graph for gm in modules], specs, communication, runtime_memory,
+                                          simulation_mode)
+        result = simulate(exported,
+                          profile,
+                          initial_memory_bytes=resident_bytes,
+                          memory_limit_bytes=limit_bytes,
+                          mode=simulation_mode)
         for name in pass_names[1:]:
             if name == 'prefetch':
                 for phase, gm in zip(('fw', 'bw'), modules):
@@ -57,11 +63,13 @@ def search(graphs,
                         for node in gm.graph.nodes if str(node.target) == 'dc.allgather_param.default'
                     }
                     plan_prefetch(gm, 0, mem, sizes, limit_bytes, lambda size: table.lookup(size, dtype))
-                exported, profile = export_graphs([gm.graph for gm in modules], specs, communication, runtime_memory)
+                exported, profile = export_graphs([gm.graph for gm in modules], specs, communication, runtime_memory,
+                                                  simulation_mode)
                 result = simulate(exported,
                                   profile,
                                   initial_memory_bytes=resident_bytes,
-                                  memory_limit_bytes=limit_bytes)
+                                  memory_limit_bytes=limit_bytes,
+                                  mode=simulation_mode)
         candidates.append({
             'passes': list(pass_names),
             'result': result,
@@ -88,7 +96,9 @@ def search(graphs,
         'memory_limit_bytes':
         limit_bytes,
         'model':
-        'serial-no-overlap-v1',
+        'compute-all-gather-overlap-v1' if simulation_mode == 'overlap' else 'serial-no-overlap-v1',
+        'simulation_mode':
+        simulation_mode,
         'truncated':
         len(candidates) < sum(math.perm(len(optional_passes), count) for count in range(len(optional_passes) + 1))
     }

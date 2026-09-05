@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Experimental serial simulator. The core has no accelerator dependencies."""
+"""Experimental serial/overlap simulators with no accelerator dependencies in the core."""

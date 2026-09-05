@@ -84,4 +84,7 @@ class CompileConfig(DeepSpeedConfigModel):
     """ Experimental ZeRO-3 pass search after mandatory baseline profiling. """
 
     search_output_dir: str = 'deepcompile-search'
-    """ Communication cache and serial simulation results for the current run. """
+    """ Communication cache and simulation results for the current run. """
+
+    simulation_mode: Literal['serial', 'overlap'] = 'overlap'
+    """ Search timing model; overlap covers compute/all-gather with conservative reduce barriers. """

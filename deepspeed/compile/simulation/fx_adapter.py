@@ -111,7 +111,7 @@ def parameter_specs(graphs, manager, world_size):
     return specs
 
 
-def export_graphs(graphs, specs, communication, runtime_memory=None):
+def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_mode='serial'):
     """Use actual storage aliases; connect AOT saved values by placeholder name."""
     storage_bytes, operators, exported = {}, {}, []
     saved = {}
@@ -156,6 +156,10 @@ def export_graphs(graphs, specs, communication, runtime_memory=None):
                 if target not in ('dc.prefetch_params_fused.default', 'dc.end_backward.default'):
                     raise ValueError(f'Missing operator duration for {key}')
             duration = float(node.meta.get('device_time', 0))
+            if simulation_mode == 'overlap' and not target.startswith('dc.'):
+                # The real baseline records device-wide synchronization costs.
+                # Use the initial isolated operator profile for compute kernels.
+                duration = float(node.meta.get('sim_compute_time_ms', duration))
             workspace = int(node.meta.get('sim_workspace_bytes', 0))
             if target == 'dc.allgather_param.default':
                 event.update(kind='gather', params=[specs[node.args[2]]])
@@ -164,7 +168,7 @@ def export_graphs(graphs, specs, communication, runtime_memory=None):
                 event.update(kind='prefetch', params=[specs[ds_id] for ds_id in node.args[2]])
                 workspace = 0
             elif target == 'dc.wait_allgather.default':
-                event['kind'] = 'wait'
+                event.update(kind='wait', param_id=node.args[2])
                 workspace = 0
             elif target == 'dc.release_param.default':
                 event.update(kind='release', param_id=node.args[2], release_count=node.args[3])
@@ -198,6 +202,8 @@ def export_graphs(graphs, specs, communication, runtime_memory=None):
                 for bucket in buckets.values():
                     event['inputs'].extend(bucket['pending'])
                 event['clear_runtime_buffers'] = True
+            if target in ('dc.reduce_grad.default', 'dc.end_backward.default'):
+                event['kind'] = 'barrier'
             operators[key] = {'time_ms': duration, 'workspace_bytes': workspace}
             events.append(event)
             if phase == 'fw':
