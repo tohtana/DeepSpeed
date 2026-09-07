@@ -96,7 +96,7 @@ def search(graphs,
         'memory_limit_bytes':
         limit_bytes,
         'model':
-        'compute-all-gather-overlap-v1' if simulation_mode == 'overlap' else 'serial-no-overlap-v1',
+        selected['result'].get('model', 'serial-no-overlap-v1'),
         'simulation_mode':
         simulation_mode,
         'truncated':

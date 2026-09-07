@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
-"""Compute/all-gather overlap with explicit waits and device storage lifetimes."""
+"""Compute/communication overlap with explicit waits and device storage lifetimes."""
 
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 import math
 
 from .core import CommTable
+from .reduction import ReductionScheduler
 
 
-def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes):
+def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes, serialize=False):
     events = [event for graph in graphs for event in graph['events']]
     table = CommTable(**profile['communication'])
+    reduction = ReductionScheduler(table, profile['reduction'], serialize) if 'reduction' in profile else None
     compute, communication = 0.0, 0.0
     serial_time, exposed_wait = 0.0, 0.0
     gathered, storages, intervals, timeline = {}, {}, [], []
@@ -89,10 +91,21 @@ def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes):
             start = max(compute, communication)
             end = compute = communication = start + duration
             lane = 'synchronized'
+        elif kind in ('reduce_grad', 'end_backward'):
+            if reduction is None:
+                raise ValueError('Missing reduction configuration')
+            compute, communication, duration = reduction.run(event, compute, communication, index)
+            end, lane = compute, 'reduction_enqueue' if kind == 'reduce_grad' else 'compute_wait'
         elif kind == 'compute':
             end = compute = start + duration
         else:
             raise ValueError(f'Unsupported overlap event: {kind}')
+        if serialize:
+            # New event profiles can also be evaluated with identical costs
+            # and no overlap. Saved v0/v1 inputs retain their original path.
+            compute = max(compute, communication, reduction.copy_ms if reduction else 0,
+                          reduction.reduce_ms if reduction else 0)
+            end = max(end, compute)
         serial_time += duration
         birth = (launch, 2 * index)
         death = (end, -1) if end > launch else (end, 2 * index + 1)
@@ -123,8 +136,15 @@ def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes):
             'compute_frontier_ms': compute,
             'duration_ms': duration
         })
-    if gathered or runtime_size:
+    if gathered or runtime_size or (reduction and reduction.buckets):
         raise ValueError('Unreleased runtime storage at end of graph pair')
+    if reduction:
+        for key, death in reduction.retained_until.items():
+            if key not in storages:
+                raise ValueError(f'Gradient storage used before allocation: {key}')
+            storages[key][1] = max(storages[key][1], death)
+        for args in reduction.intervals:
+            interval(*args)
     for key, (birth, death) in storages.items():
         interval(key, profile['storage_bytes'][key], birth, death)
 
@@ -163,7 +183,7 @@ def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes):
         })
     feasible = memory_limit_bytes is None or peak <= memory_limit_bytes
     elapsed = max(compute, communication)
-    return {
+    result = {
         'estimated_time_ms':
         elapsed,
         'peak_memory_bytes':
@@ -191,3 +211,15 @@ def simulate_overlap(graphs, profile, initial_memory_bytes, memory_limit_bytes):
             'no_host_dispatch_or_bandwidth_contention_model'
         ]
     }
+    if reduction:
+        result.update(model='compute-gather-reduce-serial-v2' if serialize else 'compute-gather-reduce-overlap-v2',
+                      reduction_timeline=reduction.timeline,
+                      exposed_reduce_wait_ms=sum(reduction.waits.values()),
+                      reduction_waits_ms=dict(reduction.waits),
+                      assumptions=[
+                          'one_compute_stream', 'one_copy_stream', 'one_all_gather_stream', 'one_reduce_stream',
+                          'shared_nccl_communicator_serial_order', 'fused_group_completion', 'bucket_capacity_flush',
+                          'one_gradient_dtype_no_accumulation', 'strided_copy_uses_contiguous_copy_cost',
+                          'no_host_dispatch_or_bandwidth_contention_model'
+                      ])
+    return result

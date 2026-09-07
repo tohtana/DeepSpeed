@@ -87,4 +87,4 @@ class CompileConfig(DeepSpeedConfigModel):
     """ Communication cache and simulation results for the current run. """
 
     simulation_mode: Literal['serial', 'overlap'] = 'overlap'
-    """ Search timing model; overlap covers compute/all-gather with conservative reduce barriers. """
+    """ Search timing model for compute, all-gather, gradient copy and bucketed reduce-scatter. """

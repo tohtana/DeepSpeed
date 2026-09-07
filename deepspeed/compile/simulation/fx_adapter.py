@@ -111,9 +111,46 @@ def parameter_specs(graphs, manager, world_size):
     return specs
 
 
+def gradient_specs(graphs, specs, runtime_memory):
+    """Describe reduction inputs before any rank starts communication profiling."""
+    world_size = runtime_memory['world_size']
+    result = {}
+    for graph in graphs:
+        for node in graph.nodes:
+            if str(node.target) != 'dc.reduce_grad.default':
+                continue
+            ds_id = int(node.args[2])
+            value = node.args[0].meta['val']
+            dtype, numel = value.dtype, int(value.numel())
+            if str(dtype) != specs[ds_id]['dtype']:
+                raise ValueError('Reduction input dtype must match the parameter dtype')
+            if numel <= 0 or numel % world_size:
+                raise ValueError('Reduction model requires positive gradient sizes divisible by world size')
+            storage_dtype = runtime_memory['gradient_storage_dtypes'][str(ds_id)]
+            stored_itemsize = getattr(torch, storage_dtype.split('.')[-1]).itemsize
+            if ds_id in result:
+                raise ValueError('Reduction model requires one gradient per parameter')
+            result[ds_id] = {
+                'id': ds_id,
+                'numel': numel,
+                'bytes': numel * dtype.itemsize,
+                'dtype': str(dtype),
+                'itemsize': dtype.itemsize,
+                'shard_bytes': numel // world_size * dtype.itemsize,
+                'storage_dtype': storage_dtype,
+                'stored_shard_bytes': numel // world_size * stored_itemsize,
+                'contiguous': value.is_contiguous()
+            }
+    if len({spec['dtype'] for spec in result.values()}) > 1:
+        raise ValueError('Reduction model requires one gradient dtype')
+    return result
+
+
 def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_mode='serial'):
     """Use actual storage aliases; connect AOT saved values by placeholder name."""
     storage_bytes, operators, exported = {}, {}, []
+    detailed_reduction = runtime_memory is not None and 'world_size' in runtime_memory
+    gradients = gradient_specs(graphs, specs, runtime_memory) if detailed_reduction else {}
     saved = {}
     for phase, graph in zip(('fw', 'bw'), graphs):
         remap = {}
@@ -156,7 +193,7 @@ def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_
                 if target not in ('dc.prefetch_params_fused.default', 'dc.end_backward.default'):
                     raise ValueError(f'Missing operator duration for {key}')
             duration = float(node.meta.get('device_time', 0))
-            if simulation_mode == 'overlap' and not target.startswith('dc.'):
+            if (simulation_mode == 'overlap' or detailed_reduction) and not target.startswith('dc.'):
                 # The real baseline records device-wide synchronization costs.
                 # Use the initial isolated operator profile for compute kernels.
                 duration = float(node.meta.get('sim_compute_time_ms', duration))
@@ -173,6 +210,12 @@ def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_
             elif target == 'dc.release_param.default':
                 event.update(kind='release', param_id=node.args[2], release_count=node.args[3])
                 workspace = 0
+            elif target == 'dc.reduce_grad.default' and detailed_reduction:
+                event.update(kind='reduce_grad', gradient=gradients[node.args[2]], gradient_inputs=keys(node.args[0]))
+                duration, workspace = 0.0, 0
+            elif target == 'dc.end_backward.default' and detailed_reduction:
+                event.update(kind='end_backward', clear_runtime_buffers=bool(node.args[2]))
+                duration, workspace = 0.0, 0
             elif target == 'dc.reduce_grad.default' and runtime_memory:
                 value = node.args[0].meta['val']
                 dtype, numel = value.dtype, value.numel()
@@ -202,7 +245,7 @@ def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_
                 for bucket in buckets.values():
                     event['inputs'].extend(bucket['pending'])
                 event['clear_runtime_buffers'] = True
-            if target in ('dc.reduce_grad.default', 'dc.end_backward.default'):
+            if target in ('dc.reduce_grad.default', 'dc.end_backward.default') and not detailed_reduction:
                 event['kind'] = 'barrier'
             operators[key] = {'time_ms': duration, 'workspace_bytes': workspace}
             events.append(event)
@@ -211,7 +254,10 @@ def export_graphs(graphs, specs, communication, runtime_memory=None, simulation_
                 if 'original_output_name' in node.meta:
                     saved[node.meta['original_output_name']] = outputs
         exported.append({'phase': phase, 'events': events})
-    return exported, {'operators': operators, 'storage_bytes': storage_bytes, 'communication': communication}
+    profile = {'operators': operators, 'storage_bytes': storage_bytes, 'communication': communication}
+    if detailed_reduction:
+        profile['reduction'] = {key: runtime_memory[key] for key in ('reduce_bucket_numel', 'double_buffer')}
+    return exported, profile
 
 
 def copy_module(graph):

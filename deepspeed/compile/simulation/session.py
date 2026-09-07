@@ -10,7 +10,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 
 from .distributed import CollectiveControl, all_rank_prepare, on_rank_zero
-from .fx_adapter import apply_recipe, graph_signature, parameter_specs
+from .fx_adapter import apply_recipe, graph_signature, gradient_specs, parameter_specs
 from .search import search, save_result
 
 
@@ -28,6 +28,7 @@ class SearchSession:
         self.current_step = -1
         self.recorded = set()
         self.runtime_memory = {'reduce_bucket_numel': reduce_bucket_size, 'double_buffer': config.double_buffer}
+        self.runtime_memory['gradient_storage_dtypes'] = {}
 
     def should_record(self):
         return self.current_step == self.capture_step and self.selected is None
@@ -50,6 +51,7 @@ class SearchSession:
 
         accelerator = get_accelerator()
         self.control = CollectiveControl(dist, torch.device(accelerator.current_device()))
+        self.runtime_memory['world_size'] = self.control.world_size
 
         def snapshot():
             if self.recorded != {False, True}:
@@ -63,9 +65,10 @@ class SearchSession:
                     graph is None or is_profile_incomplete(graph) for graph in graphs):
                 raise ValueError('Mandatory ZeRO-3 baseline profile is incomplete')
             specs = parameter_specs(graphs, managers[graph_id], dist.get_world_size())
-            return graphs, specs
+            gradients = gradient_specs(graphs, specs, self.runtime_memory)
+            return graphs, specs, gradients
 
-        graphs, specs = all_rank_prepare(self.control, snapshot)
+        graphs, specs, gradients = all_rank_prepare(self.control, snapshot)
         self.baseline_signatures = [graph_signature(graph) for graph in graphs]
 
         def save_signature():
@@ -76,7 +79,8 @@ class SearchSession:
 
         all_rank_prepare(self.control, save_signature)
         self.control.agree(self.baseline_signatures)
-        communication = prepare_table(self.control, specs, self.config.search_output_dir, MAX_FUSE_SIZE)
+        self.control.agree({'gradients': gradients, 'runtime_memory': self.runtime_memory})
+        communication = prepare_table(self.control, specs, self.config.search_output_dir, MAX_FUSE_SIZE, gradients)
         input_storages = {}
         for node in graphs[0].nodes:
             if node.op == 'placeholder':

@@ -16,7 +16,30 @@ from .core import representative_sizes
 from .distributed import all_rank_prepare, on_rank_zero, prepare_communication
 
 
-def prepare_table(control, specs, output_dir, max_fuse_size):
+def profile_requests(specs, world_size, max_fuse_size, gradients=None):
+    requests = {}
+
+    def add(op, dtype_name, upper, quantum):
+        for size in representative_sizes(upper, quantum):
+            requests[(op, dtype_name, size)] = {'op': op, 'dtype': dtype_name, 'bytes': size}
+
+    for dtype_name in sorted({param['dtype'] for param in specs.values()}):
+        dtype = getattr(torch, dtype_name.split('.')[-1])
+        values = [p['bytes'] for p in specs.values() if p['dtype'] == dtype_name]
+        upper = max(max(values), min(sum(values), int(max_fuse_size)))
+        add('all_gather', dtype_name, upper, dtype.itemsize * world_size)
+    if not requests:
+        raise ValueError('No ZeRO-3 all-gathers found')
+    for grad in (gradients or {}).values():
+        dtype_name = grad['dtype']
+        for op in ('copy', 'pre_divide', 'reduce_scatter'):
+            add(op, dtype_name, grad['bytes'], grad['itemsize'] * world_size)
+        if grad['storage_dtype'] != dtype_name:
+            add(f'store:{grad["storage_dtype"]}', dtype_name, grad['shard_bytes'], grad['itemsize'])
+    return [requests[key] for key in sorted(requests)]
+
+
+def prepare_table(control, specs, output_dir, max_fuse_size, gradients=None):
     accelerator = get_accelerator()
     output_dir = Path(output_dir)
     raw_rows = []
@@ -33,7 +56,7 @@ def prepare_table(control, specs, output_dir, max_fuse_size):
             digest.update(path.read_bytes())
         return {
             'protocol':
-            'serial-search-v1',
+            'bucketed-reduction-search-v2',
             'source_sha256':
             digest.hexdigest(),
             'world_size':
@@ -60,22 +83,13 @@ def prepare_table(control, specs, output_dir, max_fuse_size):
             'representative':
             'max_rank_mean_ms',
             'size_unit':
-            'padded_gathered_output_bytes',
+            'all_gather: padded output bytes; all other operations: source bytes',
             'async_op':
             False
         }
 
     header = on_rank_zero(control, environment)
-    requests = []
-    for dtype_name in sorted({param['dtype'] for param in specs.values()}):
-        dtype = getattr(torch, dtype_name.split('.')[-1])
-        values = [p['bytes'] for p in specs.values() if p['dtype'] == dtype_name]
-        # The grouping heuristic never queries a fused size >= MAX_FUSE_SIZE.
-        upper = max(max(values), min(sum(values), int(max_fuse_size)))
-        for size in representative_sizes(upper, dtype.itemsize * control.world_size):
-            requests.append({'op': 'all_gather', 'dtype': dtype_name, 'bytes': size})
-    if not requests:
-        raise ValueError('No ZeRO-3 all-gathers found')
+    requests = all_rank_prepare(control, lambda: profile_requests(specs, control.world_size, max_fuse_size, gradients))
 
     def read_cache():
         path = output_dir / 'communication.json'
@@ -86,8 +100,12 @@ def prepare_table(control, specs, output_dir, max_fuse_size):
     def allocate(request):
         dtype = getattr(torch, request['dtype'].split('.')[-1])
         numel = request['bytes'] // dtype.itemsize
-        source = torch.full((numel // control.world_size, ), control.rank, dtype=dtype, device=control.device)
-        destination = torch.empty(numel, dtype=dtype, device=control.device)
+        op = request['op']
+        source_numel = numel // control.world_size if op == 'all_gather' else numel
+        destination_numel = numel // control.world_size if op == 'reduce_scatter' else numel
+        destination_dtype = getattr(torch, op.split(':')[1].split('.')[-1]) if op.startswith('store:') else dtype
+        source = torch.full((source_numel, ), control.rank + 1, dtype=dtype, device=control.device)
+        destination = torch.empty(destination_numel, dtype=destination_dtype, device=control.device)
         start = accelerator.Event(enable_timing=True)
         end = accelerator.Event(enable_timing=True)
         accelerator.synchronize()
@@ -95,14 +113,30 @@ def prepare_table(control, specs, output_dir, max_fuse_size):
 
     def measure(buffers, request):
         source, destination, start, end = buffers
+
+        def operation():
+            op = request['op']
+            if op == 'all_gather':
+                dist.all_gather_into_tensor(destination, source)
+            elif op == 'reduce_scatter':
+                dist.reduce_scatter_tensor(destination, source)
+            elif op == 'copy':
+                destination.copy_(source, non_blocking=True)
+            elif op == 'pre_divide':
+                source.div_(control.world_size)
+            elif op.startswith('store:'):
+                destination.copy_(source.to(destination.dtype), non_blocking=True)
+            else:
+                raise ValueError(f'Unknown profile operation: {op}')
+
         dist.barrier()
         for _ in range(header['warmup']):
-            dist.all_gather_into_tensor(destination, source)
+            operation()
         accelerator.synchronize()
         dist.barrier()
         start.record()
         for _ in range(header['trials']):
-            dist.all_gather_into_tensor(destination, source)
+            operation()
         end.record()
         accelerator.synchronize()
         local_ms = start.elapsed_time(end) / header['trials']

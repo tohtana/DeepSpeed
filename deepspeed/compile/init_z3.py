@@ -90,9 +90,11 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
     search_session = None
     if auto_requested(compile_config.pass_mode, compile_config.passes, schedule):
         from .simulation.session import SearchSession
-        if compile_config.simulation_mode == 'overlap' and any(
-            (compile_config.sync_before_allgather, compile_config.sync_after_allgather)):
-            raise ValueError('Overlap search requires all-gather debug synchronization disabled')
+        if any((compile_config.sync_before_allgather, compile_config.sync_after_allgather,
+                compile_config.sync_before_reduce, compile_config.sync_after_reduce)):
+            raise ValueError('Pass search requires all-gather/reduce debug synchronization disabled')
+        if engine.gradient_accumulation_steps() != 1:
+            raise ValueError('Bucketed reduction search requires gradient_accumulation_steps=1')
         if any((compile_config.offload_parameters, compile_config.offload_opt_states,
                 compile_config.offload_activation, compile_config.free_activation, compile_config.symmetric_memory)):
             raise ValueError('v0 auto search requires offload, free_activation and symmetric_memory disabled')
@@ -166,6 +168,8 @@ def init_z3(engine, backend, compile_config, compile_kwargs, schedule=None):
         p.ds_persist = False
         dc.register_z3_param(p.ds_id, p.ds_shape, p.ds_tensor, grad_buffer, p.ds_persist,
                              _resolve_expected_grad_dtype(p))
+        if search_session is not None and p.requires_grad:
+            search_session.runtime_memory['gradient_storage_dtypes'][str(p.ds_id)] = str(grad_buffer.dtype)
 
     if schedule is None:
         if compile_config.offload_parameters and compile_config.offload_opt_states:
