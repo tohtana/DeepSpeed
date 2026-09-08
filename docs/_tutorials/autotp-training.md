@@ -182,6 +182,16 @@ the supplied SP group. TP and SP may be combined with explicit orthogonal
 process groups, but AutoTP does not currently construct a combined TP x SP mesh
 automatically.
 
+Gathered sequence losses have two backward conventions. The general
+`vocab_parallel_cross_entropy(..., gather_sequence_loss=True)` API sums the
+gradient contributions from every SP rank before returning each rank's local
+slice. The compatibility wrapper `vocab_sequence_parallel_cross_entropy`
+preserves its legacy behavior and returns only the corresponding local slice of
+the gathered loss gradient. New callers that consume or reduce the gathered
+loss on every SP rank should use the general API; existing callers can retain
+the wrapper without changing their gradient scale. Both gathered forms require
+an explicit `sp_group`.
+
 Under DeepSpeed's Ulysses sequence-parallel engine, the installed loss must keep
 its default sequence-parallel settings (no `sp_group`): the engine aggregates
 each shard's mean itself, weighted by the shard's valid-token count, so an

@@ -224,6 +224,8 @@ def vocab_sequence_parallel_cross_entropy(vocab_parallel_logits,
     """Sequence-parallel wrapper preserving the legacy local-slice gradient."""
     if gather_sequence_loss and reduction != "none":
         raise ValueError("gather_sequence_loss is only supported with reduction='none'")
+    if gather_sequence_loss and sp_group is None:
+        raise ValueError("sp_group is required when gather_sequence_loss=True")
 
     loss = vocab_parallel_cross_entropy(vocab_parallel_logits,
                                         target,

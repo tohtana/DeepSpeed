@@ -57,6 +57,8 @@ def test_vocab_parallel_cross_entropy_validates_inputs():
         vocab_parallel_cross_entropy(logits, target, reduction="batchmean")
     with pytest.raises(ValueError, match="only supported with reduction='none'"):
         vocab_parallel_cross_entropy(logits, target, reduction="mean", gather_sequence_loss=True)
+    with pytest.raises(ValueError, match="sp_group is required"):
+        vocab_sequence_parallel_cross_entropy(logits, target, sp_group=None)
     with pytest.raises(ValueError, match="Vocabulary shard bounds"):
         vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=10)
     target[0, 0] = 11
