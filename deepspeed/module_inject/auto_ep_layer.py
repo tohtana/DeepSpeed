@@ -731,12 +731,40 @@ class AutoEPMoELayer(nn.Module):
         return output
 
 
-def collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank):
-    """Map every parameter of ``replacement`` to the source parameters it was built from.
+class ReplacementSourceMap:
+    """What a module replacement did, in the terms the client-optimizer remap needs.
 
-    Keyed by ``id()``. A caller-supplied optimizer has already sorted the sources into param
-    groups, so this is what lets the engine put each replacement back into the group its sources
-    came from.
+    ``sources`` maps each replacement parameter to the source parameters it was built from, keyed
+    by ``id()``, so a replacement can rejoin the param group its sources were in.
+
+    ``discarded`` holds the ``id()`` of every parameter the replacement detached from the module
+    tree, including the experts belonging to other ranks, which ``sources`` never names. It is what
+    lets the remap remove exactly the parameters the replacement invalidated instead of everything
+    it cannot find in the model, which would also remove a caller's unrelated external parameters.
+
+    Storing identities rather than the parameters themselves is safe here: any discarded parameter
+    the optimizer still holds is kept alive by that optimizer, so its identity cannot be reused
+    while the remap is looking at it.
+    """
+
+    def __init__(self):
+        self.sources: dict[int, list[nn.Parameter]] = {}
+        self.discarded: set[int] = set()
+
+    def update(self, other: "ReplacementSourceMap") -> None:
+        self.sources.update(other.sources)
+        self.discarded.update(other.discarded)
+
+    def __bool__(self) -> bool:
+        return bool(self.sources)
+
+
+def collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank):
+    """Return the ``ReplacementSourceMap`` describing what this replacement did.
+
+    A caller-supplied optimizer has already sorted the sources into param groups, so this is what
+    lets the engine put each replacement back into the group its sources came from, and remove
+    exactly the parameters the replacement invalidated.
 
     Built by the caller rather than stashed on the layer: the values are the discarded pre-shard
     expert weights, and an attribute on a long-lived module would keep them alive for the whole
@@ -749,12 +777,17 @@ def collect_replacement_sources(source_module, replacement, spec, ep_size, ep_ra
         ep_rank=ep_rank,
         ep_size=ep_size,
     )
-    sources = {
+    collected = ReplacementSourceMap()
+    # Every parameter the source module owned is about to leave the tree. The ones the replacement
+    # keeps (shared experts) are still reachable from the model, and the remap filters on that.
+    collected.discarded = {id(param) for param in source_module.parameters()}
+    sources = collected.sources
+    sources.update({
         id(replacement.experts.w1): list(w1_sources),
         id(replacement.experts.w2): list(w2_sources),
         id(replacement.experts.w3): list(w3_sources),
         id(replacement.router.gate.weight): [source_gate.weight],
-    }
+    })
     source_gate_bias = getattr(source_gate, 'bias', None)
     if spec.gate_bias and source_gate_bias is not None:
         sources[id(replacement.router.gate.bias)] = [source_gate_bias]
@@ -767,4 +800,4 @@ def collect_replacement_sources(source_module, replacement, spec, ep_size, ep_ra
     for fresh_module in (replacement.router, replacement.experts):
         for param in fresh_module.parameters():
             sources.setdefault(id(param), [source_gate.weight])
-    return sources
+    return collected

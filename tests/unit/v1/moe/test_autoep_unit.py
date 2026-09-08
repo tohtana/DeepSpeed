@@ -1360,11 +1360,12 @@ def _detach_moe_blocks(model, ep_size=2, layers=None):
     """Do to the module tree what AutoEP does: every MoE block's parameters become new objects
     (a fresh router gate plus ``GroupedExperts`` w1/w2/w3), so the originals leave the model.
 
-    Returns the same source map AutoEP hands the engine. The fused ``gate_up_proj`` feeds both w1
-    and w3, matching ``repack_expert_source_params``, and each replacement inherits its source's
-    ``requires_grad``, matching ``AutoEPMoELayer``.
+    Returns the same ``ReplacementSourceMap`` AutoEP hands the engine. The fused ``gate_up_proj``
+    feeds both w1 and w3, matching ``repack_expert_source_params``, and each replacement inherits
+    its source's ``requires_grad``, matching ``AutoEPMoELayer``.
     """
-    replacement_sources = {}
+    collected = auto_ep_layer.ReplacementSourceMap()
+    replacement_sources = collected.sources
     for layer_index, layer in enumerate(model.model.layers):
         if layers is not None and layer_index not in layers:
             continue
@@ -1383,11 +1384,14 @@ def _detach_moe_blocks(model, ep_size=2, layers=None):
             setattr(replacement.experts, name, shard)
             replacement_sources[id(shard)] = [source]
         replacement_sources[id(replacement.router.gate.weight)] = [source_gate.weight]
+        collected.discarded.update(id(p) for p in layer.mlp.parameters())
         layer.mlp = replacement
-    return replacement_sources
+    return collected
 
 
 def _remap(optimizer, model, replacement_sources=None):
+    if replacement_sources is None:
+        replacement_sources = auto_ep_layer.ReplacementSourceMap()
     ds_engine._remap_client_optimizer_after_module_replacement(optimizer, model, replacement_sources)
 
 
@@ -1504,7 +1508,7 @@ class TestClientOptimizerRemap:
         optimizer = torch.optim.AdamW(list(model.parameters()) + [external], lr=1e-3)
         optimizer.state[external] = {"step": torch.tensor(1.0)}
 
-        _remap(optimizer, model, {})
+        _remap(optimizer, model, auto_ep_layer.ReplacementSourceMap())
 
         assert id(external) in _owned_ids(optimizer), "a parameter outside the model was stripped"
         assert external in optimizer.state, "optimizer state for a parameter outside the model was dropped"
@@ -1594,6 +1598,60 @@ class TestClientOptimizerRemap:
         layer1 = [n for n, p in model.model.layers[1].mlp.named_parameters() if id(p) in owned]
         assert not layer1, f"layer 1 replacements were added even though its sources were not optimized: {layer1}"
 
+    def test_partially_optimized_packed_sources_raise(self):
+        """``module_list`` storage packs several local experts into one replacement tensor. If the
+        caller optimized only some of them, that tensor can be neither optimized nor skipped:
+        optimizing it trains the experts they excluded, skipping it stops training the ones they
+        included. Neither is what they asked for, so refuse instead of picking one silently.
+        """
+        model = MockMoETransformer()
+        first_layer = model.model.layers[0].mlp
+        packed = [first_layer.experts.gate_up_proj, first_layer.experts.down_proj]
+        # the caller optimizes the first of the two packed sources and not the second
+        optimizer = torch.optim.AdamW([p for _, p in model.named_parameters() if p is not packed[1]], lr=1e-3)
+
+        replacement_sources = _detach_moe_blocks(model)
+        replacement_sources.sources[id(model.model.layers[0].mlp.experts.w1)] = packed
+
+        with pytest.raises(RuntimeError, match="packed several source parameters into one tensor"):
+            _remap(optimizer, model, replacement_sources)
+
+    def test_external_parameter_survives_a_real_replacement(self):
+        """A caller may legitimately optimize something outside the model -- an auxiliary trainable
+        loss term, say -- which is valid at ZeRO stage 0, the default for AutoEP. A replacement
+        elsewhere in the model must not take it, or its optimizer state, away.
+        """
+        model = MockMoETransformer()
+        external = nn.Parameter(torch.randn(4))
+        optimizer = torch.optim.AdamW(list(model.parameters()) + [external], lr=1e-3)
+        optimizer.state[external] = {"step": torch.tensor(7.0)}
+
+        _remap(optimizer, model, _detach_moe_blocks(model))
+
+        owned = _owned_ids(optimizer)
+        assert id(external) in owned, "an unrelated external parameter was removed by the remap"
+        assert external in optimizer.state, "an unrelated external parameter lost its optimizer state"
+        orphans = [name for name, p in model.named_parameters() if p.requires_grad and id(p) not in owned]
+        assert not orphans, f"trainable parameters left out of the optimizer: {orphans}"
+
+    def test_discarded_sources_the_map_does_not_name_are_still_removed(self):
+        """Removal follows what the replacement detached, not what the source map names.
+
+        For ``module_list`` storage the map names only this rank's local experts while the
+        replacement detaches every rank's. Those unnamed parameters must still leave the optimizer,
+        or ZeRO would later be handed a parameter that is no longer part of the model.
+        """
+        model = MockMoETransformer()
+        other_rank_expert = nn.Parameter(torch.randn(4, 4))
+        model.model.layers[0].mlp.other_rank_expert = other_rank_expert
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        assert id(other_rank_expert) in _owned_ids(optimizer), "test setup: it should start in the optimizer"
+
+        _remap(optimizer, model, _detach_moe_blocks(model))
+
+        assert id(other_rank_expert) not in _owned_ids(optimizer), \
+            "a parameter the replacement discarded is still in the optimizer"
+
     def test_sources_split_across_groups_raise(self):
         """``module_list`` storage packs one grouped tensor from one weight per expert. If the
         caller put those weights in different param groups the replacement has no unambiguous
@@ -1612,7 +1670,7 @@ class TestClientOptimizerRemap:
                                       lr=1e-3)
 
         replacement_sources = _detach_moe_blocks(model)
-        replacement_sources[id(model.model.layers[0].mlp.experts.w1)] = [source_gate_up, source_down]
+        replacement_sources.sources[id(model.model.layers[0].mlp.experts.w1)] = [source_gate_up, source_down]
 
         with pytest.raises(RuntimeError, match="split across param groups"):
             _remap(optimizer, model, replacement_sources)
@@ -1645,10 +1703,11 @@ class TestReplacementSourceMap:
         # optimizer and need no entry; everything else is newly allocated and must be covered.
         uncovered = [
             name for name, param in replacement.named_parameters()
-            if id(param) not in sources and not name.startswith("shared_experts")
+            if id(param) not in sources.sources and not name.startswith("shared_experts")
         ]
         assert not uncovered, f"replacement parameters missing from the source map: {uncovered}"
-        assert all(sources[id(p)] for _, p in replacement.named_parameters() if id(p) in sources), \
+        assert all(sources.sources[id(p)] for _, p in replacement.named_parameters()
+                   if id(p) in sources.sources), \
             "a replacement parameter was mapped to an empty source list"
 
     def test_no_map_is_built_and_nothing_is_stashed_when_not_requested(self, monkeypatch):
@@ -1657,7 +1716,7 @@ class TestReplacementSourceMap:
 
         replacement, sources = auto_ep._replace_moe_layer_without_retarget(spec, ep_size=2, ep_rank=0)
 
-        assert sources == {}
+        assert not sources and sources.sources == {}
         assert not hasattr(replacement, "_autoep_replacement_sources"), \
             "the replacement is holding the source weights on an attribute"
 

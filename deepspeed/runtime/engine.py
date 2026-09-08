@@ -273,6 +273,16 @@ def _resolve_replacement_param_groups(missing, replacement_sources, param_groups
     for param in missing:
         sources = replacement_sources.get(id(param), ())
         source_groups = sorted({group_of_source[id(s)] for s in sources if id(s) in group_of_source})
+        unoptimized_sources = [s for s in sources if id(s) not in group_of_source]
+        if source_groups and unoptimized_sources:
+            raise RuntimeError("Module replacement (AutoEP) packed several source parameters into one tensor, but "
+                               f"the client optimizer holds only {len(sources) - len(unoptimized_sources)} of "
+                               f"{len(sources)} of them. The replacement is a single tensor, so the sources left out "
+                               "cannot stay unoptimized -- optimizing it would train parameters the caller excluded, "
+                               "and skipping it would stop training the ones they included. Give the optimizer all of "
+                               'a layer\'s expert weights or none of them, declare the optimizer in the DeepSpeed '
+                               'config ("optimizer": {...}) so it is built after replacement, or construct it after '
+                               "deepspeed.initialize().")
         if len(source_groups) > 1:
             raise RuntimeError("Module replacement (AutoEP) built a single parameter from sources that the client "
                                f"optimizer had split across param groups {source_groups}, so it cannot be assigned "
@@ -304,25 +314,24 @@ def _remap_client_optimizer_after_module_replacement(optimizer, model, replaceme
         'partition_numel'`` from ``_create_fp16_sub_groups``, because the stale params were
         never converted.
 
-    ``replacement_sources`` maps each replacement parameter to the source parameters it was built
-    from. It is empty unless a module replacement actually happened, which is what keeps this a
-    no-op for every model AutoEP did not touch. Only parameters in that map are added, so a
-    module the caller deliberately kept out of the optimizer stays out, and a frozen replacement
-    keeps the place its frozen source had -- the ZeRO optimizers filter frozen parameters
-    themselves (``stage3.py: _get_trainable_parameter_groups``).
+    ``replacement_sources`` is the ``ReplacementSourceMap`` the replacement produced. It is empty
+    unless a module replacement actually happened, which is what keeps this a no-op for every
+    model AutoEP did not touch. Only parameters it names as replacements are added, so a module
+    the caller deliberately kept out of the optimizer stays out, and a frozen replacement keeps
+    the place its frozen source had -- the ZeRO optimizers filter frozen parameters themselves
+    (``stage3.py: _get_trainable_parameter_groups``).
 
     A replacement rejoins the group its sources were already in, which keeps per-layer groupings
     such as layer-wise learning-rate decay working. When a replacement's own sources were split
     across groups we raise rather than guess, since guessing wrong silently mis-assigns weight
     decay.
 
-    Removal is by absence from the module tree rather than by consulting the map, because for
-    ``module_list`` expert storage the map records only this rank's local experts while the
-    replacement detaches every rank's. The cost is that an optimizer built over a strict superset
-    of ``model.parameters()`` loses the extra parameters here. That combination is already
-    unsupported: AutoEP with a caller-supplied optimizer is ZeRO-3 in practice, and ZeRO-3 only
-    converts ``module.parameters()`` (``partition_parameters.py: _convert_to_zero_parameters``),
-    so a parameter outside the module never becomes a ZeRO param anyway.
+    Removal is driven by ``replacement_sources.discarded``, the identity of every parameter the
+    replacement detached, rather than by absence from the module tree. The two differ for a caller
+    whose optimizer also owns something outside ``model.parameters()`` -- an auxiliary trainable
+    loss term, say -- which is legitimate at ZeRO stage 0 and must survive. Parameters the
+    replacement kept, such as shared experts, are still reachable from the model, so the
+    ``live`` check leaves them in place.
     """
     if not _client_optimizer_needs_remap(optimizer):
         return  # config-built or callable optimizer: DeepSpeed builds it post-replacement
@@ -331,30 +340,35 @@ def _remap_client_optimizer_after_module_replacement(optimizer, model, replaceme
 
     live = {id(p): p for p in model.parameters()}
     param_groups = optimizer.param_groups
+    sources = replacement_sources.sources
+    discarded = replacement_sources.discarded
+
+    def _was_replaced(param):
+        return id(param) in discarded and id(param) not in live
 
     stale = 0
     owned = set()
     for group in param_groups:
         for param in group["params"]:
             owned.add(id(param))
-            if id(param) not in live:
+            if _was_replaced(param):
                 stale += 1
     if not stale:
         return  # nothing this optimizer holds was replaced
 
-    missing = [p for p in live.values() if id(p) not in owned and id(p) in replacement_sources]
-    placement, unoptimized = _resolve_replacement_param_groups(missing, replacement_sources, param_groups)
+    missing = [p for p in live.values() if id(p) not in owned and id(p) in sources]
+    placement, unoptimized = _resolve_replacement_param_groups(missing, sources, param_groups)
     missing = [p for p in missing if id(p) in placement]
 
     for group in param_groups:
-        group["params"] = [p for p in group["params"] if id(p) in live]
+        group["params"] = [p for p in group["params"] if not _was_replaced(p)]
     for param in missing:
         param_groups[placement[id(param)]]["params"].append(param)
 
     # Adam/AdamW key their state dict on the parameter object; stale entries would leak.
     state = getattr(optimizer, "state", None)
     if state is not None:
-        for param in [p for p in list(state.keys()) if id(p) not in live]:
+        for param in [p for p in list(state.keys()) if _was_replaced(p)]:
             del state[param]
 
     added_per_group = Counter(placement.values())
@@ -780,9 +794,11 @@ class DeepSpeedEngine(Module):
 
     def _configure_expert_parallel(self, model):
         """Initialize AutoEP: detect MoE layers, create EP groups, replace with EP-enabled layers."""
+        from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
+
         autoep_config = self._config.expert_parallel_config
         if autoep_config is None or not autoep_config.enabled:
-            return {}
+            return ReplacementSourceMap()
 
         from deepspeed.module_inject.auto_ep import AutoEP
         from deepspeed.module_inject.auto_ep_config import validate_autoep_config, validate_autoep_post_detection
@@ -848,7 +864,7 @@ class DeepSpeedEngine(Module):
         auto_ep = AutoEP(model, autoep_config)
         specs = auto_ep.ep_parser()
 
-        replacement_sources = {}
+        replacement_sources = ReplacementSourceMap()
         if specs:
             validate_autoep_post_detection(autoep_config, specs)
             # The map holds the discarded pre-shard expert weights alive until the remap is

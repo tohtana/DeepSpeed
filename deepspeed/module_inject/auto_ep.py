@@ -492,8 +492,9 @@ class AutoEP:
         ep_size: int,
         ep_rank: int,
         collect_sources: bool = False,
-    ) -> tuple[nn.Module, dict[int, list[nn.Parameter]]]:
-        from deepspeed.module_inject.auto_ep_layer import AutoEPMoELayer, collect_replacement_sources
+    ) -> tuple[nn.Module, "ReplacementSourceMap"]:
+        from deepspeed.module_inject.auto_ep_layer import (AutoEPMoELayer, ReplacementSourceMap,
+                                                           collect_replacement_sources)
 
         # Navigate to the parent module and get the child name
         parts = spec.moe_module_name.split(".")
@@ -515,7 +516,7 @@ class AutoEP:
         # Collected before the source module leaves the tree, and only when a caller-supplied
         # optimizer needs it: the values are the discarded pre-shard expert weights.
         sources = (collect_replacement_sources(source_module, replacement, spec, ep_size, ep_rank)
-                   if collect_sources else {})
+                   if collect_sources else ReplacementSourceMap())
 
         # Replace in-place on parent
         setattr(parent, child_name, replacement)
@@ -551,18 +552,21 @@ class AutoEP:
         ep_size: int,
         ep_rank: int,
         collect_sources: bool = False,
-    ) -> dict[int, list[nn.Parameter]]:
+    ) -> "ReplacementSourceMap":
         """Replace multiple MoE modules and batch post-replacement recorder retargeting.
 
-        With ``collect_sources``, returns the source parameters behind each replacement parameter,
-        keyed by ``id()``, so that a caller-supplied optimizer can put each replacement back into
-        the param group its sources belonged to. Those values are the discarded pre-shard expert
-        weights and stay alive until the engine has finished the remap, so the caller asks for
-        them only when there is such an optimizer. Otherwise the map is empty and each source
-        module is freed as its replacement takes its place.
+        With ``collect_sources``, returns a ``ReplacementSourceMap``: the source parameters behind
+        each replacement parameter, so a caller-supplied optimizer can put each replacement back
+        into the param group its sources belonged to, plus the identity of every parameter the
+        replacement detached, so the same optimizer can drop exactly those. The source values are
+        the discarded pre-shard expert weights and stay alive until the engine has finished the
+        remap, so the caller asks for them only when there is such an optimizer. Otherwise the map
+        is empty and each source module is freed as its replacement takes its place.
         """
+        from deepspeed.module_inject.auto_ep_layer import ReplacementSourceMap
+
         replacements: list[tuple[MoELayerSpec, nn.Module]] = []
-        replacement_sources: dict[int, list[nn.Parameter]] = {}
+        replacement_sources = ReplacementSourceMap()
         for spec in specs:
             replacement, sources = self._replace_moe_layer_without_retarget(spec, ep_size, ep_rank, collect_sources)
             replacements.append((spec, replacement))
