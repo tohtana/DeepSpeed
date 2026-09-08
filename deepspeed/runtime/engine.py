@@ -930,11 +930,28 @@ class DeepSpeedEngine(Module):
             log_dist("AutoTP: no effective HuggingFace tp_plan was found; falling back to heuristic AutoTP.",
                      ranks=[0])
 
+        vocab_head_autotp = None
+        if tp_config.vocab_parallel_lm_head:
+            vocab_head_autotp = AutoTP(module=model,
+                                       all_reduce_linears=(),
+                                       prefix="",
+                                       state_dict=None,
+                                       linear_layer_setting=(torch.nn.Linear, torch.nn.Embedding),
+                                       orig_layer_impl=None,
+                                       keep_module_on_host=tp_config.keep_module_on_host,
+                                       vocab_parallel_lm_head=True,
+                                       model_config=model_config,
+                                       tp_grain_size=tp_config.tensor_parallel.tp_grain_size,
+                                       training_mode=True)
+            vocab_head_autotp.set_tensor_parallel_config(tp_size, tp_config.tensor_parallel.tp_group)
+
         parser_dict = AutoTP.tp_parser(model)
         for client_module, injection_policy in parser_dict:
             tp_config.injection_policy_tuple = injection_policy
             replace_transformer_layer(client_module, model, None, tp_config, model_config, training_mode=True)
 
+        if vocab_head_autotp is not None:
+            vocab_head_autotp.replace_vocab_parallel_lm_head()
         finalize_autotp(attach_uc_metadata=True)
 
     def __del__(self):

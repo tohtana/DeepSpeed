@@ -324,6 +324,29 @@ def test_plain_colwise_lm_head_rejects_tied_weights():
         _build_local_lm_head_autotp(model)._replace_module(model)
 
 
+def test_plain_colwise_lm_head_rejects_tie_before_embedding_is_sliced():
+    model = OutputModel(tied=True)
+    specs = TPPlanConverter.convert({
+        "embed_tokens": "embedding_rowwise",
+        "lm_head": "colwise",
+    })
+    autotp = AutoTP(
+        module=model,
+        all_reduce_linears=[],
+        prefix="",
+        state_dict=None,
+        linear_layer_setting=None,
+        orig_layer_impl=None,
+        partition_config=AutoTPConfig(layer_specs=specs),
+        vocab_parallel_lm_head=True,
+    )
+    autotp.set_tensor_parallel_config(2, None)
+    autotp.update_linear_policies()
+
+    with pytest.raises(ValueError, match="requires untied"):
+        autotp._replace_module(model)
+
+
 def test_configure_vocab_parallel_loss_installs_and_preserves_hook():
     model = OutputModel(tied=False)
     model.loss_function = nn.CrossEntropyLoss()

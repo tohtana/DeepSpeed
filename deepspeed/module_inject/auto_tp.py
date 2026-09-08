@@ -228,6 +228,15 @@ class AutoTP():
         self.partition_config = partition_config
         self.vocab_parallel_lm_head = vocab_parallel_lm_head
         self.training_mode = training_mode
+        embedding_weights = {
+            id(module.weight)
+            for module in self.module.modules() if isinstance(module, nn.Embedding) and hasattr(module, "weight")
+        }
+        self._originally_tied_vocab_head_ids = {
+            id(module)
+            for name, module in self.module.named_modules()
+            if self._is_vocab_parallel_lm_head(module, name) and id(module.weight) in embedding_weights
+        }
         self._gathered_column_tie_fallbacks_configured = False
         self._tied_gathered_column_module_names = set()
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
@@ -537,9 +546,28 @@ class AutoTP():
         return VocabParallelLinear(child, self.mp_group, name=name, tp_meta=self.tp_meta)
 
     def _validate_untied_vocab_head(self, lm_head):
+        if id(lm_head) in self._originally_tied_vocab_head_ids:
+            raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
         for _, module in self.module.named_modules():
             if isinstance(module, nn.Embedding) and getattr(module, "weight", None) is lm_head.weight:
                 raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
+
+    def replace_vocab_parallel_lm_head(self):
+        candidates = []
+        for parent_name, parent in self.module.named_modules():
+            for child_name, child in parent.named_children():
+                full_name = f"{parent_name}.{child_name}" if parent_name else child_name
+                if self._is_vocab_parallel_lm_head(child, full_name):
+                    candidates.append((parent, child_name, child, full_name))
+
+        if not candidates:
+            raise ValueError("vocab_parallel_lm_head requires a supported nn.Linear named 'lm_head' or 'embed_out'")
+        if len(candidates) > 1:
+            names = [full_name for _, _, _, full_name in candidates]
+            raise ValueError(f"Unable to choose among multiple vocab-parallel LM heads: {names}")
+
+        parent, child_name, child, full_name = candidates[0]
+        setattr(parent, child_name, self._create_vocab_parallel_layer(child, full_name))
 
     def _configure_gathered_column_tie_fallbacks(self):
         """Configure a replicated fallback for gathered output layers tied to embeddings."""
