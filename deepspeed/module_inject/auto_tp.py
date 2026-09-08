@@ -571,6 +571,8 @@ class AutoTP():
         for module_name, module in named_modules:
             if not module_name or isinstance(module, nn.Embedding) or not hasattr(module, "weight"):
                 continue
+            if self._is_vocab_parallel_lm_head(module, module_name):
+                continue
 
             tied_embedding_name = next(
                 (embedding_name for embedding_name, embedding in embeddings if module.weight is embedding.weight),
@@ -757,7 +759,7 @@ class AutoTP():
                 self.update_mp_params(child, full_name)
 
     def _replace_module(self, r_module, prev_name='', prev_class_name=''):
-        if prev_name == '' and prev_class_name == '' and not self.vocab_parallel_lm_head:
+        if prev_name == '' and prev_class_name == '':
             self._configure_gathered_column_tie_fallbacks()
 
         for name, child in r_module.named_children():

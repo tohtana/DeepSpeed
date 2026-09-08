@@ -264,7 +264,7 @@ class VocabParallelCrossEntropyLoss(nn.Module):
                                             gather_sequence_loss=self.gather_sequence_loss)
 
 
-class VocabParallelCausalLMLoss(nn.Module):
+class VocabParallelCausalLMLoss:
     """Distributed causal-LM loss for a vocabulary-sharded (no-gather) LM head.
 
     ``sp_group`` must stay ``None`` under DeepSpeed's Ulysses sequence-parallel engine:
@@ -275,14 +275,13 @@ class VocabParallelCausalLMLoss(nn.Module):
     """
 
     def __init__(self, tp_group=None, sp_group=None, vocab_start_index=None, vocab_end_index=None, ignore_index=-100):
-        super().__init__()
         self.tp_group = tp_group
         self.sp_group = sp_group
         self.vocab_start_index = vocab_start_index
         self.vocab_end_index = vocab_end_index
         self.ignore_index = ignore_index
 
-    def forward(self, logits, labels=None, vocab_size=None, shift_labels=None, num_items_in_batch=None, **kwargs):
+    def __call__(self, logits, labels=None, vocab_size=None, shift_labels=None, num_items_in_batch=None, **kwargs):
         if shift_labels is None:
             if labels is None:
                 raise ValueError("labels or shift_labels must be provided")
@@ -332,18 +331,22 @@ def configure_vocab_parallel_loss(model, vocab_parallel_head, sp_group=None, ign
                                         vocab_start_index=vocab_parallel_head.vocab_start_index,
                                         vocab_end_index=vocab_parallel_head.vocab_end_index,
                                         ignore_index=ignore_index)
-    # Keep the stock loss reachable so callers can restore it when tearing the head down.
-    if not hasattr(model, "_deepspeed_original_loss_function"):
-        model._deepspeed_original_loss_function = model.loss_function
+    original_loss_function = model.loss_function
+    registered_loss_module = getattr(model, "_modules", {}).pop("loss_function", None)
 
     # Some model classes expose loss_function as a read-only property, in which case the
     # assignment raises; the identity check below turns that into an actionable error
     # instead of leaving the model silently computing loss on rank-local logits.
     try:
         model.loss_function = loss_fn
-    except AttributeError:
-        pass
+    except (AttributeError, TypeError):
+        if registered_loss_module is not None:
+            model.add_module("loss_function", registered_loss_module)
 
     if model.loss_function is not loss_fn:
         raise ValueError("Unable to install the vocab-parallel loss_function hook; use gather_output=True")
+
+    # Keep the stock loss reachable so callers can restore it when tearing the head down.
+    if not hasattr(model, "_deepspeed_original_loss_function"):
+        model._deepspeed_original_loss_function = original_loss_function
     return model
