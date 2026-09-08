@@ -228,15 +228,18 @@ class AutoTP():
         self.partition_config = partition_config
         self.vocab_parallel_lm_head = vocab_parallel_lm_head
         self.training_mode = training_mode
-        embedding_weights = {
-            id(module.weight)
-            for module in self.module.modules() if isinstance(module, nn.Embedding) and hasattr(module, "weight")
-        }
-        self._originally_tied_vocab_head_ids = {
-            id(module)
-            for name, module in self.module.named_modules()
-            if self._is_vocab_parallel_lm_head(module, name) and id(module.weight) in embedding_weights
-        }
+        self._originally_tied_vocab_head_ids = set()
+        self._vocab_parallel_lm_head_candidate = None
+        if self.vocab_parallel_lm_head:
+            embedding_weights = {
+                id(module.weight)
+                for module in self.module.modules() if isinstance(module, nn.Embedding) and hasattr(module, "weight")
+            }
+            self._originally_tied_vocab_head_ids = {
+                id(module)
+                for name, module in self.module.named_modules()
+                if self._is_vocab_parallel_lm_head(module, name) and id(module.weight) in embedding_weights
+            }
         self._gathered_column_tie_fallbacks_configured = False
         self._tied_gathered_column_module_names = set()
         TensorParallel_Layer.set_keep_module_on_host(keep_module_on_host)
@@ -552,7 +555,10 @@ class AutoTP():
             if isinstance(module, nn.Embedding) and getattr(module, "weight", None) is lm_head.weight:
                 raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
 
-    def replace_vocab_parallel_lm_head(self):
+    def _resolve_vocab_parallel_lm_head(self):
+        if self._vocab_parallel_lm_head_candidate is not None:
+            return self._vocab_parallel_lm_head_candidate
+
         candidates = []
         for parent_name, parent in self.module.named_modules():
             for child_name, child in parent.named_children():
@@ -566,7 +572,14 @@ class AutoTP():
             names = [full_name for _, _, _, full_name in candidates]
             raise ValueError(f"Unable to choose among multiple vocab-parallel LM heads: {names}")
 
-        parent, child_name, child, full_name = candidates[0]
+        self._validate_untied_vocab_head(candidates[0][2])
+        self._vocab_parallel_lm_head_candidate = candidates[0]
+        return self._vocab_parallel_lm_head_candidate
+
+    def _replace_vocab_parallel_lm_head(self):
+        parent, child_name, child, full_name = self._resolve_vocab_parallel_lm_head()
+        if getattr(parent, child_name) is not child:
+            raise RuntimeError(f"Vocab-parallel LM head '{full_name}' changed during AutoTP partitioning")
         setattr(parent, child_name, self._create_vocab_parallel_layer(child, full_name))
 
     def _configure_gathered_column_tie_fallbacks(self):
