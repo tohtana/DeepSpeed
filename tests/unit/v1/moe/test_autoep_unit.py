@@ -883,6 +883,42 @@ class TestAutoEPRegionalCompile:
         with pytest.raises(ValueError, match="has no forward implementation"):
             compile_autoep_non_moe_regions(model, backend="eager", compile_kwargs={})
 
+    def test_compiles_model_root_for_direct_autoep_child(self, monkeypatch):
+
+        class RootDirectMoE(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.mlp = AutoEPMoELayer(
+                    spec=_make_spec(moe_module_name="mlp"),
+                    source_module=MockMoEBlock(),
+                    ep_size=1,
+                    ep_rank=0,
+                    config=_runtime_config(),
+                )
+
+            def forward(self, hidden_states):
+                return self.mlp(hidden_states)
+
+        model = RootDirectMoE()
+        compile_calls = []
+
+        def record_compile(module, **kwargs):
+            compile_calls.append((module, kwargs))
+            module._compiled_call_impl = object()
+
+        monkeypatch.setattr(RootDirectMoE, "compile", record_compile)
+
+        regions = compile_autoep_non_moe_regions(model, backend="eager", compile_kwargs={})
+
+        assert regions == [""]
+        assert compile_calls == [(model, {
+            "backend": "eager",
+            "dynamic": False,
+            "fullgraph": False,
+        })]
+        assert getattr(model.mlp.forward, "_torchdynamo_disable", False)
+
     def test_compiles_decoder_parents_and_disables_autoep(self, monkeypatch):
         model = _replace_callable_autoep_layers()
         compile_calls = []

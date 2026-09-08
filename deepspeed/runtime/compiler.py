@@ -143,8 +143,8 @@ def compile_autoep_non_moe_regions(model: nn.Module, backend, compile_kwargs: di
     }
     regions: OrderedDict[str, nn.Module] = OrderedDict()
     for module_name, _ in autoep_modules:
-        parent_name, separator, _ = module_name.rpartition(".")
-        if not separator:
+        parent_name, _, _ = module_name.rpartition(".")
+        if not module_name:
             raise ValueError("compile_mode='autoep_non_moe' cannot compile an AutoEPMoELayer at the model root.")
         parent = named_modules[parent_name]
         if type(parent).forward is nn.Module.forward:
