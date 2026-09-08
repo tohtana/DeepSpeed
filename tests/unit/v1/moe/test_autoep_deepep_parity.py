@@ -224,6 +224,22 @@ def _run_one_step(backend, ep_size, seed, *, cleanup=True, activation_checkpoint
     return result
 
 
+def _assert_optimizer_update_invariants(actual, expected):
+    names = sorted(expected)
+    assert names == sorted(actual)
+    actual_flat = torch.cat([actual[name].double().reshape(-1) for name in names])
+    expected_flat = torch.cat([expected[name].double().reshape(-1) for name in names])
+    assert torch.isfinite(actual_flat).all() and torch.isfinite(expected_flat).all(), "optimizer update is non-finite"
+
+    actual_norm = actual_flat.norm()
+    expected_norm = expected_flat.norm()
+    assert expected_norm > 0, "reference optimizer update is zero"
+    assert actual_norm > 0, "optimizer update is missing"
+    torch.testing.assert_close(actual_norm, expected_norm, rtol=5e-2, atol=0, msg="optimizer update norm")
+    cosine_similarity = torch.dot(actual_flat, expected_flat) / (actual_norm * expected_norm)
+    assert cosine_similarity > 0.95, f"optimizer update direction mismatch; cosine_similarity={cosine_similarity}"
+
+
 def _assert_cleanup_results_close(actual, expected, *, compare_score_gradients):
     for name, rtol, atol in (
         ("output", 2e-3, 2e-3),
@@ -279,6 +295,15 @@ def _assert_cleanup_results_close(actual, expected, *, compare_score_gradients):
             atol=5e-4,
             msg=(f"optimizer delta for {name}; max_diff="
                  f"{(actual['parameter_deltas'][name] - expected['parameter_deltas'][name]).abs().max().item()}"))
+    _assert_optimizer_update_invariants(actual["parameter_deltas"], expected["parameter_deltas"])
+
+
+@pytest.mark.parametrize("multiplier", [0.0, -1.0], ids=["missing", "reversed"])
+def test_optimizer_update_invariants_reject_invalid_updates(multiplier):
+    expected = {"weight": torch.tensor([-1e-4, 1e-4])}
+    actual = {"weight": multiplier * expected["weight"]}
+    with pytest.raises(AssertionError, match="optimizer update"):
+        _assert_optimizer_update_invariants(actual, expected)
 
 
 @pytest.mark.skipif(not _deepep_available(), reason="deep_ep is not installed")
