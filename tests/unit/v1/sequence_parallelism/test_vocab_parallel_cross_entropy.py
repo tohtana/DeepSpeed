@@ -13,7 +13,8 @@ import deepspeed.sequence.cross_entropy as cross_entropy
 from deepspeed.accelerator import get_accelerator
 from deepspeed.module_inject.layers import VocabParallelLinear
 from deepspeed.module_inject.tp_shard import AutoTPMeta, get_shard_size_list
-from deepspeed.sequence.cross_entropy import VocabParallelCausalLMLoss, vocab_parallel_cross_entropy
+from deepspeed.sequence.cross_entropy import (VocabParallelCausalLMLoss, vocab_parallel_cross_entropy,
+                                              vocab_sequence_parallel_cross_entropy)
 from unit.common import DistributedTest
 
 
@@ -237,6 +238,21 @@ class TestVocabParallelCrossEntropySP(DistributedTest):
         total_weight = sum(range(1, self.world_size + 1))
         reference_loss = F.cross_entropy(reference_logits.view(-1, 13), local_target.view(-1), reduction="sum")
         (reference_loss * total_weight).backward()
+        torch.testing.assert_close(local_logits.grad, reference_logits.grad)
+
+    def test_legacy_sequence_loss_backward_keeps_local_gradient_scale(self):
+        device = torch.device(get_accelerator().current_device_name())
+        local_logits = torch.randn(2, 3, 13, device=device, requires_grad=True)
+        reference_logits = local_logits.detach().clone().requires_grad_(True)
+        local_target = torch.tensor([[0, 1, 2], [3, 4, 5]], device=device)
+
+        gathered_loss = vocab_sequence_parallel_cross_entropy(local_logits,
+                                                              local_target,
+                                                              sp_group=dist.get_world_group())
+        gathered_loss.sum().backward()
+
+        reference_loss = F.cross_entropy(reference_logits.view(-1, 13), local_target.view(-1), reduction="sum")
+        reference_loss.backward()
         torch.testing.assert_close(local_logits.grad, reference_logits.grad)
 
 

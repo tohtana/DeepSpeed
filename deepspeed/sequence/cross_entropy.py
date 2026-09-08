@@ -59,9 +59,11 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 class _GatherSequenceLoss(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, local_loss, sp_group):
+    def forward(ctx, local_loss, sp_group, sum_gradients):
         ctx.sp_group = sp_group
         ctx.local_sequence_size = local_loss.shape[0]
+        ctx.sum_gradients = sum_gradients
+        ctx.sp_rank = dist.get_rank(sp_group)
 
         output_shape = (ctx.local_sequence_size * dist.get_world_size(sp_group), *local_loss.shape[1:])
         gathered_loss = torch.empty(output_shape, dtype=local_loss.dtype, device=local_loss.device)
@@ -70,11 +72,15 @@ class _GatherSequenceLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        if not ctx.sum_gradients:
+            start = ctx.sp_rank * ctx.local_sequence_size
+            return grad_output.narrow(0, start, ctx.local_sequence_size), None, None
+
         grad_input = torch.empty((ctx.local_sequence_size, *grad_output.shape[1:]),
                                  dtype=grad_output.dtype,
                                  device=grad_output.device)
         dist.reduce_scatter_fn(grad_input, grad_output.contiguous(), group=ctx.sp_group)
-        return grad_input, None
+        return grad_input, None, None
 
 
 def _global_sp_sum(local_value, sp_group):
@@ -193,7 +199,7 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits,
         if gather_sequence_loss:
             if sp_group is None:
                 raise ValueError("sp_group is required when gather_sequence_loss=True")
-            loss = _GatherSequenceLoss.apply(loss, sp_group)
+            loss = _GatherSequenceLoss.apply(loss, sp_group, True)
         return loss
 
     loss_sum = _global_sp_sum(loss.sum(), sp_group)
@@ -215,22 +221,21 @@ def vocab_sequence_parallel_cross_entropy(vocab_parallel_logits,
                                           ignore_index=-100,
                                           reduction="none",
                                           gather_sequence_loss=True):
-    """Sequence-parallel wrapper over :func:`vocab_parallel_cross_entropy`.
+    """Sequence-parallel wrapper preserving the legacy local-slice gradient."""
+    if gather_sequence_loss and reduction != "none":
+        raise ValueError("gather_sequence_loss is only supported with reduction='none'")
 
-    Backward reduce-scatters the gradient over ``sp_group``, so each rank receives the
-    gradient of its own sequence shard with the other ranks' contributions already
-    summed in. Downstream code must therefore treat the returned loss as replicated
-    across the SP group and must not average SP gradients a second time.
-    """
-    return vocab_parallel_cross_entropy(vocab_parallel_logits,
+    loss = vocab_parallel_cross_entropy(vocab_parallel_logits,
                                         target,
                                         tp_group=tp_group,
                                         sp_group=sp_group,
                                         vocab_start_index=vocab_start_index,
                                         vocab_end_index=vocab_end_index,
                                         ignore_index=ignore_index,
-                                        reduction=reduction,
-                                        gather_sequence_loss=gather_sequence_loss)
+                                        reduction=reduction)
+    if not gather_sequence_loss:
+        return loss
+    return _GatherSequenceLoss.apply(loss, sp_group, False)
 
 
 class VocabParallelCrossEntropyLoss(nn.Module):
