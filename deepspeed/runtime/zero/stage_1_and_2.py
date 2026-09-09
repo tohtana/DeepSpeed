@@ -176,6 +176,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  ignore_unused_parameters=True,
                  partition_grads=True,
                  round_robin_gradients=False,
+                 parameter_alignment=False,
                  has_moe_layers=False,
                  fp16_master_weights_and_gradients=False,
                  bf16_master_weights_and_gradients=False,
@@ -205,6 +206,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # 2. keep common stuff here in case we need to add ne552w fused optimizer later
 
         self.elastic_checkpoint = elastic_checkpoint
+        self.parameter_alignment = parameter_alignment
         self.check_grad_overflow = check_grad_overflow
         self.param_names = param_names
         self.mpu = mpu
@@ -396,7 +398,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             alignment = self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i])
             param_dtype = self.bit16_groups[i][0].dtype
             element_size = torch.tensor([], dtype=param_dtype).element_size()
-            param_alignment = 16 // math.gcd(16, element_size)
+            param_alignment = 16 // math.gcd(16, element_size) if self.parameter_alignment else 1
             max_param_padding = sum((-param.numel()) % param_alignment for param in self.bit16_groups[i])
             aligned_numel = int(math.ceil((orig_group_numel + max_param_padding) / alignment)) * alignment
             flat_buffer_bytes = aligned_numel * element_size
@@ -3079,6 +3081,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._load_global_state(current_rank_sd)
 
         ckpt_is_rigid = isinstance(current_rank_sd[BASE_OPTIMIZER_STATE], dict)
+        saved_param_padding = current_rank_sd.get(PARAM_ALIGNMENT_PADDINGS)
+        if saved_param_padding is None:
+            saved_param_padding = [[0] * len(group_padding) for group_padding in self.round_robin_bit16_padding]
+        incompatible_param_layout = saved_param_padding != self.round_robin_bit16_padding
+        if incompatible_param_layout and (load_optimizer_states or load_from_fp32_weights):
+            raise RuntimeError("The ZeRO checkpoint parameter-alignment layout does not match the current "
+                               "zero_optimization.parameter_alignment setting. Load with the setting used to save "
+                               "the checkpoint, or disable optimizer-state loading for a module-only warm start.")
         unpadded_layout = (PARAM_ALIGNMENT_PADDINGS not in current_rank_sd
                            and any(any(group_padding) for group_padding in self.round_robin_bit16_padding))
 
