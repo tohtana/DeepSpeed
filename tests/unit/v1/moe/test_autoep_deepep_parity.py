@@ -144,6 +144,13 @@ def _run_one_step(backend, ep_size, seed, *, cleanup=True, activation_checkpoint
     # dtype anyway for the comparison to mean anything.
     config.pop("fp16", None)
     config["bf16"] = {"enabled": True}
+    # At step 1, Adam's bias correction makes every updated parameter's delta
+    # equal to +/-lr regardless of its gradient's magnitude. make_autoep_config's
+    # default lr=1e-4 is smaller than the parameter_deltas comparison's
+    # atol=5e-4 below, so that check could not have told a correct update apart
+    # from a missing or wrong-signed one (deepspeedai/DeepSpeed#8423, review
+    # comment from tohtana). Raised well above that noise floor instead.
+    config["optimizer"]["params"]["lr"] = 1e-2
     config["expert_parallel"]["comm_backend"] = backend
     if backend == "deepep":
         # Sized explicitly rather than from the first batch, so both backends
