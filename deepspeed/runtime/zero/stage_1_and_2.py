@@ -2886,10 +2886,12 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param_id = param_group['params'][0]
             saved_state = saved_optimizer_state['state'].get(param_id, {})
             converted_param_state = {}
+            saved_partition = current_rank_sd[SINGLE_PARTITION_OF_FP32_GROUPS][i]
+            saved_partition_size = saved_partition.numel() + current_rank_sd[GROUP_PADDINGS][i]
 
             for key, value in saved_state.items():
-                if torch.is_tensor(value) and value.dim() > 0:
-                    converted_param_state[key] = self._redistribute_unpadded_partition(value.view(-1), i)
+                if torch.is_tensor(value) and value.shape == torch.Size([saved_partition_size]):
+                    converted_param_state[key] = self._redistribute_unpadded_partition(value, i)
                 else:
                     converted_param_state[key] = value
             converted_state['state'][param_id] = converted_param_state

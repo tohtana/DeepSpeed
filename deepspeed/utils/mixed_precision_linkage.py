@@ -18,8 +18,12 @@ def link_hp_params(lp_param_list,
                    partition_size,
                    dp_group,
                    param_offsets=None):
-    local_lp_param_and_offset = _init_lp_to_hp_mapping(lp_param_list, partition_start, partition_size, dp_group,
-                                                       param_offsets)
+    local_lp_param_and_offset = _init_lp_to_hp_mapping(lp_param_list,
+                                                       partition_start,
+                                                       partition_size,
+                                                       dp_group,
+                                                       param_offsets,
+                                                       use_offload=use_offload)
 
     for lp_param, lp_start in local_lp_param_and_offset:
         lp_param._hp_mapping = get_hp_fragment_mapping(lp_param, lp_start, flat_hp_partition, gradient_dict,
@@ -33,7 +37,12 @@ def lazy_init_hp_params_optimizer_state(lp_param_list, flat_hp_partition, optimi
             lp._hp_mapping.set_optim_state_fragment(flat_hp_partition, optimizer_state[flat_hp_partition])
 
 
-def _init_lp_to_hp_mapping(lp_param_list, partition_start, partition_size, dp_group, param_offsets=None):
+def _init_lp_to_hp_mapping(lp_param_list,
+                           partition_start,
+                           partition_size,
+                           dp_group,
+                           param_offsets=None,
+                           use_offload=False):
     current_offset = 0
     param_and_offset_list = []
     partition_end = partition_start + partition_size
@@ -52,7 +61,10 @@ def _init_lp_to_hp_mapping(lp_param_list, partition_start, partition_size, dp_gr
 
             fragment_start = max(param_offset, partition_start)
             dest_offset = fragment_start - partition_start
-            if dest_offset > current_partition_offset:
+            # averaged_gradients includes explicit padding entries, while the CPU-offload
+            # gradient dictionary contains parameter fragments only. Keep the mapping
+            # index aligned with the list selected by tensor_fragment.get_lp_grad_fragment().
+            if not use_offload and dest_offset > current_partition_offset:
                 gradient_list_index += 1
             gradient_index_by_param[id(lp_param)] = gradient_list_index
             gradient_list_index += 1

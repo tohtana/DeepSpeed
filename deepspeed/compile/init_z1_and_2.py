@@ -52,6 +52,16 @@ def _build_partition_grad_views(optimizer, group_idx):
             optimizer.all_grad_tensors[group_idx] = original_all_grad_tensors
 
 
+def _clone_partition_grad_views(partition_grad_views):
+    cloned_views = []
+    for view in partition_grad_views:
+        cloned = view.clone().detach()
+        if getattr(view, "_zero_padding", False):
+            cloned._zero_padding = True
+        cloned_views.append(cloned)
+    return cloned_views
+
+
 def _build_flat_partition_grad_views(optimizer, group_idx):
     partition_size = int(optimizer.partition_size[group_idx])
     dtype = optimizer.gradient_accumulation_dtype
@@ -102,7 +112,7 @@ def init_z1_and_2(engine, backend, compile_config, compile_kwargs, schedule=None
         grad_buffer = {}
         for i, group in enumerate(optimizer.bit16_groups):
             partition_grad_views = _build_partition_grad_views(optimizer, i)
-            grad_buffer[i] = [p.clone().detach() for p in partition_grad_views]
+            grad_buffer[i] = _clone_partition_grad_views(partition_grad_views)
             param_grad_buffers = [
                 cloned for original, cloned in zip(partition_grad_views, grad_buffer[i])
                 if not getattr(original, "_zero_padding", False)

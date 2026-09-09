@@ -10,7 +10,9 @@ Parametrized over zero_stage (1, 2) and dtype (fp32, fp16, bf16).
 import pytest
 import torch
 import deepspeed
+import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+from deepspeed.checkpoint.constants import BASE_OPTIMIZER_STATE, GROUP_PADDINGS, SINGLE_PARTITION_OF_FP32_GROUPS
 from deepspeed.utils import safe_get_full_grad, safe_set_full_grad, set_log_level_from_string
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel, random_dataloader
@@ -164,6 +166,44 @@ class TestStage12ParamAlignment(DistributedTest):
         replacement = torch.full_like(full_grad, 3)
         safe_set_full_grad(weight, replacement)
         assert torch.equal(safe_get_full_grad(weight), replacement)
+
+    def test_pre_padding_checkpoint_preserves_tensor_metadata(self, zero_stage):
+        engine = _init_alignment_engine(zero_stage)
+        opt = engine.optimizer
+        group_id = 0
+        world_size = dist.get_world_size(group=opt.real_dp_process_group[group_id])
+        rank = dist.get_rank(group=opt.real_dp_process_group[group_id])
+        alignment = opt.nccl_start_alignment_factor * world_size
+        unpadded_numel = sum(param.numel() for param in opt.round_robin_bit16_groups[group_id])
+        old_group_numel = ((unpadded_numel + alignment - 1) // alignment) * alignment
+        old_partition_size = old_group_numel // world_size
+        partition_start = rank * old_partition_size
+        old_group_padding = max(0, partition_start + old_partition_size - unpadded_numel)
+        old_group_padding = min(old_group_padding, old_partition_size)
+
+        param_id = 0
+        tensor_step = torch.tensor([17], dtype=torch.int64)
+        current_rank_sd = {
+            BASE_OPTIMIZER_STATE: {
+                "state": {
+                    param_id: {
+                        "exp_avg": torch.arange(old_partition_size, dtype=torch.float32),
+                        "tensor_step": tensor_step,
+                    }
+                },
+                "param_groups": [{
+                    "params": [param_id]
+                }],
+            },
+            SINGLE_PARTITION_OF_FP32_GROUPS:
+            [torch.zeros(old_partition_size - old_group_padding, dtype=torch.float32)],
+            GROUP_PADDINGS: [old_group_padding],
+        }
+
+        converted = opt._convert_unpadded_rigid_optimizer_state(current_rank_sd)
+        converted_state = converted["state"][param_id]
+        assert converted_state["exp_avg"].numel() == opt.single_partition_of_fp32_groups[group_id].numel()
+        assert torch.equal(converted_state["tensor_step"], tensor_step)
 
 
 def _apply_dtype_to_config(config_dict, dtype):
