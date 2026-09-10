@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from op_builder.mps import cpu_adam as mps_cpu_adam
+
 BUILDER_PATH = Path(__file__).resolve().parents[3] / "op_builder" / "builder.py"
 BUILDER_SPEC = importlib.util.spec_from_file_location("test_op_builder_module", BUILDER_PATH)
 builder_module = importlib.util.module_from_spec(BUILDER_SPEC)
@@ -47,6 +49,27 @@ def make_builder(**overrides):
     for key, value in overrides.items():
         setattr(builder, key, value)
     return builder
+
+
+@pytest.mark.parametrize("torch_version,expected_standard", [
+    ((2, 11), "-std=c++17"),
+    ((2, 12), "-std=c++20"),
+    ((2, 14), "-std=c++20"),
+])
+def test_mps_cpu_adam_cpp_standard(torch_version, expected_standard):
+    with patch("op_builder.builder.TORCH_MAJOR", torch_version[0]):
+        with patch("op_builder.builder.TORCH_MINOR", torch_version[1]):
+            with patch.object(mps_cpu_adam.CPUAdamBuilder, "_libomp_prefix", return_value=None):
+                cxx_args = mps_cpu_adam.CPUAdamBuilder().builder().extra_compile_args["cxx"]
+
+    assert cxx_args == ["-O3", expected_standard, "-g", "-Wno-reorder", "-D__SCALAR__"]
+
+
+def test_mps_cpu_adam_import_without_torch():
+    command = [sys.executable, "-c", "import sys; sys.modules['torch'] = None; import op_builder.mps.cpu_adam"]
+    result = subprocess.run(command, cwd=Path(__file__).resolve().parents[3], capture_output=True, text=True)
+
+    assert result.returncode == 0, result.stderr
 
 
 def assert_jit_uses_explicit_arch_list(builder, expected_arch_list, env_updates=None):
