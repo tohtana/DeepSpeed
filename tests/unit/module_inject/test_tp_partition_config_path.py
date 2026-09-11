@@ -9,6 +9,7 @@ because the name was just ``0.self_attn.q_proj``.
 """
 
 import pytest
+import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, PretrainedConfig
 
@@ -55,6 +56,25 @@ class OutputModel(nn.Module):
         self.lm_head = nn.Linear(32, 100, bias=False)
         if tied:
             self.lm_head.weight = self.embed_tokens.weight
+
+
+class WrappedEmbedding(nn.Module):
+
+    def __init__(self, vocab_size, hidden_size):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
+
+
+class WrappedEmbeddingOutputModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = WrappedEmbedding(100, 32)
+        self.lm_head = nn.Linear(32, 100, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
 
 
 class HFOutputModel(PreTrainedModel):
@@ -345,6 +365,27 @@ def test_plain_colwise_lm_head_rejects_tie_before_embedding_is_sliced():
 
     with pytest.raises(ValueError, match="requires untied"):
         autotp._replace_module(model)
+
+
+def test_plain_colwise_lm_head_rejects_custom_input_embedding_tie_before_mutation():
+    model = WrappedEmbeddingOutputModel()
+    embedding = model.embed_tokens
+    lm_head = model.lm_head
+    weight = embedding.weight
+    embedding_shape = tuple(embedding.weight.shape)
+    head_shape = tuple(lm_head.weight.shape)
+
+    with pytest.raises(ValueError, match="requires untied"):
+        _build_local_lm_head_autotp(model)._replace_module(model)
+
+    assert model.embed_tokens is embedding
+    assert model.lm_head is lm_head
+    assert embedding.weight is weight
+    assert lm_head.weight is weight
+    assert tuple(embedding.weight.shape) == embedding_shape
+    assert tuple(lm_head.weight.shape) == head_shape
+    assert not hasattr(embedding, "replaced")
+    assert not hasattr(lm_head, "replaced")
 
 
 def test_configure_vocab_parallel_loss_installs_and_preserves_hook():

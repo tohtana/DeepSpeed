@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -115,10 +115,8 @@ def test_causal_lm_loss_vocab_size_mismatch_warns_instead_of_raising():
     torch.testing.assert_close(loss, expected)
 
 
-def test_vocab_metadata_validation_runs_once(monkeypatch):
+def test_vocab_metadata_validation_runs_for_each_stateless_call(monkeypatch):
     torch.manual_seed(10)
-    # A vocab size unique to this test keeps the process-wide metadata cache from being
-    # warmed by the other tests, whatever order pytest runs them in.
     vocab_size = 23
     logits = torch.randn(2, 3, vocab_size)
     target = torch.zeros(2, 3, dtype=torch.long)
@@ -133,7 +131,22 @@ def test_vocab_metadata_validation_runs_once(monkeypatch):
     vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
     vocab_parallel_cross_entropy(logits, target, vocab_start_index=0, vocab_end_index=vocab_size)
 
-    assert len(calls) == 1
+    assert len(calls) == 2
+
+
+def test_causal_lm_loss_honors_runtime_ignore_index():
+    torch.manual_seed(11)
+    vocab_size = 7
+    logits = torch.randn(2, 4, vocab_size)
+    labels = torch.tensor([[0, 1, -1, 3], [4, 5, 6, -1]])
+    loss_fn = VocabParallelCausalLMLoss(vocab_start_index=0, vocab_end_index=vocab_size)
+
+    actual = loss_fn(logits=logits, labels=labels, ignore_index=-1)
+    expected = F.cross_entropy(logits[..., :-1, :].reshape(-1, vocab_size),
+                               labels[..., 1:].reshape(-1),
+                               ignore_index=-1)
+
+    torch.testing.assert_close(actual, expected)
 
 
 class TestVocabParallelCrossEntropyTP(DistributedTest):
@@ -163,6 +176,28 @@ class TestVocabParallelCrossEntropyTP(DistributedTest):
         actual.backward()
         expected.backward()
         torch.testing.assert_close(local_logits.grad, reference_logits.grad[..., vocab_start_index:vocab_end_index])
+
+    def test_sequential_uneven_vocab_layouts_match_torch(self):
+        device = torch.device(get_accelerator().current_device_name())
+        rank = dist.get_rank()
+        group = dist.get_world_group()
+
+        for vocab_size in (17, 18):
+            partition_sizes = get_shard_size_list(vocab_size, self.world_size, AutoTPMeta(), "lm_head")
+            vocab_start_index = sum(partition_sizes[:rank])
+            vocab_end_index = vocab_start_index + partition_sizes[rank]
+            torch.manual_seed(vocab_size)
+            full_logits = torch.randn(2, 3, vocab_size, device=device)
+            local_logits = full_logits[..., vocab_start_index:vocab_end_index].detach().clone().requires_grad_(True)
+            target = torch.tensor([[0, 8, -100], [vocab_size - 1, 7, 9]], device=device)
+
+            actual = vocab_parallel_cross_entropy(local_logits,
+                                                  target,
+                                                  tp_group=group,
+                                                  vocab_start_index=vocab_start_index,
+                                                  vocab_end_index=vocab_end_index)
+            expected = F.cross_entropy(full_logits.view(-1, vocab_size), target.view(-1))
+            torch.testing.assert_close(actual, expected)
 
     def test_rejects_non_contiguous_vocab_shards(self):
         device = torch.device(get_accelerator().current_device_name())

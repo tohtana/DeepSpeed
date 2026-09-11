@@ -231,10 +231,7 @@ class AutoTP():
         self._originally_tied_vocab_head_ids = set()
         self._vocab_parallel_lm_head_candidate = None
         if self.vocab_parallel_lm_head:
-            embedding_weights = {
-                id(module.weight)
-                for module in self.module.modules() if isinstance(module, nn.Embedding) and hasattr(module, "weight")
-            }
+            embedding_weights = {id(module.weight) for _, module in self._input_embeddings()}
             self._originally_tied_vocab_head_ids = {
                 id(module)
                 for name, module in self.module.named_modules()
@@ -551,9 +548,23 @@ class AutoTP():
     def _validate_untied_vocab_head(self, lm_head):
         if id(lm_head) in self._originally_tied_vocab_head_ids:
             raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
-        for _, module in self.module.named_modules():
-            if isinstance(module, nn.Embedding) and getattr(module, "weight", None) is lm_head.weight:
+        for _, module in self._input_embeddings():
+            if module.weight is lm_head.weight:
                 raise ValueError("A no-gather vocab-parallel LM head requires untied embedding and output weights")
+
+    def _input_embeddings(self):
+        named_modules = list(self.module.named_modules())
+        embeddings = [(name, module) for name, module in named_modules
+                      if isinstance(module, nn.Embedding) and hasattr(module, "weight")]
+        get_input_embeddings = getattr(self.module, "get_input_embeddings", None)
+        if callable(get_input_embeddings):
+            input_embedding = get_input_embeddings()
+            is_known_embedding = any(module is input_embedding for _, module in embeddings)
+            if input_embedding is not None and hasattr(input_embedding, "weight") and not is_known_embedding:
+                input_embedding_name = next((name for name, module in named_modules if module is input_embedding),
+                                            None)
+                embeddings.append((input_embedding_name, input_embedding))
+        return embeddings
 
     def _resolve_vocab_parallel_lm_head(self):
         if self._vocab_parallel_lm_head_candidate is not None:
@@ -591,19 +602,7 @@ class AutoTP():
             return
 
         named_modules = list(self.module.named_modules())
-        embeddings = [(name, module) for name, module in named_modules
-                      if isinstance(module, nn.Embedding) and hasattr(module, "weight")]
-        get_input_embeddings = getattr(self.module, "get_input_embeddings", None)
-        if callable(get_input_embeddings):
-            input_embedding = get_input_embeddings()
-            if input_embedding is not None and hasattr(input_embedding, "weight"):
-                input_embedding_name = next(
-                    (name for name, module in named_modules if module is input_embedding),
-                    None,
-                )
-                is_known_embedding = any(module is input_embedding for _, module in embeddings)
-                if input_embedding_name is not None and not is_known_embedding:
-                    embeddings.append((input_embedding_name, input_embedding))
+        embeddings = [(name, module) for name, module in self._input_embeddings() if name is not None]
         if not embeddings:
             self._gathered_column_tie_fallbacks_configured = True
             return

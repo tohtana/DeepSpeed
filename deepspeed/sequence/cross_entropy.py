@@ -119,22 +119,7 @@ def _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_
     return expected_start
 
 
-_vocab_metadata_cache = {}
-
-
 def _resolve_vocab_metadata(local_vocab_size, vocab_start_index, vocab_end_index, tp_group, device):
-    """Collectively validate the vocabulary shard layout once and cache the result.
-
-    The shard geometry is fixed for the lifetime of the layers, so the repeated calls a
-    training loop makes every micro-batch must not re-run the validation collectives or
-    their host synchronizations. Decisions are made from identical all-gathered data, so
-    every TP rank raises together instead of diverging into a collective hang.
-    """
-    key = (tp_group, local_vocab_size, vocab_start_index, vocab_end_index)
-    cached = _vocab_metadata_cache.get(key)
-    if cached is not None:
-        return cached
-
     if vocab_start_index is None:
         tp_world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
         tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
@@ -151,9 +136,7 @@ def _resolve_vocab_metadata(local_vocab_size, vocab_start_index, vocab_end_index
     global_vocab_size = _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_index, tp_group,
                                                      device)
 
-    metadata = (vocab_start_index, vocab_end_index, global_vocab_size)
-    _vocab_metadata_cache[key] = metadata
-    return metadata
+    return vocab_start_index, vocab_end_index, global_vocab_size
 
 
 def vocab_parallel_cross_entropy(vocab_parallel_logits,
@@ -288,14 +271,21 @@ class VocabParallelCausalLMLoss:
         self.vocab_end_index = vocab_end_index
         self.ignore_index = ignore_index
 
-    def __call__(self, logits, labels=None, vocab_size=None, shift_labels=None, num_items_in_batch=None, **kwargs):
+    def __call__(self,
+                 logits,
+                 labels=None,
+                 vocab_size=None,
+                 shift_labels=None,
+                 num_items_in_batch=None,
+                 ignore_index=None,
+                 **kwargs):
         if shift_labels is None:
             if labels is None:
                 raise ValueError("labels or shift_labels must be provided")
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = labels[..., 1:].to(device=logits.device).contiguous()
             logits = logits[..., :-1, :].contiguous()
         else:
-            shift_labels = shift_labels.contiguous()
+            shift_labels = shift_labels.to(device=logits.device).contiguous()
 
         if vocab_size is not None and self.vocab_start_index is not None and self.vocab_end_index is not None:
             # The LM head's shard metadata is the source of truth; a mismatch usually means
@@ -308,13 +298,14 @@ class VocabParallelCausalLMLoss:
                                     f"described vocab_size={vocab_size}; the LM head's weights win")
 
         reduction = "sum" if num_items_in_batch is not None else "mean"
+        effective_ignore_index = self.ignore_index if ignore_index is None else ignore_index
         loss = vocab_parallel_cross_entropy(logits,
                                             shift_labels,
                                             tp_group=self.tp_group,
                                             sp_group=self.sp_group,
                                             vocab_start_index=self.vocab_start_index,
                                             vocab_end_index=self.vocab_end_index,
-                                            ignore_index=self.ignore_index,
+                                            ignore_index=effective_ignore_index,
                                             reduction=reduction)
         if num_items_in_batch is not None:
             denominator = torch.as_tensor(num_items_in_batch, device=loss.device, dtype=loss.dtype)
