@@ -5,6 +5,7 @@
 """Compact critical-path tests for AutoEP."""
 
 import ast
+import gc
 import inspect
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import deepspeed
 import deepspeed.runtime.engine as ds_engine
 import deepspeed.runtime.zero.stage3 as zero_stage3
 import deepspeed.moe.ep_repack as ep_repack
@@ -48,6 +50,7 @@ from deepspeed.moe.ep_router import TokenChoiceTopKRouter
 from deepspeed.runtime.engine import DeepSpeedEngine
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 from deepspeed.utils import groups
+from unit.common import DistributedTest
 from unit.v1.moe.autoep_test_utils import (
     MockMoEBlock,
     MockMoETransformer,
@@ -874,6 +877,47 @@ class TestAutoEPConfig:
     def test_invalid_routed_scaling_factor_rejected(self, value):
         with pytest.raises(ValueError, match="routed_scaling_factor"):
             _resolve_route_scale(AutoEPConfig(enabled=True, routed_scaling_factor=value), None)
+
+
+class TestAutoEPPythonGCLifecycle(DistributedTest):
+    world_size = 1
+
+    def test_disable_during_training_follows_engine_lifecycle(self):
+        config = {
+            "train_micro_batch_size_per_gpu": 1,
+            "expert_parallel": {
+                "enabled": True,
+                "autoep_size": 1,
+                "preset_model": "mixtral",
+                "use_grouped_mm": False,
+                "python_gc_policy": "disable_during_training",
+            },
+        }
+        engines = []
+        gc_was_enabled = gc.isenabled()
+        gc.enable()
+
+        try:
+            first, _, _, _ = deepspeed.initialize(model=MockMoETransformer(num_layers=1), config=config)
+            engines.append(first)
+            assert not gc.isenabled()
+            assert isinstance(first.collect_python_gc(), int)
+            assert not gc.isenabled()
+
+            second, _, _, _ = deepspeed.initialize(model=MockMoETransformer(num_layers=1), config=config)
+            engines.append(second)
+            first.destroy()
+            assert not gc.isenabled()
+
+            second.destroy()
+            assert gc.isenabled()
+        finally:
+            for engine in engines:
+                engine.destroy()
+            if gc_was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
 
 
 class TestRoutingAndLayerSemantics:
