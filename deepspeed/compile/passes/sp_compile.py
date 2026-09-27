@@ -161,6 +161,7 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
         return
 
     causal_losses = []
+    direct_losses = []
     for loss_node in label_loss_nodes:
         weight = loss_node.kwargs.get("weight", loss_node.args[2] if len(loss_node.args) > 2 else None)
         if weight is not None:
@@ -174,6 +175,7 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
         worklist = [target_node]
         visited = set()
         shifted_label_node = None
+        incompatible_label_node = None
         while worklist:
             current = worklist.pop(0)
             if current in visited or current is label_ids_node:
@@ -184,14 +186,25 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
                 current_seq_len = current_meta.shape[seq_dim]
                 if str(current_seq_len) == str(seq_len):
                     shifted_label_node = current
-                    break
+                else:
+                    incompatible_label_node = current
+                break
             worklist.extend(current.all_input_nodes)
 
         if shifted_label_node is None:
-            shard_tensor_node(gm, label_ids_node, seq_dim)
-            return
+            if incompatible_label_node is not None:
+                raise RuntimeError("AutoSP does not support causal labels whose shifted sequence length differs "
+                                   "from the input sequence length; pad the shifted labels to the input length")
+            direct_losses.append(loss_node)
+            continue
 
         causal_losses.append((loss_node, shifted_label_node, ignore_index))
+
+    if direct_losses:
+        if causal_losses:
+            raise RuntimeError("AutoSP does not support mixing direct and shifted label losses in one graph")
+        shard_tensor_node(gm, label_ids_node, seq_dim)
+        return
 
     sharded_candidates = {}
     for loss_node, shifted_label_node, ignore_index in causal_losses:

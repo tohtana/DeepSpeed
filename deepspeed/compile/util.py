@@ -546,7 +546,7 @@ def create_shard_offsets(gm: GraphModule, s0_node: Node) -> Tuple[Node, Node]:
         divisible_node = gm.graph.call_function(operator.eq, args=(remainder_node, 0))
     with gm.graph.inserting_after(divisible_node):
         assert_node = gm.graph.call_function(
-            torch._assert,
+            torch.ops.aten._assert_scalar.default,
             args=(divisible_node, f"AutoSP sequence length must be divisible by sequence_parallel_size={sp_size}"),
         )
     with gm.graph.inserting_after(assert_node):

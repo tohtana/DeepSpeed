@@ -235,9 +235,18 @@ def compare_sp_loss(self, config, sp_size, iterations=3):
                                    attention_mask=autosp_msk)
         autosp_loss = autosp_out.loss
 
-        ulysses_engine.backward(weighted_ul_loss)
-        ulysses_engine.step()
+        ulysses_engine.backward(weighted_ul_loss * sp_size)
         autosp_engine.backward(autosp_loss)
+
+        for ul_param, autosp_param in zip(ulysses_engine.parameters(), autosp_engine.parameters()):
+            if ul_param.grad is not None and autosp_param.grad is not None:
+                allclose_on_all_ranks(autosp_param.grad,
+                                      ul_param.grad,
+                                      "AutoSP and Ulysses gradients are not close.",
+                                      rtol=RTOL,
+                                      atol=ATOL)
+
+        ulysses_engine.step()
         autosp_engine.step()
 
     allclose_on_all_ranks(autosp_loss, ul_loss, "AutoSP and Ulysses losses are not close.", rtol=RTOL, atol=ATOL)

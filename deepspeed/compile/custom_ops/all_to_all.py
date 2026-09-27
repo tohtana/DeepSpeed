@@ -144,7 +144,9 @@ def _aggregate_loss_backward_setup(ctx, inputs, output):
 def _aggregate_loss_backward(ctx, grad_loss, grad_weight):
     del grad_weight
     (weight, ) = ctx.saved_tensors
-    return grad_loss * weight, None
+    # DeepSpeed averages parameter gradients across the world group. Compensate for
+    # the SP ranks here so that the engine averages only the independent DP replicas.
+    return grad_loss * weight * sp_size(), None
 
 
 torch.library.register_autograd("autosp::aggregate_loss",

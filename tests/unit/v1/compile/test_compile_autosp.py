@@ -46,14 +46,26 @@ def _create_sdpa_graph(seq_len, num_heads=2, mask_rank=None):
     return GraphModule({}, graph)
 
 
-def _create_causal_loss_graph(seq_len=16, ignore_index=-100, shift_labels=True):
+def _create_causal_loss_graph(seq_len=16,
+                              ignore_index=-100,
+                              shift_labels=True,
+                              conventional_shift=False,
+                              mixed_loss=False):
 
     class CausalLoss(torch.nn.Module):
 
         def forward(self, input_ids, labels):
             logits = F.one_hot(input_ids, num_classes=32).float()
-            targets = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous() if shift_labels else labels
-            return F.cross_entropy(logits.view(-1, 32), targets.view(-1), ignore_index=ignore_index)
+            full_logits = logits
+            if conventional_shift:
+                logits = logits[..., :-1, :].contiguous()
+                targets = labels[..., 1:].contiguous()
+            else:
+                targets = F.pad(labels, (0, 1), value=ignore_index)[..., 1:].contiguous() if shift_labels else labels
+            loss = F.cross_entropy(logits.view(-1, 32), targets.view(-1), ignore_index=ignore_index)
+            if mixed_loss:
+                loss = loss + F.cross_entropy(full_logits.view(-1, 32), labels.view(-1), ignore_index=ignore_index)
+            return loss
 
     torch._dynamo.reset()
     input_ids = torch.randint(0, 32, (2, seq_len))
@@ -233,7 +245,7 @@ class TestShardOffsetsCompile:
         # create_shard_offsets emits: chunk = seq // sp_size; start = rank * chunk; end = start + chunk.
         # Verify the three-node chain has the right operators and wiring.
         chunk_size_node = start_node.args[1]  # start = rank * chunk  →  chunk is arg[1]
-        assert_node = next(node for node in gm.graph.nodes if node.target == torch._assert)
+        assert_node = next(node for node in gm.graph.nodes if node.target == torch.ops.aten._assert_scalar.default)
         divisible_node = assert_node.args[0]
         remainder_node = divisible_node.args[0]
 
@@ -434,7 +446,7 @@ class TestAutoSPValidation:
 
         input_ids = torch.ones(15, 2, dtype=torch.long)
         labels = input_ids.clone()
-        with pytest.raises(AssertionError, match="sequence length must be divisible"):
+        with pytest.raises(RuntimeError, match="sequence length must be divisible"):
             gm(15, 2, input_ids, 15, labels)
 
     def test_rejects_changed_mesh(self):
@@ -470,6 +482,22 @@ class TestAutoSPValidation:
         assert global_loss.item() == 0
         assert weight.item() == 0
         assert loss.grad.item() == 0
+
+    def test_loss_backward_compensates_for_engine_sp_average(self):
+        import deepspeed.comm as _dist
+        from deepspeed.compile.custom_ops import sp_dp_registry
+        from deepspeed.compile.custom_ops.all_to_all import aggregate_loss
+
+        loss = torch.tensor(3.0, requires_grad=True)
+        valid_tokens = torch.tensor(1)
+        registry = {0: object(), "SP_SIZE": 2, "DP_SIZE": 1, "is_reg": True}
+        with patch.object(sp_dp_registry, "GROUP_REGISTRY", registry), \
+             patch.object(_dist, "get_rank", return_value=0), \
+             patch.object(_dist, "all_reduce"):
+            global_loss, _ = aggregate_loss(loss, valid_tokens)
+            global_loss.backward()
+
+        assert loss.grad.item() == 2
 
     def test_rejects_non_divisible_attention_heads(self):
         from deepspeed.compile.custom_ops import sp_dp_registry
@@ -523,6 +551,26 @@ class TestAutoSPValidation:
         assert not raw_label_slices
         assert any(node.target == torch.ops.autosp.aggregate_loss.default for node in gm.graph.nodes)
         gm.graph.lint()
+
+    @pytest.mark.sequential
+    def test_rejects_unpadded_causal_shift(self):
+        from deepspeed.compile.custom_ops import sp_dp_registry
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+
+        gm = _create_causal_loss_graph(seq_len=64, conventional_shift=True)
+        with patch.object(sp_dp_registry, "sp_size", return_value=_SP_SIZE):
+            with pytest.raises(RuntimeError, match="shifted sequence length differs"):
+                pass_shard_label_ids(gm, ())
+
+    @pytest.mark.sequential
+    def test_rejects_mixed_direct_and_shifted_label_losses(self):
+        from deepspeed.compile.custom_ops import sp_dp_registry
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+
+        gm = _create_causal_loss_graph(seq_len=64, mixed_loss=True)
+        with patch.object(sp_dp_registry, "sp_size", return_value=_SP_SIZE):
+            with pytest.raises(RuntimeError, match="mixing direct and shifted label losses"):
+                pass_shard_label_ids(gm, ())
 
     @pytest.mark.sequential
     def test_shards_direct_cross_entropy_labels(self):
