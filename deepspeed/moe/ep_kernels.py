@@ -286,11 +286,16 @@ _GATHER_ROWS = 4
 def gather_rows(src: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     """``out[r] = src[index[r]]``, or a zero row where ``index[r]`` is outside ``[0, src.shape[0])``.
 
-    ``generate_permute_indices`` marks padding slots with -1, so this reads a
-    permuted, alignment-padded buffer in one pass, without first appending a
-    zero row to ``src``.
+    The forward kernel of :func:`permute_rows`. ``generate_permute_indices``
+    marks padding slots with -1, so this reads a permuted, alignment-padded
+    buffer in one pass, without first appending a zero row to ``src``. ``src``
+    is a 2-D CUDA tensor and ``index`` a 1-D integer tensor on its device. The
+    kernel is invisible to autograd; :func:`permute_rows` is the differentiable
+    reorder.
     """
+    # The kernel addresses both by linear offset.
     src = src.contiguous()
+    index = index.contiguous()
     out = torch.empty((index.numel(), src.shape[1]), dtype=src.dtype, device=src.device)
     if out.numel() == 0:
         return out
@@ -311,9 +316,13 @@ def gather_rows(src: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
 def inverse_permutation(permuted_indices: torch.Tensor, num_rows: int) -> torch.Tensor:
     """For each of ``num_rows`` original rows, the padded position ``permuted_indices`` sent it to.
 
-    Every original row appears exactly once among the valid entries. Padding
-    entries are scattered to distinct slots past ``num_rows`` and dropped, so
-    the scatter never writes one location twice.
+    ``permuted_indices`` must hold each of ``0 .. num_rows - 1`` exactly once,
+    and every other entry must be padding: negative, or at least ``num_rows``.
+    ``generate_permute_indices`` produces such indices when the counts sum to
+    ``num_rows``; this is not checked. Padding entries are scattered to distinct
+    slots past ``num_rows`` and dropped, so every location is written once. A
+    missing row would leave its entry uninitialized, and a repeated one would
+    write a location twice.
     """
     positions = torch.arange(permuted_indices.numel(), device=permuted_indices.device, dtype=torch.int64)
     indices = permuted_indices.to(torch.int64)
@@ -357,19 +366,32 @@ class _UnpermuteRows(torch.autograd.Function):
 def permute_rows(rows: torch.Tensor, permuted_indices: torch.Tensor) -> torch.Tensor:
     """``rows`` in the padded order of ``permuted_indices``, with zero rows at padding slots.
 
-    Equal, bit for bit and in both directions, to appending a zero row to
-    ``rows`` and indexing it with ``permuted_indices``, without copying
-    ``rows`` or accumulating its gradient.
+    This is not a general gather: ``permuted_indices`` must be a complete
+    one-to-one permutation of the rows plus padding, as
+    :func:`inverse_permutation` describes. Each row then lands in exactly one
+    position, so the backward gathers each row's gradient from that position
+    instead of accumulating it, and is itself differentiable (double backward).
+
+    Outputs and gradients equal, as compared by ``torch.equal``, those of
+    appending a zero row to ``rows`` and indexing it with ``permuted_indices``,
+    without copying ``rows`` or accumulating its gradient. ``torch.equal`` does
+    not distinguish ``+0.0`` from ``-0.0``.
     """
     return _PermuteRows.apply(rows, permuted_indices, inverse_permutation(permuted_indices, rows.shape[0]))
 
 
 def unpermute_rows(rows: torch.Tensor, permuted_indices: torch.Tensor, num_rows: int) -> torch.Tensor:
-    """Invert :func:`permute_rows`: the ``num_rows`` original rows back from the padded order."""
+    """Invert :func:`permute_rows`: the ``num_rows`` original rows back from the padded order.
+
+    Padding rows are never read. ``permuted_indices`` must meet the requirement
+    of :func:`permute_rows`, and the results equal, under ``torch.equal``, those
+    of scattering ``rows`` into a zero-filled buffer.
+    """
     return _UnpermuteRows.apply(rows, permuted_indices, inverse_permutation(permuted_indices, num_rows))
 
 
 def permute_rows_supported(rows: torch.Tensor) -> bool:
+    """Whether :func:`permute_rows` and :func:`unpermute_rows` can take ``rows``: 2-D, on CUDA, with Triton."""
     return _TRITON_AVAILABLE and rows.device.type == "cuda" and rows.dim() == 2
 
 

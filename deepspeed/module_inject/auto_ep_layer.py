@@ -353,6 +353,9 @@ def permute_by_local_expert(
     """Reorder tokens so they are grouped contiguously by local expert ID.
 
     Uses TorchTitan's Triton kernel for permutation index generation.
+    ``local_counts`` must account for every row of ``tokens`` exactly once,
+    i.e. sum to ``tokens.shape[0]``. On CUDA the reorder and its inverse are
+    gathers that rely on this; see :func:`deepspeed.moe.ep_kernels.permute_rows`.
 
     Returns:
         tokens_permuted: [N_padded, H] (alignment-padded)

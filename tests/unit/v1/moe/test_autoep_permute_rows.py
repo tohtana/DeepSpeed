@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
-"""The gather-based AutoEP expert reorder against the zero-row-and-index reference, bit for bit."""
+"""The gather-based AutoEP expert reorder against the zero-row-and-index reference, compared with torch.equal."""
 
 import pytest
 import torch
@@ -123,9 +123,13 @@ def test_no_tokens_at_all():
 
 
 @gpu
-def test_gather_rows_treats_both_padding_encodings_as_zero():
+@pytest.mark.parametrize("strided_index", [False, True], ids=["contiguous-index", "strided-index"])
+def test_gather_rows_treats_both_padding_encodings_as_zero(strided_index):
     src = torch.arange(12, dtype=torch.float32).view(4, 3).to(_device())
     index = torch.tensor([2, -1, 4, 0], dtype=torch.int32).to(_device())
+    if strided_index:
+        # The same entries at every other position; reading the ones in between would pick row 1.
+        index = torch.tensor([2, 1, -1, 1, 4, 1, 0, 1], dtype=torch.int32).to(_device())[::2]
     out = ep_kernels.gather_rows(src, index)
     assert torch.equal(out.cpu(), torch.tensor([[6., 7., 8.], [0., 0., 0.], [0., 0., 0.], [0., 1., 2.]]))
 
