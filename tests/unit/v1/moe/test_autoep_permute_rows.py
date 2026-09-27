@@ -2,21 +2,33 @@
 # DeepSpeed Team
 """The gather-based AutoEP expert reorder against the zero-row-and-index reference, compared with torch.equal."""
 
+import importlib.util
 import pytest
 import torch
 
-from deepspeed.accelerator import get_accelerator
-from deepspeed.module_inject.auto_ep_layer import permute_by_local_expert, unpermute_by_local_expert
-from deepspeed.moe import ep_kernels
-
 
 def _device():
+    from deepspeed.accelerator import get_accelerator
     return get_accelerator().device_name()
 
 
 def _cuda_triton():
-    return get_accelerator().device_name() == "cuda" and get_accelerator().is_available(
-    ) and ep_kernels._TRITON_AVAILABLE
+    return torch.version.cuda is not None and importlib.util.find_spec("triton") is not None
+
+
+def _ep_kernels():
+    from deepspeed.moe import ep_kernels
+    return ep_kernels
+
+
+def permute_by_local_expert(*args, **kwargs):
+    from deepspeed.module_inject.auto_ep_layer import permute_by_local_expert as permute
+    return permute(*args, **kwargs)
+
+
+def unpermute_by_local_expert(*args, **kwargs):
+    from deepspeed.module_inject.auto_ep_layer import unpermute_by_local_expert as unpermute
+    return unpermute(*args, **kwargs)
 
 
 gpu = pytest.mark.skipif(not _cuda_triton(), reason="the gather-based reorder needs CUDA and Triton")
@@ -165,14 +177,14 @@ def test_gather_rows_treats_both_padding_encodings_as_zero(strided_index):
     if strided_index:
         # The same entries at every other position; reading the ones in between would pick row 1.
         index = torch.tensor([2, 1, -1, 1, 4, 1, 0, 1], dtype=torch.int32).to(_device())[::2]
-    out = ep_kernels.gather_rows(src, index)
+    out = _ep_kernels().gather_rows(src, index)
     assert torch.equal(out.cpu(), torch.tensor([[6., 7., 8.], [0., 0., 0.], [0., 0., 0.], [0., 1., 2.]]))
 
 
 def test_host_tensors_keep_the_reference_path():
     counts = torch.tensor([[3, 0], [2, 1]], dtype=torch.int32)
     tokens = torch.randn(6, 5)
-    assert not ep_kernels.permute_rows_supported(tokens)
+    assert not _ep_kernels().permute_rows_supported(tokens)
     permuted, permuted_indices, _, n_tokens = permute_by_local_expert(tokens, counts)
     assert torch.equal(permuted, _reference_permute(tokens, permuted_indices))
     assert torch.equal(unpermute_by_local_expert(permuted, permuted_indices, n_tokens), tokens)
