@@ -79,15 +79,50 @@ def test_permute_and_unpermute_match_the_reference(dtype, hidden, ep_degree, num
 
 
 @gpu
-def test_double_backward_matches_the_reference():
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_strided_rows_and_upstream_gradients(dtype):
+    counts = _counts(4, 8, seed=13, empty_experts=(6, ))
+    n_tokens = int(counts.sum().item())
+    hidden = 96
+    generator = torch.Generator().manual_seed(9)
+    # Each function sees every row through a view that skips half the buffer's columns, and the upstream gradients
+    # are column-major, as a transposed product gives them.
+    tokens = torch.randn(n_tokens, 2 * hidden, generator=generator).to(_device()).to(dtype)
+    permuted, permuted_indices, _, _ = permute_by_local_expert(tokens[:, :hidden], counts)
+    upstream = torch.randn(hidden, permuted.shape[0], generator=generator).to(_device()).to(dtype).t()
+
+    actual = _grads(lambda leaf: permute_by_local_expert(leaf[:, :hidden], counts)[0], tokens, upstream)
+    expected = _grads(lambda leaf: _reference_permute(leaf[:, :hidden], permuted_indices), tokens, upstream)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a, e) and a.stride() == e.stride()
+
+    expert_output = torch.randn(permuted.shape[0], 2 * hidden, generator=generator).to(_device()).to(dtype)
+    back_upstream = torch.randn(hidden, n_tokens, generator=generator).to(_device()).to(dtype).t()
+    actual = _grads(lambda leaf: unpermute_by_local_expert(leaf[:, :hidden], permuted_indices, n_tokens),
+                    expert_output, back_upstream)
+    expected = _grads(lambda leaf: _reference_unpermute(leaf[:, :hidden], permuted_indices, n_tokens), expert_output,
+                      back_upstream)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a, e) and a.stride() == e.stride()
+
+
+@gpu
+@pytest.mark.parametrize("direction", ["permute", "unpermute"])
+def test_double_backward_matches_the_reference(direction):
     counts = _counts(4, 8, seed=11, empty_experts=(3, ))
     n_tokens = int(counts.sum().item())
     tokens = torch.randn(n_tokens, 48, dtype=torch.float32).to(_device())
-    _, permuted_indices, _, _ = permute_by_local_expert(tokens, counts)
+    permuted, permuted_indices, _, _ = permute_by_local_expert(tokens, counts)
+    inputs = tokens
+    functions = (lambda leaf: permute_by_local_expert(leaf, counts)[0],
+                 lambda leaf: _reference_permute(leaf, permuted_indices))
+    if direction == "unpermute":
+        inputs = torch.randn(permuted.shape, generator=torch.Generator().manual_seed(4)).to(_device())
+        functions = (lambda leaf: unpermute_by_local_expert(leaf, permuted_indices, n_tokens),
+                     lambda leaf: _reference_unpermute(leaf, permuted_indices, n_tokens))
     results = []
-    for function in (lambda leaf: permute_by_local_expert(leaf, counts)[0],
-                     lambda leaf: _reference_permute(leaf, permuted_indices)):
-        leaf = tokens.clone().requires_grad_(True)
+    for function in functions:
+        leaf = inputs.clone().requires_grad_(True)
         output = function(leaf)
         upstream = torch.randn(output.shape,
                                generator=torch.Generator().manual_seed(5)).to(_device()).requires_grad_(True)
