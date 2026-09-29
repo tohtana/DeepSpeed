@@ -5,6 +5,7 @@
 import copy
 import functools
 import importlib
+import io
 import types
 
 import pytest
@@ -373,6 +374,33 @@ def test_replace_rms_norm_leaves_norms_wider_than_the_kernels_alone():
     rms_norm_class = _hf_class(QWEN3_MOE_RMS_NORM)
     assert fused_rms_norm.replace_rms_norm(rms_norm_class(2048)) == 1
     assert fused_rms_norm.replace_rms_norm(rms_norm_class(2049)) == 0
+
+
+def test_replace_rms_norm_survives_data_parallel_replication_and_serialization():
+    rms_norm_class = _hf_class(QWEN3_MOE_RMS_NORM)
+    norm = rms_norm_class(128).to(torch.bfloat16)
+    model = torch.nn.Sequential(norm)
+    hidden = torch.randn((4, 128)).to(torch.bfloat16)
+    expected = model(hidden)
+    state_dict_keys = tuple(model.state_dict())
+
+    assert fused_rms_norm.replace_rms_norm(model) == 1
+    replica = norm._replicate_for_data_parallel()
+    assert replica.forward.__self__ is replica
+
+    serialized = io.BytesIO()
+    torch.save(model, serialized)
+    serialized.seek(0)
+    loaded = torch.load(serialized, weights_only=False)
+    assert loaded[0].forward.__self__ is loaded[0]
+    assert torch.equal(loaded(hidden), expected)
+    assert tuple(loaded.state_dict()) == state_dict_keys
+
+    # The class-level dispatcher must leave other instances eligible for their own explicit opt-in.
+    sibling = rms_norm_class(128)
+    sibling_expected = _hf_rms_norm(hidden, sibling.weight, sibling.variance_epsilon)
+    assert torch.equal(sibling(hidden), sibling_expected)
+    assert fused_rms_norm.replace_rms_norm(sibling) == 1
 
 
 @pytest.mark.skipif(not _fused_engine_available(), reason="fused RMSNorm needs CUDA and Triton")
