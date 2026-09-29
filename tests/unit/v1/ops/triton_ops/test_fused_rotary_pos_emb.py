@@ -132,6 +132,31 @@ def test_non_contiguous_incoming_gradients():
         _assert_equal(a, e, name)
 
 
+@pytest.mark.skipif(get_accelerator().device_count() < 2, reason="requires a non-current CUDA device")
+def test_non_current_device():
+    accelerator = get_accelerator()
+    current_device = accelerator.current_device()
+    target_device = (current_device + 1) % accelerator.device_count()
+    generator = torch.Generator().manual_seed(8663)
+    try:
+        accelerator.set_device(target_device)
+        dtype = torch.bfloat16
+        q = _projection_layout(1, 17, 4, 128, dtype, generator)
+        k = _projection_layout(1, 17, 2, 128, dtype, generator)
+        cos, sin = _tables(1, 17, 128, dtype)
+        grad_q = torch.randn(q.shape, generator=generator).to(_device(), dtype)
+        grad_k = torch.randn(k.shape, generator=generator).to(_device(), dtype)
+    finally:
+        accelerator.set_device(current_device)
+
+    assert accelerator.current_device() == current_device
+    expected = _run(eager_rope, q, k, cos, sin, grad_q, grad_k)
+    actual = _run(fused_rope.fused_apply_rotary_pos_emb, q, k, cos, sin, grad_q, grad_k)
+    for name, a, e in zip(("q_embed", "k_embed", "q.grad", "k.grad"), actual, expected):
+        _assert_equal(a, e, name)
+    assert accelerator.current_device() == current_device
+
+
 def test_unused_key_output_leaves_no_key_gradient():
     generator = torch.Generator().manual_seed(5)
     dtype = torch.bfloat16

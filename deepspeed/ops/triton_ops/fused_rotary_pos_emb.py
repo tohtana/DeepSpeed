@@ -170,29 +170,30 @@ def _launch(x, cos, sin, out, backward):
     if x.numel() == 0:
         return out
     grid = (triton.cdiv(seq_len, _BLOCK_S), batch, triton.cdiv(heads, _HEADS_PER_PROGRAM))
-    _rotary_kernel[grid](
-        x,
-        cos,
-        sin,
-        out,
-        heads,
-        seq_len,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        cos.stride(0) if cos.shape[0] > 1 else 0,
-        cos.stride(1),
-        HALF=head_dim // 2,
-        BLOCK_HALF=max(16, triton.next_power_of_2(head_dim // 2)),
-        BLOCK_S=_BLOCK_S,
-        HEADS_PER_PROGRAM=_HEADS_PER_PROGRAM,
-        BACKWARD=backward,
-        # Contracting a product and a sum into one FMA would skip the product's rounding, which eager performs.
-        enable_fp_fusion=False,
-    )
+    with torch.cuda.device(x.device):  #ignore-cuda
+        _rotary_kernel[grid](
+            x,
+            cos,
+            sin,
+            out,
+            heads,
+            seq_len,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            cos.stride(0) if cos.shape[0] > 1 else 0,
+            cos.stride(1),
+            HALF=head_dim // 2,
+            BLOCK_HALF=max(16, triton.next_power_of_2(head_dim // 2)),
+            BLOCK_S=_BLOCK_S,
+            HEADS_PER_PROGRAM=_HEADS_PER_PROGRAM,
+            BACKWARD=backward,
+            # Contracting a product and a sum into one FMA would skip the product's rounding, which eager performs.
+            enable_fp_fusion=False,
+        )
     return out
 
 
