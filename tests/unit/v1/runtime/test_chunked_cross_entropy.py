@@ -1,4 +1,6 @@
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
+
 # DeepSpeed Team
 """The chunked causal-LM loss must equal Hugging Face's ForCausalLMLoss, in value and in gradient."""
 
@@ -150,6 +152,37 @@ def test_an_out_of_range_target_raises_on_cpu():
     for bad in (8, -3):
         with pytest.raises(RuntimeError, match="out of range"):
             chunked_cross_entropy(logits, torch.tensor([1, bad, 2, 3]), backend="torch")
+
+
+@pytest.mark.parametrize("bad_block_rows", [0, -1])
+def test_non_positive_block_rows_raise(bad_block_rows):
+    logits = torch.randn(4, 8)
+    target = torch.tensor([1, 2, 3, 4])
+    with pytest.raises(ValueError, match="block_rows must be positive"):
+        chunked_cross_entropy(logits, target, block_rows=bad_block_rows, backend="torch")
+
+
+@pytest.mark.parametrize("target_dtype", [torch.float32, torch.bool, torch.int32])
+def test_rejects_non_class_index_target_dtypes(target_dtype):
+    logits = torch.randn(4, 8)
+    target = torch.tensor([1, 2, 3, 4], dtype=target_dtype)
+    with pytest.raises(RuntimeError, match="expected target dtype to be Long or Byte"):
+        chunked_cross_entropy(logits, target, backend="torch")
+
+
+def test_supports_the_pytorch_2_0_one_argument_assert_async(monkeypatch):
+    original_assert_async = torch._assert_async
+    calls = []
+
+    def one_argument_assert_async(condition):
+        calls.append(condition)
+        return original_assert_async(condition)
+
+    monkeypatch.setattr(torch, "_assert_async", one_argument_assert_async)
+    logits = torch.randn(4, 8)
+    target = torch.tensor([1, 2, 3, 4])
+    loss = chunked_cross_entropy(logits, target, backend="torch")
+    assert torch.isfinite(loss) and len(calls) == 1
 
 
 @pytest.mark.skipif(not _TRITON_ON_CUDA, reason="the Triton backend needs CUDA and Triton")

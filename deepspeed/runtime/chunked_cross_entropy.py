@@ -1,4 +1,6 @@
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
+
 # DeepSpeed Team
 """Causal-LM cross entropy that never materializes a full-vocabulary FP32 tensor.
 
@@ -95,6 +97,16 @@ def _refuse_create_graph():
     if torch.is_grad_enabled():
         raise RuntimeError("The chunked cross entropy has no second derivative; backward with create_graph=True is "
                            "not supported")
+
+
+def _assert_async_with_message(condition: torch.Tensor, message: str) -> None:
+    """Use the message overload when available while retaining PyTorch 2.0 support."""
+    try:
+        torch._assert_async(condition, message)
+    except TypeError as error:
+        if "positional argument" not in str(error):
+            raise
+        torch._assert_async(condition)
 
 
 class _TritonCrossEntropy(torch.autograd.Function):
@@ -198,6 +210,10 @@ def chunked_cross_entropy(logits: torch.Tensor,
                          f"{tuple(target.shape)}")
     if reduction not in ("none", "sum", "mean"):
         raise ValueError(f"Unsupported reduction: {reduction!r}")
+    if target.dtype not in (torch.long, torch.uint8):
+        raise RuntimeError(f"expected target dtype to be Long or Byte, but got {target.dtype}")
+    if block_rows is not None and block_rows <= 0:
+        raise ValueError(f"block_rows must be positive, got {block_rows}")
     # The Triton kernels index both tensors by row with unit stride.
     target = target.to(device=logits.device, dtype=torch.long).contiguous()
     logits = logits.contiguous()
@@ -205,7 +221,7 @@ def chunked_cross_entropy(logits: torch.Tensor,
     # silently read another row. Asserting on the device fails the way cross_entropy does, without the host
     # synchronization a Python-side check would add to every step.
     out_of_range = (target != ignore_index) & ((target < 0) | (target >= logits.shape[-1]))
-    torch._assert_async(~out_of_range.any(), f"Target is out of range for vocabulary size {logits.shape[-1]}")
+    _assert_async_with_message(~out_of_range.any(), f"Target is out of range for vocabulary size {logits.shape[-1]}")
     if _resolve_backend(backend, logits) == "triton":
         loss = _TritonCrossEntropy.apply(logits, target, ignore_index)
     else:
