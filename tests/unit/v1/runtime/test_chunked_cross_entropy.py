@@ -150,7 +150,7 @@ def test_a_strided_target_is_read_by_row(backend, device):
 def test_an_out_of_range_target_raises_on_cpu():
     logits = torch.randn(4, 8)
     for bad in (8, -3):
-        with pytest.raises(RuntimeError, match="out of range"):
+        with pytest.raises(RuntimeError):
             chunked_cross_entropy(logits, torch.tensor([1, bad, 2, 3]), backend="torch")
 
 
@@ -182,7 +182,10 @@ def test_supports_the_pytorch_2_0_one_argument_assert_async(monkeypatch):
     logits = torch.randn(4, 8)
     target = torch.tensor([1, 2, 3, 4])
     loss = chunked_cross_entropy(logits, target, backend="torch")
-    assert torch.isfinite(loss) and len(calls) == 1
+    assert torch.isfinite(loss)
+    with pytest.raises(RuntimeError):
+        chunked_cross_entropy(logits, torch.tensor([1, 8, 2, 3]), backend="torch")
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(not _TRITON_ON_CUDA, reason="the Triton backend needs CUDA and Triton")
