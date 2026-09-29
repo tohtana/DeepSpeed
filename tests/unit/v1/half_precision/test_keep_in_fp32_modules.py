@@ -1,3 +1,4 @@
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -35,6 +36,16 @@ class ToyModel(torch.nn.Module):
         return ((self.linear(x) * self.scale + self.router_bias)**2).mean()
 
 
+class WrappedToyModel(torch.nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.child = ToyModel()
+
+    def forward(self, x):
+        return self.child(x)
+
+
 def _config(stage, keep="auto", buffer_dtype=None):
     data_types = {"keep_in_fp32_modules": keep}
     if buffer_dtype is not None:
@@ -69,6 +80,11 @@ class TestKeepInFp32Pattern:
         model._keep_in_fp32_modules = ["scale"]
         assert not keep_in_fp32_pattern(model, "auto", torch.bfloat16).search("scale")
         assert keep_in_fp32_pattern(model, "auto", torch.float16).search("scale")
+
+    def test_auto_uses_lists_from_nested_modules(self):
+        pattern = keep_in_fp32_pattern(WrappedToyModel(), "auto", torch.bfloat16)
+        assert pattern.search("child.router_bias")
+        assert not pattern.search("child.scale")
 
     def test_explicit_list_and_glob(self):
         pattern = keep_in_fp32_pattern(ToyModel(), ["layers.*.gate.bias"], torch.bfloat16)
@@ -124,6 +140,12 @@ class TestZeroInitKeepsBuffersFp32(DistributedTest):
         assert engine.module.router_bias.dtype == torch.float32
         assert torch.equal(engine.module.router_bias.cpu(), EXACT_VALUES)
 
+    def test_existing_wrapped_module_uses_child_list(self):
+        model = WrappedToyModel().bfloat16()
+        deepspeed.zero.Init(module=model, config_dict_or_path=_config(3))
+        assert model.child.router_bias.dtype == torch.float32
+        assert model.child.scale.dtype == torch.bfloat16
+
 
 @pytest.mark.skipif(torch.bfloat16 not in get_accelerator().supported_dtypes(), reason="bf16 not supported")
 @pytest.mark.parametrize("zero_stage", [0, 3])
@@ -154,3 +176,13 @@ class TestEngineKeepsBuffersFp32(DistributedTest):
                                                model=model,
                                                model_parameters=model.parameters())
         assert engine.module.router_bias.dtype == torch.bfloat16
+
+    def test_wrapped_model_uses_child_list(self, zero_stage):
+        model = WrappedToyModel()
+        model.child.router_bias.copy_(EXACT_VALUES)
+        engine, _, _, _ = deepspeed.initialize(config=_config(zero_stage, buffer_dtype="bf16"),
+                                               model=model,
+                                               model_parameters=model.parameters())
+        assert engine.module.child.router_bias.dtype == torch.float32
+        assert torch.equal(engine.module.child.router_bias.cpu(), EXACT_VALUES)
+        assert engine.module.child.scale.dtype == torch.bfloat16

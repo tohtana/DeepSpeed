@@ -1,3 +1,4 @@
+# Copyright (c) DeepSpeed Team.
 # SPDX-License-Identifier: Apache-2.0
 
 # DeepSpeed Team
@@ -39,9 +40,14 @@ def keep_in_fp32_pattern(module, setting, dtype):
     if dtype not in (torch.float16, torch.bfloat16):
         return None
     if setting is None or setting == KEEP_IN_FP32_AUTO:
-        names = set(getattr(module, "_keep_in_fp32_modules_strict", None) or [])
-        if dtype == torch.float16:
-            names |= set(getattr(module, "_keep_in_fp32_modules", None) or [])
+        names = set()
+        for module_name, child in module.named_modules():
+            child_names = set(getattr(child, "_keep_in_fp32_modules_strict", None) or [])
+            if dtype == torch.float16:
+                child_names |= set(getattr(child, "_keep_in_fp32_modules", None) or [])
+            if module_name:
+                child_names = {f"{module_name}.{name}" for name in child_names}
+            names |= child_names
     else:
         names = set(setting)
     if not names:
