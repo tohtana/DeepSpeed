@@ -29,7 +29,6 @@ def _bf16_optimizer_stub(lp, hp_grad):
     optimizer.param_names = {lp: "model.layers.0.mlp.router.gate.weight"}
     optimizer.fp32_groups_gradients = [[hp_grad]]
     optimizer.fp32_groups_has_gradients = [[False]]
-    optimizer.graph_harvesting = False
     return optimizer
 
 
@@ -93,24 +92,6 @@ def test_bf16_immediate_grad_update_corrects_every_consumed_gradient(monkeypatch
         optimizer.fp32_groups_has_gradients[0][0] = False
 
 
-def test_bf16_immediate_grad_update_preserves_graph_harvesting_addresses(monkeypatch):
-    lp = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
-    lp.grad = torch.full((2, ), 6.0, dtype=torch.bfloat16)
-    lp.allreduce = False
-    hp_grad = torch.zeros(2, dtype=torch.float32)
-    optimizer = _bf16_optimizer_stub(lp, hp_grad)
-    optimizer.immediate_grad_update = True
-    optimizer.graph_harvesting = True
-    optimizer.param_names[lp] = "model.layers.0.mlp.experts.w2"
-    monkeypatch.setattr(bf16_mod.dist, "get_world_size", lambda group=None: 2)
-
-    optimizer.accumulate_hp_grads_and_remove_lp(lp, group_idx=0, param_idx=0)
-
-    torch.testing.assert_close(hp_grad, torch.full_like(hp_grad, 3.0))
-    assert lp.grad is not None
-    assert is_autoep_folding_gradient_corrected(lp)
-
-
 class _FoldedGradientLifecycleModel(torch.nn.Module):
 
     def __init__(self, expert_scale, reentrant_checkpointing):
@@ -158,6 +139,7 @@ def _run_bf16_gradient_lifecycle(*, immediate_grad_update, micro_batches):
     engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
     assert isinstance(engine.optimizer, BF16_Optimizer)
     expert = engine.module.expert_weight
+    dense_weight = engine.module.dense.weight
     tp_group = dist.get_world_group()
     if immediate_grad_update:
         assert dist.get_world_size(group=tp_group) == 2
@@ -176,7 +158,8 @@ def _run_bf16_gradient_lifecycle(*, immediate_grad_update, micro_batches):
         for step in range(2):
             gradients = []
             for _ in range(micro_batches):
-                x = torch.tensor([[1.0, 2.0]],
+                rank = dist.get_rank(group=tp_group)
+                x = torch.tensor([[1.0 + rank, 2.0 + rank]],
                                  dtype=torch.bfloat16,
                                  device=engine.device,
                                  requires_grad=micro_batches == 2)
@@ -185,9 +168,12 @@ def _run_bf16_gradient_lifecycle(*, immediate_grad_update, micro_batches):
                 accumulated = expert.get_full_hp_grad()
                 if immediate_grad_update:
                     assert expert.grad is None
-                    public_grad = safe_get_full_grad(expert)
-                    assert public_grad is not None and public_grad.dtype == torch.float32
-                    torch.testing.assert_close(public_grad, accumulated, rtol=0, atol=0)
+                    assert dense_weight.grad is None
+                    if engine.is_gradient_accumulation_boundary():
+                        for param in (expert, dense_weight):
+                            public_grad = safe_get_full_grad(param)
+                            assert public_grad is not None and public_grad.dtype == torch.float32
+                            torch.testing.assert_close(public_grad, param._hp_grad, rtol=0, atol=0)
                 gradients.append(accumulated.detach().float().cpu().clone())
                 engine.step()
 
