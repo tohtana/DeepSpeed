@@ -332,7 +332,7 @@ Example of <i>**scheduler**</i>
 
 | Description | Default |
 | ----------- | ------- |
-| When `BF16_Optimizer` is selected, accumulate each completed BF16 gradient in an autograd hook (in FP32 when `data_types.grad_accum_dtype="fp32"`). The consumed `param.grad` is released and may be `None` after backward. At a gradient-accumulation boundary, `deepspeed.utils.safe_get_full_grad(param)` returns the reduced accumulated gradient; read it after `engine.backward()` and **before** `engine.step()`. The default keeps the existing backward-epilogue accumulation. | `false` |
+| When `BF16_Optimizer` is selected, accumulate each completed BF16 gradient in an autograd hook (in FP32 when `data_types.grad_accum_dtype="fp32"`). The consumed `param.grad` is released and may be `None` after backward. The default keeps the existing backward-epilogue accumulation. | `false` |
 
 <i>**bf16:bf16_master_weights_and_grads**</i>: [boolean]
 

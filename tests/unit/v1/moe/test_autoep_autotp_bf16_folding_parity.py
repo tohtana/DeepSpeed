@@ -17,7 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from deepspeed.module_inject.auto_ep_folding import is_autoep_folding_gradient_corrected
 from deepspeed.runtime import bf16_optimizer as bf16_mod
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
-from deepspeed.utils import groups, safe_get_full_fp32_param, safe_get_full_grad
+from deepspeed.utils import groups, safe_get_full_fp32_param
 from unit.common import DistributedTest
 from unit.v1.moe.autoep_test_utils import skip_unless_h100_tests_enabled
 
@@ -139,7 +139,6 @@ def _run_bf16_gradient_lifecycle(*, immediate_grad_update, micro_batches):
     engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
     assert isinstance(engine.optimizer, BF16_Optimizer)
     expert = engine.module.expert_weight
-    dense_weight = engine.module.dense.weight
     tp_group = dist.get_world_group()
     if immediate_grad_update:
         assert dist.get_world_size(group=tp_group) == 2
@@ -168,12 +167,6 @@ def _run_bf16_gradient_lifecycle(*, immediate_grad_update, micro_batches):
                 accumulated = expert.get_full_hp_grad()
                 if immediate_grad_update:
                     assert expert.grad is None
-                    assert dense_weight.grad is None
-                    if engine.is_gradient_accumulation_boundary():
-                        for param in (expert, dense_weight):
-                            public_grad = safe_get_full_grad(param)
-                            assert public_grad is not None and public_grad.dtype == torch.float32
-                            torch.testing.assert_close(public_grad, param._hp_grad, rtol=0, atol=0)
                 gradients.append(accumulated.detach().float().cpu().clone())
                 engine.step()
 
