@@ -40,10 +40,22 @@ class WrappedToyModel(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.child = ToyModel()
+        self.child = torch.nn.Module()
+        self.child._keep_in_fp32_modules_strict = ["router_bias"]
+        self.child.inner = torch.nn.Module()
+        self.child.inner.linear = torch.nn.Linear(HIDDEN, HIDDEN, bias=False)
+        self.child.inner.register_buffer("router_bias", torch.zeros(HIDDEN))
+        self.child.inner.register_buffer("scale", torch.ones(HIDDEN))
+        self.other_child = torch.nn.Module()
+        self.other_child.inner = torch.nn.Module()
+        self.other_child.inner.register_buffer("router_bias", torch.zeros(HIDDEN))
+        self.child2 = torch.nn.Module()
+        self.child2.inner = torch.nn.Module()
+        self.child2.inner.register_buffer("router_bias", torch.zeros(HIDDEN))
 
     def forward(self, x):
-        return self.child(x)
+        inner = self.child.inner
+        return ((inner.linear(x) * inner.scale + inner.router_bias)**2).mean()
 
 
 def _config(stage, keep="auto", buffer_dtype=None):
@@ -83,8 +95,10 @@ class TestKeepInFp32Pattern:
 
     def test_auto_uses_lists_from_nested_modules(self):
         pattern = keep_in_fp32_pattern(WrappedToyModel(), "auto", torch.bfloat16)
-        assert pattern.search("child.router_bias")
-        assert not pattern.search("child.scale")
+        assert pattern.search("child.inner.router_bias")
+        assert not pattern.search("child.inner.scale")
+        assert not pattern.search("other_child.inner.router_bias")
+        assert not pattern.search("child2.inner.router_bias")
 
     def test_explicit_list_and_glob(self):
         pattern = keep_in_fp32_pattern(ToyModel(), ["layers.*.gate.bias"], torch.bfloat16)
@@ -143,8 +157,10 @@ class TestZeroInitKeepsBuffersFp32(DistributedTest):
     def test_existing_wrapped_module_uses_child_list(self):
         model = WrappedToyModel().bfloat16()
         deepspeed.zero.Init(module=model, config_dict_or_path=_config(3))
-        assert model.child.router_bias.dtype == torch.float32
-        assert model.child.scale.dtype == torch.bfloat16
+        assert model.child.inner.router_bias.dtype == torch.float32
+        assert model.child.inner.scale.dtype == torch.bfloat16
+        assert model.other_child.inner.router_bias.dtype == torch.bfloat16
+        assert model.child2.inner.router_bias.dtype == torch.bfloat16
 
 
 @pytest.mark.skipif(torch.bfloat16 not in get_accelerator().supported_dtypes(), reason="bf16 not supported")
@@ -179,10 +195,12 @@ class TestEngineKeepsBuffersFp32(DistributedTest):
 
     def test_wrapped_model_uses_child_list(self, zero_stage):
         model = WrappedToyModel()
-        model.child.router_bias.copy_(EXACT_VALUES)
+        model.child.inner.router_bias.copy_(EXACT_VALUES)
         engine, _, _, _ = deepspeed.initialize(config=_config(zero_stage, buffer_dtype="bf16"),
                                                model=model,
                                                model_parameters=model.parameters())
-        assert engine.module.child.router_bias.dtype == torch.float32
-        assert torch.equal(engine.module.child.router_bias.cpu(), EXACT_VALUES)
-        assert engine.module.child.scale.dtype == torch.bfloat16
+        assert engine.module.child.inner.router_bias.dtype == torch.float32
+        assert torch.equal(engine.module.child.inner.router_bias.cpu(), EXACT_VALUES)
+        assert engine.module.child.inner.scale.dtype == torch.bfloat16
+        assert engine.module.other_child.inner.router_bias.dtype == torch.bfloat16
+        assert engine.module.child2.inner.router_bias.dtype == torch.bfloat16
