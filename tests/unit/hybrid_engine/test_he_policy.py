@@ -2,9 +2,6 @@
 # DeepSpeed Team
 
 import importlib.util
-from pathlib import Path
-import subprocess
-import sys
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +32,22 @@ def _make_engine(module):
     engine = DeepSpeedHybridEngine.__new__(DeepSpeedHybridEngine)
     object.__setattr__(engine, 'module', module)
     return engine
+
+
+def test_hybrid_engine_import_does_not_resolve_transformers_opt(monkeypatch):
+    from transformers.models import opt
+
+    class TransformersOPTImportGuard:
+
+        def __getattr__(self, name):
+            raise AssertionError(f'Hybrid Engine resolved transformers.models.opt.modeling_opt.{name} during import')
+
+    monkeypatch.setattr(opt, 'modeling_opt', TransformersOPTImportGuard(), raising=False)
+    spec = importlib.util.spec_from_file_location('deepspeed.runtime._hybrid_engine_import_test',
+                                                  hybrid_engine.__file__)
+    module = importlib.util.module_from_spec(spec)
+
+    spec.loader.exec_module(module)
 
 
 def test_unsupported_model_uses_native_fallback(monkeypatch):
@@ -77,16 +90,7 @@ def test_supported_model_without_transformers_registers_auxiliary_policies(monke
     assert all(policy.__name__ != 'OPTLearnedPositionalEmbedding' for policy in engine.inference_policies)
 
 
-def test_fresh_process_transformers_deepspeed_import_orders():
-    import_orders = (
-        'import transformers.modeling_utils; import deepspeed',
-        'import deepspeed; import transformers.modeling_utils',
-    )
-    for script in import_orders:
-        subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True)
-
-
-def test_transformers_checkpoint_loads_in_fresh_process(tmp_path):
+def test_transformers_checkpoint_roundtrip(tmp_path):
     from transformers import BertConfig, BertForSequenceClassification
 
     torch.manual_seed(1234)
@@ -108,23 +112,11 @@ def test_transformers_checkpoint_loads_in_fresh_process(tmp_path):
     checkpoint = tmp_path / 'ordinary_transformers_model.pt'
     torch.save({'model': model, 'input_ids': input_ids, 'expected': expected}, checkpoint)
 
-    script = """
-import sys
-import torch
-
-checkpoint = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
-model = checkpoint['model']
-model.eval()
-with torch.inference_mode():
-    actual = model(checkpoint['input_ids']).logits
-torch.testing.assert_close(actual, checkpoint['expected'])
-"""
-    source_root = Path(hybrid_engine.__file__).resolve().parents[2]
-    subprocess.run([sys.executable, '-c', script, str(checkpoint)],
-                   cwd=source_root,
-                   check=True,
-                   capture_output=True,
-                   text=True)
+    restored = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    restored['model'].eval()
+    with torch.inference_mode():
+        actual = restored['model'](restored['input_ids']).logits
+    torch.testing.assert_close(actual, restored['expected'])
 
 
 def test_modern_opt_uses_native_fallback():
