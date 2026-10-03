@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team
 
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 
+import pytest
+import torch
 import torch.nn as nn
 
 import deepspeed.runtime.hybrid_engine as hybrid_engine
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
-from deepspeed.module_inject.layers import LinearLayer
+from deepspeed.module_inject.layers import LinearLayer, OPTEmbedding
 
 
 class SupportedLayer(nn.Module):
@@ -45,18 +51,84 @@ def test_unsupported_model_uses_native_fallback(monkeypatch):
 
 
 def test_supported_model_registers_auxiliary_policies(monkeypatch):
-    monkeypatch.setattr(hybrid_engine, 'replace_policies', [SupportedPolicy])
+    from transformers.models.opt.modeling_opt import OPTLearnedPositionalEmbedding
+
+    monkeypatch.setattr(hybrid_engine, 'replace_policies', [SupportedPolicy, hybrid_engine.HFOPTLayerPolicy])
     engine = _make_engine(nn.Sequential(SupportedLayer(), nn.Linear(2, 2)))
 
     engine.populate_all_inference_policies()
 
     assert SupportedLayer in engine.inference_policies
     assert engine.inference_policies[nn.Linear][0] is LinearLayer
+    assert engine.inference_policies[OPTLearnedPositionalEmbedding] == (OPTEmbedding, )
+
+
+def test_supported_model_without_transformers_registers_auxiliary_policies(monkeypatch):
+    if importlib.util.find_spec('transformers') is not None:
+        pytest.skip('Requires an environment without Transformers')
+
+    monkeypatch.setattr(hybrid_engine, 'replace_policies', [SupportedPolicy, hybrid_engine.HFOPTLayerPolicy])
+    engine = _make_engine(nn.Sequential(SupportedLayer(), nn.Linear(2, 2)))
+
+    engine.populate_all_inference_policies()
+
+    assert SupportedLayer in engine.inference_policies
+    assert engine.inference_policies[nn.Linear][0] is LinearLayer
+    assert all(policy.__name__ != 'OPTLearnedPositionalEmbedding' for policy in engine.inference_policies)
+
+
+def test_fresh_process_transformers_deepspeed_import_orders():
+    import_orders = (
+        'import transformers.modeling_utils; import deepspeed',
+        'import deepspeed; import transformers.modeling_utils',
+    )
+    for script in import_orders:
+        subprocess.run([sys.executable, '-c', script], check=True, capture_output=True, text=True)
+
+
+def test_transformers_checkpoint_loads_in_fresh_process(tmp_path):
+    from transformers import BertConfig, BertForSequenceClassification
+
+    torch.manual_seed(1234)
+    model = BertForSequenceClassification(
+        BertConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=32,
+            hidden_dropout_prob=0.0,
+            attention_probs_dropout_prob=0.0,
+        ))
+    model.eval()
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.inference_mode():
+        expected = model(input_ids).logits
+
+    checkpoint = tmp_path / 'ordinary_transformers_model.pt'
+    torch.save({'model': model, 'input_ids': input_ids, 'expected': expected}, checkpoint)
+
+    script = """
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
+model = checkpoint['model']
+model.eval()
+with torch.inference_mode():
+    actual = model(checkpoint['input_ids']).logits
+torch.testing.assert_close(actual, checkpoint['expected'])
+"""
+    source_root = Path(hybrid_engine.__file__).resolve().parents[2]
+    subprocess.run([sys.executable, '-c', script, str(checkpoint)],
+                   cwd=source_root,
+                   check=True,
+                   capture_output=True,
+                   text=True)
 
 
 def test_modern_opt_uses_native_fallback():
     import inspect
-    import pytest
     from transformers import OPTConfig, OPTForCausalLM
     from transformers.models.opt.modeling_opt import OPTDecoderLayer
 
