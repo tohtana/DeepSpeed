@@ -45,7 +45,7 @@ on:
     - cron: '0 10 * * *'
 
   pull_request_target:
-    types: [review_requested, ready_for_review, synchronize]
+    types: [opened, reopened, review_requested, ready_for_review, synchronize]
     branches:
       - master
 

@@ -427,6 +427,7 @@ def test_remote_plan_is_structural_and_preserves_order_and_scope():
 
 def test_sandbox_kwargs_are_fixed_and_secret_free():
     kwargs = torch_latest.build_sandbox_kwargs("image")
+    assert kwargs["cloud"] == "oci"
     assert kwargs["gpu"] == "l40s:2"
     assert kwargs["timeout"] == 7200
     assert torch_latest.SANDBOX_ACQUIRE_TIMEOUT_SECONDS == 1800

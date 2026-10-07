@@ -439,6 +439,7 @@ def build_sandbox_kwargs(image: Any) -> dict[str, Any]:
         "unencrypted_ports": [],
         "proxy": None,
         "block_network": False,
+        "cloud": "oci",
         "gpu": "l40s:2",
         "timeout": SANDBOX_TIMEOUT_SECONDS,
     }
