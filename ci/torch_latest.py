@@ -1283,25 +1283,28 @@ def _read_ssm_output_tail(
         _ssm_output_key(run_identity, phase, command_id, instance.instance_id, stream))
     with tempfile.TemporaryDirectory(prefix="ds-ssm-tail-") as temp_root:
         output_path = Path(temp_root) / stream
-        result = _run_aws(
-            run_command,
-            (
-                "s3api",
-                "get-object",
-                "--region",
-                instance.region,
-                "--bucket",
-                instance.config.output_bucket,
-                "--key",
-                key,
-                "--range",
-                f"bytes=-{SSM_OUTPUT_TAIL_BYTES}",
-                "--output",
-                "json",
-                str(output_path),
-            ),
-            timeout=60,
-        )
+        try:
+            result = _run_aws(
+                run_command,
+                (
+                    "s3api",
+                    "get-object",
+                    "--region",
+                    instance.region,
+                    "--bucket",
+                    instance.config.output_bucket,
+                    "--key",
+                    key,
+                    "--range",
+                    f"bytes=-{SSM_OUTPUT_TAIL_BYTES}",
+                    "--output",
+                    "json",
+                    str(output_path),
+                ),
+                timeout=60,
+            )
+        except AwsControllerError:
+            return None
         if result.returncode:
             return None
         try:

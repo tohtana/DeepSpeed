@@ -1218,6 +1218,43 @@ def test_aws_test_failure_emits_bounded_s3_tail_for_nightly_triage():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_aws_s3_tail_timeout_preserves_test_timeout_and_cleanup():
+    root, path = _selection_file("tests/unit/v1/test_one.py\n")
+    try:
+        env = _valid_env(
+            path,
+            DS_TEST_SELECTION_MODE="subset",
+            AWS_MODAL_FALLBACK_CONFIG=_aws_config(),
+            GITHUB_RUN_ID="123",
+            GITHUB_RUN_ATTEMPT="1",
+        )
+
+        class TailTimeoutAws(FakeAwsCli):
+
+            def __call__(self, argv, *, timeout=None):
+                if argv[2:4] == ("s3api", "get-object"):
+                    self.calls.append((tuple(argv), timeout))
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                return super().__call__(argv, timeout=timeout)
+
+        fake = TailTimeoutAws(
+            test_code=torch_latest.EXIT_TIMEOUT,
+            test_stdout="progress\n" * 4000,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert torch_latest.run_aws_controller(env, fake) == torch_latest.EXIT_TIMEOUT
+        public_log = output.getvalue()
+        assert "[aws:test:tail] complete stdout unavailable" in public_log
+        assert "DS_CI_FAILURE_CLASS=timeout: no test progress for 300 seconds" in public_log
+        assert "DS_CI_FAILURE_CLASS=test" not in public_log
+        operations = [call[2:4] for call, _ in fake.calls]
+        assert operations.count(("ec2", "terminate-instances")) == 1
+        assert len([call for call, _ in fake.calls if call[2:5] == ("ec2", "wait", "instance-terminated")]) == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_aws_test_deadlines_and_terminal_timeouts_are_classified_as_timeouts():
     root, path = _selection_file("tests/unit/v1/test_one.py\n")
     try:
