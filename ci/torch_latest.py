@@ -955,13 +955,23 @@ def wait_for_aws_backend(
     monotonic: Any = time.monotonic,
     timeout_seconds: int = AWS_BACKEND_START_TIMEOUT_SECONDS,
 ) -> None:
+    deadline = monotonic() + timeout_seconds
+
+    def remaining_timeout() -> float:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise AwsControllerError("AWS backend did not become ready before the startup bound")
+        return remaining
+
     try:
         _aws_text(
             run_command,
             ("ec2", "wait", "instance-running", "--region", instance.region, "--instance-ids", instance.instance_id),
-            timeout=timeout_seconds,
+            timeout=remaining_timeout(),
         )
     except AwsControllerError as exc:
+        if monotonic() >= deadline or str(exc) == "AWS CLI operation exceeded its time bound":
+            raise AwsControllerError("AWS instance did not reach a running state before the startup bound") from None
         state_reason = _aws_text(
             run_command,
             (
@@ -976,25 +986,23 @@ def wait_for_aws_backend(
                 "--output",
                 "text",
             ),
-            timeout=60,
+            timeout=min(60, remaining_timeout()),
         ).split()
         if len(state_reason) == 2 and state_reason[0] == "terminated" and state_reason[1] in \
                 AWS_CAPACITY_STATE_REASON_CODES:
             raise AwsCapacityUnavailable(state_reason[1]) from exc
         raise
-    except subprocess.TimeoutExpired as exc:
-        raise AwsControllerError("AWS instance did not reach a running state before the startup bound") from exc
-
     try:
         _aws_text(
             run_command,
             ("ec2", "wait", "instance-status-ok", "--region", instance.region, "--instance-ids", instance.instance_id),
-            timeout=timeout_seconds,
+            timeout=remaining_timeout(),
         )
-    except subprocess.TimeoutExpired as exc:
-        raise AwsControllerError("AWS instance did not become healthy before the startup bound") from exc
+    except AwsControllerError as exc:
+        if monotonic() >= deadline or str(exc) == "AWS CLI operation exceeded its time bound":
+            raise AwsControllerError("AWS instance did not become healthy before the startup bound") from None
+        raise
 
-    deadline = monotonic() + timeout_seconds
     while monotonic() < deadline:
         status = _aws_text(
             run_command,
@@ -1010,7 +1018,7 @@ def wait_for_aws_backend(
                 "--output",
                 "text",
             ),
-            timeout=60,
+            timeout=min(60, remaining_timeout()),
         )
         if status == "Online":
             print(f"AWS_STATE=backend_started region={instance.region}", flush=True)
@@ -1116,11 +1124,19 @@ def build_aws_scripts(inputs: ControllerInputs, run_identity: str) -> tuple[str,
     return "\n".join(prepare_lines), "\n".join(test_lines)
 
 
-def build_aws_infrastructure_smoke_script(torch_preset: str, run_identity: str) -> str:
+def build_aws_infrastructure_smoke_script(
+    torch_preset: str,
+    run_identity: str,
+    config: AwsRegionConfig,
+    *,
+    run_root: str | None = None,
+) -> str:
     if torch_preset not in MODAL_TORCH_PRESETS:
         raise ValueError("unsupported PyTorch preset for infrastructure smoke")
     image = MODAL_TORCH_PRESETS[torch_preset]["image"]
-    run_root = f"/var/lib/devds/runs/{run_identity}"
+    run_root = run_root or f"/var/lib/devds/runs/{run_identity}"
+    proof_file = f"{run_root}/artifacts/stdout-proof.txt"
+    proof_key = f"{config.output_prefix}/{run_identity}/infra-smoke/stdout-proof.txt"
     container_check = (
         "import torch; "
         "count = torch.cuda.device_count(); "  #ignore-cuda
@@ -1141,11 +1157,21 @@ def build_aws_infrastructure_smoke_script(torch_preset: str, run_identity: str) 
     )
     return "\n".join((
         "set -euo pipefail",
-        f"install -d -m 0755 {shlex.quote(run_root)}",
+        f"install -d -m 0755 {shlex.quote(run_root)} {shlex.quote(str(PurePosixPath(proof_file).parent))}",
         "host_gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)",
         'test "$host_gpu_count" -eq 2',
         f"{shlex.join(('docker', 'pull', '--quiet', image))} >/dev/null",
-        shlex.join(docker_run),
+        f"{shlex.join(docker_run)} | tee {shlex.quote(proof_file)}",
+        f"grep -Fxq 'AWS_INFRA_SMOKE=ready device_count=2 container=true' {shlex.quote(proof_file)}",
+        f"proof_checksum=$(openssl dgst -sha256 -binary {shlex.quote(proof_file)} | openssl base64 -A)",
+        "uploaded_checksum=$(aws --no-cli-pager s3api put-object "
+        f"--region {shlex.quote(config.name)} --bucket {shlex.quote(config.output_bucket)} "
+        f"--key {shlex.quote(proof_key)} --body {shlex.quote(f'fileb://{proof_file}')} "
+        "--checksum-sha256 \"$proof_checksum\" --query ChecksumSHA256 --output text 2>/dev/null) || "
+        "{ printf 'AWS_INFRA_SMOKE=private_log_upload_failed\\n'; exit 1; }",
+        'test "$uploaded_checksum" = "$proof_checksum" || '
+        "{ printf 'AWS_INFRA_SMOKE=private_log_checksum_failed\\n'; exit 1; }",
+        "printf 'AWS_INFRA_SMOKE=private_log_retained checksum=sha256\\n'",
     ))
 
 
@@ -1404,7 +1430,7 @@ def run_modal_infrastructure_smoke(env: Mapping[str, str], modal_module: Any | N
         modal_module = importlib.import_module("modal")
 
     preset = MODAL_TORCH_PRESETS[torch_preset]
-    image = modal_module.Image.from_registry(preset["image"], add_python="3.10")
+    image = modal_module.Image.from_registry(preset["image"])
     app = modal_module.App.lookup(APP_NAME, create_if_missing=True)
     sandbox = None
     primary_error = None
@@ -1590,7 +1616,7 @@ def run_aws_infrastructure_smoke(
             monotonic=monotonic,
             start_timeout_seconds=INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
         )
-        script = build_aws_infrastructure_smoke_script(torch_preset, run_identity)
+        script = build_aws_infrastructure_smoke_script(torch_preset, run_identity, instance.config)
         command_id = send_ssm_command(
             instance,
             run_identity,

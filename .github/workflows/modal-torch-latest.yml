@@ -170,7 +170,7 @@ jobs:
             printf 'AWS_SESSION_TOKEN=%s\n' "$aws_session_token_value"
           } >> "$GITHUB_ENV"
 
-      - name: Check regional launch, SSM, two GPUs, container, and logs
+      - name: Check regional launch, SSM, two GPUs, container, and private proof
         env:
           AWS_MODAL_FALLBACK_CONFIG: ${{ secrets.AWS_MODAL_FALLBACK_CONFIG }}
           DS_CI_AWS_RUN_SUFFIX: ${{ matrix.region }}

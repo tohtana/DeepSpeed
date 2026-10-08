@@ -559,7 +559,7 @@ def test_sandbox_kwargs_are_fixed_and_secret_free():
 def test_modal_infrastructure_smoke_uses_production_oci_shape_and_cleans_up():
     fake, state, sandbox = _fake_modal("a" * 40)
     assert torch_latest.run_modal_infrastructure_smoke({"MODAL_TORCH_PRESET": "2.10.0-cuda12.8"}, fake) == 0
-    assert state.image_calls == [("pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel", "3.10")]
+    assert state.image_calls == [("pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel", None)]
     assert state.app_calls == [(torch_latest.APP_NAME, True)]
     assert len(state.create_calls) == 1
     create_kwargs = state.create_calls[0][1]
@@ -876,10 +876,15 @@ def test_aws_infrastructure_smoke_is_region_scoped_and_has_no_test_execution():
     assert "torch." + "cuda.device_count" in script
     assert "pytest" not in script
     assert "pip install" not in script
+    assert "s3api put-object" in script
+    assert "--checksum-sha256" in script
+    assert "AWS_INFRA_SMOKE=private_log_upload_failed" in script
+    assert "AWS_INFRA_SMOKE=private_log_checksum_failed" in script
     operations = [call[2:4] for call, _ in fake.calls]
     assert operations.count(("ec2", "terminate-instances")) == 1
     start_waits = [timeout for call, timeout in fake.calls if call[2:4] == ("ec2", "wait")][:2]
-    assert start_waits == [torch_latest.INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS] * 2
+    assert len(start_waits) == 2
+    assert all(0 < timeout <= torch_latest.INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS for timeout in start_waits)
 
     failed = FakeAwsCli(prepare_code=7)
     _expect_error(torch_latest.run_aws_infrastructure_smoke,
@@ -892,6 +897,82 @@ def test_aws_infrastructure_smoke_is_region_scoped_and_has_no_test_execution():
 
     invalid = dict(env, DS_CI_AWS_RUN_SUFFIX="not-a-region")
     _expect_error(torch_latest._aws_run_identity, invalid)
+
+
+def test_aws_infrastructure_smoke_log_upload_is_required_and_sanitized():
+    root = Path(tempfile.mkdtemp(prefix="ds-infra-smoke-")).resolve()
+    try:
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        commands = {
+            "nvidia-smi":
+            "#!/bin/sh\nprintf 'GPU one\\nGPU two\\n'\n",
+            "docker": ("#!/bin/sh\n"
+                       "if [ \"$1\" = pull ]; then exit 0; fi\n"
+                       "printf 'AWS_INFRA_SMOKE=ready device_count=2 container=true\\n'\n"),
+            "aws": ("#!/bin/sh\n"
+                    "if [ \"${FAKE_AWS_FAIL:-}\" = 1 ]; then "
+                    "printf 'private backend detail\\n' >&2; exit 2; fi\n"
+                    "while [ \"$#\" -gt 0 ]; do\n"
+                    "  if [ \"$1\" = --checksum-sha256 ]; then printf '%s\\n' \"$2\"; exit 0; fi\n"
+                    "  shift\n"
+                    "done\n"
+                    "exit 3\n"),
+        }
+        for name, source in commands.items():
+            path = fake_bin / name
+            path.write_text(source, encoding="utf-8")
+            path.chmod(0o755)
+        config = torch_latest.load_aws_config(_aws_config())[1]
+        script = torch_latest.build_aws_infrastructure_smoke_script(
+            "2.10.0-cuda12.8",
+            "321-2-us-east-2",
+            config,
+            run_root=str(root / "run"),
+        )
+        run_env = dict(os.environ, PATH=f"{fake_bin}:{os.environ['PATH']}")
+        success = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=run_env)
+        assert success.returncode == 0, success.stderr
+        assert "AWS_INFRA_SMOKE=private_log_retained checksum=sha256" in success.stdout
+
+        failed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=dict(run_env, FAKE_AWS_FAIL="1"),
+        )
+        assert failed.returncode != 0
+        assert "AWS_INFRA_SMOKE=private_log_upload_failed" in failed.stdout
+        assert "private backend detail" not in failed.stdout + failed.stderr
+        assert config.output_bucket not in failed.stdout + failed.stderr
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_aws_backend_startup_uses_one_absolute_deadline():
+    clock = SimpleNamespace(now=0.0)
+
+    class SlowAwsCli(FakeAwsCli):
+
+        def __call__(self, argv, *, timeout=None):
+            if argv[2:4] == ("ec2", "wait") and argv[4] in {"instance-running", "instance-status-ok"}:
+                clock.now += min(290.0, timeout)
+            return super().__call__(argv, timeout=timeout)
+
+    config = torch_latest.load_aws_config(_aws_config())[1]
+    fake = SlowAwsCli()
+    _expect_error(
+        torch_latest.wait_for_aws_backend,
+        torch_latest.AwsInstance(config.name, "i-1234567890abcdef0", config),
+        fake,
+        sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        monotonic=lambda: clock.now,
+        timeout_seconds=torch_latest.INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
+        exception=torch_latest.AwsControllerError,
+    )
+    wait_timeouts = [timeout for call, timeout in fake.calls if call[2:4] == ("ec2", "wait")]
+    assert wait_timeouts == [300.0, 10.0]
+    assert clock.now == 300.0
 
 
 def test_aws_controller_runs_one_backend_and_always_terminates():

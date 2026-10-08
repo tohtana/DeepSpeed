@@ -35,9 +35,9 @@ workflows from one config — see [Adding a workflow](#add-a-new-workflow).
   It starts one short OCI `L40S:2` Sandbox check and three independent regional
   AWS jobs in parallel. Each AWS job directly selects one region, launches a
   G7.12 Spot instance, reaches it through SSM, verifies two host and container
-  GPUs, stores the SSM output in the private regional log bucket, and terminates
-  its own run-tagged instance. The matrix uses `fail-fast: false`, so one
-  regional result cannot cancel the other regions.
+  GPUs, stores a checksum-verified proof in the private regional log bucket,
+  and terminates its own run-tagged instance. The matrix uses
+  `fail-fast: false`, so one regional result cannot cancel the other regions.
 - It is **fail-safe**: anything it can't reason about safely → run the *full* suite.
   It never silently runs *fewer* tests than reality.
 - Preview locally:
@@ -114,7 +114,7 @@ A manual dispatch with `infrastructure_smoke=true` takes a separate path:
           startup + two GPUs                     fail-fast: false
           always terminates                      east-1 / east-2 / west-2
                                                  launch + SSM + two GPUs
-                                                 container + private logs
+                                                 container + private proof
                                                  per-region termination
 ```
 
