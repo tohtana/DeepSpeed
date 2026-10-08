@@ -169,8 +169,13 @@ while True:
         os.write(sys.stdout.fileno(), chunk)
         last_output = time.monotonic()
         continue
-    break
-raise SystemExit(process.wait())
+    remaining = timeout_seconds - (time.monotonic() - last_output)
+    if remaining <= 0:
+        continue
+    try:
+        raise SystemExit(process.wait(timeout=remaining))
+    except subprocess.TimeoutExpired:
+        continue
 """.strip()
 
 _REPOSITORY_COMPONENT = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
@@ -1141,10 +1146,16 @@ def send_ssm_command(
     return command_id
 
 
-def _emit_ssm_output(phase: str, payload: Mapping[str, Any]) -> None:
+def _emit_ssm_output(
+    phase: str,
+    payload: Mapping[str, Any],
+    instance_id: str,
+    command_id: str,
+) -> None:
     for stream in ("StandardOutputContent", "StandardErrorContent"):
         for line in str(payload.get(stream, "")).splitlines():
-            print(f"[aws:{phase}] {_single_line(line)}")
+            public_line = line.replace(instance_id, "<instance-id>").replace(command_id, "<command-id>")
+            print(f"[aws:{phase}] {_single_line(public_line)}")
 
 
 def wait_for_ssm_command(
@@ -1188,7 +1199,7 @@ def wait_for_ssm_command(
         if status in {"Pending", "InProgress", "Delayed"}:
             sleep(min(AWS_COMMAND_POLL_SECONDS, max(0.0, deadline - monotonic())))
             continue
-        _emit_ssm_output(phase, payload)
+        _emit_ssm_output(phase, payload, instance.instance_id, command_id)
         if status == "Success":
             return 0
         response_code = payload.get("ResponseCode")

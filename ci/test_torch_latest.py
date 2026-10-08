@@ -919,6 +919,19 @@ def test_no_progress_watchdog_enforces_deadline_after_parent_exit():
         torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = original
 
 
+def test_no_progress_watchdog_enforces_deadline_after_output_eof():
+    original = torch_latest.NO_PROGRESS_TIMEOUT_SECONDS
+    torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = 0.1
+    try:
+        child = "import os, time; os.close(1); os.close(2); time.sleep(5)"
+        argv = torch_latest._with_no_progress_watchdog((sys.executable, "-c", child))
+        result = subprocess.run((sys.executable, *argv[1:]), check=False, capture_output=True, text=True, timeout=1)
+        assert result.returncode == torch_latest.EXIT_TIMEOUT
+        assert "No test output" in result.stdout
+    finally:
+        torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = original
+
+
 def test_no_progress_watchdog_kills_sigterm_resistant_descendant():
     original = torch_latest.NO_PROGRESS_TIMEOUT_SECONDS
     torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = 0.1
@@ -932,6 +945,35 @@ def test_no_progress_watchdog_kills_sigterm_resistant_descendant():
         _assert_pid_gone(int(result.stdout.split("descendant=", 1)[1].splitlines()[0]))
     finally:
         torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = original
+
+
+def test_ssm_diagnostic_paths_redact_known_instance_and_command_ids():
+    instance_id = "i-1234567890abcdef0"
+    command_id = "11111111-1111-1111-1111-111111111111"
+    config = torch_latest.load_aws_config(_aws_config())[0]
+    instance = torch_latest.AwsInstance(config.name, instance_id, config)
+    diagnostic_path = (f"/var/lib/amazon/ssm/{instance_id}/document/orchestration/{command_id}/"
+                       "awsrunShellScript/0.awsrunShellScript/_script.sh")
+    payload = {
+        "Status": "Failed",
+        "ResponseCode": 17,
+        "StandardOutputContent": f"running {diagnostic_path}\n",
+        "StandardErrorContent": f"{diagnostic_path}: line 5: test failed\n",
+    }
+
+    def run_command(_argv, *, timeout=None):
+        return _command_result(stdout=json.dumps(payload))
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert torch_latest.wait_for_ssm_command(instance, command_id, "test", 60, run_command) == 17
+    public_log = output.getvalue()
+    assert instance_id not in public_log
+    assert command_id not in public_log
+    redacted_path = ("/var/lib/amazon/ssm/<instance-id>/document/orchestration/<command-id>/"
+                     "awsrunShellScript/0.awsrunShellScript/_script.sh")
+    assert f"running {redacted_path}" in public_log
+    assert f"{redacted_path}: line 5: test failed" in public_log
 
 
 def test_aws_logs_redact_private_identifiers_and_cli_text():
