@@ -31,6 +31,13 @@ workflows from one config — see [Adding a workflow](#add-a-new-workflow).
   tries a fixed, ordered pool of AWS `g7.12xlarge` Spot locations. The backend
   runs only for merge queue entries, the nightly scheduled full run, and manual
   runs — a plain PR event never spends GPU quota.
+- A manual `infrastructure_smoke` dispatch skips selection and pytest entirely.
+  It starts one short OCI `L40S:2` Sandbox check and three independent regional
+  AWS jobs in parallel. Each AWS job directly selects one region, launches a
+  G7.12 Spot instance, reaches it through SSM, verifies two host and container
+  GPUs, stores the SSM output in the private regional log bucket, and terminates
+  its own run-tagged instance. The matrix uses `fail-fast: false`, so one
+  regional result cannot cancel the other regions.
 - It is **fail-safe**: anything it can't reason about safely → run the *full* suite.
   It never silently runs *fewer* tests than reality.
 - Preview locally:
@@ -67,7 +74,7 @@ The design is a small, self-contained take on HuggingFace `transformers`'
 ### Job flow
 
 ```
-           pull_request_target / merge_group / schedule / workflow_dispatch
+           pull_request_target / merge_group / schedule / ordinary dispatch
                                   │
                     ┌─────────────┴─────────────┐
                     │        collect-tests       │   (no secrets)
@@ -96,6 +103,26 @@ The design is a small, self-contained take on HuggingFace `transformers`'
                     └────────────────────────────┘
 ```
 
+A manual dispatch with `infrastructure_smoke=true` takes a separate path:
+
+```text
+                  workflow_dispatch (infrastructure_smoke=true)
+                                   │
+                    ┌─────────────────┴─────────────────┐
+                    │                                     │
+          short Modal OCI smoke                  AWS regional matrix
+          startup + two GPUs                     fail-fast: false
+          always terminates                      east-1 / east-2 / west-2
+                                                 launch + SSM + two GPUs
+                                                 container + private logs
+                                                 per-region termination
+```
+
+That path never creates a test-selection artifact, installs DeepSpeed, or runs
+pytest. It is an explicit infrastructure diagnostic and is not available to
+scheduled, pull-request, or merge-queue executions, so it cannot weaken the
+Required check.
+
 `mode` controls `deploy`:
 
 - **`none`** → `deploy` is skipped. The Required status is still satisfied (a
@@ -114,6 +141,13 @@ trigger: master receives no direct pushes (the merge queue lands every entry,
 and each merge_group run already tested the merged tree), so a post-push run
 would duplicate the queue's work. Cross-entry interaction regressions are what
 the nightly full suite exists to catch.
+
+For a manual infrastructure-only check, select `infrastructure_smoke` when
+dispatching the workflow. That skips both `collect-tests` and `deploy`; the
+Modal and per-region AWS smoke jobs run directly and concurrently instead.
+Leaving the input at its default `false` preserves the ordinary manual full
+scope. The AWS smoke path does not depend on Modal's result, so a successful
+Modal allocation cannot bypass the regional checks.
 
 ### Nightly full-suite runs and regression triage
 

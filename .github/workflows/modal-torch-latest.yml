@@ -18,6 +18,11 @@ name: modal-torch-latest
 on:
   workflow_dispatch:
     inputs:
+      infrastructure_smoke:
+        description: Run only the parallel backend infrastructure smoke checks
+        required: false
+        default: false
+        type: boolean
       torch_preset:
         description: Modal PyTorch/CUDA image preset for manual runs
         required: false
@@ -68,8 +73,120 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  modal-infrastructure-smoke:
+    name: modal-torch-latest / Modal infrastructure smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.infrastructure_smoke == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted controller code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: 'pip'
+
+      - name: Install trusted controller dependency
+        run: |
+          pip install uv
+          uv pip install --system modal==1.2.6
+
+      - name: Check Modal OCI startup, two GPUs, and cleanup
+        env:
+          MODAL_TORCH_PRESET: ${{ inputs.torch_preset }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: python3 ci/torch_latest.py modal-infrastructure-smoke
+
+  aws-infrastructure-smoke:
+    name: modal-torch-latest / AWS infrastructure smoke / ${{ matrix.region }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.infrastructure_smoke == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [us-east-1, us-east-2, us-west-2]
+    steps:
+      - name: Checkout trusted controller code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Configure AWS credentials for infrastructure smoke
+        id: aws-auth
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_MODAL_FALLBACK_ROLE_ARN }}
+          SMOKE_REGION: ${{ matrix.region }}
+        run: |
+          set -euo pipefail
+          test -n "$AWS_ROLE_ARN"
+          echo "::add-mask::$AWS_ROLE_ARN"
+          oidc_response=$(curl --fail --silent --show-error \
+            --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+          web_identity_token=$(jq -er '.value | select(type == "string" and length > 0)' <<< "$oidc_response")
+          echo "::add-mask::$web_identity_token"
+          read -r aws_access_key_value aws_secret_key_value aws_session_token_value <<< "$(
+            aws --no-cli-pager sts assume-role-with-web-identity \
+              --role-arn "$AWS_ROLE_ARN" \
+              --role-session-name "DeepSpeedCI-${GITHUB_RUN_ID}-${SMOKE_REGION}" \
+              --web-identity-token "$web_identity_token" \
+              --duration-seconds 3600 \
+              --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+              --output text
+          )"
+          test -n "$aws_access_key_value"
+          test -n "$aws_secret_key_value"
+          test -n "$aws_session_token_value"
+          echo "::add-mask::$aws_access_key_value"
+          echo "::add-mask::$aws_secret_key_value"
+          echo "::add-mask::$aws_session_token_value"
+          {
+            printf 'AWS_ACCESS_KEY_ID=%s\n' "$aws_access_key_value"
+            printf 'AWS_SECRET_ACCESS_KEY=%s\n' "$aws_secret_key_value"
+            printf 'AWS_SESSION_TOKEN=%s\n' "$aws_session_token_value"
+          } >> "$GITHUB_ENV"
+
+      - name: Check regional launch, SSM, two GPUs, container, and logs
+        env:
+          AWS_MODAL_FALLBACK_CONFIG: ${{ secrets.AWS_MODAL_FALLBACK_CONFIG }}
+          DS_CI_AWS_RUN_SUFFIX: ${{ matrix.region }}
+          MODAL_TORCH_PRESET: ${{ inputs.torch_preset }}
+        run: python3 ci/torch_latest.py aws-infrastructure-smoke --region "${{ matrix.region }}"
+
+      - name: Reconcile regional infrastructure-smoke cleanup
+        if: ${{ always() && steps.aws-auth.outcome == 'success' }}
+        env:
+          AWS_MODAL_FALLBACK_CONFIG: ${{ secrets.AWS_MODAL_FALLBACK_CONFIG }}
+          DS_CI_AWS_RUN_SUFFIX: ${{ matrix.region }}
+        run: python3 ci/torch_latest.py cleanup-aws
+
   collect-tests:
     name: modal-torch-latest / collect tests
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.infrastructure_smoke != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -156,7 +273,7 @@ jobs:
     # pull_request_target runs skip the backend entirely (a skipped dependent
     # job still satisfies the Required check), so the tests gate the merge queue
     # entry instead of every PR update.
-    if: ${{ !cancelled() && (needs.collect-tests.result != 'success' || (needs.collect-tests.outputs.mode != 'none' && github.event_name != 'pull_request_target')) }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.infrastructure_smoke != true) && !cancelled() && (needs.collect-tests.result != 'success' || (needs.collect-tests.outputs.mode != 'none' && github.event_name != 'pull_request_target')) }}
     steps:
       - name: Fail if test selection failed
         if: needs.collect-tests.result != 'success'
@@ -226,6 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$AWS_ROLE_ARN"
+          echo "::add-mask::$AWS_ROLE_ARN"
           oidc_response=$(curl --fail --silent --show-error \
             --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")

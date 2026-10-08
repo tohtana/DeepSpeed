@@ -73,6 +73,7 @@ PYTORCH_CUDA_128_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 APP_NAME = "deepspeedai-torch-latest-ci"
 SANDBOX_TIMEOUT_SECONDS = 7200
 SANDBOX_ACQUIRE_TIMEOUT_SECONDS = 1800
+INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS = 300
 NO_PROGRESS_TIMEOUT_SECONDS = 300
 AWS_BACKEND_START_TIMEOUT_SECONDS = 600
 AWS_COMMAND_POLL_SECONDS = 10
@@ -562,7 +563,7 @@ def _build_sandbox_image(modal_module: Any, preset: dict[str, str], inputs: Cont
                              index_url=PYTORCH_CUDA_128_INDEX_URL)
 
 
-def build_sandbox_kwargs(image: Any) -> dict[str, Any]:
+def build_sandbox_kwargs(image: Any, *, timeout_seconds: int = SANDBOX_TIMEOUT_SECONDS) -> dict[str, Any]:
     return {
         "image": image,
         "env": build_sandbox_env(),
@@ -576,7 +577,7 @@ def build_sandbox_kwargs(image: Any) -> dict[str, Any]:
         "block_network": False,
         "cloud": "oci",
         "gpu": "l40s:2",
-        "timeout": SANDBOX_TIMEOUT_SECONDS,
+        "timeout": timeout_seconds,
     }
 
 
@@ -812,7 +813,10 @@ def _aws_run_identity(env: Mapping[str, str]) -> str:
     attempt = env.get("GITHUB_RUN_ATTEMPT", "")
     if not run_id.isdigit() or not attempt.isdigit():
         raise ValueError("GitHub run ID and attempt are required for run-owned AWS cleanup")
-    return f"{run_id}-{attempt}"
+    suffix = env.get("DS_CI_AWS_RUN_SUFFIX", "")
+    if suffix and suffix not in AWS_REGION_ORDER:
+        raise ValueError("AWS run suffix must be one of the configured regions")
+    return "-".join(value for value in (run_id, attempt, suffix) if value)
 
 
 def _default_command(argv: Sequence[str], *, timeout: float | None = None) -> subprocess.CompletedProcess:
@@ -868,6 +872,7 @@ def acquire_aws_instance(
     *,
     sleep: Any = time.sleep,
     monotonic: Any = time.monotonic,
+    start_timeout_seconds: int = AWS_BACKEND_START_TIMEOUT_SECONDS,
 ) -> AwsInstance:
     for config in regions:
         for location_index, subnet_id in enumerate(config.subnet_ids, start=1):
@@ -917,7 +922,13 @@ def acquire_aws_instance(
             print(f"AWS_INSTANCE_ALLOCATED region={config.name}", flush=True)
             instance = AwsInstance(config.name, instance_id, config)
             try:
-                wait_for_aws_backend(instance, run_command, sleep=sleep, monotonic=monotonic)
+                wait_for_aws_backend(
+                    instance,
+                    run_command,
+                    sleep=sleep,
+                    monotonic=monotonic,
+                    timeout_seconds=start_timeout_seconds,
+                )
             except AwsCapacityUnavailable as exc:
                 print(
                     f"AWS_CAPACITY_UNAVAILABLE region={config.name} location={location_index} "
@@ -942,12 +953,13 @@ def wait_for_aws_backend(
     *,
     sleep: Any = time.sleep,
     monotonic: Any = time.monotonic,
+    timeout_seconds: int = AWS_BACKEND_START_TIMEOUT_SECONDS,
 ) -> None:
     try:
         _aws_text(
             run_command,
             ("ec2", "wait", "instance-running", "--region", instance.region, "--instance-ids", instance.instance_id),
-            timeout=AWS_BACKEND_START_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except AwsControllerError as exc:
         state_reason = _aws_text(
@@ -977,12 +989,12 @@ def wait_for_aws_backend(
         _aws_text(
             run_command,
             ("ec2", "wait", "instance-status-ok", "--region", instance.region, "--instance-ids", instance.instance_id),
-            timeout=AWS_BACKEND_START_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
         raise AwsControllerError("AWS instance did not become healthy before the startup bound") from exc
 
-    deadline = monotonic() + AWS_BACKEND_START_TIMEOUT_SECONDS
+    deadline = monotonic() + timeout_seconds
     while monotonic() < deadline:
         status = _aws_text(
             run_command,
@@ -1102,6 +1114,39 @@ def build_aws_scripts(inputs: ControllerInputs, run_identity: str) -> tuple[str,
         _docker_exec(container_name, pytest_commands[0]),
     ]
     return "\n".join(prepare_lines), "\n".join(test_lines)
+
+
+def build_aws_infrastructure_smoke_script(torch_preset: str, run_identity: str) -> str:
+    if torch_preset not in MODAL_TORCH_PRESETS:
+        raise ValueError("unsupported PyTorch preset for infrastructure smoke")
+    image = MODAL_TORCH_PRESETS[torch_preset]["image"]
+    run_root = f"/var/lib/devds/runs/{run_identity}"
+    container_check = (
+        "import torch; "
+        "count = torch.cuda.device_count(); "  #ignore-cuda
+        "assert count == 2, f'expected exactly 2 visible GPUs, observed {count}'; "
+        "print('AWS_INFRA_SMOKE=ready device_count=2 container=true')")
+    docker_run = (
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        '"device=0,1"',
+        "--volume",
+        f"{run_root}:{REMOTE_ROOT}",
+        image,
+        "python",
+        "-c",
+        container_check,
+    )
+    return "\n".join((
+        "set -euo pipefail",
+        f"install -d -m 0755 {shlex.quote(run_root)}",
+        "host_gpu_count=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)",
+        'test "$host_gpu_count" -eq 2',
+        f"{shlex.join(('docker', 'pull', '--quiet', image))} >/dev/null",
+        shlex.join(docker_run),
+    ))
 
 
 def send_ssm_command(
@@ -1351,6 +1396,56 @@ def run_controller(env: Mapping[str, str], modal_module: Any | None = None) -> i
     return 0
 
 
+def run_modal_infrastructure_smoke(env: Mapping[str, str], modal_module: Any | None = None) -> int:
+    torch_preset = env.get("MODAL_TORCH_PRESET") or DEFAULT_MODAL_TORCH_PRESET
+    if torch_preset not in MODAL_TORCH_PRESETS:
+        raise ValueError("unsupported PyTorch preset for infrastructure smoke")
+    if modal_module is None:
+        modal_module = importlib.import_module("modal")
+
+    preset = MODAL_TORCH_PRESETS[torch_preset]
+    image = modal_module.Image.from_registry(preset["image"], add_python="3.10")
+    app = modal_module.App.lookup(APP_NAME, create_if_missing=True)
+    sandbox = None
+    primary_error = None
+    cleanup_error = None
+    try:
+        sandbox = modal_module.Sandbox.create(
+            app=app,
+            **build_sandbox_kwargs(image, timeout_seconds=INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS * 2),
+        )
+        startup_seconds = await_sandbox_start(sandbox, INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS)
+        command = RemoteCommand(
+            "infrastructure smoke",
+            (
+                "python",
+                "-c",
+                "import torch; "
+                "count = torch.cuda.device_count(); "  #ignore-cuda
+                "assert count == 2, f'expected exactly 2 visible GPUs, observed {count}'; "
+                "print('MODAL_INFRA_SMOKE=ready device_count=2 container=true')",
+            ),
+        )
+        run_sandbox_command(sandbox, modal_module, command)
+        print(f"MODAL_INFRA_SMOKE=complete startup_seconds={startup_seconds:.0f}", flush=True)
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if sandbox is not None:
+            try:
+                _cleanup_sandbox(sandbox)
+            except BaseException as exc:
+                cleanup_error = exc
+
+    if primary_error is not None and cleanup_error is not None:
+        raise ControllerCleanupError(primary_error, cleanup_error) from primary_error
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise RuntimeError(f"Sandbox cleanup failed: {cleanup_error}") from cleanup_error
+    return 0
+
+
 def _report_primary_failure(error: BaseException, sandbox_started_at: float | None) -> int:
     """Map a controller failure to a triage class for nightly regression tooling.
 
@@ -1469,6 +1564,71 @@ def run_aws_controller(
     return outcome
 
 
+def run_aws_infrastructure_smoke(
+    env: Mapping[str, str],
+    region_name: str,
+    run_command: Any = _default_command,
+    *,
+    sleep: Any = time.sleep,
+    monotonic: Any = time.monotonic,
+) -> int:
+    regions = load_aws_config(env.get(AWS_CONFIG_ENV, ""))
+    matching = tuple(config for config in regions if config.name == region_name)
+    if len(matching) != 1:
+        raise ValueError("infrastructure smoke region must be one configured AWS region")
+    torch_preset = env.get("MODAL_TORCH_PRESET") or DEFAULT_MODAL_TORCH_PRESET
+    run_identity = _aws_run_identity(env)
+    instance = None
+    primary_error = None
+    cleanup_error = None
+    try:
+        instance = acquire_aws_instance(
+            matching,
+            run_identity,
+            run_command,
+            sleep=sleep,
+            monotonic=monotonic,
+            start_timeout_seconds=INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
+        )
+        script = build_aws_infrastructure_smoke_script(torch_preset, run_identity)
+        command_id = send_ssm_command(
+            instance,
+            run_identity,
+            "infra-smoke",
+            script,
+            INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
+            run_command,
+        )
+        return_code = wait_for_ssm_command(
+            instance,
+            command_id,
+            "infra-smoke",
+            INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
+            run_command,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+        if return_code:
+            raise AwsControllerError(f"AWS infrastructure smoke failed with exit code {return_code}")
+        print(f"AWS_INFRA_SMOKE=complete region={region_name}", flush=True)
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if instance is not None:
+            try:
+                terminate_aws_instance(instance, run_command)
+            except BaseException as exc:
+                cleanup_error = exc
+
+    if primary_error is not None and cleanup_error is not None:
+        raise ControllerCleanupError(primary_error, cleanup_error) from primary_error
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise RuntimeError(f"AWS cleanup failed: {cleanup_error}") from cleanup_error
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1485,7 +1645,11 @@ def _build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--path", type=Path, required=True)
 
     subparsers.add_parser("controller", help="Try the no-secret Modal Sandbox and run the selected tests")
+    subparsers.add_parser("modal-infrastructure-smoke", help="Check bounded Modal OCI two-GPU startup and cleanup")
     subparsers.add_parser("aws-controller", help="Run the selected tests on the bounded AWS fallback")
+    aws_smoke = subparsers.add_parser("aws-infrastructure-smoke",
+                                      help="Check one AWS region's launch, SSM, two-GPU container, and cleanup")
+    aws_smoke.add_argument("--region", required=True, choices=AWS_REGION_ORDER)
     subparsers.add_parser("cleanup-aws", help="Terminate run-owned AWS fallback instances")
     return parser
 
@@ -1507,8 +1671,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "controller":
         return run_controller(os.environ)
+    if args.command == "modal-infrastructure-smoke":
+        return run_modal_infrastructure_smoke(os.environ)
     if args.command == "aws-controller":
         return run_aws_controller(os.environ)
+    if args.command == "aws-infrastructure-smoke":
+        return run_aws_infrastructure_smoke(os.environ, args.region)
     return cleanup_aws_instances(os.environ)
 
 

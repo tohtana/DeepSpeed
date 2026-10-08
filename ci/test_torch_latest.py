@@ -556,6 +556,29 @@ def test_sandbox_kwargs_are_fixed_and_secret_free():
         assert forbidden not in joined
 
 
+def test_modal_infrastructure_smoke_uses_production_oci_shape_and_cleans_up():
+    fake, state, sandbox = _fake_modal("a" * 40)
+    assert torch_latest.run_modal_infrastructure_smoke({"MODAL_TORCH_PRESET": "2.10.0-cuda12.8"}, fake) == 0
+    assert state.image_calls == [("pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel", "3.10")]
+    assert state.app_calls == [(torch_latest.APP_NAME, True)]
+    assert len(state.create_calls) == 1
+    create_kwargs = state.create_calls[0][1]
+    assert create_kwargs["cloud"] == "oci"
+    assert create_kwargs["gpu"] == "l40s:2"
+    assert create_kwargs["timeout"] == torch_latest.INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS * 2
+    assert create_kwargs["secrets"] == []
+    assert len(sandbox.exec_calls) == 2
+    cuda_count = "torch." + "cuda.device_count"
+    assert cuda_count in " ".join(sandbox.exec_calls[1][0])
+    assert not any("pytest" in " ".join(args) for args, _ in sandbox.exec_calls)
+    assert sandbox.terminated
+    assert sandbox.wait_calls == [False]
+
+    failed, _, failed_sandbox = _fake_modal("a" * 40, fail_label=cuda_count)
+    _expect_error(torch_latest.run_modal_infrastructure_smoke, {}, failed, exception=RuntimeError)
+    assert failed_sandbox.terminated
+
+
 def test_controller_creates_one_sandbox_without_forwarding_secrets_and_cleans_up():
     root, path = _selection_file("tests/unit/v1\n")
     try:
@@ -829,6 +852,48 @@ def test_aws_scripts_reuse_full_selection_manifest_and_two_gpu_contract():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_aws_infrastructure_smoke_is_region_scoped_and_has_no_test_execution():
+    env = {
+        "AWS_MODAL_FALLBACK_CONFIG": _aws_config(),
+        "GITHUB_RUN_ID": "321",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "DS_CI_AWS_RUN_SUFFIX": "us-east-2",
+        "MODAL_TORCH_PRESET": "2.10.0-cuda12.8",
+    }
+    fake = FakeAwsCli()
+    assert torch_latest.run_aws_infrastructure_smoke(env, "us-east-2", fake) == 0
+    launch_calls = [call for call, _ in fake.calls if call[2:4] == ("ec2", "run-instances")]
+    assert len(launch_calls) == 1
+    assert launch_calls[0][launch_calls[0].index("--region") + 1] == "us-east-2"
+    tags = launch_calls[0][launch_calls[0].index("--tag-specifications") + 1]
+    assert "Key=DeepSpeedCIRun,Value=321-2-us-east-2" in tags
+    assert len(fake.sent_scripts) == 1
+    script = shlex.split(fake.sent_scripts[0])[2]
+    assert "/var/lib/devds/runs/321-2-us-east-2" in script
+    assert "nvidia-smi" in script
+    assert "docker pull --quiet pytorch/pytorch:2.10.0-cuda12.8-cudnn9-devel >/dev/null" in script
+    assert 'device=0,1' in script
+    assert "torch." + "cuda.device_count" in script
+    assert "pytest" not in script
+    assert "pip install" not in script
+    operations = [call[2:4] for call, _ in fake.calls]
+    assert operations.count(("ec2", "terminate-instances")) == 1
+    start_waits = [timeout for call, timeout in fake.calls if call[2:4] == ("ec2", "wait")][:2]
+    assert start_waits == [torch_latest.INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS] * 2
+
+    failed = FakeAwsCli(prepare_code=7)
+    _expect_error(torch_latest.run_aws_infrastructure_smoke,
+                  env,
+                  "us-east-2",
+                  failed,
+                  exception=torch_latest.AwsControllerError)
+    failed_operations = [call[2:4] for call, _ in failed.calls]
+    assert failed_operations.count(("ec2", "terminate-instances")) == 1
+
+    invalid = dict(env, DS_CI_AWS_RUN_SUFFIX="not-a-region")
+    _expect_error(torch_latest._aws_run_identity, invalid)
+
+
 def test_aws_controller_runs_one_backend_and_always_terminates():
     root, path = _selection_file("tests/unit/v1/test_one.py\n")
     try:
@@ -1094,9 +1159,9 @@ def test_workflow_keeps_github_execution_trusted_and_preserves_modes():
     assert "modal==1.2.6" in text
     assert "timeout-minutes: 20" in text
     assert "timeout-minutes: 180" in text
-    assert text.count("persist-credentials: false") == 2
-    assert text.count("lfs: false") == 2
-    assert text.count("submodules: false") == 2
+    assert text.count("persist-credentials: false") == 4
+    assert text.count("lfs: false") == 4
+    assert text.count("submodules: false") == 4
     assert "github.event.pull_request.head.repo.full_name" in text
     assert "github.event.pull_request.head.sha" in text
     assert "github.event.pull_request.base.repo.full_name" in text
@@ -1117,9 +1182,19 @@ def test_workflow_keeps_github_execution_trusted_and_preserves_modes():
     assert "AssumedRoleId" not in text
     assert "::add-mask::$web_identity_token" in text
     assert "--duration-seconds 7200" in text
-    assert "AWS_ROLE_ARN: ${{ secrets.AWS_MODAL_FALLBACK_ROLE_ARN }}" in text
-    assert text.count("AWS_MODAL_FALLBACK_CONFIG: ${{ secrets.AWS_MODAL_FALLBACK_CONFIG }}") == 2
+    assert text.count("AWS_ROLE_ARN: ${{ secrets.AWS_MODAL_FALLBACK_ROLE_ARN }}") == 2
+    assert text.count("AWS_MODAL_FALLBACK_CONFIG: ${{ secrets.AWS_MODAL_FALLBACK_CONFIG }}") == 4
     assert "vars.AWS_MODAL_FALLBACK" not in text
+    assert "infrastructure_smoke:" in text
+    assert "default: false" in text
+    assert text.count("inputs.infrastructure_smoke == true") == 2
+    assert text.count("inputs.infrastructure_smoke != true") == 2
+    assert "region: [us-east-1, us-east-2, us-west-2]" in text
+    assert "fail-fast: false" in text
+    assert 'python3 ci/torch_latest.py modal-infrastructure-smoke' in text
+    assert 'python3 ci/torch_latest.py aws-infrastructure-smoke --region "${{ matrix.region }}"' in text
+    assert "needs: modal-infrastructure-smoke" not in text
+    assert "DS_CI_AWS_RUN_SUFFIX: ${{ matrix.region }}" in text
 
     deploy = text.split("\n  deploy:\n", 1)[1]
     collect = text.split("\n  collect-tests:\n", 1)[1].split("\n  deploy:\n", 1)[0]
