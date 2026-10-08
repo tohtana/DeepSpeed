@@ -544,7 +544,7 @@ def test_sandbox_kwargs_are_fixed_and_secret_free():
     assert kwargs["cloud"] == "oci"
     assert kwargs["gpu"] == "l40s:2"
     assert kwargs["timeout"] == 7200
-    assert torch_latest.SANDBOX_ACQUIRE_TIMEOUT_SECONDS == 1800
+    assert torch_latest.SANDBOX_ACQUIRE_TIMEOUT_SECONDS == 600
     assert kwargs["secrets"] == []
     assert kwargs["network_file_systems"] == {}
     assert kwargs["volumes"] == {}

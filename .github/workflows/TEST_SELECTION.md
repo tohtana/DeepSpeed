@@ -175,12 +175,13 @@ suite. Its outcome feeds `nightly-triage.yml`:
   is the good endpoint it would start from.
 
 The controller (`ci/torch_latest.py`) classifies its own failures for this
-routing. A Modal startup-capacity timeout returns 75 to the workflow without a
-final sentinel so that AWS can run. The selected backend prints exactly one
-final `DS_CI_FAILURE_CLASS=infra|timeout|test` sentinel on failure. If no
-backend runs the outcome is infra (75); 300 seconds without pytest output is a
-timeout (124); setup and test errors are test failures (1). A failed run with
-no sentinel routes to the unknown class instead of guessing.
+routing. It waits up to 10 minutes for Modal Sandbox startup; only that
+startup-capacity timeout returns 75 to the workflow without a final sentinel
+so that AWS can run. The selected backend prints exactly one final
+`DS_CI_FAILURE_CLASS=infra|timeout|test` sentinel on failure. If no backend runs
+the outcome is infra (75); 300 seconds without pytest output is a timeout
+(124); setup and test errors are test failures (1). A failed run with no
+sentinel routes to the unknown class instead of guessing.
 
 Triage reports (timeout, unknown, test failures) go through `ci/nightly_report.sh`:
 every report carries the `nightly-triage` label, and a recurring outcome
@@ -424,7 +425,7 @@ The selector is built to **fail safe — to `all`, never to `none`**:
 - Missing or invalid repository/SHA metadata, an inconsistent mode/list pair,
   and any failed clone, install, version probe, or pytest command fail the
   controller. There is no moving-branch fallback.
-- Only a bounded Modal Sandbox startup timeout enables AWS. Modal API,
+- Only the bounded 10-minute Modal Sandbox startup timeout enables AWS. Modal API,
   authentication, image-build, setup, test, cleanup, and lifetime failures are
   terminal. After an AWS instance is allocated, boot, SSM, setup, test, and
   cleanup failures are also terminal and never move to another location.
