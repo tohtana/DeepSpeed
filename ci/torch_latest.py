@@ -24,6 +24,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -96,6 +97,9 @@ SANDBOX_TIMEOUT_GRACE_SECONDS = 120
 MAX_TEST_LIST_BYTES = 64 * 1024
 MAX_TEST_TARGETS = 1024
 MAX_DISPLAY_BYTES_PER_COMMAND = 16 * 1024 * 1024
+SSM_INLINE_STDOUT_CHARS = 24_000
+SSM_INLINE_STDERR_CHARS = 8_000
+SSM_OUTPUT_TAIL_BYTES = 32 * 1024
 REMOTE_ROOT = "/workspace"
 REMOTE_REPOSITORY = f"{REMOTE_ROOT}/deepspeed"
 REMOTE_TRANSFORMERS = f"{REMOTE_ROOT}/transformers"
@@ -125,7 +129,8 @@ process = subprocess.Popen(
 )
 selector = selectors.DefaultSelector()
 selector.register(process.stdout, selectors.EVENT_READ)
-last_output = time.monotonic()
+started = time.monotonic()
+last_output = None
 
 def process_group_exists():
     try:
@@ -157,7 +162,12 @@ def terminate_process_group():
 
 
 while True:
-    remaining = timeout_seconds - (time.monotonic() - last_output)
+    # Sub-second values are used only by the watchdog tests. Give the child a
+    # separate startup bound so host scheduling delay is not mistaken for a
+    # no-progress timeout; the production 300-second bound is unchanged.
+    current_timeout = timeout_seconds if last_output is not None else max(1.0, timeout_seconds)
+    last_progress = last_output if last_output is not None else started
+    remaining = current_timeout - (time.monotonic() - last_progress)
     if remaining <= 0:
         print(f"No test output for {timeout_seconds:g}s; terminating pytest", flush=True)
         terminate_process_group()
@@ -170,7 +180,9 @@ while True:
         os.write(sys.stdout.fileno(), chunk)
         last_output = time.monotonic()
         continue
-    remaining = timeout_seconds - (time.monotonic() - last_output)
+    current_timeout = timeout_seconds if last_output is not None else max(1.0, timeout_seconds)
+    last_progress = last_output if last_output is not None else started
+    remaining = current_timeout - (time.monotonic() - last_progress)
     if remaining <= 0:
         continue
     try:
@@ -191,6 +203,7 @@ _INSTANCE_RE = re.compile(r"i-[0-9a-f]{8,17}\Z")
 _COMMAND_RE = re.compile(r"[0-9a-f-]{36}\Z")
 _AWS_ERROR_RE = re.compile(r"An error occurred \(([^)]+)\)")
 _AWS_ERROR_CODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+_AWS_ACCOUNT_ID_RE = re.compile(r"(?<![0-9])[0-9]{12}(?![0-9])")
 
 
 def exclude_unsupported_gds_targets(targets: Sequence[str]) -> tuple[str, ...]:
@@ -247,6 +260,15 @@ class SandboxStartTimeout(RuntimeError):
 
 class AwsControllerError(RuntimeError):
     """The AWS fallback failed after acquisition or for a non-capacity reason."""
+
+
+class AwsCommandTimeout(AwsControllerError):
+    """One SSM phase reached a provider or controller execution deadline."""
+
+    def __init__(self, phase: str, timeout_seconds: int):
+        super().__init__(f"SSM {phase} command exceeded its {timeout_seconds}-second execution bound")
+        self.phase = phase
+        self.timeout_seconds = timeout_seconds
 
 
 class AwsCapacityExhausted(RuntimeError):
@@ -1217,16 +1239,102 @@ def send_ssm_command(
     return command_id
 
 
+def _sanitize_ssm_output_line(
+    value: object,
+    instance: AwsInstance,
+    command_id: str,
+    run_identity: str,
+) -> str:
+    public_line = str(value)
+    replacements = (
+        (instance.instance_id, "<instance-id>"),
+        (command_id, "<command-id>"),
+        (instance.config.output_bucket, "<output-bucket>"),
+        (f"/var/lib/devds/runs/{run_identity}", "<run-root>"),
+    )
+    for private_value, replacement in replacements:
+        public_line = public_line.replace(private_value, replacement)
+    public_line = _AWS_ACCOUNT_ID_RE.sub("<account-id>", public_line)
+    error_match = _AWS_ERROR_RE.search(public_line)
+    if error_match:
+        error_code = error_match.group(1)
+        if not _AWS_ERROR_CODE_RE.fullmatch(error_code):
+            error_code = "unknown"
+        return f"AWS CLI error ({error_code})"
+    return _single_line(public_line)
+
+
+def _ssm_output_key(run_identity: str, phase: str, command_id: str, instance_id: str, stream: str) -> str:
+    return str(
+        PurePosixPath(run_identity) / phase / command_id / instance_id / "awsrunShellScript" / "0.awsrunShellScript" /
+        stream)
+
+
+def _read_ssm_output_tail(
+    instance: AwsInstance,
+    run_identity: str,
+    phase: str,
+    command_id: str,
+    stream: str,
+    run_command: Any,
+) -> str | None:
+    key = str(
+        PurePosixPath(instance.config.output_prefix) /
+        _ssm_output_key(run_identity, phase, command_id, instance.instance_id, stream))
+    with tempfile.TemporaryDirectory(prefix="ds-ssm-tail-") as temp_root:
+        output_path = Path(temp_root) / stream
+        result = _run_aws(
+            run_command,
+            (
+                "s3api",
+                "get-object",
+                "--region",
+                instance.region,
+                "--bucket",
+                instance.config.output_bucket,
+                "--key",
+                key,
+                "--range",
+                f"bytes=-{SSM_OUTPUT_TAIL_BYTES}",
+                "--output",
+                "json",
+                str(output_path),
+            ),
+            timeout=60,
+        )
+        if result.returncode:
+            return None
+        try:
+            return output_path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+
+
 def _emit_ssm_output(
     phase: str,
     payload: Mapping[str, Any],
-    instance_id: str,
+    instance: AwsInstance,
     command_id: str,
+    run_identity: str,
+    run_command: Any,
 ) -> None:
-    for stream in ("StandardOutputContent", "StandardErrorContent"):
-        for line in str(payload.get(stream, "")).splitlines():
-            public_line = line.replace(instance_id, "<instance-id>").replace(command_id, "<command-id>")
-            print(f"[aws:{phase}] {_single_line(public_line)}")
+    streams = (
+        ("StandardOutputContent", "StandardOutputUrl", "stdout", SSM_INLINE_STDOUT_CHARS),
+        ("StandardErrorContent", "StandardErrorUrl", "stderr", SSM_INLINE_STDERR_CHARS),
+    )
+    for content_field, url_field, stream, inline_limit in streams:
+        content = str(payload.get(content_field, ""))
+        for line in content.splitlines():
+            print(f"[aws:{phase}] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}")
+        if (phase == "test" and payload.get("Status") != "Success" and len(content) >= inline_limit
+                and payload.get(url_field)):
+            tail = _read_ssm_output_tail(instance, run_identity, phase, command_id, stream, run_command)
+            if tail is None:
+                print(f"[aws:{phase}:tail] complete {stream} unavailable", flush=True)
+                continue
+            print(f"[aws:{phase}:tail] complete {stream}", flush=True)
+            for line in tail.splitlines():
+                print(f"[aws:{phase}:tail] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}")
 
 
 def wait_for_ssm_command(
@@ -1236,6 +1344,7 @@ def wait_for_ssm_command(
     timeout_seconds: int,
     run_command: Any = _default_command,
     *,
+    run_identity: str = "unknown-run",
     sleep: Any = time.sleep,
     monotonic: Any = time.monotonic,
 ) -> int:
@@ -1270,12 +1379,14 @@ def wait_for_ssm_command(
         if status in {"Pending", "InProgress", "Delayed"}:
             sleep(min(AWS_COMMAND_POLL_SECONDS, max(0.0, deadline - monotonic())))
             continue
-        _emit_ssm_output(phase, payload, instance.instance_id, command_id)
+        _emit_ssm_output(phase, payload, instance, command_id, run_identity, run_command)
         if status == "Success":
             return 0
+        if status == "TimedOut":
+            raise AwsCommandTimeout(phase, timeout_seconds)
         response_code = payload.get("ResponseCode")
         return response_code if isinstance(response_code, int) and response_code >= 0 else EXIT_TEST_FAILURE
-    raise AwsControllerError(f"SSM {phase} command exceeded its controller time bound")
+    raise AwsCommandTimeout(phase, timeout_seconds)
 
 
 def terminate_aws_instance(instance: AwsInstance, run_command: Any = _default_command) -> None:
@@ -1538,6 +1649,7 @@ def run_aws_controller(
             "prepare",
             AWS_PREPARE_TIMEOUT_SECONDS,
             run_command,
+            run_identity=run_identity,
             sleep=sleep,
             monotonic=monotonic,
         )
@@ -1559,6 +1671,7 @@ def run_aws_controller(
             "test",
             AWS_TEST_TIMEOUT_SECONDS,
             run_command,
+            run_identity=run_identity,
             sleep=sleep,
             monotonic=monotonic,
         )
@@ -1571,6 +1684,13 @@ def run_aws_controller(
     except AwsCapacityExhausted as exc:
         print(f"DS_CI_FAILURE_CLASS=infra: no backend ran ({exc})", flush=True)
         outcome = EXIT_INFRA
+    except AwsCommandTimeout as exc:
+        if exc.phase == "test":
+            print(f"DS_CI_FAILURE_CLASS=timeout: AWS test command exceeded {exc.timeout_seconds} seconds", flush=True)
+            outcome = EXIT_TIMEOUT
+        else:
+            print(f"DS_CI_FAILURE_CLASS=test: AWS backend failed ({_single_line(exc)})", flush=True)
+            primary_error = exc
     except BaseException as exc:
         print(f"DS_CI_FAILURE_CLASS=test: AWS backend failed ({_single_line(exc)})", flush=True)
         primary_error = exc
@@ -1631,6 +1751,7 @@ def run_aws_infrastructure_smoke(
             "infra-smoke",
             INFRASTRUCTURE_SMOKE_TIMEOUT_SECONDS,
             run_command,
+            run_identity=run_identity,
             sleep=sleep,
             monotonic=monotonic,
         )

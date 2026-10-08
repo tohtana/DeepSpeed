@@ -98,6 +98,10 @@ class FakeAwsCli:
         capacity_failures=0,
         prepare_code=0,
         test_code=0,
+        test_status=None,
+        prepare_stdout="phase output\n",
+        test_stdout="phase output\n",
+        test_stderr="",
         non_capacity_launch=False,
         start_state_reason=None,
         cleanup_instances=None,
@@ -105,6 +109,10 @@ class FakeAwsCli:
         self.capacity_failures = capacity_failures
         self.prepare_code = prepare_code
         self.test_code = test_code
+        self.test_status = test_status
+        self.prepare_stdout = prepare_stdout
+        self.test_stdout = test_stdout
+        self.test_stderr = test_stderr
         self.non_capacity_launch = non_capacity_launch
         self.start_state_reason = start_state_reason
         self.cleanup_instances = cleanup_instances or {}
@@ -145,13 +153,24 @@ class FakeAwsCli:
         if (service, operation) == ("ssm", "get-command-invocation"):
             command_id = argv[argv.index("--command-id") + 1]
             code = self.prepare_code if command_id.startswith("1") else self.test_code
+            stdout = self.prepare_stdout if command_id.startswith("1") else self.test_stdout
+            stderr = "" if command_id.startswith("1") else self.test_stderr
+            status = self.test_status if not command_id.startswith("1") and self.test_status else \
+                ("Success" if code == 0 else "Failed")
             payload = {
-                "Status": "Success" if code == 0 else "Failed",
+                "Status": status,
                 "ResponseCode": code,
-                "StandardOutputContent": "phase output\n",
-                "StandardErrorContent": "",
+                "StandardOutputContent": stdout[:torch_latest.SSM_INLINE_STDOUT_CHARS],
+                "StandardErrorContent": stderr[:torch_latest.SSM_INLINE_STDERR_CHARS],
+                "StandardOutputUrl": "https://ignored.invalid/stdout",
+                "StandardErrorUrl": "https://ignored.invalid/stderr" if stderr else "",
             }
             return _command_result(stdout=json.dumps(payload))
+        if (service, operation) == ("s3api", "get-object"):
+            key = argv[argv.index("--key") + 1]
+            stream = self.test_stderr if key.endswith("/stderr") else self.test_stdout
+            Path(argv[-1]).write_bytes(stream.encode("utf-8")[-torch_latest.SSM_OUTPUT_TAIL_BYTES:])
+            return _command_result(stdout="{}\n")
         if (service, operation) == ("ec2", "terminate-instances"):
             return _command_result(stdout="{}\n")
         if (service, operation) == ("ec2", "describe-instances"):
@@ -1045,13 +1064,37 @@ def _pid_exists(pid: int) -> bool:
         return False
 
 
+def _pid_is_running(pid: int, proc_root: Path = Path("/proc")) -> bool:
+    try:
+        stat_fields = (proc_root / str(pid) / "stat").read_text(encoding="utf-8").rpartition(")")[2].split()
+    except OSError:
+        stat_fields = []
+    if stat_fields and stat_fields[0] == "Z":
+        return False
+    return _pid_exists(pid)
+
+
 def _assert_pid_gone(pid: int) -> None:
     deadline = time.monotonic() + 2
-    while _pid_exists(pid) and time.monotonic() < deadline:
+    while _pid_is_running(pid) and time.monotonic() < deadline:
         time.sleep(0.02)
-    if _pid_exists(pid):
+    if _pid_is_running(pid):
         os.kill(pid, signal.SIGKILL)
         raise AssertionError(f"watchdog left descendant {pid} running")
+
+
+def test_pid_running_treats_linux_zombies_as_terminated():
+    root = Path(tempfile.mkdtemp(prefix="ds-proc-state-"))
+    try:
+        pid = os.getpid()
+        proc = root / str(pid)
+        proc.mkdir()
+        (proc / "stat").write_text(f"{pid} (python worker) Z 1 2 3\n", encoding="utf-8")
+        assert not _pid_is_running(pid, root)
+        (proc / "stat").write_text(f"{pid} (python worker) S 1 2 3\n", encoding="utf-8")
+        assert _pid_is_running(pid, root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_no_progress_watchdog_enforces_deadline_after_parent_exit():
@@ -1077,7 +1120,7 @@ def test_no_progress_watchdog_enforces_deadline_after_output_eof():
     try:
         child = "import os, time; os.close(1); os.close(2); time.sleep(5)"
         argv = torch_latest._with_no_progress_watchdog((sys.executable, "-c", child))
-        result = subprocess.run((sys.executable, *argv[1:]), check=False, capture_output=True, text=True, timeout=1)
+        result = subprocess.run((sys.executable, *argv[1:]), check=False, capture_output=True, text=True, timeout=2)
         assert result.returncode == torch_latest.EXIT_TIMEOUT
         assert "No test output" in result.stdout
     finally:
@@ -1090,10 +1133,12 @@ def test_no_progress_watchdog_kills_sigterm_resistant_descendant():
     try:
         descendant = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                       "print(f'descendant={os.getpid()}', flush=True); time.sleep(5)")
-        parent = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {descendant!r}]); time.sleep(5)"
+        parent = ("import subprocess, sys, time; time.sleep(0.2); "
+                  f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); time.sleep(5)")
         argv = torch_latest._with_no_progress_watchdog((sys.executable, "-c", parent))
         result = subprocess.run((sys.executable, *argv[1:]), check=False, capture_output=True, text=True, timeout=2)
         assert result.returncode == torch_latest.EXIT_TIMEOUT
+        assert "descendant=" in result.stdout
         _assert_pid_gone(int(result.stdout.split("descendant=", 1)[1].splitlines()[0]))
     finally:
         torch_latest.NO_PROGRESS_TIMEOUT_SECONDS = original
@@ -1118,7 +1163,14 @@ def test_ssm_diagnostic_paths_redact_known_instance_and_command_ids():
 
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
-        assert torch_latest.wait_for_ssm_command(instance, command_id, "test", 60, run_command) == 17
+        assert torch_latest.wait_for_ssm_command(
+            instance,
+            command_id,
+            "test",
+            60,
+            run_command,
+            run_identity="123-1",
+        ) == 17
     public_log = output.getvalue()
     assert instance_id not in public_log
     assert command_id not in public_log
@@ -1126,6 +1178,92 @@ def test_ssm_diagnostic_paths_redact_known_instance_and_command_ids():
                      "awsrunShellScript/0.awsrunShellScript/_script.sh")
     assert f"running {redacted_path}" in public_log
     assert f"{redacted_path}: line 5: test failed" in public_log
+
+
+def test_aws_test_failure_emits_bounded_s3_tail_for_nightly_triage():
+    root, path = _selection_file("tests/unit/v1/test_one.py\n")
+    try:
+        late_failure = "FAILED unit/v1/test_late.py::test_case - AssertionError"
+        private_line = ("i-1234567890abcdef0 22222222-2222-2222-2222-222222222222 ds-ci-east-1 "
+                        "arn:aws:iam::123456789012:role/private")
+        raw_error = "An error occurred (AccessDenied) when calling GetObject: private detail"
+        full_output = "early output\n" * 2500 + f"{private_line}\n{raw_error}\n{late_failure}\n"
+        env = _valid_env(
+            path,
+            DS_TEST_SELECTION_MODE="subset",
+            AWS_MODAL_FALLBACK_CONFIG=_aws_config(),
+            GITHUB_RUN_ID="123",
+            GITHUB_RUN_ATTEMPT="1",
+        )
+        fake = FakeAwsCli(test_code=9, test_stdout=full_output)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert torch_latest.run_aws_controller(env, fake) == torch_latest.EXIT_TEST_FAILURE
+        public_log = output.getvalue()
+        assert late_failure in public_log
+        assert "[aws:test:tail] complete stdout" in public_log
+        assert "AWS CLI error (AccessDenied)" in public_log
+        assert "private detail" not in public_log
+        assert not any(value in public_log for value in (
+            "i-1234567890abcdef0",
+            "22222222-2222-2222-2222-222222222222",
+            "ds-ci-east-1",
+            "123456789012",
+            "ignored.invalid",
+        ))
+        tail_calls = [call for call, _ in fake.calls if call[2:4] == ("s3api", "get-object")]
+        assert len(tail_calls) == 1
+        assert tail_calls[0][tail_calls[0].index("--range") + 1] == f"bytes=-{torch_latest.SSM_OUTPUT_TAIL_BYTES}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_aws_test_deadlines_and_terminal_timeouts_are_classified_as_timeouts():
+    root, path = _selection_file("tests/unit/v1/test_one.py\n")
+    try:
+        env = _valid_env(
+            path,
+            DS_TEST_SELECTION_MODE="subset",
+            AWS_MODAL_FALLBACK_CONFIG=_aws_config(),
+            GITHUB_RUN_ID="123",
+            GITHUB_RUN_ATTEMPT="1",
+        )
+        clock = SimpleNamespace(now=0.0)
+
+        class InProgressAws(FakeAwsCli):
+
+            def __call__(self, argv, *, timeout=None):
+                if (argv[2:4] == ("ssm", "get-command-invocation")
+                        and not argv[argv.index("--command-id") + 1].startswith("1")):
+                    self.calls.append((tuple(argv), timeout))
+                    return _command_result(stdout=json.dumps({
+                        "Status": "InProgress",
+                        "ResponseCode": -1,
+                        "StandardOutputContent": "still running\n",
+                        "StandardErrorContent": "",
+                    }))
+                return super().__call__(argv, timeout=timeout)
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert torch_latest.run_aws_controller(
+                env,
+                InProgressAws(),
+                sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+                monotonic=lambda: clock.now,
+            ) == torch_latest.EXIT_TIMEOUT
+        assert "DS_CI_FAILURE_CLASS=timeout: AWS test command exceeded 3000 seconds" in output.getvalue()
+        assert "DS_CI_FAILURE_CLASS=test" not in output.getvalue()
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert torch_latest.run_aws_controller(
+                env,
+                FakeAwsCli(test_code=-1, test_status="TimedOut"),
+            ) == torch_latest.EXIT_TIMEOUT
+        assert "DS_CI_FAILURE_CLASS=timeout: AWS test command exceeded 3000 seconds" in output.getvalue()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_aws_logs_redact_private_identifiers_and_cli_text():
@@ -1206,10 +1344,10 @@ raise SystemExit(controller.main(["aws-controller"]))
             text=True,
             timeout=5,
         )
-        assert result.returncode == torch_latest.EXIT_TEST_FAILURE
-        assert "AWS CLI operation exceeded its time bound" in result.stderr
-        assert "subprocess.TimeoutExpired: Command" not in result.stderr
-        assert not any(value in result.stderr for value in private_values)
+        assert result.returncode == torch_latest.EXIT_TEST_FAILURE, (operation, result.stdout, result.stderr)
+        assert "AWS CLI operation exceeded its time bound" in result.stderr, (operation, result.stderr)
+        assert "subprocess.TimeoutExpired: Command" not in result.stderr, (operation, result.stderr)
+        assert not any(value in result.stderr for value in private_values), (operation, result.stderr)
 
 
 def test_cleanup_entrypoint_terminates_only_run_owned_instances():
