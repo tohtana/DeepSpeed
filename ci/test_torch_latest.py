@@ -877,6 +877,7 @@ def test_aws_infrastructure_smoke_is_region_scoped_and_has_no_test_execution():
     assert "pytest" not in script
     assert "pip install" not in script
     assert "s3api put-object" in script
+    assert "fileb://" not in script
     assert "--checksum-sha256" in script
     assert "AWS_INFRA_SMOKE=private_log_upload_failed" in script
     assert "AWS_INFRA_SMOKE=private_log_checksum_failed" in script

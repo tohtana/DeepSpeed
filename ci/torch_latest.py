@@ -1166,7 +1166,7 @@ def build_aws_infrastructure_smoke_script(
         f"proof_checksum=$(openssl dgst -sha256 -binary {shlex.quote(proof_file)} | openssl base64 -A)",
         "uploaded_checksum=$(aws --no-cli-pager s3api put-object "
         f"--region {shlex.quote(config.name)} --bucket {shlex.quote(config.output_bucket)} "
-        f"--key {shlex.quote(proof_key)} --body {shlex.quote(f'fileb://{proof_file}')} "
+        f"--key {shlex.quote(proof_key)} --body {shlex.quote(proof_file)} "
         "--checksum-sha256 \"$proof_checksum\" --query ChecksumSHA256 --output text 2>/dev/null) || "
         "{ printf 'AWS_INFRA_SMOKE=private_log_upload_failed\\n'; exit 1; }",
         'test "$uploaded_checksum" = "$proof_checksum" || '
