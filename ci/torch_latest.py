@@ -1124,7 +1124,7 @@ def send_ssm_command(
             "--document-name",
             "AWS-RunShellScript",
             "--parameters",
-            json.dumps({"commands": [script]}, separators=(",", ":")),
+            json.dumps({"commands": [shlex.join(("bash", "-lc", script))]}, separators=(",", ":")),
             "--timeout-seconds",
             str(timeout_seconds),
             "--output-s3-bucket-name",

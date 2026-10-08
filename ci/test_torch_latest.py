@@ -11,6 +11,7 @@ import io
 import json
 import os
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -841,6 +842,10 @@ def test_aws_controller_runs_one_backend_and_always_terminates():
         fake = FakeAwsCli()
         assert torch_latest.run_aws_controller(env, fake) == 0
         assert len(fake.sent_scripts) == 2
+        for sent_script in fake.sent_scripts:
+            shell = shlex.split(sent_script)
+            assert shell[:2] == ["bash", "-lc"]
+            assert shell[2].startswith("set -euo pipefail\n")
         operations = [call[2:4] for call, _ in fake.calls]
         assert operations.count(("ec2", "run-instances")) == 1
         assert operations.count(("ec2", "terminate-instances")) == 1
