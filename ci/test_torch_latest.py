@@ -1273,6 +1273,51 @@ def test_ssm_cloudwatch_output_is_incremental_paginated_and_not_replayed_at_term
     assert all("--start-from-head" in call and "--end-time" in call for call in log_calls)
 
 
+def test_ssm_slow_log_reads_do_not_turn_success_into_timeout():
+    instance_id = "i-1234567890abcdef0"
+    command_id = "11111111-1111-1111-1111-111111111111"
+    config = torch_latest.load_aws_config(_aws_config())[0]
+    instance = torch_latest.AwsInstance(config.name, instance_id, config)
+    clock = SimpleNamespace(now=0.0)
+
+    class SlowLogsAws:
+
+        def __init__(self):
+            self.status_polls = 0
+
+        def __call__(self, argv, *, timeout=None):
+            if argv[2:4] == ("ssm", "get-command-invocation"):
+                self.status_polls += 1
+                status = "Success" if clock.now >= 95 else "InProgress"
+                return _command_result(
+                    stdout=json.dumps({
+                        "Status": status,
+                        "ResponseCode": 0 if status == "Success" else -1,
+                        "StandardOutputContent": "finished\n" if status == "Success" else "",
+                        "StandardErrorContent": "",
+                    }))
+            if argv[2:4] == ("logs", "get-log-events"):
+                clock.now += timeout
+                raise subprocess.TimeoutExpired(argv, timeout)
+            raise AssertionError(f"unexpected AWS CLI call: {argv}")
+
+    fake = SlowLogsAws()
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert torch_latest.wait_for_ssm_command(
+            instance,
+            command_id,
+            "test",
+            100,
+            fake,
+            run_identity="123-1",
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+            monotonic=lambda: clock.now,
+        ) == 0
+    assert fake.status_polls >= 2
+    assert "finished" in output.getvalue()
+
+
 def test_ssm_cloudwatch_read_failure_preserves_test_result_and_cleanup():
     root, path = _selection_file("tests/unit/v1/test_one.py\n")
     try:
@@ -1302,6 +1347,75 @@ def test_ssm_cloudwatch_read_failure_preserves_test_result_and_cleanup():
         public_log = output.getvalue()
         assert "live output temporarily unavailable (ServiceUnavailableException)" in public_log
         assert "private detail" not in public_log
+        assert "DS_CI_FAILURE_CLASS=test: AWS pytest failed with exit code 9" in public_log
+        operations = [call[2:4] for call, _ in fake.calls]
+        assert operations.count(("ec2", "terminate-instances")) == 1
+        assert len([call for call, _ in fake.calls if call[2:5] == ("ec2", "wait", "instance-terminated")]) == 1
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_partial_live_output_falls_back_after_terminal_drain_failure():
+    root, path = _selection_file("tests/unit/v1/test_one.py\n")
+    try:
+        live_marker = "unique live progress marker"
+        late_failure = "FAILED unit/v1/test_late.py::test_case - AssertionError"
+        full_output = f"{live_marker}\n" + "filler output\n" * 4000 + f"{late_failure}\n"
+        env = _valid_env(
+            path,
+            DS_TEST_SELECTION_MODE="subset",
+            AWS_MODAL_FALLBACK_CONFIG=_aws_config(),
+            GITHUB_RUN_ID="123",
+            GITHUB_RUN_ATTEMPT="1",
+        )
+
+        class PartialLiveAws(FakeAwsCli):
+
+            def __init__(self):
+                super().__init__(test_code=9, test_stdout=full_output)
+                self.test_status_polls = 0
+                self.test_terminal = False
+
+            def __call__(self, argv, *, timeout=None):
+                if argv[2:4] == ("ssm", "get-command-invocation"):
+                    command_id = argv[argv.index("--command-id") + 1]
+                    if command_id.startswith("2"):
+                        self.test_status_polls += 1
+                        if self.test_status_polls == 1:
+                            self.calls.append((tuple(argv), timeout))
+                            return _command_result(stdout=json.dumps({
+                                "Status": "InProgress",
+                                "ResponseCode": -1,
+                                "StandardOutputContent": "",
+                                "StandardErrorContent": "",
+                            }))
+                        self.test_terminal = True
+                if argv[2:4] == ("logs", "get-log-events"):
+                    stream_name = argv[argv.index("--log-stream-name") + 1]
+                    if stream_name.startswith("22222222-") and stream_name.endswith("/stdout"):
+                        self.calls.append((tuple(argv), timeout))
+                        if self.test_terminal:
+                            return _command_result(
+                                255,
+                                stderr="An error occurred (ServiceUnavailableException) when calling GetLogEvents",
+                            )
+                        token = argv[argv.index("--next-token") + 1] if "--next-token" in argv else None
+                        events = [{"message": f"{live_marker}\n"}] if token is None else []
+                        return _command_result(stdout=json.dumps({
+                            "events": events,
+                            "nextForwardToken": "test-stdout-1",
+                        }))
+                return super().__call__(argv, timeout=timeout)
+
+        fake = PartialLiveAws()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            assert torch_latest.run_aws_controller(env, fake, sleep=lambda _seconds: None) == \
+                torch_latest.EXIT_TEST_FAILURE
+        public_log = output.getvalue()
+        assert public_log.count(live_marker) == 1
+        assert late_failure in public_log
+        assert "live output temporarily unavailable (ServiceUnavailableException)" in public_log
         assert "DS_CI_FAILURE_CLASS=test: AWS pytest failed with exit code 9" in public_log
         operations = [call[2:4] for call, _ in fake.calls]
         assert operations.count(("ec2", "terminate-instances")) == 1
