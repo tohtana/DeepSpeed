@@ -80,6 +80,7 @@ AWS_BACKEND_START_TIMEOUT_SECONDS = 600
 AWS_COMMAND_POLL_SECONDS = 10
 AWS_PREPARE_TIMEOUT_SECONDS = 600
 AWS_TEST_TIMEOUT_SECONDS = 3000
+AWS_SSM_LOG_GROUP = "/deepspeed-ci/modal-fallback-ssm"
 AWS_INSTANCE_TYPE = "g7.12xlarge"
 AWS_REGION_ORDER = ("us-east-1", "us-east-2", "us-west-2")
 AWS_CAPACITY_ERROR_CODES = frozenset({"InsufficientInstanceCapacity", "InsufficientHostCapacity"})
@@ -1226,6 +1227,12 @@ def send_ssm_command(
             f"{instance.config.output_prefix}/{run_identity}/{phase}",
             "--output-s3-region",
             instance.region,
+            "--cloud-watch-output-config",
+            json.dumps({
+                "CloudWatchLogGroupName": AWS_SSM_LOG_GROUP,
+                "CloudWatchOutputEnabled": True,
+            },
+                       separators=(",", ":")),
             "--query",
             "Command.CommandId",
             "--output",
@@ -1320,15 +1327,18 @@ def _emit_ssm_output(
     command_id: str,
     run_identity: str,
     run_command: Any,
+    emitted_streams: set[str],
 ) -> None:
     streams = (
         ("StandardOutputContent", "StandardOutputUrl", "stdout", SSM_INLINE_STDOUT_CHARS),
         ("StandardErrorContent", "StandardErrorUrl", "stderr", SSM_INLINE_STDERR_CHARS),
     )
     for content_field, url_field, stream, inline_limit in streams:
+        if stream in emitted_streams:
+            continue
         content = str(payload.get(content_field, ""))
         for line in content.splitlines():
-            print(f"[aws:{phase}] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}")
+            print(f"[aws:{phase}] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}", flush=True)
         if (phase == "test" and payload.get("Status") != "Success" and len(content) >= inline_limit
                 and payload.get(url_field)):
             tail = _read_ssm_output_tail(instance, run_identity, phase, command_id, stream, run_command)
@@ -1337,7 +1347,77 @@ def _emit_ssm_output(
                 continue
             print(f"[aws:{phase}:tail] complete {stream}", flush=True)
             for line in tail.splitlines():
-                print(f"[aws:{phase}:tail] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}")
+                print(f"[aws:{phase}:tail] {_sanitize_ssm_output_line(line, instance, command_id, run_identity)}",
+                      flush=True)
+
+
+def _poll_ssm_cloudwatch_output(
+    phase: str,
+    instance: AwsInstance,
+    command_id: str,
+    run_identity: str,
+    run_command: Any,
+    tokens: dict[str, str],
+    emitted_streams: set[str],
+) -> None:
+    for stream in ("stdout", "stderr"):
+        token = tokens.get(stream)
+        stream_name = f"{command_id}/{instance.instance_id}/awsrunShellScript/{stream}"
+        end_time = str(int(time.time() * 1000) + 1)
+        while True:
+            args = [
+                "logs",
+                "get-log-events",
+                "--region",
+                instance.region,
+                "--log-group-name",
+                AWS_SSM_LOG_GROUP,
+                "--log-stream-name",
+                stream_name,
+                "--start-from-head",
+                "--end-time",
+                end_time,
+                "--output",
+                "json",
+            ]
+            if token is not None:
+                args.extend(("--next-token", token))
+            try:
+                result = _run_aws(run_command, args, timeout=60)
+            except AwsControllerError:
+                print(f"[aws:{phase}:{stream}] live output temporarily unavailable (timeout)", flush=True)
+                break
+            if result.returncode:
+                code = _aws_error_code(result)
+                if code != "ResourceNotFoundException":
+                    print(f"[aws:{phase}:{stream}] live output temporarily unavailable ({code or 'unknown'})",
+                          flush=True)
+                break
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                print(f"[aws:{phase}:{stream}] live output temporarily unavailable (invalid-response)", flush=True)
+                break
+            events = payload.get("events") if isinstance(payload, dict) else None
+            next_token = payload.get("nextForwardToken") if isinstance(payload, dict) else None
+            if not isinstance(events, list) or not isinstance(next_token, str) or not next_token:
+                print(f"[aws:{phase}:{stream}] live output temporarily unavailable (invalid-response)", flush=True)
+                break
+            for event in events:
+                message = event.get("message") if isinstance(event, dict) else None
+                if not isinstance(message, str):
+                    continue
+                for line in message.splitlines():
+                    print(
+                        f"[aws:{phase}:{stream}] "
+                        f"{_sanitize_ssm_output_line(line, instance, command_id, run_identity)}",
+                        flush=True)
+                    emitted_streams.add(stream)
+            previous_token = token
+            token = next_token
+            tokens[stream] = token
+            if token == previous_token:
+                break
 
 
 def wait_for_ssm_command(
@@ -1352,6 +1432,8 @@ def wait_for_ssm_command(
     monotonic: Any = time.monotonic,
 ) -> int:
     deadline = monotonic() + timeout_seconds
+    log_tokens: dict[str, str] = {}
+    emitted_streams: set[str] = set()
     while monotonic() < deadline:
         result = _run_aws(
             run_command,
@@ -1379,10 +1461,19 @@ def wait_for_ssm_command(
         except json.JSONDecodeError as exc:
             raise AwsControllerError("SSM observation returned invalid JSON") from exc
         status = payload.get("Status")
+        _poll_ssm_cloudwatch_output(
+            phase,
+            instance,
+            command_id,
+            run_identity,
+            run_command,
+            log_tokens,
+            emitted_streams,
+        )
         if status in {"Pending", "InProgress", "Delayed"}:
             sleep(min(AWS_COMMAND_POLL_SECONDS, max(0.0, deadline - monotonic())))
             continue
-        _emit_ssm_output(phase, payload, instance, command_id, run_identity, run_command)
+        _emit_ssm_output(phase, payload, instance, command_id, run_identity, run_command, emitted_streams)
         if status == "Success":
             return 0
         if status == "TimedOut":
