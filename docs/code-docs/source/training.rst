@@ -752,6 +752,10 @@ tokens over the sequence-parallel group, for both ``reduction="mean"`` and ``red
 losses are summed in FP32, so half-precision training does not overflow the shard sum, and the result is returned
 in the dtype of the logits.
 Class-weighted cross entropy and ``reduction="none"`` are not supported.
+The deprecated ``size_average`` and ``reduce`` arguments are also rejected; use ``reduction`` explicitly.
+Do not set ``data_parallel_size`` or pass ``mesh_param`` with AutoSP. AutoSP derives the data-parallel size from
+the world size because the explicit DP/SP device mesh does not currently reduce gradients across the
+sequence-parallel dimension.
 
 Memory Optimization
 ~~~~~~~~~~~~~~~~~~~

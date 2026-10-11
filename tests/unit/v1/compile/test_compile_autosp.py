@@ -6,6 +6,7 @@
 import copy
 import operator
 import re
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -414,6 +415,13 @@ class TestAutoSPMeshValidation:
             sp_dp_registry.populate_registry(sp_size, dp_size)
         assert not sp_dp_registry.is_setup()
 
+    def test_rejects_explicit_dp_sp_device_mesh_from_config_or_mesh_param(self):
+        from deepspeed.runtime.engine import DeepSpeedEngine
+
+        engine = SimpleNamespace(mesh_device=object())
+        with pytest.raises(RuntimeError, match="does not support an explicit DP/SP device mesh"):
+            DeepSpeedEngine.get_autosp_backend(engine, {})
+
     @pytest.mark.parametrize("sp_size, dp_size", [(0, 4), (-2, -2)])
     def test_rejects_non_positive_mesh_dimensions(self, monkeypatch, sp_size, dp_size):
         from deepspeed.compile.custom_ops import sp_dp_registry
@@ -709,6 +717,63 @@ def _create_shard_offsets_graph():
     output.args = ((start, end), )
     gm.recompile()
     return gm
+
+
+def _create_cross_entropy_graph(*,
+                                shorten_labels=False,
+                                preprocess_labels=False,
+                                legacy_kwargs=None,
+                                legacy_position=None):
+    """Build the label side of a cross entropy graph with concrete metadata for rewrite validation."""
+    graph = Graph()
+    logits = graph.placeholder("logits")
+    logits.meta["example_value"] = torch.empty(32 if not shorten_labels else 30, 64)
+    labels = graph.placeholder("labels")
+    labels.meta["example_value"] = torch.empty(2, 16, dtype=torch.long)
+    labels.meta["tensor_dict"] = {"tag": (constants.AUTOSP_LABEL_ID_KEY, 1)}
+
+    target = labels
+    if preprocess_labels:
+        target = graph.call_method("clone", args=(target, ))
+        target.meta["example_value"] = torch.empty(2, 16, dtype=torch.long)
+    if shorten_labels:
+        target = graph.call_function(operator.getitem, args=(target, (slice(None), slice(1, None))))
+        target.meta["example_value"] = torch.empty(2, 15, dtype=torch.long)
+        target = graph.call_method("contiguous", args=(target, ))
+        target.meta["example_value"] = torch.empty(2, 15, dtype=torch.long)
+    target = graph.call_method("reshape", args=(target, (-1, )))
+    target.meta["example_value"] = torch.empty(30 if shorten_labels else 32, dtype=torch.long)
+    loss_args = (logits, target) if legacy_position is None else (logits, target, None, legacy_position)
+    loss = graph.call_function(F.cross_entropy, args=loss_args, kwargs=legacy_kwargs or {})
+    loss.meta["example_value"] = torch.empty(())
+    graph.output(loss)
+    return GraphModule({}, graph)
+
+
+class TestAutoSPCrossEntropyValidation:
+
+    @pytest.mark.parametrize("preprocess_labels", [False, True], ids=["raw-labels", "full-shape-preprocessing"])
+    def test_rejects_sequence_shortening_before_label_sharding(self, preprocess_labels):
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+
+        gm = _create_cross_entropy_graph(shorten_labels=True, preprocess_labels=preprocess_labels)
+        with pytest.raises(RuntimeError, match="target shortened along the sequence dimension"):
+            pass_shard_label_ids(gm, ())
+
+    @pytest.mark.parametrize("legacy_kwargs", [{"size_average": False}, {"reduce": False}])
+    def test_rejects_deprecated_reduction_arguments(self, legacy_kwargs):
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+
+        gm = _create_cross_entropy_graph(legacy_kwargs=legacy_kwargs)
+        with pytest.raises(RuntimeError, match="deprecated cross entropy"):
+            pass_shard_label_ids(gm, ())
+
+    def test_rejects_positional_deprecated_reduction_argument(self):
+        from deepspeed.compile.passes.sp_compile import pass_shard_label_ids
+
+        gm = _create_cross_entropy_graph(legacy_position=False)
+        with pytest.raises(RuntimeError, match="deprecated cross entropy"):
+            pass_shard_label_ids(gm, ())
 
 
 class TestAutoSPDivisibilityValidation:

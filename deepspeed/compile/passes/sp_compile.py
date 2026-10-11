@@ -160,6 +160,25 @@ def _find_full_label_node(target_node: Node, label_ids_node: Node, label_users: 
     return None
 
 
+def _has_shortened_sequence_path(target_node: Node, full_label_node: Node, label_users: set, seq_dim: int) -> bool:
+    """Return whether a loss target was shortened along the sequence dimension before flattening."""
+    full_label_meta = get_node_shape_meta(full_label_node)
+    full_label_shape = full_label_meta.shape
+    worklist = [target_node]
+    visited = set()
+    while worklist:
+        node = worklist.pop(0)
+        if node in visited or node not in label_users or node is full_label_node:
+            continue
+        visited.add(node)
+        node_meta = get_node_shape_meta(node)
+        if isinstance(node_meta, torch.Tensor) and node_meta.ndim == len(full_label_shape):
+            if str(node_meta.shape[seq_dim]) != str(full_label_shape[seq_dim]):
+                return True
+        worklist.extend(node.all_input_nodes)
+    return False
+
+
 def pass_shard_label_ids(gm: GraphModule, example_inputs):
     """
     Shard the labels so that the sequence-parallel loss equals the full-sequence loss.
@@ -191,13 +210,17 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
 
     full_label_nodes = {}
     for loss_node in loss_nodes:
-        full_label_node = _find_full_label_node(_get_cross_entropy_arg(loss_node, "target", 1, None), label_ids_node,
-                                                label_users)
+        target_node = _get_cross_entropy_arg(loss_node, "target", 1, None)
+        full_label_node = _find_full_label_node(target_node, label_ids_node, label_users)
         if full_label_node is None:
             print("[WARNING] AutoSP could not find the full-length labels of a cross entropy loss. "
                   "Sharding the label input directly; the loss is only computed over the local shard.")
             shard_tensor_node(gm, label_ids_node)
             return
+        if _has_shortened_sequence_path(target_node, full_label_node, label_users, seq_dim):
+            raise RuntimeError("AutoSP cannot preserve a cross entropy target shortened along the sequence "
+                               "dimension before sharding. Pad the labels so the shifted target keeps the full "
+                               "sequence length, and use ignore_index for the final token.")
         full_label_nodes[loss_node] = full_label_node
 
     sharded_label_nodes = {}
@@ -205,6 +228,11 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
         weight = _get_cross_entropy_arg(loss_node, "weight", 2, None)
         if weight is not None:
             raise RuntimeError("AutoSP does not support class-weighted cross entropy on sequence-sharded labels")
+        size_average = _get_cross_entropy_arg(loss_node, "size_average", 3, None)
+        reduce = _get_cross_entropy_arg(loss_node, "reduce", 5, None)
+        if size_average is not None or reduce is not None:
+            raise RuntimeError("AutoSP does not support the deprecated cross entropy size_average or reduce "
+                               "arguments; use reduction='mean' or reduction='sum' explicitly")
         reduction = _get_cross_entropy_arg(loss_node, "reduction", 6, "mean")
         if reduction not in ("mean", "sum"):
             raise RuntimeError(f"AutoSP supports cross entropy with reduction 'mean' or 'sum', got {reduction!r}")

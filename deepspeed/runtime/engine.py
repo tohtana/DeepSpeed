@@ -5769,6 +5769,10 @@ class DeepSpeedEngine(Module):
             get_accelerator().empty_cache()
 
     def get_autosp_backend(self, compile_kwargs):
+        if self.mesh_device is not None:
+            raise RuntimeError("AutoSP does not support an explicit DP/SP device mesh because gradients are not "
+                               "reduced across sequence-parallel ranks. Remove data_parallel_size or mesh_param "
+                               "and let AutoSP derive the data-parallel size from the world size.")
         if self.compile_autosp() and self.zero_optimization_stage() not in [
                 ZeroStageEnum.disabled, ZeroStageEnum.optimizer_states
         ]:
