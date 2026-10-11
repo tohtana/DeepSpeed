@@ -752,6 +752,19 @@ def _create_cross_entropy_graph(*,
 
 class TestAutoSPCrossEntropyValidation:
 
+    def test_does_not_classify_label_transpose_as_shortening(self):
+        from deepspeed.compile.passes.sp_compile import _has_shortened_sequence_path
+
+        graph = Graph()
+        labels = graph.placeholder("labels")
+        labels.meta["example_value"] = torch.empty(2, 16, dtype=torch.long)
+        transposed = graph.call_method("transpose", args=(labels, 0, 1))
+        transposed.meta["example_value"] = torch.empty(16, 2, dtype=torch.long)
+        flattened = graph.call_method("reshape", args=(transposed, (-1, )))
+        flattened.meta["example_value"] = torch.empty(32, dtype=torch.long)
+
+        assert not _has_shortened_sequence_path(flattened, labels, {labels, transposed, flattened})
+
     @pytest.mark.parametrize("preprocess_labels", [False, True], ids=["raw-labels", "full-shape-preprocessing"])
     def test_rejects_sequence_shortening_before_label_sharding(self, preprocess_labels):
         from deepspeed.compile.passes.sp_compile import pass_shard_label_ids

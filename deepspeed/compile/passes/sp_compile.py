@@ -160,10 +160,10 @@ def _find_full_label_node(target_node: Node, label_ids_node: Node, label_users: 
     return None
 
 
-def _has_shortened_sequence_path(target_node: Node, full_label_node: Node, label_users: set, seq_dim: int) -> bool:
-    """Return whether a loss target was shortened along the sequence dimension before flattening."""
+def _has_shortened_sequence_path(target_node: Node, full_label_node: Node, label_users: set) -> bool:
+    """Return whether a loss target dropped elements before flattening."""
     full_label_meta = get_node_shape_meta(full_label_node)
-    full_label_shape = full_label_meta.shape
+    full_label_numel = str(full_label_meta.numel())
     worklist = [target_node]
     visited = set()
     while worklist:
@@ -172,9 +172,8 @@ def _has_shortened_sequence_path(target_node: Node, full_label_node: Node, label
             continue
         visited.add(node)
         node_meta = get_node_shape_meta(node)
-        if isinstance(node_meta, torch.Tensor) and node_meta.ndim == len(full_label_shape):
-            if str(node_meta.shape[seq_dim]) != str(full_label_shape[seq_dim]):
-                return True
+        if isinstance(node_meta, torch.Tensor) and str(node_meta.numel()) != full_label_numel:
+            return True
         worklist.extend(node.all_input_nodes)
     return False
 
@@ -217,7 +216,7 @@ def pass_shard_label_ids(gm: GraphModule, example_inputs):
                   "Sharding the label input directly; the loss is only computed over the local shard.")
             shard_tensor_node(gm, label_ids_node)
             return
-        if _has_shortened_sequence_path(target_node, full_label_node, label_users, seq_dim):
+        if _has_shortened_sequence_path(target_node, full_label_node, label_users):
             raise RuntimeError("AutoSP cannot preserve a cross entropy target shortened along the sequence "
                                "dimension before sharding. Pad the labels so the shifted target keeps the full "
                                "sequence length, and use ignore_index for the final token.")
