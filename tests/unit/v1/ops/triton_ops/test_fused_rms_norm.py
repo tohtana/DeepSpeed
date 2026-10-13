@@ -119,11 +119,14 @@ def _ulp_stats(actual, expected):
     }
 
 
-def _assert_ulp_close(actual, expected, *, max_ulp, min_frac_within_1, label):
+def _assert_ulp_close(actual, expected, *, max_ulp, min_frac_within_1, label, max_abs_for_ulp_outlier=0.0):
     stats = _ulp_stats(actual, expected)
     message = (f"{label} ULP stats: max={stats['max']}, median={stats['median']}, "
                f"frac_within_1={stats['frac_within_1']}")
-    assert stats["max"] <= max_ulp, message
+    ulp_distances = (_ordered_float_bits(actual) - _ordered_float_bits(expected)).abs()
+    absolute_error = (actual.float() - expected.float()).abs()
+    ulp_or_absolute_close = (ulp_distances <= max_ulp) | (absolute_error <= max_abs_for_ulp_outlier)
+    assert bool(ulp_or_absolute_close.all()), message
     assert stats["frac_within_1"] >= min_frac_within_1, message
 
 
@@ -145,7 +148,14 @@ def _check_fused_rms_norm_matches_hf_forward_and_backward(dtype, shape):
     fused_out.backward(upstream)
 
     _assert_ulp_close(fused_out, eager_out, max_ulp=2, min_frac_within_1=0.99, label="forward")
-    _assert_ulp_close(fused_hidden.grad, eager_hidden.grad, max_ulp=8, min_frac_within_1=0.95, label="dx")
+    # Near cancellation, a few-nanounit BF16 dx can be many ULPs apart even though its absolute error is negligible.
+    # Keep the population-wide ULP requirement while allowing only a strict absolute fallback for such outliers.
+    _assert_ulp_close(fused_hidden.grad,
+                      eager_hidden.grad,
+                      max_ulp=8,
+                      min_frac_within_1=0.95,
+                      label="dx",
+                      max_abs_for_ulp_outlier=1e-7)
     _assert_ulp_close(fused_weight.grad, eager_weight.grad, max_ulp=8, min_frac_within_1=0.95, label="dgamma")
 
 
