@@ -64,8 +64,8 @@ def check_environment(pytestconfig):
 # The multi-rank-only CI workflow (DS_MULTIRANK_ONLY=1) spends its budget only on
 # the multi-rank tests its LOCAL_SIZE gate admits; single-rank tests are deselected
 # because the plain cpu-torch-latest run already guards them. Per-test world_size
-# marks are honored with the same precedence as the launcher (mark, then class
-# attribute); a fixture-injected world_size falls back to the class attribute.
+# marks and parametrized fixtures are honored with the same precedence as the
+# launcher (mark, then fixture, then class attribute).
 def pytest_collection_modifyitems(config, items):
     if os.environ.get('DS_MULTIRANK_ONLY', '0') != '1':
         return
@@ -75,8 +75,11 @@ def pytest_collection_modifyitems(config, items):
         if not getattr(cls, 'is_dist_test', False):
             return False
         mark = item.get_closest_marker('world_size')
+        callspec = getattr(item, 'callspec', None)
         if mark is not None:
             world_size = mark.args[0]
+        elif callspec is not None and 'world_size' in callspec.params:
+            world_size = callspec.params['world_size']
         else:
             world_size = getattr(cls, 'world_size', None)
         if isinstance(world_size, (list, tuple)):

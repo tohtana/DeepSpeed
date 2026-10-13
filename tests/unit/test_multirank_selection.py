@@ -80,6 +80,14 @@ class TestListAllSingle(DistBase):
         pass
 
 
+@pytest.mark.parametrize("world_size", [1, 2], ids=["tp1", "tp2"])
+class TestFixtureWorldSize(DistBase):
+    world_size = 2
+
+    def test_fixture_world_size(self, world_size):
+        pass
+
+
 def test_plain_function():
     pass
 '''
@@ -133,6 +141,8 @@ ALL_ITEMS = [
     "test_sandbox.py::TestMarkLowersToSingle::test_mark_lowers",
     "test_sandbox.py::TestListWorldSize::test_list_has_multi",
     "test_sandbox.py::TestListAllSingle::test_list_all_single",
+    "test_sandbox.py::TestFixtureWorldSize::test_fixture_world_size[tp1]",
+    "test_sandbox.py::TestFixtureWorldSize::test_fixture_world_size[tp2]",
     "test_sandbox.py::test_plain_function",
 ]
 
@@ -140,6 +150,7 @@ MULTIRANK_ITEMS = [
     "test_sandbox.py::TestClassWorldSizeTwo::test_class_level_multi",
     "test_sandbox.py::TestMarkRaisesToMulti::test_mark_raises",
     "test_sandbox.py::TestListWorldSize::test_list_has_multi",
+    "test_sandbox.py::TestFixtureWorldSize::test_fixture_world_size[tp2]",
 ]
 
 
