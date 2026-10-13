@@ -365,6 +365,13 @@ class TestAutoEPConfig:
                 "skip_recompute_combine": True,
                 **deepep
             }, "autoep_size=1"),
+            ({
+                "autoep_size": 2,
+                "skip_recompute_combine": True,
+                "preset_model": "mixtral",
+                "moe_layer_pattern": r"custom\.wrapper\.moe",
+                **deepep
+            }, "skip_recompute_combine.*moe_layer_pattern"),
         )
         for overrides, match in rejected:
             config = parse_autoep_config({"enabled": True, **overrides})
