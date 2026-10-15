@@ -23,6 +23,7 @@ from deepspeed.accelerator import get_accelerator
 import deepspeed.comm as dist
 
 from .util import torch_assert_close
+from .diagnostics import diagnostic_event, diagnostic_pool_processes, diagnostic_snapshot
 
 import pytest
 from _pytest.outcomes import Skipped
@@ -197,21 +198,60 @@ class DistributedExec(ABC):
             pool = mp.Pool(processes=num_procs)
             master_port = get_master_port()
 
+        diagnostic_event(
+            "distributed_pool_ready",
+            num_procs=num_procs,
+            reuse_dist_env=self.reuse_dist_env,
+            master_port=master_port,
+            children=diagnostic_pool_processes(pool),
+        )
+
         # Run the test
         args = [(local_rank, num_procs, master_port, init_method) for local_rank in range(num_procs)]
         skip_msgs_async = pool.starmap_async(self._dist_run, args)
+        diagnostic_event(
+            "distributed_pool_submitted",
+            num_procs=num_procs,
+            timeout_seconds=self.exec_timeout,
+            children=diagnostic_pool_processes(pool),
+        )
 
         try:
+            diagnostic_event("distributed_pool_wait_start", timeout_seconds=self.exec_timeout)
             skip_msgs = skip_msgs_async.get(self.exec_timeout)
+            diagnostic_event("distributed_pool_result", children=diagnostic_pool_processes(pool))
         except mp.TimeoutError:
             # Shortcut to exit pytest in the case of a hanged test. This
             # usually means an environment error and the rest of tests will
             # hang (causing super long unit test runtimes)
+            children = diagnostic_pool_processes(pool)
+            diagnostic_event(
+                "distributed_pool_timeout",
+                timeout_seconds=self.exec_timeout,
+                children=children,
+            )
+            diagnostic_snapshot(
+                "distributed-pool-timeout",
+                timeout_seconds=self.exec_timeout,
+                children=children,
+            )
+            diagnostic_event("pytest_exit", cause="distributed_pool_timeout", returncode=1)
             pytest.exit("Test hanged, exiting", returncode=1)
         finally:
             # Regardless of the outcome, ensure proper teardown
             # Tear down distributed environment and close process pools
-            self._close_pool(pool, num_procs)
+            diagnostic_event("distributed_pool_cleanup_start", children=diagnostic_pool_processes(pool))
+            try:
+                self._close_pool(pool, num_procs)
+            except BaseException as error:
+                diagnostic_event(
+                    "distributed_pool_cleanup_error",
+                    error=repr(error),
+                    children=diagnostic_pool_processes(pool),
+                )
+                raise
+            finally:
+                diagnostic_event("distributed_pool_cleanup_end", children=diagnostic_pool_processes(pool))
 
         # If we skipped a test, propagate that to this process
         if any(skip_msgs):
@@ -296,51 +336,73 @@ class DistributedExec(ABC):
             self._launch_daemonic_procs(num_procs, init_method)
 
     def _dist_run(self, local_rank, num_procs, master_port, init_method, skip_msg=""):
-        if dist.is_initialized():
-            if get_accelerator().is_available():
-                # local_rank might not match the rank in the previous run if you are reusing the environment
-                get_accelerator().set_device(dist.get_rank())
-        else:
-            """ Initialize deepspeed.comm and execute the user function. """
-            if self.set_dist_env:
-                os.environ['MASTER_ADDR'] = '127.0.0.1'
-                os.environ['MASTER_PORT'] = str(master_port)
-                os.environ['LOCAL_RANK'] = str(local_rank)
-                # NOTE: unit tests don't support multi-node so local_rank == global rank
-                os.environ['RANK'] = str(local_rank)
-                # In case of multiprocess launching LOCAL_SIZE should be same as WORLD_SIZE
-                # DeepSpeed single node launcher would also set LOCAL_SIZE accordingly
-                os.environ['LOCAL_SIZE'] = str(num_procs)
-                os.environ['WORLD_SIZE'] = str(num_procs)
-
-            # turn off NCCL logging if set
-            os.environ.pop('NCCL_DEBUG', None)
-
-            if get_accelerator().is_available():
-                set_accelerator_visible()
-
-            if get_accelerator().is_available():
-                get_accelerator().set_device(local_rank)
-
-            if self.init_distributed:
-                deepspeed.init_distributed(dist_backend=self.backend,
-                                           init_method=init_method,
-                                           rank=local_rank,
-                                           world_size=num_procs)
-                dist.barrier()
-
         try:
-            self.run(**self._fixture_kwargs)
-        except BaseException as e:
-            if isinstance(e, Skipped):
-                if self.non_daemonic_procs:
-                    skip_msg.put(e.msg)
-                else:
-                    skip_msg = e.msg
+            diagnostic_event(
+                "distributed_child_start",
+                process_role="distributed-test-child",
+                local_rank=local_rank,
+                num_procs=num_procs,
+                master_port=master_port,
+            )
+            if dist.is_initialized():
+                if get_accelerator().is_available():
+                    # local_rank might not match the rank in the previous run if you are reusing the environment
+                    get_accelerator().set_device(dist.get_rank())
             else:
-                raise e
+                """ Initialize deepspeed.comm and execute the user function. """
+                if self.set_dist_env:
+                    os.environ['MASTER_ADDR'] = '127.0.0.1'
+                    os.environ['MASTER_PORT'] = str(master_port)
+                    os.environ['LOCAL_RANK'] = str(local_rank)
+                    # NOTE: unit tests don't support multi-node so local_rank == global rank
+                    os.environ['RANK'] = str(local_rank)
+                    # In case of multiprocess launching LOCAL_SIZE should be same as WORLD_SIZE
+                    os.environ['LOCAL_SIZE'] = str(num_procs)
+                    os.environ['WORLD_SIZE'] = str(num_procs)
 
-        return skip_msg
+                # turn off NCCL logging if set
+                os.environ.pop('NCCL_DEBUG', None)
+
+                if get_accelerator().is_available():
+                    set_accelerator_visible()
+
+                if get_accelerator().is_available():
+                    get_accelerator().set_device(local_rank)
+
+                if self.init_distributed:
+                    deepspeed.init_distributed(dist_backend=self.backend,
+                                               init_method=init_method,
+                                               rank=local_rank,
+                                               world_size=num_procs)
+                    dist.barrier()
+
+            try:
+                self.run(**self._fixture_kwargs)
+            except BaseException as e:
+                if isinstance(e, Skipped):
+                    if self.non_daemonic_procs:
+                        skip_msg.put(e.msg)
+                    else:
+                        skip_msg = e.msg
+                else:
+                    raise e
+
+            return skip_msg
+        except BaseException as error:
+            diagnostic_event(
+                "distributed_child_error",
+                process_role="distributed-test-child",
+                local_rank=local_rank,
+                exception_type=type(error).__name__,
+                exception=repr(error),
+            )
+            raise
+        finally:
+            diagnostic_event(
+                "distributed_child_end",
+                process_role="distributed-test-child",
+                local_rank=local_rank,
+            )
 
     def _launch_with_file_store(self, request, world_size):
         tmpdir = request.getfixturevalue("tmpdir")

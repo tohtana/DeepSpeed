@@ -26,6 +26,9 @@ def pytest_configure(config):
     config.option.durations = 0
     config.option.durations_min = 1
     config.option.verbose = True
+    if os.environ.get("DS_UNITTEST_DIAGNOSTICS_DIR"):
+        from unit.diagnostics import register_pytest_diagnostics
+        register_pytest_diagnostics(config)
 
 
 def pytest_addoption(parser):
