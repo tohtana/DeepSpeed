@@ -48,6 +48,14 @@ def _identity():
     }
 
 
+def _proc_start_time(pid):
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        return stat[stat.rfind(")") + 2:].split()[19]
+    except (IndexError, OSError):
+        return None
+
+
 def _ensure_faulthandler():
     global _fault_handle, _fault_pid
     pid = os.getpid()
@@ -65,6 +73,13 @@ def _ensure_faulthandler():
             faulthandler.register(signal.SIGUSR1, file=_fault_handle, all_threads=True, chain=False)
         except (AttributeError, OSError, RuntimeError):
             pass
+        else:
+            ready_path = _root() / "faulthandler-ready" / f"{_role()}-{pid}.json"
+            _write_json(ready_path, {
+                "pid": pid,
+                "fault_path": str(fault_path),
+                "proc_start_time": _proc_start_time(pid),
+            })
 
 
 def _write_json(path, payload):
@@ -99,15 +114,21 @@ def diagnostic_event(event, **payload):
         pass
 
 
-def diagnostic_pool_processes(pool):
+def diagnostic_pool_processes(pool, submitted_processes=()):
+    current_processes = tuple(getattr(pool, "_pool", ()))
+    processes_to_report = list(submitted_processes)
+    processes_to_report.extend(process for process in current_processes
+                               if not any(process is submitted for submitted in submitted_processes))
     processes = []
-    for process in getattr(pool, "_pool", ()):
+    for process in processes_to_report:
         try:
             processes.append({
                 "name": process.name,
                 "pid": process.pid,
                 "exitcode": process.exitcode,
                 "alive": process.is_alive(),
+                "submitted": any(process is submitted for submitted in submitted_processes),
+                "current": any(process is current for current in current_processes),
             })
         except BaseException as error:
             processes.append({"error": repr(error)})
@@ -206,6 +227,51 @@ def _capture_active_map(path):
     _write_json(path, states)
 
 
+def _request_registered_faulthandler_dumps(path):
+    requests = []
+    signaled = False
+    for ready_path in sorted((_root() / "faulthandler-ready").glob("*.json")):
+        try:
+            ready = json.loads(ready_path.read_text())
+            pid = int(ready["pid"])
+            fault_path = Path(ready["fault_path"])
+        except (KeyError, OSError, ValueError, json.JSONDecodeError) as error:
+            requests.append({"ready_path": str(ready_path), "error": repr(error)})
+            continue
+        request = {"ready_path": str(ready_path), "path": str(fault_path), "pid": pid}
+        try:
+            request["bytes_before"] = fault_path.stat().st_size
+        except OSError as error:
+            request["status"] = "fault-file-unavailable"
+            request["error"] = repr(error)
+            requests.append(request)
+            continue
+        registered_start_time = ready.get("proc_start_time")
+        current_start_time = _proc_start_time(pid)
+        if registered_start_time is not None and current_start_time != registered_start_time:
+            request["status"] = "pid-no-longer-matches"
+            request["current_proc_start_time"] = current_start_time
+        elif pid == os.getpid():
+            request["status"] = "self-dumped-separately"
+        else:
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                request["status"] = "signaled"
+                signaled = True
+            except (OSError, RuntimeError) as error:
+                request["status"] = "signal-failed"
+                request["error"] = repr(error)
+        requests.append(request)
+    if signaled:
+        time.sleep(0.5)
+    for request in requests:
+        try:
+            request["bytes_after"] = Path(request["path"]).stat().st_size
+        except OSError as error:
+            request["bytes_after_error"] = repr(error)
+    _write_json(path, requests)
+
+
 def diagnostic_snapshot(reason, **payload):
     if not diagnostic_enabled():
         return
@@ -224,6 +290,7 @@ def diagnostic_snapshot(reason, **payload):
         }
         _write_json(root / "markers" / f"{label}.json", marker)
         diagnostic_event("diagnostic_snapshot_start", reason=reason, snapshot=label, **payload)
+        _request_registered_faulthandler_dumps(snapshot_dir / "faulthandler-signals.json")
         with (snapshot_dir / "python-stacks.txt").open("w") as handle:
             faulthandler.dump_traceback(file=handle, all_threads=True)
         _capture_active_map(snapshot_dir / "active-items.json")

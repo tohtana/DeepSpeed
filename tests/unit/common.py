@@ -197,13 +197,14 @@ class DistributedExec(ABC):
         else:
             pool = mp.Pool(processes=num_procs)
             master_port = get_master_port()
+        submitted_processes = tuple(getattr(pool, "_pool", ()))
 
         diagnostic_event(
             "distributed_pool_ready",
             num_procs=num_procs,
             reuse_dist_env=self.reuse_dist_env,
             master_port=master_port,
-            children=diagnostic_pool_processes(pool),
+            children=diagnostic_pool_processes(pool, submitted_processes),
         )
 
         # Run the test
@@ -213,18 +214,18 @@ class DistributedExec(ABC):
             "distributed_pool_submitted",
             num_procs=num_procs,
             timeout_seconds=self.exec_timeout,
-            children=diagnostic_pool_processes(pool),
+            children=diagnostic_pool_processes(pool, submitted_processes),
         )
 
         try:
             diagnostic_event("distributed_pool_wait_start", timeout_seconds=self.exec_timeout)
             skip_msgs = skip_msgs_async.get(self.exec_timeout)
-            diagnostic_event("distributed_pool_result", children=diagnostic_pool_processes(pool))
+            diagnostic_event("distributed_pool_result", children=diagnostic_pool_processes(pool, submitted_processes))
         except mp.TimeoutError:
             # Shortcut to exit pytest in the case of a hanged test. This
             # usually means an environment error and the rest of tests will
             # hang (causing super long unit test runtimes)
-            children = diagnostic_pool_processes(pool)
+            children = diagnostic_pool_processes(pool, submitted_processes)
             diagnostic_event(
                 "distributed_pool_timeout",
                 timeout_seconds=self.exec_timeout,
@@ -240,18 +241,20 @@ class DistributedExec(ABC):
         finally:
             # Regardless of the outcome, ensure proper teardown
             # Tear down distributed environment and close process pools
-            diagnostic_event("distributed_pool_cleanup_start", children=diagnostic_pool_processes(pool))
+            diagnostic_event("distributed_pool_cleanup_start",
+                             children=diagnostic_pool_processes(pool, submitted_processes))
             try:
                 self._close_pool(pool, num_procs)
             except BaseException as error:
                 diagnostic_event(
                     "distributed_pool_cleanup_error",
                     error=repr(error),
-                    children=diagnostic_pool_processes(pool),
+                    children=diagnostic_pool_processes(pool, submitted_processes),
                 )
                 raise
             finally:
-                diagnostic_event("distributed_pool_cleanup_end", children=diagnostic_pool_processes(pool))
+                diagnostic_event("distributed_pool_cleanup_end",
+                                 children=diagnostic_pool_processes(pool, submitted_processes))
 
         # If we skipped a test, propagate that to this process
         if any(skip_msgs):
