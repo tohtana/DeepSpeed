@@ -16,6 +16,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 import deepspeed.runtime.zero.fused_gradient_statistics as fused_stats
 from deepspeed.runtime.zero.fused_gradient_statistics import (FusedGradientStatistics, build_gradient_statistics_plan)
+from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
 
@@ -71,6 +72,31 @@ def test_runtime_fallback_is_atomic_on_unsupported_gradients():
     assert "CUDA" in helper.last_fallback_reason
     assert not helper.active_for_update
     assert helper.cache is None
+
+
+@pytest.mark.parametrize("is_rocm, expected_fused", [(True, False), (False, True)])
+def test_static_eligibility_excludes_rocm(monkeypatch, is_rocm, expected_fused):
+    optimizer = SimpleNamespace(partition_gradients=True,
+                                compute_grad_norm=True,
+                                check_grad_overflow=True,
+                                cpu_offload=False,
+                                has_moe_layers=False,
+                                zenflow=False,
+                                contiguous_gradients=True,
+                                dtype=torch.bfloat16,
+                                master_weights_and_grads_dtype=torch.bfloat16,
+                                bf16_optimizer_states=True,
+                                device=torch.device("cuda"),
+                                fused_gradient_statistics=None,
+                                model_parallel_rank=0)
+    monkeypatch.setattr(fused_stats, "_TRITON_AVAILABLE", True)
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", is_rocm)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+
+    DeepSpeedZeroOptimizer._configure_fused_gradient_statistics(optimizer)
+
+    assert FusedGradientStatistics.is_available() is expected_fused
+    assert (optimizer.fused_gradient_statistics is not None) is expected_fused
 
 
 def test_cache_refreshes_same_storage_without_retaining_gradients():

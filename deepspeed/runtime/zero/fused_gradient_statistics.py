@@ -12,6 +12,7 @@ from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, triton, tl
 from deepspeed.runtime.constants import PIPE_REPLICATED
 from deepspeed.runtime.utils import is_model_parallel_parameter
 
+_IS_ROCM_PYTORCH = getattr(torch.version, "hip", None) is not None
 _CHUNK_SIZE = 4096
 
 
@@ -207,7 +208,7 @@ class FusedGradientStatistics:
 
     @staticmethod
     def is_available():
-        return _TRITON_AVAILABLE
+        return _TRITON_AVAILABLE and not _IS_ROCM_PYTORCH
 
     def refresh(self, gradient_groups, parameter_groups):
         previous = self.cache
