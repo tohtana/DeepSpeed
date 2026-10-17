@@ -395,6 +395,7 @@ Enabling and configuring ZeRO memory optimizations
     "allgather_partitions": [true|false],
     "allgather_bucket_size": 5e8,
     "compute_grad_norm": [true|false],
+    "fused_gradient_statistics": [true|false],
     "overlap_comm": false,
     "reduce_scatter": [true|false],
     "reduce_bucket_size": 5e8,
@@ -451,6 +452,12 @@ Enabling and configuring ZeRO memory optimizations
 | Description                                                                                                                                                                                                                     | Default |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | Compute and retain the global gradient norm during ZeRO Stage 1/2 optimizer steps. Set to `false` only with a GPU optimizer, without ZenFlow, gradient clipping, or ZeRO Stage 1 BF16 parameters with FP32 gradient accumulation, and when callers do not use `get_global_grad_norm()`; finite/overflow checking is unchanged. | `true`  |
+
+***fused_gradient_statistics***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| Fuse the local finite check and L2 statistics for ZeRO Stage 2 BF16 CUDA gradients. This requires BF16 master weights/gradients and optimizer states, contiguous gradients, overflow checking, and Triton, without optimizer offload, MoE, or ZenFlow. Unsupported configurations use the native implementation. | `false` |
 
 <i>**overlap_comm**</i>: [boolean]
 

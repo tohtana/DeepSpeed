@@ -204,7 +204,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                  bf16_optimizer_states=False,
                  elastic_checkpoint=False,
                  check_grad_overflow=True,
-                 compute_grad_norm=True):
+                 compute_grad_norm=True,
+                 fused_gradient_statistics=False):
 
         super().__init__()
 
@@ -247,6 +248,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.parameter_alignment = parameter_alignment
         self.check_grad_overflow = check_grad_overflow
         self.compute_grad_norm = compute_grad_norm
+        self.fused_gradient_statistics = None
         self.param_names = param_names
         self.mpu = mpu
         # differences from apex.fp16_utils:
@@ -733,6 +735,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.initialize_optimizer_states()
         see_memory_usage("After initializing optimizer states", force=False)
 
+        if fused_gradient_statistics:
+            self._configure_fused_gradient_statistics()
+
         if dist.get_rank() == 0:
             logger.info("optimizer state initialized")
 
@@ -748,6 +753,43 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._create_optimizer_mapping()
 
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
+
+    def _configure_fused_gradient_statistics(self):
+        unsupported = []
+        if not self.partition_gradients:
+            unsupported.append("ZeRO Stage 2 is required")
+        if not self.compute_grad_norm:
+            unsupported.append("gradient norm computation is disabled")
+        if not self.check_grad_overflow:
+            unsupported.append("gradient overflow checking is disabled")
+        if self.cpu_offload:
+            unsupported.append("optimizer offload is enabled")
+        if self.has_moe_layers:
+            unsupported.append("MoE parameters are present")
+        if self.zenflow:
+            unsupported.append("ZenFlow is enabled")
+        if not self.contiguous_gradients:
+            unsupported.append("contiguous gradients are disabled")
+        if self.dtype != torch.bfloat16:
+            unsupported.append("parameters are not BF16")
+        if self.master_weights_and_grads_dtype != torch.bfloat16:
+            unsupported.append("master weights and gradients are not BF16")
+        if not self.bf16_optimizer_states:
+            unsupported.append("optimizer states are not BF16")
+        if torch.device(self.device).type != "cuda":
+            unsupported.append("the optimizer is not on CUDA")
+
+        if not unsupported:
+            from deepspeed.runtime.zero.fused_gradient_statistics import FusedGradientStatistics
+            if FusedGradientStatistics.is_available():
+                self.fused_gradient_statistics = FusedGradientStatistics(self.model_parallel_rank)
+                return
+            unsupported.append("Triton is unavailable")
+
+        if dist.get_rank() == 0:
+            logger.warning_once(
+                "zero_optimization.fused_gradient_statistics is unavailable (%s); using native "
+                "gradient statistics", ", ".join(unsupported))
 
     def destroy(self):
         self._wait_for_offload_copies()
@@ -2664,6 +2706,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
         norm_type = float(norm_type)
         all_norms = []
+        if norm_type == 2.0 and self.fused_gradient_statistics is not None \
+                and self.fused_gradient_statistics.active_for_update:
+            total_norm = self.fused_gradient_statistics.local_group_sum_squares(gradients, params)
+            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=self.dp_process_group)
+            self._model_parallel_all_reduce(tensor=total_norm, op=dist.ReduceOp.SUM)
+            total_norm = total_norm.sqrt()
+            mask_nan_or_inf_with_val_inplace(total_norm, device=self.device)
+            return total_norm
+
         if norm_type == inf:
             for g in gradients:
                 all_norms.append(g.data.abs().max().float())
@@ -3228,6 +3279,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         return invalid_grad_count.bool()
 
     def has_overflow_partitioned_grads_serial(self):
+        if self.fused_gradient_statistics is not None:
+            gradient_groups = [self.averaged_gradients[i] for i in range(len(self.bit16_groups))]
+            overflow = self.fused_gradient_statistics.refresh(gradient_groups, self.params_in_partition)
+            if overflow is not None:
+                return overflow
+            if dist.get_rank() == 0:
+                logger.warning_once(
+                    "zero_optimization.fused_gradient_statistics cannot process this update (%s); "
+                    "using native gradient statistics", self.fused_gradient_statistics.last_fallback_reason)
+
         invalid_grad_count = torch.zeros([1], dtype=torch.float, device=get_accelerator().current_device_name())
         for i in range(len(self.bit16_groups)):
             for j, grad in enumerate(self.averaged_gradients[i]):

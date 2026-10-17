@@ -1612,6 +1612,9 @@ class DeepSpeedEngine(Module):
     def zero_compute_grad_norm(self):
         return self._config.zero_config.compute_grad_norm
 
+    def zero_fused_gradient_statistics(self):
+        return self._config.zero_config.fused_gradient_statistics
+
     def zero_optimization_partition_gradients(self):
         return self.zero_optimization_stage() >= ZeroStageEnum.gradients
 
@@ -2633,6 +2636,13 @@ class DeepSpeedEngine(Module):
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
 
+        if self.zero_fused_gradient_statistics() and zero_stage != ZeroStageEnum.gradients:
+            log_dist(
+                "zero_optimization.fused_gradient_statistics supports only ZeRO Stage 2; using native "
+                "gradient statistics",
+                ranks=[0],
+                level=logging.WARNING)
+
         model_dtype, gradient_accumulation_dtype = self.get_data_types()
 
         if self.bfloat16_enabled():
@@ -2704,7 +2714,9 @@ class DeepSpeedEngine(Module):
                 communication_data_type=self.communication_data_type,
                 elastic_checkpoint=self.zero_elastic_checkpoint(),
                 check_grad_overflow=check_grad_overflow,
-                compute_grad_norm=self.zero_compute_grad_norm())
+                compute_grad_norm=self.zero_compute_grad_norm(),
+                fused_gradient_statistics=self.zero_fused_gradient_statistics()
+                and zero_stage == ZeroStageEnum.gradients)
 
         elif zero_stage == ZeroStageEnum.weights:
             self._validate_zero3_moe_compatibility()

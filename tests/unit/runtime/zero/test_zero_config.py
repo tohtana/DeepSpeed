@@ -70,6 +70,11 @@ def test_zero_config_compute_grad_norm():
             DeepSpeedZeroConfig(stage=stage, compute_grad_norm=False)
 
 
+def test_zero_config_fused_gradient_statistics():
+    assert DeepSpeedZeroConfig(stage=2).fused_gradient_statistics is False
+    assert DeepSpeedZeroConfig(stage=2, fused_gradient_statistics=True).fused_gradient_statistics is True
+
+
 def test_zero_config_offload_configs():
     config = DeepSpeedZeroConfig()
     assert config.offload_param is None

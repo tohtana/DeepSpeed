@@ -147,6 +147,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     and callers do not use ``get_global_grad_norm()``.
     """
 
+    fused_gradient_statistics: bool = False
+    """
+    Fuse local BF16 gradient finite checks and L2 statistics for supported ZeRO Stage 2 CUDA training.
+    Unsupported configurations use the native implementation.
+    """
+
     load_from_fp32_weights: bool = True
     """
     Boolean indicating whether to initialize fp32 master weights from fp32
