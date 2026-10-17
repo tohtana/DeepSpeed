@@ -3,8 +3,12 @@
 
 # DeepSpeed Team
 
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 
+from deepspeed.runtime.engine import DeepSpeedEngine
 from deepspeed.runtime.zero.config import DeepSpeedZeroConfig, DeepSpeedZeroOffloadParamConfig, DeepSpeedZeroOffloadOptimizerConfig
 
 
@@ -73,6 +77,18 @@ def test_zero_config_compute_grad_norm():
 def test_zero_config_fused_gradient_statistics():
     assert DeepSpeedZeroConfig(stage=2).fused_gradient_statistics is False
     assert DeepSpeedZeroConfig(stage=2, fused_gradient_statistics=True).fused_gradient_statistics is True
+
+
+@pytest.mark.parametrize("stage, expected_warnings", [(0, 1), (1, 1), (2, 0), (3, 1)])
+def test_fused_gradient_statistics_unsupported_stage_warning(stage, expected_warnings):
+    engine = object.__new__(DeepSpeedEngine)
+    zero_config = DeepSpeedZeroConfig(stage=stage, fused_gradient_statistics=True)
+    engine._config = SimpleNamespace(zero_config=zero_config, zero_optimization_stage=zero_config.stage)
+
+    with mock.patch("deepspeed.runtime.engine.log_dist") as warning:
+        engine._warn_unsupported_fused_gradient_statistics()
+
+    assert warning.call_count == expected_warnings
 
 
 def test_zero_config_offload_configs():

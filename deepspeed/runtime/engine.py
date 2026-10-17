@@ -2329,6 +2329,7 @@ class DeepSpeedEngine(Module):
 
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
+        self._warn_unsupported_fused_gradient_statistics()
         if client_optimizer is None:
             if self.has_moe_layers:
                 model_parameters = configure_moe_param_groups(model_parameters)
@@ -2370,6 +2371,14 @@ class DeepSpeedEngine(Module):
 
         self._configure_autoep_folding_optimizer_gradient_reduction()
         log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer.__class__.__name__), ranks=[0])
+
+    def _warn_unsupported_fused_gradient_statistics(self):
+        if self.zero_fused_gradient_statistics() and self.zero_optimization_stage() != ZeroStageEnum.gradients:
+            log_dist(
+                "zero_optimization.fused_gradient_statistics supports only ZeRO Stage 2; using native "
+                "gradient statistics",
+                ranks=[0],
+                level=logging.WARNING)
 
     def _configure_autoep_folding_optimizer_gradient_reduction(self):
         configure = getattr(self.optimizer, "configure_autoep_folding_tp_gradient_reduction", None)
@@ -2635,13 +2644,6 @@ class DeepSpeedEngine(Module):
 
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
-
-        if self.zero_fused_gradient_statistics() and zero_stage != ZeroStageEnum.gradients:
-            log_dist(
-                "zero_optimization.fused_gradient_statistics supports only ZeRO Stage 2; using native "
-                "gradient statistics",
-                ranks=[0],
-                level=logging.WARNING)
 
         model_dtype, gradient_accumulation_dtype = self.get_data_types()
 

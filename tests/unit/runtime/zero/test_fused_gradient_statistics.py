@@ -12,6 +12,7 @@ import pytest
 import torch
 
 import deepspeed
+import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 import deepspeed.runtime.zero.fused_gradient_statistics as fused_stats
 from deepspeed.runtime.zero.fused_gradient_statistics import (FusedGradientStatistics, build_gradient_statistics_plan)
@@ -157,68 +158,80 @@ def _integration_config(fused):
 
 
 class TestFusedGradientStatisticsIntegration(DistributedTest):
-    world_size = 1
+    world_size = 2
 
-    def test_real_zero2_update_and_overflow_skip(self):
+    def test_real_zero2_native_parity_and_cross_rank_overflow_skip(self):
         if not get_accelerator().is_bf16_supported() or not FusedGradientStatistics.is_available():
             pytest.skip("BF16 CUDA with Triton is required")
 
         torch.manual_seed(1234)
-        model = SimpleModel(hidden_dim=8)
-        engine, optimizer, _, _ = deepspeed.initialize(model=model,
-                                                       model_parameters=model.parameters(),
-                                                       config=_integration_config(fused=True))
-        assert optimizer.fused_gradient_statistics is not None
+        native_model = SimpleModel(hidden_dim=8)
+        fused_model = SimpleModel(hidden_dim=8)
+        fused_model.load_state_dict(native_model.state_dict())
+        native_engine, native_optimizer, _, _ = deepspeed.initialize(model=native_model,
+                                                                     model_parameters=native_model.parameters(),
+                                                                     config=_integration_config(fused=False))
+        fused_engine, fused_optimizer, _, _ = deepspeed.initialize(model=fused_model,
+                                                                   model_parameters=fused_model.parameters(),
+                                                                   config=_integration_config(fused=True))
+        assert native_optimizer.fused_gradient_statistics is None
+        assert fused_optimizer.fused_gradient_statistics is not None
 
-        inputs = torch.randn(1, 8, device=engine.device, dtype=torch.bfloat16)
-        targets = torch.randn(1, 8, device=engine.device, dtype=torch.bfloat16)
-        before = [parameter.detach().clone() for parameter in engine.module.parameters()]
-        engine.backward(engine(inputs, targets))
+        torch.manual_seed(1234 + dist.get_rank())
+        inputs = torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16)
+        targets = torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16)
+        fused_engine.backward(fused_engine(inputs, targets))
+        native_engine.backward(native_engine(inputs, targets))
 
-        assert not optimizer.has_overflow_partitioned_grads_serial().item()
+        assert not fused_optimizer.has_overflow_partitioned_grads_serial().item()
+        assert not native_optimizer.has_overflow_partitioned_grads_serial().item()
         fused_norms = []
-        reference_norms = []
-        for index in range(len(optimizer.bit16_groups)):
-            gradients = optimizer.averaged_gradients[index]
-            parameters = optimizer.params_in_partition[index]
-            selected = []
-            nonpadding = (gradient for gradient in gradients if not getattr(gradient, "_zero_padding", False))
-            for gradient, parameter in zip(nonpadding, parameters):
-                if not getattr(parameter, "ds_pipe_replicated", False):
-                    selected.append(torch.linalg.vector_norm(gradient.double(), ord=2))
-            reference_norms.append(torch.stack(selected).square().sum().float().sqrt())
-            fused_norms.append(optimizer.get_grad_norm_direct(gradients, parameters))
-        torch.testing.assert_close(torch.stack(fused_norms), torch.stack(reference_norms))
+        native_norms = []
+        for index in range(len(fused_optimizer.bit16_groups)):
+            fused_norms.append(
+                fused_optimizer.get_grad_norm_direct(fused_optimizer.averaged_gradients[index],
+                                                     fused_optimizer.params_in_partition[index]))
+            native_norms.append(
+                native_optimizer.get_grad_norm_direct(native_optimizer.averaged_gradients[index],
+                                                      native_optimizer.params_in_partition[index]))
+        torch.testing.assert_close(torch.stack(fused_norms), torch.stack(native_norms))
 
         global_norm = torch.linalg.vector_norm(torch.stack(fused_norms))
-        sample = next(gradient for gradients in optimizer.averaged_gradients.values() for gradient in gradients
-                      if gradient is not None)
-        actual = sample.clone()
-        expected = sample.clone()
-        optimizer.unscale_and_clip_grads([actual], global_norm)
-        clip = torch.clamp((global_norm + 1e-6) / optimizer.clip_grad, min=1.0)
-        expected.mul_(1.0 / clip)
-        assert torch.equal(actual, expected)
+        native_global_norm = torch.linalg.vector_norm(torch.stack(native_norms))
+        fused_sample = next(gradient for gradients in fused_optimizer.averaged_gradients.values()
+                            for gradient in gradients if gradient is not None).clone()
+        native_sample = next(gradient for gradients in native_optimizer.averaged_gradients.values()
+                             for gradient in gradients if gradient is not None).clone()
+        fused_optimizer.unscale_and_clip_grads([fused_sample], global_norm)
+        native_optimizer.unscale_and_clip_grads([native_sample], native_global_norm)
+        torch.testing.assert_close(fused_sample, native_sample)
 
-        engine.step()
-        assert optimizer.fused_gradient_statistics.refresh_count >= 2
-        assert any(not torch.equal(previous, current) for previous, current in zip(before, engine.module.parameters()))
+        fused_engine.step()
+        native_engine.step()
+        assert fused_optimizer.fused_gradient_statistics.refresh_count >= 2
+        for fused_parameter, native_parameter in zip(fused_engine.module.parameters(),
+                                                     native_engine.module.parameters()):
+            torch.testing.assert_close(fused_parameter, native_parameter)
         moment_tensors = [
-            state[name] for state in optimizer.optimizer.state.values() for name in ("exp_avg", "exp_avg_sq")
+            state[name] for state in fused_optimizer.optimizer.state.values() for name in ("exp_avg", "exp_avg_sq")
             if name in state
         ]
         assert moment_tensors
         assert all(moment.dtype == torch.bfloat16 for moment in moment_tensors)
 
-        engine.backward(engine(inputs, targets))
-        gradient = next(gradient for gradients in optimizer.averaged_gradients.values() for gradient in gradients
+        fused_engine.backward(fused_engine(inputs, targets))
+        gradient = next(gradient for gradients in fused_optimizer.averaged_gradients.values() for gradient in gradients
                         if gradient is not None)
-        gradient.view(-1)[0] = float("nan")
-        before_overflow = [parameter.detach().clone() for parameter in engine.module.parameters()]
-        skipped_before = engine.skipped_steps
-        engine.step()
+        if dist.get_rank() == 0:
+            gradient.view(-1)[0] = float("nan")
+        before_overflow = [parameter.detach().clone() for parameter in fused_engine.module.parameters()]
+        skipped_before = fused_engine.skipped_steps
+        fused_engine.step()
 
-        assert engine.skipped_steps == skipped_before + 1
+        assert fused_engine.skipped_steps == skipped_before + 1
         assert all(
-            torch.equal(previous, current) for previous, current in zip(before_overflow, engine.module.parameters()))
-        assert optimizer.fused_gradient_statistics.cache.plan.gradients == ()
+            torch.equal(previous, current)
+            for previous, current in zip(before_overflow, fused_engine.module.parameters()))
+        assert fused_optimizer.fused_gradient_statistics.cache.plan.gradients == ()
+        fused_engine.destroy()
+        native_engine.destroy()
