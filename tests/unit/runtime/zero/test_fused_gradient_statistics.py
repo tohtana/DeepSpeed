@@ -14,11 +14,14 @@ import torch
 import deepspeed
 import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
+import deepspeed.ops.triton_ops.fused_gradient_statistics as fused_stats_ops
 import deepspeed.runtime.zero.fused_gradient_statistics as fused_stats
 from deepspeed.runtime.zero.fused_gradient_statistics import (FusedGradientStatistics, build_gradient_statistics_plan)
 from deepspeed.runtime.zero.stage_1_and_2 import DeepSpeedZeroOptimizer
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel
+
+torch_cuda = torch.cuda  #ignore-cuda
 
 
 def _parameter(**attributes):
@@ -40,6 +43,24 @@ def _reference_statistics(plan, stable_descriptors=None):
         invalid = torch.empty(0, dtype=torch.bool)
     descriptors = stable_descriptors or (("test", plan.lengths), )
     return sum_squares, invalid, (None, descriptors, None, None)
+
+
+def _reference_launch(gradients,
+                      lengths,
+                      chunk_tensors,
+                      chunk_offsets,
+                      chunk_starts,
+                      chunk_counts,
+                      device,
+                      stable_descriptors=None):
+    plan = SimpleNamespace(gradients=gradients, lengths=lengths)
+    return _reference_statistics(plan, stable_descriptors)
+
+
+def _run_plan(plan, stable_descriptors=None):
+    return fused_stats_ops.run_fused_gradient_statistics(plan.gradients, plan.lengths, plan.chunk_tensors,
+                                                         plan.chunk_offsets, plan.chunk_starts, plan.chunk_counts,
+                                                         plan.gradients[0].device, stable_descriptors)
 
 
 def test_plan_preserves_selection_and_checks_all_gradients():
@@ -64,7 +85,7 @@ def test_plan_preserves_selection_and_checks_all_gradients():
 
 
 def test_runtime_fallback_is_atomic_on_unsupported_gradients():
-    helper = FusedGradientStatistics(model_parallel_rank=0)
+    helper = FusedGradientStatistics(model_parallel_rank=0, device="cpu")
     gradients = [[torch.ones(4, dtype=torch.bfloat16)]]
     parameters = [[_parameter()]]
 
@@ -74,8 +95,33 @@ def test_runtime_fallback_is_atomic_on_unsupported_gradients():
     assert helper.cache is None
 
 
-@pytest.mark.parametrize("is_rocm, expected_fused", [(True, False), (False, True)])
-def test_static_eligibility_excludes_rocm(monkeypatch, is_rocm, expected_fused):
+def test_device_eligibility_reports_unsupported_backends_and_architecture(monkeypatch):
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", False)
+    monkeypatch.setattr(fused_stats, "_TRITON_AVAILABLE", True)
+    capability_devices = []
+
+    def capability(device):
+        capability_devices.append(device)
+        return (7, 5)
+
+    monkeypatch.setattr(torch_cuda, "get_device_capability", capability)
+
+    assert "not CUDA" in FusedGradientStatistics.unavailable_reason(torch.device("cpu"))
+    assert "8.0" in FusedGradientStatistics.unavailable_reason(torch.device("cuda:1"))
+    assert capability_devices == [torch.device("cuda:1")]
+
+    monkeypatch.setattr(torch_cuda, "get_device_capability", lambda device: (8, 0))
+    assert FusedGradientStatistics.unavailable_reason(torch.device("cuda:1")) is None
+
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", True)
+    assert "ROCm" in FusedGradientStatistics.unavailable_reason(torch.device("cuda:1"))
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", False)
+    monkeypatch.setattr(fused_stats, "_TRITON_AVAILABLE", False)
+    assert "Triton" in FusedGradientStatistics.unavailable_reason(torch.device("cuda:1"))
+
+
+@pytest.mark.parametrize("capability, expected_fused", [((7, 5), False), ((8, 0), True)])
+def test_static_eligibility_uses_optimizer_tensor_device(monkeypatch, capability, expected_fused):
     optimizer = SimpleNamespace(partition_gradients=True,
                                 compute_grad_norm=True,
                                 check_grad_overflow=True,
@@ -86,17 +132,56 @@ def test_static_eligibility_excludes_rocm(monkeypatch, is_rocm, expected_fused):
                                 dtype=torch.bfloat16,
                                 master_weights_and_grads_dtype=torch.bfloat16,
                                 bf16_optimizer_states=True,
-                                device=torch.device("cuda"),
+                                device=torch.device("cuda:0"),
+                                single_partition_of_fp32_groups=[SimpleNamespace(device=torch.device("cuda:1"))],
                                 fused_gradient_statistics=None,
                                 model_parallel_rank=0)
     monkeypatch.setattr(fused_stats, "_TRITON_AVAILABLE", True)
-    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", is_rocm)
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", False)
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    capability_devices = []
+    monkeypatch.setattr(torch_cuda, "get_device_capability",
+                        lambda device: capability_devices.append(device) or capability)
 
     DeepSpeedZeroOptimizer._configure_fused_gradient_statistics(optimizer)
 
-    assert FusedGradientStatistics.is_available() is expected_fused
     assert (optimizer.fused_gradient_statistics is not None) is expected_fused
+    if expected_fused:
+        assert optimizer.fused_gradient_statistics.device == torch.device("cuda:1")
+    assert capability_devices == [torch.device("cuda:1")]
+
+
+def test_per_update_architecture_fallback_uses_gradient_device(monkeypatch):
+    gradient = SimpleNamespace(device=torch.device("cuda:1"),
+                               dtype=torch.bfloat16,
+                               layout=torch.strided,
+                               is_contiguous=lambda: True,
+                               numel=lambda: 8)
+    helper = FusedGradientStatistics(model_parallel_rank=0, device="cuda:0")
+    monkeypatch.setattr(fused_stats, "_TRITON_AVAILABLE", True)
+    monkeypatch.setattr(fused_stats, "_IS_ROCM_PYTORCH", False)
+    capability_devices = []
+    monkeypatch.setattr(torch_cuda, "get_device_capability",
+                        lambda device: capability_devices.append(device) or (7, 5))
+
+    assert helper.refresh([[gradient]], [[_parameter()]]) is None
+    assert "8.0" in helper.last_fallback_reason
+    assert capability_devices == [torch.device("cuda:1")]
+
+
+def test_launch_errors_propagate_without_native_retry():
+    helper = FusedGradientStatistics(model_parallel_rank=0, device="cpu")
+    gradients = [[torch.ones(4, dtype=torch.bfloat16)]]
+    parameters = [[_parameter()]]
+
+    with mock.patch.object(fused_stats, "_preflight_plan", return_value=None), \
+            mock.patch.object(fused_stats, "_availability_reason", return_value=None), \
+            mock.patch.object(fused_stats, "run_fused_gradient_statistics", side_effect=RuntimeError("launch failed")):
+        with pytest.raises(RuntimeError, match="launch failed"):
+            helper.refresh(gradients, parameters)
+
+    assert helper.last_fallback_reason is None
+    assert not helper.active_for_update
 
 
 def test_cache_refreshes_same_storage_without_retaining_gradients():
@@ -104,12 +189,12 @@ def test_cache_refreshes_same_storage_without_retaining_gradients():
     gradient_reference = weakref.ref(gradient)
     gradients = [[gradient]]
     parameters = [[_parameter()]]
-    helper = FusedGradientStatistics(model_parallel_rank=0)
+    helper = FusedGradientStatistics(model_parallel_rank=0, device="cpu")
 
-    with mock.patch.object(fused_stats, "_preflight_plan",
-                           return_value=None), mock.patch.object(fused_stats,
-                                                                 "_run_fused_gradient_statistics",
-                                                                 side_effect=_reference_statistics):
+    with mock.patch.object(fused_stats, "_preflight_plan", return_value=None), mock.patch.object(
+            fused_stats, "_availability_reason", return_value=None), mock.patch.object(fused_stats,
+                                                                                       "run_fused_gradient_statistics",
+                                                                                       side_effect=_reference_launch):
         assert not helper.refresh(gradients, parameters).item()
         first = helper.local_group_sum_squares(gradients[0], parameters[0]).sqrt()
         gradient.mul_(2)
@@ -139,7 +224,8 @@ def _assert_cuda_statistics(plan, sum_squares, invalid):
 
 @pytest.mark.skipif(not get_accelerator().is_available(), reason="an accelerator is required")
 def test_cuda_kernel_matches_fp64_and_detects_nonfinite_values():
-    if not FusedGradientStatistics.is_available():
+    device = torch.device(get_accelerator().current_device_name())
+    if not FusedGradientStatistics.is_available(device):
         pytest.skip("Triton is unavailable")
 
     finfo = torch.finfo(torch.bfloat16)
@@ -150,11 +236,11 @@ def test_cuda_kernel_matches_fp64_and_detects_nonfinite_values():
     parameters = [[_parameter(), _parameter(ds_pipe_replicated=True)]]
     plan = build_gradient_statistics_plan([[values, excluded]], parameters, model_parallel_rank=0)
 
-    sum_squares, invalid, descriptors = fused_stats._run_fused_gradient_statistics(plan)
+    sum_squares, invalid, descriptors = _run_plan(plan)
     _assert_cuda_statistics(plan, sum_squares, invalid)
     for nonfinite in (float("nan"), float("inf"), -float("inf")):
         excluded[0] = nonfinite
-        sum_squares, invalid, descriptors = fused_stats._run_fused_gradient_statistics(plan, descriptors[1])
+        sum_squares, invalid, descriptors = _run_plan(plan, descriptors[1])
         assert invalid.tolist() == [False, True]
     excluded.zero_()
 
@@ -187,7 +273,8 @@ class TestFusedGradientStatisticsIntegration(DistributedTest):
     world_size = 2
 
     def test_real_zero2_native_parity_and_cross_rank_overflow_skip(self):
-        if not get_accelerator().is_bf16_supported() or not FusedGradientStatistics.is_available():
+        device = torch.device(get_accelerator().current_device_name())
+        if not get_accelerator().is_bf16_supported() or not FusedGradientStatistics.is_available(device):
             pytest.skip("BF16 CUDA with Triton is required")
 
         torch.manual_seed(1234)

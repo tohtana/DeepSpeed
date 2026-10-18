@@ -7,8 +7,8 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from deepspeed.accelerator import get_accelerator
-from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE, triton, tl
+from deepspeed.ops.triton_ops._triton import _TRITON_AVAILABLE
+from deepspeed.ops.triton_ops.fused_gradient_statistics import run_fused_gradient_statistics
 from deepspeed.runtime.constants import PIPE_REPLICATED
 from deepspeed.runtime.utils import is_model_parallel_parameter
 
@@ -90,41 +90,6 @@ def build_gradient_statistics_plan(gradient_groups,
                                   tuple(group_selected), tuple(group_keys))
 
 
-if _TRITON_AVAILABLE:
-
-    @triton.jit
-    def _chunk_gradient_statistics(pointer_table, lengths, chunk_tensors, chunk_offsets, partial_sum_squares,
-                                   partial_invalid, BLOCK: tl.constexpr):
-        chunk = tl.program_id(0)
-        tensor_index = tl.load(chunk_tensors + chunk)
-        base = tl.load(chunk_offsets + chunk)
-        length = tl.load(lengths + tensor_index)
-        gradient = tl.load(pointer_table + tensor_index).to(tl.pointer_type(tl.bfloat16))
-        offsets = base + tl.arange(0, BLOCK)
-        values = tl.load(gradient + offsets, mask=offsets < length, other=0.0).to(tl.float32)
-        invalid = ((values != values) | (tl.abs(values) == float("inf"))).to(tl.int32)
-        values = values.to(tl.float64)
-        tl.store(partial_sum_squares + chunk, tl.sum(values * values, axis=0))
-        tl.store(partial_invalid + chunk, tl.max(invalid, axis=0))
-
-    @triton.jit
-    def _tensor_gradient_statistics(partial_sum_squares, partial_invalid, chunk_starts, chunk_counts,
-                                    tensor_sum_squares, tensor_invalid, REDUCE_BLOCK: tl.constexpr):
-        tensor_index = tl.program_id(0)
-        start = tl.load(chunk_starts + tensor_index)
-        count = tl.load(chunk_counts + tensor_index)
-        sum_squares = tl.zeros((), tl.float64)
-        invalid = tl.zeros((), tl.int32)
-        for base in tl.range(0, count, REDUCE_BLOCK):
-            offsets = base + tl.arange(0, REDUCE_BLOCK)
-            mask = offsets < count
-            sum_squares += tl.sum(tl.load(partial_sum_squares + start + offsets, mask=mask, other=0.0), axis=0)
-            invalid = tl.maximum(invalid, tl.max(tl.load(partial_invalid + start + offsets, mask=mask, other=0),
-                                                 axis=0))
-        tl.store(tensor_sum_squares + tensor_index, sum_squares)
-        tl.store(tensor_invalid + tensor_index, invalid)
-
-
 def _preflight_plan(plan):
     if not plan.gradients:
         return None
@@ -140,51 +105,19 @@ def _preflight_plan(plan):
     return None
 
 
-def _run_fused_gradient_statistics(plan, stable_descriptors=None):
+def _availability_reason(device):
+    device = torch.device(device)
+    if device.type != "cuda":
+        return "the device is not CUDA"
+    if _IS_ROCM_PYTORCH:
+        return "ROCm is unsupported"
     if not _TRITON_AVAILABLE:
-        raise RuntimeError("Triton is unavailable")
-    if not plan.gradients:
-        device = torch.device(get_accelerator().current_device_name())
-        return (torch.empty(0, dtype=torch.float64, device=device), torch.empty(0, dtype=torch.bool,
-                                                                                device=device), (None, None))
+        return "Triton is unavailable"
 
-    device = plan.gradients[0].device
-
-    def make(values, dtype):
-        return torch.tensor(values, dtype=dtype, device=device)
-
-    pointers = make([gradient.data_ptr() for gradient in plan.gradients], torch.int64)
-    descriptor_key = (device, plan.lengths)
-    if stable_descriptors is None or stable_descriptors[0] != descriptor_key:
-        stable_descriptors = (descriptor_key, make(plan.lengths, torch.int64), make(plan.chunk_tensors, torch.int32),
-                              make(plan.chunk_offsets,
-                                   torch.int64), make(plan.chunk_starts,
-                                                      torch.int64), make(plan.chunk_counts, torch.int64))
-
-    _, lengths, chunk_tensors, chunk_offsets, chunk_starts, chunk_counts = stable_descriptors
-    partial_sum_squares = torch.empty(len(plan.chunk_tensors), dtype=torch.float64, device=device)
-    partial_invalid = torch.empty(len(plan.chunk_tensors), dtype=torch.int32, device=device)
-    tensor_sum_squares = torch.empty(len(plan.gradients), dtype=torch.float64, device=device)
-    tensor_invalid = torch.empty(len(plan.gradients), dtype=torch.int32, device=device)
-    if plan.chunk_tensors:
-        _chunk_gradient_statistics[(len(plan.chunk_tensors), )](pointers,
-                                                                lengths,
-                                                                chunk_tensors,
-                                                                chunk_offsets,
-                                                                partial_sum_squares,
-                                                                partial_invalid,
-                                                                BLOCK=_CHUNK_SIZE,
-                                                                num_warps=8)
-    _tensor_gradient_statistics[(len(plan.gradients), )](partial_sum_squares,
-                                                         partial_invalid,
-                                                         chunk_starts,
-                                                         chunk_counts,
-                                                         tensor_sum_squares,
-                                                         tensor_invalid,
-                                                         REDUCE_BLOCK=256,
-                                                         num_warps=4)
-    keepalive = (pointers, stable_descriptors, partial_sum_squares, partial_invalid)
-    return tensor_sum_squares, tensor_invalid.bool(), keepalive
+    major, minor = torch.cuda.get_device_capability(device)  #ignore-cuda
+    if major < 8:
+        return f"NVIDIA compute capability {major}.{minor} is below the required 8.0"
+    return None
 
 
 @dataclass
@@ -199,16 +132,21 @@ class _GradientStatisticsCache:
 
 class FusedGradientStatistics:
 
-    def __init__(self, model_parallel_rank):
+    def __init__(self, model_parallel_rank, device):
         self.model_parallel_rank = model_parallel_rank
+        self.device = torch.device(device)
         self.cache = None
         self.active_for_update = False
         self.last_fallback_reason = None
         self.refresh_count = 0
 
     @staticmethod
-    def is_available():
-        return _TRITON_AVAILABLE and not _IS_ROCM_PYTORCH
+    def unavailable_reason(device):
+        return _availability_reason(device)
+
+    @staticmethod
+    def is_available(device):
+        return _availability_reason(device) is None
 
     def refresh(self, gradient_groups, parameter_groups):
         previous = self.cache
@@ -221,11 +159,17 @@ class FusedGradientStatistics:
             return self._fallback(str(error))
 
         fallback_reason = _preflight_plan(plan)
+        if fallback_reason is None:
+            device = plan.gradients[0].device if plan.gradients else self.device
+            fallback_reason = _availability_reason(device)
         if fallback_reason is not None:
             return self._fallback(fallback_reason)
 
         stable_descriptors = previous.keepalive[1] if previous is not None else None
-        sum_squares, invalid, keepalive = _run_fused_gradient_statistics(plan, stable_descriptors)
+        sum_squares, invalid, keepalive = run_fused_gradient_statistics(plan.gradients, plan.lengths,
+                                                                        plan.chunk_tensors, plan.chunk_offsets,
+                                                                        plan.chunk_starts, plan.chunk_counts,
+                                                                        self.device, stable_descriptors)
         device = sum_squares.device
         if previous is not None and previous.plan.group_selected == plan.group_selected:
             selected = previous.selected

@@ -776,15 +776,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             unsupported.append("master weights and gradients are not BF16")
         if not self.bf16_optimizer_states:
             unsupported.append("optimizer states are not BF16")
-        if torch.device(self.device).type != "cuda":
-            unsupported.append("the optimizer is not on CUDA")
-
         if not unsupported:
             from deepspeed.runtime.zero.fused_gradient_statistics import FusedGradientStatistics
-            if FusedGradientStatistics.is_available():
-                self.fused_gradient_statistics = FusedGradientStatistics(self.model_parallel_rank)
+            statistics_device = self.single_partition_of_fp32_groups[0].device
+            unavailable_reason = FusedGradientStatistics.unavailable_reason(statistics_device)
+            if unavailable_reason is None:
+                self.fused_gradient_statistics = FusedGradientStatistics(self.model_parallel_rank, statistics_device)
                 return
-            unsupported.append("Triton is unavailable")
+            unsupported.append(unavailable_reason)
 
         if dist.get_rank() == 0:
             logger.warning_once(
