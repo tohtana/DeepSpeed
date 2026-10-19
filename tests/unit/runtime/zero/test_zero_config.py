@@ -75,11 +75,12 @@ def test_zero_config_compute_grad_norm():
 
 
 def test_zero_config_fused_gradient_statistics():
-    assert DeepSpeedZeroConfig(stage=2).fused_gradient_statistics is False
-    assert DeepSpeedZeroConfig(stage=2, fused_gradient_statistics=True).fused_gradient_statistics is True
+    for stage in (1, 2):
+        assert DeepSpeedZeroConfig(stage=stage).fused_gradient_statistics is False
+        assert DeepSpeedZeroConfig(stage=stage, fused_gradient_statistics=True).fused_gradient_statistics is True
 
 
-@pytest.mark.parametrize("stage, expected_warnings", [(0, 1), (1, 1), (2, 0), (3, 1)])
+@pytest.mark.parametrize("stage, expected_warnings", [(0, 1), (1, 0), (2, 0), (3, 1)])
 def test_fused_gradient_statistics_unsupported_stage_warning(stage, expected_warnings):
     engine = object.__new__(DeepSpeedEngine)
     zero_config = DeepSpeedZeroConfig(stage=stage, fused_gradient_statistics=True)

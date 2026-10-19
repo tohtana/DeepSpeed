@@ -149,7 +149,7 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
 
     fused_gradient_statistics: bool = False
     """
-    Fuse local BF16 gradient finite checks and L2 statistics for supported ZeRO Stage 2 training on NVIDIA GPUs
+    Fuse local BF16 gradient finite checks and L2 statistics for supported ZeRO Stage 1/2 training on NVIDIA GPUs
     with compute capability 8.0 or newer. Known unsupported configurations and per-update inputs use the native
     implementation; Triton compilation, allocation, and kernel execution errors propagate.
     """

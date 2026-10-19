@@ -120,9 +120,10 @@ def test_device_eligibility_reports_unsupported_backends_and_architecture(monkey
     assert "Triton" in FusedGradientStatistics.unavailable_reason(torch.device("cuda:1"))
 
 
+@pytest.mark.parametrize("partition_gradients", [False, True], ids=["zero1", "zero2"])
 @pytest.mark.parametrize("capability, expected_fused", [((7, 5), False), ((8, 0), True)])
-def test_static_eligibility_uses_optimizer_tensor_device(monkeypatch, capability, expected_fused):
-    optimizer = SimpleNamespace(partition_gradients=True,
+def test_static_eligibility_uses_optimizer_tensor_device(monkeypatch, partition_gradients, capability, expected_fused):
+    optimizer = SimpleNamespace(partition_gradients=partition_gradients,
                                 compute_grad_norm=True,
                                 check_grad_overflow=True,
                                 cpu_offload=False,
@@ -245,9 +246,10 @@ def test_cuda_kernel_matches_fp64_and_detects_nonfinite_values():
     excluded.zero_()
 
 
-def _integration_config(fused):
+def _integration_config(fused, stage):
     return {
         "train_micro_batch_size_per_gpu": 1,
+        "gradient_accumulation_steps": 2,
         "gradient_clipping": 0.5,
         "optimizer": {
             "type": "AdamW",
@@ -262,7 +264,7 @@ def _integration_config(fused):
             "bf16_optimizer_states": True,
         },
         "zero_optimization": {
-            "stage": 2,
+            "stage": stage,
             "contiguous_gradients": True,
             "fused_gradient_statistics": fused,
         },
@@ -272,7 +274,8 @@ def _integration_config(fused):
 class TestFusedGradientStatisticsIntegration(DistributedTest):
     world_size = 2
 
-    def test_real_zero2_native_parity_and_cross_rank_overflow_skip(self):
+    @pytest.mark.parametrize("stage", [1, 2], ids=["zero1", "zero2"])
+    def test_real_zero_native_parity_and_cross_rank_overflow_skip(self, stage):
         device = torch.device(get_accelerator().current_device_name())
         if not get_accelerator().is_bf16_supported() or not FusedGradientStatistics.is_available(device):
             pytest.skip("BF16 CUDA with Triton is required")
@@ -283,16 +286,26 @@ class TestFusedGradientStatisticsIntegration(DistributedTest):
         fused_model.load_state_dict(native_model.state_dict())
         native_engine, native_optimizer, _, _ = deepspeed.initialize(model=native_model,
                                                                      model_parameters=native_model.parameters(),
-                                                                     config=_integration_config(fused=False))
+                                                                     config=_integration_config(fused=False,
+                                                                                                stage=stage))
         fused_engine, fused_optimizer, _, _ = deepspeed.initialize(model=fused_model,
                                                                    model_parameters=fused_model.parameters(),
-                                                                   config=_integration_config(fused=True))
+                                                                   config=_integration_config(fused=True, stage=stage))
         assert native_optimizer.fused_gradient_statistics is None
         assert fused_optimizer.fused_gradient_statistics is not None
+        initial_parameters = [parameter.detach().clone() for parameter in fused_engine.module.parameters()]
 
         torch.manual_seed(1234 + dist.get_rank())
-        inputs = torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16)
-        targets = torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16)
+        batches = [(torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16),
+                    torch.randn(1, 8, device=fused_engine.device, dtype=torch.bfloat16)) for _ in range(2)]
+        inputs, targets = batches[0]
+        fused_engine.backward(fused_engine(inputs, targets))
+        native_engine.backward(native_engine(inputs, targets))
+        fused_engine.step()
+        native_engine.step()
+        assert fused_optimizer.fused_gradient_statistics.refresh_count == 0
+
+        inputs, targets = batches[1]
         fused_engine.backward(fused_engine(inputs, targets))
         native_engine.backward(native_engine(inputs, targets))
 
@@ -322,9 +335,12 @@ class TestFusedGradientStatisticsIntegration(DistributedTest):
         fused_engine.step()
         native_engine.step()
         assert fused_optimizer.fused_gradient_statistics.refresh_count >= 2
+        assert fused_optimizer.fused_gradient_statistics.cache.plan.gradients == ()
         for fused_parameter, native_parameter in zip(fused_engine.module.parameters(),
                                                      native_engine.module.parameters()):
             torch.testing.assert_close(fused_parameter, native_parameter)
+        assert any(not torch.equal(initial, updated)
+                   for initial, updated in zip(initial_parameters, fused_engine.module.parameters()))
         moment_tensors = [
             state[name] for state in fused_optimizer.optimizer.state.values() for name in ("exp_avg", "exp_avg_sq")
             if name in state
@@ -332,6 +348,10 @@ class TestFusedGradientStatisticsIntegration(DistributedTest):
         assert moment_tensors
         assert all(moment.dtype == torch.bfloat16 for moment in moment_tensors)
 
+        refresh_count = fused_optimizer.fused_gradient_statistics.refresh_count
+        fused_engine.backward(fused_engine(inputs, targets))
+        fused_engine.step()
+        assert fused_optimizer.fused_gradient_statistics.refresh_count == refresh_count
         fused_engine.backward(fused_engine(inputs, targets))
         gradient = next(gradient for gradients in fused_optimizer.averaged_gradients.values() for gradient in gradients
                         if gradient is not None)

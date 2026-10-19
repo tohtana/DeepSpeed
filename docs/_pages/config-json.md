@@ -457,7 +457,7 @@ Enabling and configuring ZeRO memory optimizations
 
 | Description | Default |
 | ----------- | ------- |
-| Fuse the local finite check and L2 statistics for ZeRO Stage 2 BF16 gradients on NVIDIA GPUs with compute capability 8.0 or newer. This requires BF16 master weights/gradients and optimizer states, contiguous gradients, overflow checking, and Triton, without optimizer offload, MoE, or ZenFlow. Known unsupported configurations use the native implementation, as do unsupported inputs for an individual update. Triton JIT compilation, allocation/OOM, and kernel execution errors propagate instead of retrying with the native path. | `false` |
+| Fuse the local finite check and L2 statistics for ZeRO Stage 1/2 BF16 gradients on NVIDIA GPUs with compute capability 8.0 or newer. This requires BF16 master weights/gradients and optimizer states, contiguous gradients, overflow checking, and Triton, without optimizer offload, MoE, or ZenFlow. Known unsupported configurations use the native implementation, as do unsupported inputs for an individual update. Triton JIT compilation, allocation/OOM, and kernel execution errors propagate instead of retrying with the native path. | `false` |
 
 <i>**overlap_comm**</i>: [boolean]
 

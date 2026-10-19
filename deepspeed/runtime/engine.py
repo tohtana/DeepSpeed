@@ -2373,9 +2373,10 @@ class DeepSpeedEngine(Module):
         log_dist("DeepSpeed Final Optimizer = {}".format(self.optimizer.__class__.__name__), ranks=[0])
 
     def _warn_unsupported_fused_gradient_statistics(self):
-        if self.zero_fused_gradient_statistics() and self.zero_optimization_stage() != ZeroStageEnum.gradients:
+        supported_stages = (ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients)
+        if self.zero_fused_gradient_statistics() and self.zero_optimization_stage() not in supported_stages:
             log_dist(
-                "zero_optimization.fused_gradient_statistics supports only ZeRO Stage 2; using native "
+                "zero_optimization.fused_gradient_statistics supports only ZeRO Stage 1 or 2; using native "
                 "gradient statistics",
                 ranks=[0],
                 level=logging.WARNING)
@@ -2718,7 +2719,7 @@ class DeepSpeedEngine(Module):
                 check_grad_overflow=check_grad_overflow,
                 compute_grad_norm=self.zero_compute_grad_norm(),
                 fused_gradient_statistics=self.zero_fused_gradient_statistics()
-                and zero_stage == ZeroStageEnum.gradients)
+                and zero_stage in (ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients))
 
         elif zero_stage == ZeroStageEnum.weights:
             self._validate_zero3_moe_compatibility()

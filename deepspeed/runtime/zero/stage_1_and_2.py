@@ -756,8 +756,6 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def _configure_fused_gradient_statistics(self):
         unsupported = []
-        if not self.partition_gradients:
-            unsupported.append("ZeRO Stage 2 is required")
         if not self.compute_grad_norm:
             unsupported.append("gradient norm computation is disabled")
         if not self.check_grad_overflow:
