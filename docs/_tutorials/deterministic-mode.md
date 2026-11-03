@@ -2,7 +2,7 @@
 title: "Deterministic Mode"
 ---
 
-The JSON boolean `deterministic_mode` selects a CUDA/PyTorch execution policy.
+The JSON boolean `deterministic_mode` selects an NVIDIA CUDA/PyTorch execution policy.
 It defaults to `false` and does not select a Megatron numerical strategy.
 Set the workspace environment before the first CUDA operation:
 
@@ -22,7 +22,7 @@ Parsing does not change input configuration or process-global PyTorch settings.
 Engine initialization enables strict deterministic algorithms, disables TF32
 and cuDNN benchmarking, and enables deterministic cuDNN algorithms.
 PyTorch raises for recognized nondeterministic operations without an alternative.
-Non-CUDA enabling currently raises; the disabled flag is a no-op.
+Non-NVIDIA-CUDA enabling currently raises; the disabled flag is a no-op.
 
 The flag does not change gradient precision, GAS, TP/EP, overlap, NCCL algorithms
 or AutoEP arithmetic, and does not reject configurations merely because they
