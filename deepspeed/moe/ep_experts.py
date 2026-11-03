@@ -269,20 +269,22 @@ def _run_experts_for_loop(
 class _ZeroEmptyExpertGrad(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, weight, active_experts):
-        ctx.save_for_backward(active_experts)
+    def forward(ctx, weight, empty_experts):
+        ctx.save_for_backward(empty_experts)
         return weight
 
     @staticmethod
     def backward(ctx, grad):
-        (active_experts, ) = ctx.saved_tensors
-        return grad.masked_fill(~active_experts, 0), None
+        (empty_experts, ) = ctx.saved_tensors
+        # The incoming gradient is private to this identity autograd node. Clear only the affected
+        # expert slices in place instead of materializing a full-sized masked copy of every weight.
+        return grad.index_fill_(0, empty_experts, 0), None
 
 
 def _zero_empty_expert_grad(weight: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
     # Some grouped-GEMM backends leave the weight gradient for a zero-row group undefined.
-    active_experts = (num_tokens_per_expert != 0).view(-1, 1, 1)
-    return _ZeroEmptyExpertGrad.apply(weight, active_experts)
+    empty_experts = torch.nonzero(num_tokens_per_expert == 0, as_tuple=False).flatten()
+    return _ZeroEmptyExpertGrad.apply(weight, empty_experts)
 
 
 def _run_experts_grouped_mm(

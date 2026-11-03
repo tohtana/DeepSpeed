@@ -13,7 +13,12 @@
 import torch
 import triton
 import triton.language as tl
-from triton.runtime.errors import OutOfResources
+
+try:
+    from triton.runtime.errors import OutOfResources
+except ImportError:
+    # Triton 2.0 exposes this exception from triton.compiler.
+    from triton.compiler import OutOfResources
 
 # Largest num_stages that fits in shared memory, per device and tile configuration.
 _fitting_num_stages = {}
