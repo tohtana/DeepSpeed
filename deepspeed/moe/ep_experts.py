@@ -281,10 +281,11 @@ class _ZeroEmptyExpertGrad(torch.autograd.Function):
         return grad.index_fill_(0, empty_experts, 0), None
 
 
-def _zero_empty_expert_grad(weight: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+def _zero_empty_expert_grads(weights: tuple[torch.Tensor, ...],
+                             num_tokens_per_expert: torch.Tensor) -> tuple[torch.Tensor, ...]:
     # Some grouped-GEMM backends leave the weight gradient for a zero-row group undefined.
     empty_experts = torch.nonzero(num_tokens_per_expert == 0, as_tuple=False).flatten()
-    return _ZeroEmptyExpertGrad.apply(weight, empty_experts)
+    return tuple(_ZeroEmptyExpertGrad.apply(weight, empty_experts) for weight in weights)
 
 
 def _run_experts_grouped_mm(
@@ -315,9 +316,7 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     cast_dtype = x.dtype
-    w1 = _zero_empty_expert_grad(w1, num_tokens_per_expert)
-    w2 = _zero_empty_expert_grad(w2, num_tokens_per_expert)
-    w3 = _zero_empty_expert_grad(w3, num_tokens_per_expert)
+    w1, w2, w3 = _zero_empty_expert_grads((w1, w2, w3), num_tokens_per_expert)
     gate = torch._grouped_mm(
         x.to(cast_dtype),
         w1.to(cast_dtype).transpose(-2, -1),
@@ -361,9 +360,7 @@ def _run_experts_grouped_mm_fused_gate_up(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
     cast_dtype = x.dtype
-    w1 = _zero_empty_expert_grad(w1, num_tokens_per_expert)
-    w2 = _zero_empty_expert_grad(w2, num_tokens_per_expert)
-    w3 = _zero_empty_expert_grad(w3, num_tokens_per_expert)
+    w1, w2, w3 = _zero_empty_expert_grads((w1, w2, w3), num_tokens_per_expert)
     w13 = torch.cat([w1.to(cast_dtype), w3.to(cast_dtype)], dim=1)
     gate_up = torch._grouped_mm(
         x.to(cast_dtype),
