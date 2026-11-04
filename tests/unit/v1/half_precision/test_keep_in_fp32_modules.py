@@ -119,8 +119,8 @@ class TestKeepInFp32Pattern:
 
         num_params, num_buffers = keep_tensors_in_fp32(model, pattern)
 
-        assert (num_params, num_buffers) == (1, 0)
-        assert model.weight.dtype == torch.float32
+        assert (num_params, num_buffers) == (0, 0)
+        assert model.weight.dtype == torch.bfloat16
         assert model.weight.ds_tensor.dtype == torch.int8
         assert hasattr(model.weight.ds_tensor, "ds_quant_scale")
 
