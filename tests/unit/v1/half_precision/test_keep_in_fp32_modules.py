@@ -15,7 +15,7 @@ import torch
 import deepspeed
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.config import DeepSpeedConfig, DeepSpeedConfigError
-from deepspeed.runtime.keep_in_fp32 import keep_in_fp32_pattern
+from deepspeed.runtime.keep_in_fp32 import keep_in_fp32_pattern, keep_tensors_in_fp32
 from deepspeed.utils import safe_get_full_fp32_param, safe_get_full_grad
 from unit.common import DistributedTest
 
@@ -109,6 +109,20 @@ class TestKeepInFp32Pattern:
     @pytest.mark.parametrize("keep,dtype", [([], torch.bfloat16), ("auto", torch.float32)])
     def test_nothing_to_keep(self, keep, dtype):
         assert keep_in_fp32_pattern(ToyModel(), keep, dtype) is None
+
+    def test_quantized_partition_storage_stays_encoded(self):
+        model = torch.nn.Linear(2, 2, bias=False).bfloat16()
+        model._keep_in_fp32_modules_strict = ["weight"]
+        model.weight.ds_tensor = torch.ones(model.weight.numel(), dtype=torch.int8)
+        model.weight.ds_tensor.ds_quant_scale = torch.ones(1)
+        pattern = keep_in_fp32_pattern(model, "auto", torch.bfloat16)
+
+        num_params, num_buffers = keep_tensors_in_fp32(model, pattern)
+
+        assert (num_params, num_buffers) == (1, 0)
+        assert model.weight.dtype == torch.float32
+        assert model.weight.ds_tensor.dtype == torch.int8
+        assert hasattr(model.weight.ds_tensor, "ds_quant_scale")
 
 
 class TestKeepInFp32Config(DistributedTest):

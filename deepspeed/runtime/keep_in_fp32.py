@@ -95,10 +95,13 @@ def keep_tensors_in_fp32(module, pattern, include_params=True):
             continue
         partition = getattr(tensor, "ds_tensor", None)
         if partition is not None:
-            partition.data = partition.data.float()
+            # A quantized copy (frozen weights with quantized_nontrainable_weights) stays encoded; the full
+            # parameter placeholder below becomes fp32 so a later gather dequantizes into fp32 without corrupting
+            # the encoded partition while leaving its ds_quant_scale marker attached.
+            if not hasattr(partition, "ds_quant_scale"):
+                partition.data = partition.data.float()
             # With hpZ, all-gathers read this node-local copy of the partition while it exists, and a later
-            # checkpoint load writes into it. A quantized copy (frozen weights with quantized_nontrainable_weights)
-            # stays as it is.
+            # checkpoint load writes into it.
             secondary = getattr(tensor, "ds_secondary_tensor", None)
             if secondary is not None and not hasattr(secondary, "ds_quant_scale"):
                 secondary.data = secondary.data.float()
