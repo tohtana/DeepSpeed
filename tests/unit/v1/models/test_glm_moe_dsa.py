@@ -386,6 +386,10 @@ class TestDsaAttentionContextParallel(DistributedTest):
         start = rank * local
         set_context_parallel_group(dist.new_group(list(range(size))))
         try:
+            # The model defaults to local 0..S-1 positions on every rank. All ranks must reject together, instead of
+            # letting rank 0 enter the next collective while a nonzero rank raises.
+            with pytest.raises(NotImplementedError, match="global position ids"):
+                split(input_ids=input_ids[:, start:start + local])
             logits, local_sum = loss_sum(split, input_ids[:, start:start + local],
                                          torch.arange(start, start + local, device=device)[None],
                                          input_ids[:, start + 1:start + local + 1])

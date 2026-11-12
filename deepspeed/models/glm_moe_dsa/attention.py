@@ -155,6 +155,28 @@ def _check_causal_only(attention_mask: torch.Tensor | None,
     _LAST_CHECKED = (attention_mask, position_ids)
 
 
+_LAST_CHECKED_CONTEXT_POSITIONS = (None, None)
+
+
+def _check_context_parallel_positions(position_ids: torch.Tensor | None, seq_length: int, cp_group, cp_rank: int,
+                                      device: torch.device) -> None:
+    """Collectively require the documented global positions for every context-parallel sequence shard."""
+    global _LAST_CHECKED_CONTEXT_POSITIONS
+    if _LAST_CHECKED_CONTEXT_POSITIONS[0] is position_ids and _LAST_CHECKED_CONTEXT_POSITIONS[1] is cp_group:
+        return
+    valid = position_ids is not None and tuple(position_ids.shape) == (1, seq_length)
+    if valid:
+        expected = cp_rank * seq_length + torch.arange(seq_length, device=position_ids.device)
+        valid = bool((position_ids[0] == expected).all())
+    import deepspeed.comm as dist
+    all_valid = torch.tensor(valid, dtype=torch.int32, device=device)
+    dist.all_reduce(all_valid, op=dist.ReduceOp.MIN, group=cp_group)
+    if not bool(all_valid):
+        raise NotImplementedError(
+            "context parallel DSA attention needs global position ids matching every rank's shard.")
+    _LAST_CHECKED_CONTEXT_POSITIONS = (position_ids, cp_group)
+
+
 class DeepSpeedGlmMoeDsaAttention(nn.Module):
     """The GLM-5.2 attention layer computed with the DSA kernels. See the module docstring."""
 
@@ -226,9 +248,11 @@ class DeepSpeedGlmMoeDsaAttention(nn.Module):
         from deepspeed.models.glm_moe_dsa.kernels import sparse_mla
 
         batch_size, seq_length, _ = hidden_states.shape
-        cp_group, cp_size, _ = _context_parallel()
+        cp_group, cp_size, cp_rank = _context_parallel()
         if cp_size > 1 and batch_size != 1:
             raise NotImplementedError("context parallel DSA attention needs batch size 1 (one sequence per group).")
+        if cp_size > 1:
+            _check_context_parallel_positions(position_ids, seq_length, cp_group, cp_rank, hidden_states.device)
         _check_causal_only(attention_mask, position_ids, seq_length)
         if self.warm_up:
             _warm_up_once(self, hidden_states.device)
