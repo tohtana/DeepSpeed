@@ -238,8 +238,13 @@ class MPS_Accelerator(DeepSpeedAccelerator):
 
     # Apple Silicon has unified memory, so host tensors are already directly accessible to the GPU
     # and there is nothing to pin. torch's pin_memory() also raises for the MPS backend.
+    _torch_pins_host_memory = False
+
     def _torch_pin_memory(self, tensor):
         return tensor
+
+    def _torch_empty_pinned(self, tensor, shape):
+        return tensor.new_empty(shape)
 
     def _torch_is_pinned(self, tensor):
         return tensor.device.type == 'cpu'

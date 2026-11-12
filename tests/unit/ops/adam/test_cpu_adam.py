@@ -147,6 +147,32 @@ def test_cpu_adam_grad_scale_matches_scaling_in_place(model_size, adamw_mode, we
         assert torch.equal(fused.state[fused_param]['exp_avg_sq'], in_place.state[in_place_param]['exp_avg_sq'])
 
 
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('use_closure', [False, True])
+def test_cpu_adam_grad_scale_rejects_low_precision_gradients(dtype, use_closure):
+    """Scaling after widening a low-precision gradient is not equivalent to grad.mul_(scale), which rounds first."""
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+    param = torch.nn.Parameter(torch.ones(4, dtype=dtype))
+    initial = param.detach().clone()
+    optimizer = DeepSpeedCPUAdam([param])
+    if not optimizer.grad_scale_supported():
+        pytest.skip("this CPU Adam build cannot apply grad_scale (RVV)")
+
+    def closure():
+        loss = param.sum()
+        loss.backward()
+        return loss
+
+    if not use_closure:
+        param.grad = torch.ones_like(param)
+
+    with pytest.raises(ValueError, match="float32 gradients"):
+        optimizer.step(closure if use_closure else None, grad_scale=0.37)
+    assert torch.equal(param, initial)
+    assert param not in optimizer.state
+
+
 @pytest.mark.parametrize('model_size', [3, 17, 513, 524289])
 @pytest.mark.parametrize('piece_numel', [1000, 1 << 20])
 @pytest.mark.parametrize('grad_scale', [0.37, 1.0])

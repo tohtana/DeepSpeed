@@ -129,7 +129,8 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             grad_scale (float, optional): every gradient is multiplied by this
                 factor as the kernel loads it, the same float multiply as
                 ``grad.mul_(grad_scale)`` before the step but without a separate
-                pass over the gradients (which are left unchanged). Defaults to 1.
+                pass over the gradients (which are left unchanged). Scaling is
+                supported only for float32 gradients. Defaults to 1.
             bf16_copy (tuple, optional): ``(piece_numel, before_piece, after_piece)``
                 to also write a bfloat16 copy of the updated float32 parameters in
                 the same kernel pass. Each parameter is updated in pieces of
@@ -153,6 +154,13 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if grad_scale != 1.0:
+            low_precision_grad = next(
+                (p.grad for group in self.param_groups
+                 for p in group['params'] if p.grad is not None and p.grad.dtype != torch.float32), None)
+            if low_precision_grad is not None:
+                raise ValueError(f"grad_scale needs float32 gradients, got {low_precision_grad.dtype}")
 
         # intended device for step
         device = torch.device('cpu')

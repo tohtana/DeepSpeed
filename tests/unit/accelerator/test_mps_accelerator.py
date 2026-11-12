@@ -25,3 +25,13 @@ def test_construction_fails_clearly_without_memory_query(monkeypatch):
     monkeypatch.delattr(torch.mps, "recommended_max_memory")
     with pytest.raises(ValueError, match="torch>=2.5"):
         MPS_Accelerator()
+
+
+def test_pin_empty_uses_unified_memory_without_pin_allocator():
+    accelerator = MPS_Accelerator()
+    tensor = accelerator.pin_empty(4, dtype=torch.bfloat16)
+
+    assert tensor.shape == (4, )
+    assert tensor.dtype == torch.bfloat16
+    assert tensor.device.type == "cpu"
+    assert accelerator.is_pinned(tensor)
