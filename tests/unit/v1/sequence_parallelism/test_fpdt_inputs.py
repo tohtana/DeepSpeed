@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from deepspeed.sequence.fpdt_layer import FPDT_InputConstruct
+import deepspeed.sequence.fpdt_layer as fpdt_layer
+from deepspeed.sequence.fpdt_layer import FPDT_InputConstruct, FPDT_LogitsLoss
 
 
 def construct(tokens, labels=None, weights=None, mask=None, positions=None, chunk=8, size=1, rank=0):
@@ -113,3 +114,25 @@ def test_padding_rejects_attention_mask():
     with pytest.raises(ValueError, match='attention_mask') as error:
         construct(torch.ones(2, 9), weights=torch.ones(2, 9), mask=torch.ones(9, 9))
     assert all(value in str(error.value) for value in ('S=9', 'C=8', 'P=1', 'rank=0'))
+
+
+def test_padded_extreme_logits_have_finite_masked_loss_and_gradients(monkeypatch):
+    """Zero-weight padding must stay finite when its target probability underflows."""
+    monkeypatch.setattr(fpdt_layer.dist, 'allgather_fn', lambda output, value, group=None: output.copy_(value))
+    tokens = torch.arange(6).reshape(2, 3)
+    labels = torch.ones_like(tokens)
+    weights = torch.ones_like(tokens, dtype=torch.float32)
+    _, labels, weights, _, _ = construct(tokens, labels, weights, chunk=4).generate()
+    lm_output = torch.zeros(4, 2, 2, requires_grad=True)
+    with torch.no_grad():
+        lm_output[-1] = torch.tensor([-1000.0, 1000.0])
+    logit_weights = torch.eye(2, requires_grad=True)
+
+    losses = FPDT_LogitsLoss.apply(lm_output, labels, logit_weights, 0, 1, None, 1)
+    loss = (losses * weights.t()).sum() / weights.sum()
+    loss.backward()
+
+    assert losses.shape == (4, 2)
+    assert torch.isfinite(losses).all() and torch.isfinite(loss)
+    assert torch.isfinite(lm_output.grad).all() and lm_output.grad[-1].eq(0).all()
+    assert torch.isfinite(logit_weights.grad).all()
