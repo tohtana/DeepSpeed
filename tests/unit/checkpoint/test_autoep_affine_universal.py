@@ -239,7 +239,7 @@ def test_zero3_affine_rebuild_allows_omitted_empty_rank():
 
 
 def test_zero3_partition_native_consolidation_uses_affine_placement(tmp_path):
-    param_names = [f"layer.experts.w{index}" for index in range(1, 4)]
+    param_names = [f"layer/block.experts.w{index}" for index in range(1, 4)]
     placement = make_autoep_placement_descriptor(4, [[2, 0, 3], [1]])
     full = torch.arange(8, dtype=torch.float32).view(4, 2)
     rank_tensors = {
@@ -255,7 +255,7 @@ def test_zero3_partition_native_consolidation_uses_affine_placement(tmp_path):
             'num_experts': 4,
             'num_local_experts': local_tensor.shape[0],
             'ep_size': 2,
-            'expert_key_prefix': 'layer.experts',
+            'expert_key_prefix': 'layer/block.experts',
             AUTOEP_EXPERT_PLACEMENT: placement,
             AUTOEP_ZERO3_EXPERT_STATE_FORMAT_KEY: AUTOEP_ZERO3_PARTITIONED_EXPERT_STATE_FORMAT,
             AUTOEP_ZERO3_EXPERT_STATE_FORMAT_VERSION_KEY: AUTOEP_ZERO3_EXPERT_STATE_FORMAT_VERSION,
@@ -306,6 +306,7 @@ def test_zero3_partition_native_consolidation_uses_affine_placement(tmp_path):
         for state_name in ('fp32', 'exp_avg', 'exp_avg_sq'):
             state = _load_consolidated(str(output_dir), param_name, state_name)
             assert torch.equal(state[PARAM], full)
+    assert not list((output_dir / "tmp" / "autoep_expert_fragments").rglob("*.pt"))
 
 
 def test_zero3_partition_native_consolidation_allows_rank_without_fragments(tmp_path):

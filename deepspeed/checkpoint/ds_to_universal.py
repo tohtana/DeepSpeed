@@ -899,8 +899,10 @@ def _consolidate_zero3_autoep_expert_states(output_dir, model_files, optim_files
                                                f"parameter {param_name} on ZeRO rank {rank}")
                         # clone(): saving the narrowed view would write the whole flat tensor behind it.
                         fragment = flat_tensor.narrow(0, offset, padding_free_numel).clone()
-                        fragment_path = os.path.join(fragment_dir,
-                                                     f"{param_name}.{state_key}.ep{ep_rank}.part{partition_rank}.pt")
+                        param_fragment_dir = os.path.join(fragment_dir, param_name)
+                        os.makedirs(param_fragment_dir, exist_ok=True)
+                        fragment_path = os.path.join(param_fragment_dir,
+                                                     f"{state_key}.ep{ep_rank}.part{partition_rank}.pt")
                         torch.save(fragment, fragment_path)
                         key = (param_name, state_key, ep_rank)
                         expert_fragments.setdefault(key, []).append((partition_rank, fragment_path, shape))
