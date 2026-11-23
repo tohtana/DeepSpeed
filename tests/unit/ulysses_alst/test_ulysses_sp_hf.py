@@ -184,11 +184,7 @@ class TestUlyssesSPHF(DistributedTest):
         # - we are feeding the exact same sample to each rank of A
         # - for B we feed half the sample to each rank, but in total it's the same sample as each rank of A sees
         # thus we expect very similar grads (but not exact)
-        if zero_stage in [1, 2]:
-            # possibly some issue with z1/z2 as it requires higher tolerance than z3?
-            torch_assert_close(grad_a, grad_b, rtol=1.6e-02, atol=1e-03)
-        else:
-            torch_assert_close(grad_a, grad_b)
+        torch_assert_close(grad_a, grad_b)
 
 
 class TestUlyssesSPHFPEFT(DistributedTest):
@@ -564,8 +560,4 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
         # - we are feeding the exact same sample to each rank of A
         # - for B we feed half the sample to each rank, but in total it's the same sample as each rank of A sees
         # thus we expect very similar grads (but not exact)
-        if zero_stage in [1, 2]:
-            # possibly some issue with z1/z2 as it requires higher tolerance than z3?
-            torch_assert_close(grad_a, grad_b, rtol=1.6e-02, atol=1e-03)
-        else:
-            torch_assert_close(grad_a, grad_b)
+        torch_assert_close(grad_a, grad_b)
