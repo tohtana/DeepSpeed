@@ -3,8 +3,11 @@
 
 // DeepSpeed Team
 
+#include <c10/core/DeviceGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 #include "inference_context.h"
@@ -669,6 +672,7 @@ at::Tensor ds_bias_residual(at::Tensor& input, at::Tensor& residual, at::Tensor&
 
 #define DISPATCH_LAYER_NORM(T_TYPE, C_TYPE)                               \
     if (input.options().dtype() == torch::T_TYPE) {                       \
+        auto output = at::empty_like(input);                              \
         launch_fused_ln((C_TYPE*)output.data_ptr(),                       \
                         (const C_TYPE*)input.data_ptr(),                  \
                         (const C_TYPE*)gamma.data_ptr(),                  \
@@ -677,21 +681,38 @@ at::Tensor ds_bias_residual(at::Tensor& input, at::Tensor& residual, at::Tensor&
                         rows,                                             \
                         elems_per_row,                                    \
                         InferenceContext::Instance().GetCurrentStream()); \
+        return output;                                                    \
     }
 
 at::Tensor ds_layer_norm(at::Tensor& input, at::Tensor& gamma, at::Tensor& beta, float epsilon)
 {
-    const int rows = input.size(0) * input.size(1);
-    const int elems_per_row = input.size(2);
-    auto output = at::empty_like(input);
-
-    DISPATCH_LAYER_NORM(kFloat, float);
-    DISPATCH_LAYER_NORM(kHalf, __half);
+    const auto elems_per_row = gamma.size(0);
+    // The fused kernel uses aligned 16-byte loads and supports up to four 4096-element steps.
+    const auto vectorizable = [&input](const at::Tensor& tensor) {
+        return tensor.device() == input.device() && tensor.scalar_type() == input.scalar_type() &&
+               tensor.is_contiguous() &&
+               reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % 16 == 0;
+    };
+    if (input.is_cuda() && input.dim() == 3 && input.size(2) == elems_per_row && gamma.dim() == 1 &&
+        beta.sizes() == gamma.sizes() && elems_per_row > 0 && elems_per_row <= 16384 &&
+        elems_per_row * input.element_size() % 16 == 0 &&
+        input.numel() <= std::numeric_limits<int>::max() && vectorizable(input) &&
+        vectorizable(gamma) && vectorizable(beta)) {
+        const c10::DeviceGuard guard(input.device());
+        const int rows = input.size(0) * input.size(1);
+        DISPATCH_LAYER_NORM(kFloat, float);
+        DISPATCH_LAYER_NORM(kHalf, __half);
 #ifdef BF16_AVAILABLE
-    DISPATCH_LAYER_NORM(kBFloat16, __nv_bfloat16);
+        DISPATCH_LAYER_NORM(kBFloat16, __nv_bfloat16);
 #endif
+    }
 
-    return output;
+    return at::layer_norm(input.to(at::kFloat),
+                          {elems_per_row},
+                          gamma.to(at::kFloat),
+                          beta.to(at::kFloat),
+                          epsilon)
+        .to(gamma.scalar_type());
 }
 
 #define DISPATCH_RMS_NORM(T_TYPE, C_TYPE)                                 \

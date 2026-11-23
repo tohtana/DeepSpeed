@@ -8,6 +8,7 @@ import torch
 import pytest
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.op_builder import InferenceBuilder
+from deepspeed.ops.transformer.inference.config import DeepSpeedInferenceConfig
 from deepspeed.ops.transformer.inference.op_binding.layer_norm import LayerNormOp
 from .inference_test_utils import allclose, get_dtypes
 try:
@@ -63,6 +64,23 @@ def test_layer_norm(batch, seq_len, channels, dtype, use_triton_ops):
 
     if not allclose(new_output, ref_output):
         assert allclose(new_output, ref_output)
+
+
+@pytest.mark.inference_ops
+@pytest.mark.parametrize("shape", [(2, 128), (1, 1, 18432), (1, 1, 16384)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_configured_layer_norm(shape, dtype):
+    device = get_accelerator().current_device_name()
+    vals = torch.randn(shape, dtype=dtype, device=device)
+    gamma = torch.randn(shape[-1], dtype=dtype, device=device)
+    beta = torch.randn_like(gamma)
+    epsilon = 1e-5
+
+    op = LayerNormOp(DeepSpeedInferenceConfig(dtype=dtype))
+    output = op(vals, gamma, beta, epsilon)
+    reference = ref_implementation(vals, gamma, beta, epsilon, shape[-1], dtype)
+    assert output.shape == vals.shape
+    assert allclose(output, reference)
 
 
 def residual_ref_implementation(vals, bias, res, gamma, beta, epsilon, channels, dtype):
