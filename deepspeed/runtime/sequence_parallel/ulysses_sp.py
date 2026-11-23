@@ -30,6 +30,7 @@ https://github.com/snowflakedb/ArcticTraining/blob/main/projects/sequence-parall
 """
 
 from collections import defaultdict, deque
+from deepspeed.sequence.cross_entropy import _global_sp_sum
 from deepspeed.sequence.layer import _dim_zero_all_to_all, register_all_to_all_group
 from deepspeed.utils.logging import logger
 from einops import rearrange
@@ -44,6 +45,20 @@ import math
 import re
 import torch
 import torch.distributed.nn
+
+
+def ulysses_sp_loss(local_mean_loss: Tensor, local_token_count: Tensor, sp_group: dist.ProcessGroup) -> Tensor:
+    """Return the mean loss over valid targets in the sequence-parallel group.
+
+    Pass the shard's scalar mean loss and its scalar count of valid targets on the same
+    device. An empty shard contributes zero, even when its mean is NaN. Backward
+    weights each shard's gradient by its share of the valid targets. DeepSpeed sums
+    those gradients across the sequence-parallel group.
+    """
+    count = local_token_count.to(torch.promote_types(local_mean_loss.dtype, torch.float32))
+    local_loss = torch.where(local_token_count > 0, local_mean_loss, 0.0)
+    loss_sum, token_count = _global_sp_sum(torch.stack((local_loss * count, count)), sp_group).unbind()
+    return loss_sum / token_count.clamp_min(1)
 
 
 class UlyssesSPAttentionHF(torch.nn.Module):
@@ -707,8 +722,7 @@ class UlyssesSPDataLoaderAdapter:
                 raise ValueError(f"batch's seqlen={seq_length} isn't divisible by sp-size={self.sp_world_size}")
             chunk_len = seq_length // self.sp_world_size
 
-            # because we have to gather logits from all sp ranks we have to do the loss function ourselves
-            # therefore remove labels to avoid an attempt to calculate loss by transformers
+            # Shift before sharding so targets at shard boundaries keep their context.
             labels = batch.pop("labels")
             labels = torch.nn.functional.pad(labels, (0, 1), value=-100)
             batch["shift_labels"] = labels[..., 1:].contiguous()

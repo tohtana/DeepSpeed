@@ -134,9 +134,11 @@ def _global_sp_sum(local_value, sp_group):
     if sp_group is None or dist.get_world_size(sp_group) == 1:
         return local_value
 
-    global_value = local_value.detach().clone()
-    dist.all_reduce(global_value, op=dist.ReduceOp.SUM, group=sp_group)
-    return local_value + (global_value - local_value.detach())
+    # Report the sum on every rank and keep the gradient of this rank's contribution.
+    global_value = local_value.clone()
+    with torch.no_grad():
+        dist.all_reduce(global_value, op=dist.ReduceOp.SUM, group=sp_group)
+    return global_value
 
 
 def _validate_vocab_shard_bounds(local_vocab_size, vocab_start_index, vocab_end_index, tp_group, device):

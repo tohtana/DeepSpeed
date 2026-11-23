@@ -10,6 +10,7 @@ import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed import initialize
 import deepspeed.runtime.sequence_parallel.parallel_state_sp as sp_mpu
+from deepspeed.runtime.sequence_parallel.ulysses_sp import ulysses_sp_loss
 from transformers import AutoModel
 from unit.common import DistributedTest
 from deepspeed.sequence.layer import (DistributedAttention, _SeqAllToAll, _generate_layout_params, post_all2all,
@@ -472,10 +473,10 @@ class TestFPDTAttentionGQABackward(DistributedTest):
         assert_close(fpdt_bias.grad, ref_bias.grad, "qkv bias grad")
 
 
-@pytest.mark.parametrize("sp_size", [2])
 class TestUlyssesLossBackward(DistributedTest):
     world_size = 4
 
+    @pytest.mark.parametrize("sp_size", [2])
     def test_sp_loss_backward_stability(self, sp_size: int) -> None:
         """
         Regression test for Issue #7672.
@@ -525,6 +526,50 @@ class TestUlyssesLossBackward(DistributedTest):
         expected_grad = 0.5
         assert torch.allclose(local_loss.grad, torch.tensor(expected_grad, device=ds_engine.device)), \
             f"Gradient mismatch! Expected {expected_grad}, got {local_loss.grad}"
+
+    @pytest.mark.parametrize("targets", [
+        [0, -100, -100, 1, 2, 0],
+        [-100, -100, -100, 1, 2, 0],
+        [-100] * 6,
+    ],
+                             ids=["unequal-counts", "empty-shard", "all-ignored"])
+    def test_masked_cross_entropy_matches_full_sequence(self, targets):
+        rank = dist.get_rank()
+        sp_groups = [dist.new_group(ranks=[0, 1]), dist.new_group(ranks=[2, 3])]
+        sp_group = sp_groups[rank // 2]
+        sp_rank = dist.get_rank(group=sp_group)
+        device = get_accelerator().current_device_name()
+
+        # Each SP group processes a different sequence.
+        torch.manual_seed(42 + rank // 2)
+        logits = torch.randn(6, 3, device=device, requires_grad=True)
+        targets = torch.tensor(targets, device=device)
+        local_logits = logits.detach().chunk(2)[sp_rank].requires_grad_()
+        local_targets = targets.chunk(2)[sp_rank]
+        local_mean = F.cross_entropy(local_logits, local_targets)
+        local_mean.retain_grad()
+        local_count = (local_targets != -100).sum()
+        loss = ulysses_sp_loss(local_mean, local_count, sp_group)
+        loss.backward()
+
+        valid_count = (targets != -100).sum().clamp_min(1)
+        reference = F.cross_entropy(logits, targets, reduction="sum") / valid_count
+        reference.backward()
+        torch.testing.assert_close(loss, reference)
+        torch.testing.assert_close(local_logits.grad, logits.grad.chunk(2)[sp_rank])
+        torch.testing.assert_close(local_mean.grad, local_count / valid_count)
+
+    @pytest.mark.world_size(2)
+    def test_fp16_mean_with_long_sequence(self):
+        rank = dist.get_rank()
+        device = get_accelerator().current_device_name()
+        local_mean = torch.tensor([1., 3.][rank], device=device, dtype=torch.float16, requires_grad=True)
+        local_count = torch.tensor([65536, 196608][rank], device=device)
+        loss = ulysses_sp_loss(local_mean, local_count, dist.get_world_group())
+        loss.backward()
+
+        torch.testing.assert_close(loss.float(), torch.tensor(2.5, device=device))
+        torch.testing.assert_close(local_mean.grad.float(), torch.tensor([0.25, 0.75][rank], device=device))
 
 
 class _RecordingAttention(torch.nn.Module):

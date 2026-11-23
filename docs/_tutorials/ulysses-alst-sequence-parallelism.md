@@ -26,7 +26,9 @@ If you want to integrate Ulysses Sequence Parallelism for HF Transformers into y
 
 ```python
 # train.py
-from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF, UlyssesSPDataLoaderAdapter
+from deepspeed.runtime.sequence_parallel.ulysses_sp import (
+    UlyssesSPAttentionHF, UlyssesSPDataLoaderAdapter, ulysses_sp_loss,
+)
 from deepspeed.runtime.utils import move_to_device
 from deepspeed.utils import groups
 from torch import tensor
@@ -80,7 +82,7 @@ mpu = UlyssesSPAttentionHF.register_with_transformers(
 )
 
 # Deepspeed setup
-model = AutoModelForCausalLM.from_pretrained(model_name_or_path)
+model = AutoModelForCausalLM.from_pretrained(model_name_or_path, attn_implementation="sdpa")
 model, _, _, _ = deepspeed.initialize(config=config_dict,
                                         model=model,
                                         model_parameters=model.parameters(),
@@ -104,38 +106,26 @@ for iter, batch in enumerate(dl):
     batch = move_to_device(batch, model.device)
 
     outputs = model(**batch)
-    # as of this writing HF doesn't calculate loss with shift_labels yet and requires us to do it manually (liger does that automatically)
     shift_labels = batch["shift_labels"]
-    loss = model.module.loss_function(
+    local_mean_loss = model.module.loss_function(
         logits=outputs.logits,
         labels=None,
         shift_labels=shift_labels,
         vocab_size=model.module.config.vocab_size,
     )
-
-    # differentiable weighted per-shard-loss aggregation across ranks
-    losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)
-    # special dealing with SFT that has prompt tokens that aren't used in loss computation
-    good_tokens = (shift_labels != -100).view(-1).sum()
-    good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
-    total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
-    total_good_tokens = sum(good_tokens_per_rank)
-    loss = total_loss / max(total_good_tokens, 1)
+    loss = ulysses_sp_loss(local_mean_loss, (shift_labels != -100).sum(), sp_group)
 
     if dist.get_rank() == 0:
         print(f"{iter}: {loss=}")
 
     model.backward(loss)
+    model.step()
 ```
 
 Now to train:
 
 ```bash
 $ deepspeed --num_gpus 2 train.py
-0: loss=tensor(10.4248, device='cuda:0', grad_fn=<DivBackward0>)
-1: loss=tensor(10.4248, device='cuda:0', grad_fn=<DivBackward0>)
-2: loss=tensor(10.3818, device='cuda:0', grad_fn=<DivBackward0>)
-3: loss=tensor(10.3818, device='cuda:0', grad_fn=<DivBackward0>)
 ```
 
 This example has been derived from the [UlyssesSP unit test](https://github.com/deepspeedai/DeepSpeed/blob/master/tests/unit/ulysses_alst/test_ulysses_sp_hf.py).
@@ -205,28 +195,21 @@ It also takes care of replacing `labels` with `shift_labels` in the batch, by pr
 
 ### Loss averaging
 
-Since each rank processes a segment we need to average loss. To get the gradients right we need to use a differentiable `all_gather`
+Pass the model's local mean loss and the number of valid shifted targets to `ulysses_sp_loss`.
+The example computes the local mean with the HF causal language model's loss function.
+It passes the adapter's pre-shifted targets as `shift_labels`, so the loss includes targets at shard boundaries.
 
 ```python
-    # differentiable weighted per-shard-loss aggregation across ranks
-    losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=sp_group)
-    # special dealing with SFT that has prompt tokens that aren't used in loss computation
-    good_tokens = (shift_labels != -100).view(-1).sum()
-    good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
-    total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
-    total_good_tokens = sum(good_tokens_per_rank)
-    loss = total_loss / max(total_good_tokens, 1)
+local_token_count = (shift_labels != -100).sum()
+loss = ulysses_sp_loss(local_mean_loss, local_token_count, sp_group)
 ```
 
-In theory you could just average `losses_per_rank`, but the system supports variable sequence length so the last rank is likely to have a shorter sequence length and also use cases like SFT may have a variable number of tokens that contribute to the loss calculation, so it's best to compute a weighted loss.
+Every rank in the sequence-parallel group reports the same mean over valid targets.
+In backward, each rank contributes its local gradient weighted by its fraction of those targets.
+DeepSpeed sums the contributions across the group. A shard with only ignored targets contributes zero.
+If all shards contain only ignored targets, the loss is zero.
 
 ## Nuances
-
-### Note on PyTorch Versions < 2.3
-
-If you are using Sequence Parallelism with **PyTorch version < 2.3**, you may encounter an `IndexError: tuple index out of range` during the backward pass when `sequence_parallel_size < world_size`. This is due to a known issue in the `torch.distributed.all_gather` backward implementation in older versions.
-
-**Workaround:** We recommend using a **weighted `all_reduce` pattern** instead of `all_gather` for loss averaging. You can refer to our [regression test case](https://github.com/deepspeedai/DeepSpeed/blob/master/tests/unit/v1/sequence_parallelism/test_ulysses.py) for a code example of this workaround.
 
 ### Why do labels need to be pre-shifted?
 
@@ -264,15 +247,18 @@ If you use [Liger-kernel](https://github.com/linkedin/Liger-Kernel) it'll automa
 
 If your model isn't supported by Liger-kernel you can use our implementation, which uses about the same amount of memory, but which is slightly slower since it's written in plain PyTorch. Here is a simplified version of it:
 
+The tile function `loss_fn` computes cross-entropy on FP32 logits with `reduction="sum"` and `ignore_index=-100`. This gives a zero sum for an all-ignored tile and lets the example normalize by the number of valid targets across tiles.
+
 ```python
     def loss(self, batch):
         num_shards = 4
         outputs = model(**batch, use_cache=False)
         hidden_states = outputs.last_hidden_state
 
+        shift_labels = batch["shift_labels"]
         kwargs_to_shard = dict(
             hidden_states=hidden_states,
-            shift_labels=batch["shift_labels"],
+            shift_labels=shift_labels,
         )
         kwargs_to_pass = dict(model=model, vocab_size=model.config.vocab_size)
         grad_requiring_tensor_key = "hidden_states"
@@ -290,18 +276,9 @@ If your model isn't supported by Liger-kernel you can use our implementation, wh
             output_unshard_dimension=0,  # loss is a scalar
             output_reduction="sum",
         )
-        total_good_items = (shift_labels != -100).squeeze().sum()
-        loss = total_loss_sum / max(total_good_items, 1)
-
-        # differentiable weighted per-shard-loss aggregation across ranks
-        losses_per_rank = torch.distributed.nn.functional.all_gather(loss, group=self.sp_group)
-        good_tokens = (shift_labels != -100).view(-1).sum()
-        good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=self.sp_group)
-        total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(self.sp_world_size))
-        total_good_tokens = sum(good_tokens_per_rank)
-        loss = total_loss / max(total_good_tokens, 1)
-
-        return loss
+        local_token_count = (shift_labels != -100).sum()
+        local_mean_loss = total_loss_sum / local_token_count.clamp_min(1)
+        return ulysses_sp_loss(local_mean_loss, local_token_count, self.sp_group)
 ```
 
 You can see the full version [here](https://github.com/snowflakedb/ArcticTraining/blob/main/arctic_training/trainer/sft_trainer.py#L45).

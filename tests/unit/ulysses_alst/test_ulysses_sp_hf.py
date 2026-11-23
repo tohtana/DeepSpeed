@@ -6,7 +6,11 @@
 UlyssesPlus: UlyssesSPHF tests
 """
 
-from deepspeed.runtime.sequence_parallel.ulysses_sp import UlyssesSPAttentionHF, UlyssesSPDataLoaderAdapter
+from deepspeed.runtime.sequence_parallel.ulysses_sp import (
+    UlyssesSPAttentionHF,
+    UlyssesSPDataLoaderAdapter,
+    ulysses_sp_loss,
+)
 from deepspeed.runtime.utils import move_to_device
 from deepspeed.utils import groups
 from deepspeed.utils import safe_get_full_grad
@@ -154,24 +158,14 @@ class TestUlyssesSPHF(DistributedTest):
         # 4. UlyssesSPAttentionHF test
         batch_b = move_to_device(batch_b, model_b.device)
         outputs = model_b(**batch_b)
-        # HF doesn't calculate loss with shift_labels yet and requires us to do it manually (liger does that)
         shift_labels = batch_b["shift_labels"]
-        loss_b = model_b.module.loss_function(
+        local_mean_loss = model_b.module.loss_function(
             logits=outputs.logits,
             labels=None,
             shift_labels=shift_labels,
             vocab_size=model_b.module.config.vocab_size,
         )
-        # print(f"{sp_rank=} {loss_b=}")
-
-        # differentiable weighted per-shard-loss aggregation across ranks
-        losses_per_rank = torch.distributed.nn.functional.all_gather(loss_b, group=sp_group)
-        good_tokens = sum((shift_labels != -100).view(-1))
-        good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
-        total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
-        total_good_tokens = sum(good_tokens_per_rank)
-        loss_b = total_loss / total_good_tokens
-        # print(f"{sp_rank=} gathered {loss_b=}")
+        loss_b = ulysses_sp_loss(local_mean_loss, (shift_labels != -100).sum(), sp_group)
         model_b.backward(loss_b)
 
         grad_b = get_grad(model_b.module.model.layers[0].self_attn.q_proj.weight, zero_stage)
@@ -530,24 +524,14 @@ class TestUlyssesSPHFFlexAttention(DistributedTest):
         # 4. UlyssesSPAttentionHF test
         batch_b = move_to_device(batch_b, model_b.device)
         outputs = model_b(**batch_b)
-        # HF doesn't calculate loss with shift_labels yet and requires us to do it manually (liger does that)
         shift_labels = batch_b["shift_labels"]
-        loss_b = model_b.module.loss_function(
+        local_mean_loss = model_b.module.loss_function(
             logits=outputs.logits,
             labels=None,
             shift_labels=shift_labels,
             vocab_size=model_b.module.config.vocab_size,
         )
-        # print(f"{sp_rank=} {loss_b=}")
-
-        # differentiable weighted per-shard-loss aggregation across ranks
-        losses_per_rank = torch.distributed.nn.functional.all_gather(loss_b, group=sp_group)
-        good_tokens = sum((shift_labels != -100).view(-1))
-        good_tokens_per_rank = torch.distributed.nn.functional.all_gather(good_tokens, group=sp_group)
-        total_loss = sum(losses_per_rank[rank] * good_tokens_per_rank[rank] for rank in range(sp_world_size))
-        total_good_tokens = sum(good_tokens_per_rank)
-        loss_b = total_loss / total_good_tokens
-        # print(f"{sp_rank=} gathered {loss_b=}")
+        loss_b = ulysses_sp_loss(local_mean_loss, (shift_labels != -100).sum(), sp_group)
         model_b.backward(loss_b)
 
         grad_b = get_grad(model_b.module.model.layers[0].self_attn.q_proj.weight, zero_stage)
