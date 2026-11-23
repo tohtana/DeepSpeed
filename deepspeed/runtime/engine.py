@@ -37,6 +37,7 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from deepspeed.runtime.zero.utils import is_zero_supported_optimizer, ZeRORuntimeException
 from deepspeed.runtime.zero.parameter_offload import DeepSpeedZeRoOffload, ZeROOrderedDict, ensure_zero_ordered_dict
 from deepspeed.runtime.zero.config import ZERO_OPTIMIZATION
+from deepspeed.runtime.zero.optimizer_state_replica import OptimizerStateReplica, OptimizerStateReplicator
 from deepspeed.runtime.zenflow.engine import (configure_zenflow, zenflow_step, is_zenflow_update_boundary,
                                               sync_zenflow_optimizer_lr)
 
@@ -566,6 +567,8 @@ class DeepSpeedEngine(Module):
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
         self.checkpoint_engine = None
         self.optimizer = None
+        self._optimizer_state_replicator = None
+        self._optimizer_state_replica = None
         self.basic_optimizer = None
         self.lr_scheduler = None
 
@@ -1317,6 +1320,7 @@ class DeepSpeedEngine(Module):
 
     def destroy(self):
         self._destroyed = True
+        self._optimizer_state_replica = None
         try:
             # DeepEP buffers ask the library not to reclaim them, so they outlive
             # the engine unless something releases them here. Only this engine's
@@ -2474,6 +2478,9 @@ class DeepSpeedEngine(Module):
 
         self._check_for_duplicates(basic_optimizer)
 
+        if self._config.zero_config.optimizer_state_replica_rank_offset:
+            self._validate_optimizer_state_replica_optimizer(basic_optimizer)
+
         self.basic_optimizer = basic_optimizer
         log_dist(f"DeepSpeed Basic Optimizer = {basic_optimizer.__class__.__name__}", ranks=[0])
 
@@ -2753,6 +2760,45 @@ class DeepSpeedEngine(Module):
 
         return optimizer
 
+    @staticmethod
+    def _validate_optimizer_state_replica_optimizer(optimizer):
+        if type(optimizer) not in (torch.optim.Adam, torch.optim.AdamW, FusedAdam):
+            raise ValueError("optimizer_state_replica_rank_offset requires Adam, AdamW, or DeepSpeed FusedAdam")
+        if any(group.get("amsgrad") for group in optimizer.param_groups):
+            raise ValueError("optimizer_state_replica_rank_offset does not support AMSGrad")
+
+    def _configure_optimizer_state_replica(self, offset):
+        world_size = dist.get_world_size()
+        if offset >= world_size:
+            raise ValueError("optimizer_state_replica_rank_offset must be less than world size")
+        if (self.pipeline_parallelism or self.has_moe_layers or self.autotp_size() > 1 or self.mp_world_size > 1
+                or self.sequence_parallel_size > 1 or self.dp_world_size != world_size
+                or self.zero_hpz_partition_size() > 1 or groups._get_zero_param_intra_parallel_group() is not None):
+            raise ValueError("optimizer_state_replica_rank_offset requires pure data-parallel ZeRO Stage 3")
+        if self.zenflow or self.super_offload():
+            raise ValueError("optimizer_state_replica_rank_offset does not support ZenFlow or SuperOffload")
+        if self.fp16_master_weights_and_gradients() or self.bf16_master_weights_and_gradients():
+            raise ValueError("optimizer_state_replica_rank_offset requires FP32 master weights")
+        if (self.device.type, dist.get_backend()) not in (("cpu", "gloo"), ("cuda", "nccl")):
+            raise ValueError("optimizer_state_replica_rank_offset requires CPU/Gloo or CUDA/NCCL")
+
+        world_group = dist.get_world_group()
+        partition_groups = {self.seq_data_parallel_group}
+        for param in self.module.parameters():
+            if hasattr(param, "ds_process_group"):
+                partition_groups.add(param.ds_process_group)
+                if param.ds_tensor.device.type != self.device.type or param.nvme_swapper is not None:
+                    raise ValueError("optimizer_state_replica_rank_offset requires parameter offload to be disabled")
+                if param.ds_zero_param_process_group is not None:
+                    raise ValueError("optimizer_state_replica_rank_offset does not support hierarchical partitioning")
+
+        for group in partition_groups - {None, world_group}:
+            if dist.get_world_size(group) != world_size or any(
+                    dist.get_global_rank(group, rank) != rank for rank in range(world_size)):
+                raise ValueError("optimizer_state_replica_rank_offset requires partitions in global rank order")
+
+        self._optimizer_state_replicator = OptimizerStateReplicator(dist.get_rank(), world_size, offset)
+
     def _configure_zero_optimizer(self, optimizer):
         zero_stage = self.zero_optimization_stage()
 
@@ -2766,6 +2812,12 @@ class DeepSpeedEngine(Module):
             check_grad_overflow = False
 
         timers = self.timers if self.wall_clock_breakdown() else NoopTimer()
+
+        replica_offset = self._config.zero_config.optimizer_state_replica_rank_offset
+        if replica_offset:
+            if optimizer is None:
+                self._validate_optimizer_state_replica_optimizer(optimizer)
+            self._configure_optimizer_state_replica(replica_offset)
 
         if optimizer is None:
             optimizer = DummyOptim(list(self.module.parameters()))
@@ -3704,6 +3756,27 @@ class DeepSpeedEngine(Module):
             self._unmanaged_backward_count = 0
         else:
             self.global_samples += self.train_batch_size()
+
+        if self._step_applied and self._optimizer_state_replicator is not None:
+            self._optimizer_state_replica = self._optimizer_state_replicator.replicate(
+                self.optimizer, self.global_steps)
+
+    def get_optimizer_state_replica(self,
+                                    source_rank: int,
+                                    *,
+                                    global_step: Optional[int] = None) -> Optional[OptimizerStateReplica]:
+        """Return this rank's latest completed CPU snapshot of ``source_rank``.
+
+        Pass ``global_step`` to require an exact engine step. Return ``None`` if no
+        snapshot matches. This method uses local memory and can read a snapshot
+        after process-group teardown. Treat the returned tensors as read-only.
+        """
+        replica = self._optimizer_state_replica
+        if replica is None or replica.source_rank != source_rank:
+            return None
+        if global_step is not None and replica.global_step != global_step:
+            return None
+        return replica
 
     def step(self, lr_kwargs=None):
         r"""Execute the weight update step after forward and backward propagation
@@ -4746,6 +4819,8 @@ class DeepSpeedEngine(Module):
         if checkpoint is None:
             return None, None
 
+        self._optimizer_state_replica = None
+
         folding_spec = getattr(self, "_autoep_folding_spec", None)
         folded_autoep_tp = folding_spec is not None and folding_spec.tp_size > 1
         ep_group_name = f"ep_size_{folding_spec.ep_size}" if folded_autoep_tp else None
@@ -4928,6 +5003,9 @@ class DeepSpeedEngine(Module):
                                        checkpoint_folder=checkpoint_folder,
                                        load_serial=load_serial,
                                        param_shapes=param_shapes)
+
+        if self._optimizer_state_replicator is not None:
+            self._validate_optimizer_state_replica_optimizer(self.optimizer.optimizer)
 
         if self.load_universal_checkpoint():
             logger.info(f'loaded universal zero checkpoints from {checkpoint_folder} for rank {self.global_rank}')

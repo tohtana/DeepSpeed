@@ -70,6 +70,21 @@ def test_zero_config_compute_grad_norm():
             DeepSpeedZeroConfig(stage=stage, compute_grad_norm=False)
 
 
+def test_zero_config_optimizer_state_replica_rank_offset():
+    assert DeepSpeedZeroConfig().optimizer_state_replica_rank_offset == 0
+    assert DeepSpeedZeroConfig(stage=3, optimizer_state_replica_rank_offset=2).optimizer_state_replica_rank_offset == 2
+
+    for value in (-1, True, 1.5, "1"):
+        with pytest.raises(ValueError, match="optimizer_state_replica_rank_offset"):
+            DeepSpeedZeroConfig(stage=3, optimizer_state_replica_rank_offset=value)
+    for stage in (0, 1, 2):
+        with pytest.raises(ValueError, match="requires ZeRO Stage 3"):
+            DeepSpeedZeroConfig(stage=stage, optimizer_state_replica_rank_offset=1)
+    for offload_key in ("offload_param", "offload_optimizer"):
+        with pytest.raises(ValueError, match="requires offload to be disabled"):
+            DeepSpeedZeroConfig(stage=3, optimizer_state_replica_rank_offset=1, **{offload_key: {"device": "cpu"}})
+
+
 def test_zero_config_offload_configs():
     config = DeepSpeedZeroConfig()
     assert config.offload_param is None

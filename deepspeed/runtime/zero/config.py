@@ -99,6 +99,13 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     partitioning, and optimizer+gradient+parameter partitioning, respectively.
     """
 
+    optimizer_state_replica_rank_offset: int = Field(0, ge=0, strict=True)
+    """
+    Rank offset for a CPU replica of each ZeRO-3 Adam optimizer partition.
+    Zero disables replication. A positive offset sends rank r's partition
+    to rank (r + offset) % world_size.
+    """
+
     contiguous_gradients: bool = True
     """
     Copies the gradients to a contiguous buffer as they are produced. Avoids
@@ -390,6 +397,16 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     """
 
     # Validators
+    @model_validator(mode="after")
+    def optimizer_state_replica_valid(self):
+        if self.optimizer_state_replica_rank_offset:
+            if self.stage != ZeroStageEnum.weights:
+                raise ValueError("optimizer_state_replica_rank_offset requires ZeRO Stage 3")
+            if any(config is not None and config.device != OffloadDeviceEnum.none
+                   for config in (self.offload_param, self.offload_optimizer)):
+                raise ValueError("optimizer_state_replica_rank_offset requires offload to be disabled")
+        return self
+
     @model_validator(mode="after")
     def overlap_comm_valid(self):
         if self.overlap_comm is None:

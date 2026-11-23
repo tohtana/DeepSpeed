@@ -71,6 +71,51 @@ parsed by `DeepSpeedZeroOffloadParamConfig`_ and
 .. autopydantic_model:: deepspeed.runtime.zero.config.DeepSpeedZeroOffloadOptimizerConfig
 
 
+Optimizer state replicas
+========================
+
+Set ``zero_optimization.optimizer_state_replica_rank_offset`` to hold one peer's
+completed optimizer state in CPU memory on each rank. Use the same positive
+integer offset on all ranks. For offset ``k``, rank ``r`` sends to
+``(r + k) % world_size`` and receives from ``(r - k) % world_size``. The offset
+must be smaller than the world size. The default of zero disables replicas.
+
+Use pure data-parallel ZeRO-3 in global rank order, with FP32 master weights
+and torch Adam, torch AdamW, or DeepSpeed FusedAdam. CPU workers use Gloo and
+CUDA workers use NCCL. Leave parameter and optimizer offload, AMSGrad, hpZ,
+ZenFlow, and SuperOffload disabled.
+
+Each snapshot contains the source rank, its engine ``global_step``, and its
+ordered flat optimizer subgroups, including ZeRO padding. Each subgroup
+contains ``fp32_master``, ``exp_avg``, ``exp_avg_sq``, and the Adam ``step``.
+The tensors preserve the source bytes and dtype, and the Adam step preserves
+its tensor or integer type. Treat the returned tensors as read-only.
+
+The engine replaces the local snapshot after all of the new data arrives.
+Only completed optimizer updates generate snapshots. Accumulation microsteps
+and overflow skips leave the previous snapshot available, even if the
+engine's ``global_steps`` counter advances. For a known completed engine
+step, pass it to the getter to require an exact match.
+
+.. code-block:: python
+
+    snapshot = engine.get_optimizer_state_replica(source_rank, global_step=completed_step)
+    if snapshot is not None:
+        master_partitions = [subgroup.fp32_master for subgroup in snapshot.subgroups]
+
+The getter returns ``None`` when the local rank has no matching snapshot. It
+uses local memory after the process group has stopped, provided the engine
+has been kept alive. Loading a training checkpoint clears the snapshot when
+the load reaches the model state. Destroying the engine clears its snapshot
+reference. Recovery code can use the local partitions to build a restart
+procedure.
+
+Each update sends one local FP32 master partition and its two Adam moments
+to the peer. The receiver holds one complete snapshot in CPU memory and
+allocates the next snapshot while the previous one remains readable.
+Transfers use bounded device buffers and run as part of the update.
+
+
 Example ZeRO-3 Configurations
 =============================
 

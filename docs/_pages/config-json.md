@@ -406,6 +406,7 @@ Enabling and configuring ZeRO memory optimizations
 ```json
   "zero_optimization": {
     "stage": [0|1|2|3],
+    "optimizer_state_replica_rank_offset": 0,
     "allgather_partitions": [true|false],
     "allgather_bucket_size": 5e8,
     "compute_grad_norm": [true|false],
@@ -447,6 +448,14 @@ Enabling and configuring ZeRO memory optimizations
 | Description                                                                                                                                                                                                               | Default |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | Chooses different stages of ZeRO Optimizer. Stage 0, 1, 2, and 3 refer to disabled, optimizer state partitioning, and optimizer+gradient state partitioning, and optimizer+gradient+parameter partitioning, respectively. | `0`     |
+
+***optimizer_state_replica_rank_offset***: [integer]
+
+| Description | Default |
+| ----------- | ------- |
+| A positive offset enables a CPU replica of each rank's ZeRO-3 Adam optimizer state on rank `(rank + offset) % world_size`. Set the same offset on all ranks and use an offset smaller than the world size. | `0` (disabled) |
+
+See the [ZeRO-3 optimizer state replicas guide](https://deepspeed.readthedocs.io/en/latest/zero3.html#optimizer-state-replicas) for requirements and retrieval.
 
 <i>**allgather_partitions**</i>: [boolean]
 
