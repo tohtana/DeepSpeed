@@ -37,7 +37,7 @@ class Backend(object):
     def is_initialized(self):
         return self.initialized
 
-    def new_group(self):
+    def new_group(self, ranks, backend=None):
         # create a new pg and add it to pg list
         pass
 

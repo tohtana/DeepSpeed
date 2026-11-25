@@ -15,3 +15,4 @@ from .tiling import TiledLinear
 from .tiling import TiledLinearReturnBias
 
 from .stage3 import unwrap_model_for_generation
+from .optimizer_state_replica import prepare_optimizer_state_recovery, replicate_optimizer_state, restore_optimizer_state

@@ -158,6 +158,71 @@ Example ZeRO-3 Configurations
             ...
         }
 
+Replicating optimizer state in memory
+------------------------------------
+
+To keep a recoverable copy of each ZeRO-3 optimizer shard, pair ranks in
+two-rank Gloo groups. Create the groups in the same order on all training
+ranks. Choose peers in different failure domains if you need protection
+against losing a whole host.
+
+Call :func:`deepspeed.zero.replicate_optimizer_state` on both members of
+each pair after the same completed optimizer step and before the next
+forward. The call returns the local snapshot and the peer's snapshot.
+Each snapshot contains the rank, step, FP32 masters, and optimizer state,
+including Adam moments and step counters. The transfer blocks while it
+copies both optimizer shards into CPU memory. Keep the previous snapshots
+until all pairs have finished a new exchange and your launcher commits
+that step as recoverable.
+
+For example, with four data-parallel ranks, every rank runs the following
+code at setup and uses its own ``replica_group`` after each selected step.
+
+.. code-block:: python
+
+    first_pair = deepspeed.comm.new_group([0, 1], backend="gloo")
+    second_pair = deepspeed.comm.new_group([2, 3], backend="gloo")
+    replica_group = first_pair if deepspeed.comm.get_rank() < 2 else second_pair
+
+    # After engine.step() completes an optimizer step on every rank.
+    local, peer = deepspeed.zero.replicate_optimizer_state(engine, replica_group)
+
+After a failure, the launcher selects the last committed step and
+rebuilds communication groups with the original logical ranks. It
+preserves a live owner for each needed snapshot and sends the failed
+rank its snapshot over a trusted transport. The default elastic
+``torchrun`` policy restarts all workers, so keeping snapshots only in
+those workers requires a different launcher policy or a separate
+process that retains the snapshots.
+
+1. On every rank, select the local training device and initialize
+   communication. Call
+   :func:`deepspeed.zero.prepare_optimizer_state_recovery` before constructing
+   any ZeRO-3 parameters or the replacement engine.
+2. Recreate the model and engine with the original world size, parameter
+   layout, optimizer type, and configuration. Call
+   :func:`deepspeed.zero.restore_optimizer_state` on all ranks with their
+   own snapshots from the same step. Restore updates trainable model
+   weight partitions from the FP32 masters.
+3. Restore the rest of your training state before continuing. This
+   includes scheduler progress, engine counters, RNG, mutable buffers,
+   frozen weights if applicable, and the input position. Resume at an
+   optimizer-step boundary.
+
+The APIs support regular ZeRO-3 data parallelism with resident FP32
+masters and Adam, AdamW, or FusedAdam. Offload and other parallelism
+dimensions require a different recovery path. A pair can recover one
+lost snapshot owner as long as the other owner survives. These APIs
+manage optimizer state. The launcher manages rank replacement, and the
+caller manages the training state beyond the optimizer.
+
+.. autofunction:: deepspeed.zero.replicate_optimizer_state
+
+.. autofunction:: deepspeed.zero.prepare_optimizer_state_recovery
+
+.. autofunction:: deepspeed.zero.restore_optimizer_state
+
+
 Assumptions
 ===========
 
