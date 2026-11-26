@@ -22,9 +22,6 @@ LOWER_PRECISION_SAFE_MODULES = [
 PARAM_COMM_DTYPE_ATTR_NAME = "comm_dtype"
 _WARNED_NESTED_AUTOCAST = False
 
-TORCH_AUTOCAST_INITIALIZED = False
-TORCH_AUTOCAST_DTYPE = None
-
 
 def _validate_auto_cast_settings(engine):
 
@@ -55,24 +52,9 @@ def init_autocast_params(engine, dtype: torch.dtype,
             for p in module.parameters(recurse=False):
                 setattr(p, PARAM_COMM_DTYPE_ATTR_NAME, dtype)
 
-    global TORCH_AUTOCAST_INITIALIZED
-    TORCH_AUTOCAST_INITIALIZED = True
-    global TORCH_AUTOCAST_DTYPE
-    TORCH_AUTOCAST_DTYPE = dtype
-
-
-def is_autocast_initialized() -> bool:
-    """Return whether any engine initialized torch autocast. Use engine.torch_autocast_enabled() for one engine."""
-    return TORCH_AUTOCAST_INITIALIZED
-
 
 def get_default_autocast_lower_precision_modules() -> List[str]:
     return [f"{cls.__module__}.{cls.__name__}" for cls in LOWER_PRECISION_SAFE_MODULES]
-
-
-def get_autocast_dtype() -> Union[None, torch.dtype]:
-    """Return the last initialized autocast dtype. Use engine.torch_autocast_dtype() for one engine."""
-    return TORCH_AUTOCAST_DTYPE
 
 
 def has_comm_dtype(param: torch.nn.Parameter) -> bool:

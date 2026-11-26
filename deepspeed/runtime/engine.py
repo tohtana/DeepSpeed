@@ -1800,9 +1800,11 @@ class DeepSpeedEngine(Module):
         return self._config.bfloat16_config.bf16_optimizer_states
 
     def torch_autocast_enabled(self) -> bool:
+        """Return whether this engine enables torch autocast in its configuration."""
         return self._config.torch_autocast_enabled
 
-    def torch_autocast_dtype(self) -> torch.dtype:
+    def torch_autocast_dtype(self) -> Optional[torch.dtype]:
+        """Return the configured autocast dtype, even when disabled, or None if omitted."""
         return self._config.torch_autocast_dtype
 
     def torch_autocast_lower_precision_safe_modules(self) -> List[str]:

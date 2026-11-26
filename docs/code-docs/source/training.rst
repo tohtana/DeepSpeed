@@ -287,10 +287,14 @@ When DeepSpeed detects a nested autocast context, it handles it as follows:
 In both cases, PyTorch's ``torch.autocast`` is idempotent when nested with the same
 dtype, so there is no performance or correctness penalty from the nesting.
 
+The engine accessors report the DeepSpeed configuration for that engine.
+Use PyTorch's autocast accessors to inspect the active autocast context.
+
+.. automethod:: deepspeed.DeepSpeedEngine.torch_autocast_enabled
+.. automethod:: deepspeed.DeepSpeedEngine.torch_autocast_dtype
+
 .. autofunction:: deepspeed.runtime.torch_autocast.init_autocast_params
-.. autofunction:: deepspeed.runtime.torch_autocast.is_autocast_initialized
 .. autofunction:: deepspeed.runtime.torch_autocast.get_default_autocast_lower_precision_modules
-.. autofunction:: deepspeed.runtime.torch_autocast.has_autocast_dtype
 
 
 Configuring ZeRO Leaf Modules
