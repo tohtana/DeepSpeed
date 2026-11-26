@@ -7,10 +7,11 @@ import os
 import torch
 from typing import Any
 
+from deepspeed.accelerator import get_accelerator
 from deepspeed.utils import logger
 from deepspeed.utils.tensor_fragment import map_to_flat_opt_states
 from deepspeed.runtime.utils import bwc_tensor_model_parallel_rank, see_memory_usage
-from deepspeed.runtime.torch_autocast import get_comm_dtype, is_autocast_initialized
+from deepspeed.runtime.torch_autocast import get_comm_dtype
 from deepspeed.runtime.utils import maybe_loss_for_backward
 
 
@@ -264,7 +265,11 @@ class BackwardHookStateManager:
 class ZeROOptimizer(DeepSpeedOptimizer):
     """Base class for ZeRO optimizer implementations (stages 1, 2, and 3)."""
 
-    def __init__(self):
+    def __init__(self, torch_autocast_enabled=False, torch_autocast_dtype=None):
+        self.torch_autocast_enabled = torch_autocast_enabled
+        self.torch_autocast_gradscaler = None
+        if torch_autocast_enabled and torch_autocast_dtype == torch.float16:
+            self.torch_autocast_gradscaler = torch.amp.GradScaler(device=get_accelerator().device_name())
         self._backward_hook_state = BackwardHookStateManager()
         # Mirrored copy of the engine GAS boundary for managed reduce/offload paths.
         # Engine owns the source of truth (micro-step / step() / set_*); ZeRO reads this
@@ -422,7 +427,7 @@ class ZeROOptimizer(DeepSpeedOptimizer):
             )
 
     def get_param_comm_dtype(self, param):
-        if is_autocast_initialized():
+        if self.torch_autocast_enabled:
             return get_comm_dtype(param)
         else:
             return self.communication_data_type

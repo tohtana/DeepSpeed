@@ -23,7 +23,7 @@ from deepspeed.utils.torch import register_grad_hook, required_torch_version
 from deepspeed.utils.pin_memory_tracker import pinned_memory_summary
 from deepspeed.runtime.fp16.loss_scaler import CreateLossScaler
 from deepspeed.module_inject.auto_ep_folding import apply_folding_correction_to_grad_buffer
-from deepspeed.runtime.torch_autocast import get_autocast_dtype, get_all_comm_dtypes, is_autocast_initialized, sort_dtypes
+from deepspeed.runtime.torch_autocast import get_all_comm_dtypes, sort_dtypes
 from deepspeed.runtime.comm.coalesced_collectives import reduce_scatter_coalesced, all_to_all_quant_reduce
 from deepspeed.runtime.utils import (combine_grad_norm_groups, count_used_parameters_in_backward, has_inf_or_nan, inf,
                                      is_invalid_grad_norm, is_model_parallel_parameter, is_optimized_parameter,
@@ -209,11 +209,13 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         enable_sanity_checks=False,
         cpuadam_cores_perc=0.8,
         save_muon_momentum_buffer_in_memory=False,
+        torch_autocast_enabled=False,
+        torch_autocast_dtype=None,
     ):
         see_memory_usage("Stage 3 initialize beginning", force=False)
 
         print_rank_0(f"initialized {__class__.__name__} with args: {locals()}", force=False)
-        super().__init__()
+        super().__init__(torch_autocast_enabled=torch_autocast_enabled, torch_autocast_dtype=torch_autocast_dtype)
 
         if dist.get_rank() == 0:
             logger.info(f"Reduce bucket size {reduce_bucket_size}")
@@ -498,11 +500,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         # map between param_id and bool to specify if a param is in this partition
         self.is_param_in_current_partition = {}
 
-        self.torch_autocast_gradscaler = None
-        if is_autocast_initialized():
+        if self.torch_autocast_enabled:
             comm_dtypes = get_all_comm_dtypes([p for params in self.fp16_groups for p in params])
-            if get_autocast_dtype() == torch.float16:
-                self.torch_autocast_gradscaler = torch.amp.GradScaler(device=get_accelerator().device_name())
         else:
             comm_dtypes = {self.communication_data_type}
         comm_dtypes |= {self.get_param_comm_dtype(p) for params in self.fp16_groups for p in params}
