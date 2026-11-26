@@ -3,10 +3,13 @@
 
 # DeepSpeed Team
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 
 import deepspeed
+import deepspeed.comm as dist
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.torch_autocast import get_comm_dtype, has_comm_dtype
 from deepspeed.runtime.zero.partition_parameters import get_allgather_dtype
@@ -127,3 +130,69 @@ class TestZero3AutocastMixedDtype(DistributedTest):
             _assert_mixed_partition_dtypes(engine.module)
         finally:
             engine.destroy()
+
+
+@contextmanager
+def _zero1_engine(autocast):
+    config = {
+        "train_micro_batch_size_per_gpu": 1,
+        "bf16": {
+            "enabled": True
+        },
+        "data_types": {
+            "grad_accum_dtype": "fp32"
+        },
+        "communication_data_type": "fp32",
+        "zero_optimization": {
+            "stage": 1,
+            "offload_optimizer": {
+                "device": "cpu"
+            },
+            "reduce_bucket_size": 64,
+        },
+        "zero_force_ds_cpu_optimizer": False,
+        "torch_autocast": {
+            "enabled": autocast,
+            "dtype": "bfloat16"
+        },
+    }
+    model = torch.nn.Linear(16, 1, bias=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
+    try:
+        yield engine
+    finally:
+        engine.destroy()
+
+
+def _check_reduced_gradient(engine, expected):
+    # The two ranks' inputs are adjacent BF16 values. Their mean is exact in FP32
+    # and rounds to 1 in BF16. Each weight gradient equals this mean.
+    value = 1 + dist.get_rank() / 128
+    inputs = torch.full((1, 16), value, dtype=torch.bfloat16, device=engine.device)
+    engine.backward(engine(inputs).sum())
+    grad = safe_get_full_grad(engine.module.weight)
+    torch.testing.assert_close(grad, torch.full_like(grad, expected, dtype=torch.float32), rtol=0, atol=0)
+    engine.step()
+
+
+@pytest.mark.skipif(not bf16_required_version_check(), reason="BF16 support required")
+class TestZero1AutocastEngineIsolation(DistributedTest):
+    world_size = 2
+
+    def test_sequential_engines(self):
+        with _zero1_engine(autocast=False) as fresh:
+            _check_reduced_gradient(fresh, 1 + 1 / 256)
+        with _zero1_engine(autocast=True) as autocast:
+            _check_reduced_gradient(autocast, 1)
+        with _zero1_engine(autocast=False) as plain:
+            _check_reduced_gradient(plain, 1 + 1 / 256)
+
+    @pytest.mark.parametrize("autocast_first", [True, False])
+    def test_coexisting_engines(self, autocast_first):
+        with _zero1_engine(autocast=autocast_first) as first:
+            with _zero1_engine(autocast=not autocast_first) as second:
+                autocast, plain = (first, second) if autocast_first else (second, first)
+                _check_reduced_gradient(autocast, 1)
+                _check_reduced_gradient(plain, 1 + 1 / 256)
+                _check_reduced_gradient(autocast, 1)
