@@ -144,6 +144,10 @@ After receiving the PRs, we will review them and merge them after necessary test
 ### Step 3: release and maintenance
 After the PRs are merged, we will announce the feature on our website (with credit to the feature author). We ask the feature author to commit to the maintenance of the feature.
 
+## Publishing a DeepSpeed release
+
+Maintainers can use the [release guide](release/README.md) to request a release, approve publication, and merge the next version bump.
+
 ## Developer Certificate of Origin
 This project welcomes contributions and suggestions. All contributions to deepspeedai projects
 require commits to be signed off with a [Developer Certificate of Origin](https://en.wikipedia.org/wiki/Developer_Certificate_of_Origin)
